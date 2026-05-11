@@ -377,7 +377,7 @@ duo-paste/
 - 在一台 Mac 上跑：捕获 → SQLite/FTS5 → 搜索窗 → 小时级 snapshot
 - LaunchAgent daily-driver 已上线
 
-**M2：Primary + Client 单向 push** ✅ 代码完成（未真部署 mini）
+**M2：Primary + Client 单向 push** ✅ 已上线生产
 - v1_initial 已含 `origin_device / ingested_at_ns / push_state / push_attempts / last_push_error`——M1 schema 当初就前瞻式建好，**没需要 ALTER**
 - v2_mirror migration：预建 `item_mirror / item_mirror_fts / pull_cursor`（M3 才用，提前建避免二次 migration）
 - `config.json`：`serve` / `serve_host` / `serve_port` / `primary_url` / `pull.*` / `shared_secret_keychain_account`
@@ -388,18 +388,31 @@ duo-paste/
 - SearchProvider：有 remote → 试远端 → 失败回退本地 + `searchMode` 标 `.remoteFallback(reason)`；UI banner 显示 reason
 - CLI 子命令：`duo-pasted init-secret [--force]` / `retry-failed` / `--help`（SwiftUI App.init 拦截 + exit）
 - 集成测试：同进程 server + worker 真 HTTP 全链路（push、search、blob 都覆盖）
-- 测试 63/63 通过；live daemon curl 验证 `/health` `/ingest` `/blob HEAD-PUT-GET` `/search` 全通
-- **未做**：真上 mini + Tailscale + `tailscale cert` TLS 切换
+- 测试 66/66 通过；live daemon curl 验证 `/health` `/ingest` `/blob HEAD-PUT-GET` `/search` 全通
+- FTS5 snippet 高亮 + UI 加粗（单次 SQL 同时拿 item+snippet，maxTokens=8 紧贴匹配词）
+- SearchView debounce 100ms + 进程级 URLSession（push/search 共享 TLS 连接池）
+- TLS 已实装：mini 上 `tailscale cert` 签发，URLSession 默认信任（macOS 根证书链）
+- **生产部署**：mini = `bobbys-mac-mini.tail69730a.ts.net:8443` (primary HTTPS)；MBP `100.68.44.27` = client
+- **已知 M2 局限**：client 搜索每次过 Tailscale 一跳，连打 debounce 后单次仍 ~120ms。M3 mirror 模式才能彻底本地化。
 
-**M3：Mirror 模式 + 离线韧性 + DR**
-- Primary 加 `GET /since?cursor=...` 增量 API + `POST /audit` 缺失检查
-- Client 加 pull worker（`pull.enabled=true` 时启动）→ item_mirror
-- 搜索 union mirror（离线时 banner 区分"mirror 模式"vs"仅本机"）
-- `duo-pasted promote-to-primary` / `migrate-primary` / `audit-push` 子命令
-- MBP 接入做离线缓冲测试
+**M3：Mirror 模式 + 离线韧性 + DR** ⏳ 下一站
+- 第一刀（最小 mirror MVP）：
+  - Primary 加 `GET /since?cursor=<ingested_at_ns>&limit=N` 增量 API，按 ingested_at_ns ASC 返回；空 cursor 时全量拉
+  - Client `PullWorker` actor，周期（默认 30s）打 `/since`，`INSERT OR IGNORE INTO item_mirror`，更新 `pull_cursor.cursor_ns`
+  - `SearchAPI.searchHits` 改：mirror 启用时 UNION ALL 查 `item` + `item_mirror`，按 id 去重（origin 自己的优先）
+  - `pull.enabled=true` 时 AppDelegate 启 PullWorker，SearchProvider 知道 mirror 在 → 优先打本地（不再每次 keystroke 过网络）
+  - UI banner: 区分 "mirror @ cursor 14m ago" / "primary 离线" / "本机 only"
+- 第二刀（运维 + DR）：
+  - `duo-pasted promote-to-primary` —— mirror 表提升为 item 表 + 改 config + 重启
+  - `duo-pasted audit-push` —— 扫本地 origin 项，问新 primary 缺哪些再 re-push
+  - `duo-pasted migrate-primary` —— rsync DB + blobs 到新 primary 的脚手架
+- 第三刀（优化）：
+  - Blob 懒拉（mirror 默认不预拉 blob，搜索结果点开图片时按需 GET）；`pull.eager_blobs=true` 走全量预拉
+  - 时钟偏移 sanity check（启动时与 primary 时钟差 > 30s → banner 警告）
 - 验证：
-  - 主 Mac 开 mirror，停 mini → 主 Mac 搜索能看到 mini 的历史
-  - 模拟 mini 永久下线 → 主 Mac promote 成功，MBP 切过去 + audit-push 补齐
+  - MBP 开 mirror → 搜索时延 < 50ms（纯本地 FTS）
+  - MBP 拔网线 → 搜索仍能看到 mirror 全集（cursor 时刻为准）
+  - 模拟 mini 永久下线 → MBP promote 成功，secondary client 切过去 + audit-push 补齐
   - MBP 断网捕获 100 条 → 重连全部到达新 primary
 
 **M4：导出 + UX 打磨**

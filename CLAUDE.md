@@ -7,19 +7,22 @@
 ## 项目当前状态
 
 - **M1 完成**：捕获 + SQLite/FTS5 + 内容寻址 blob + SwiftUI 搜索窗（NSPanel HUD）+ ⌥⌘V 全局快捷键 + 菜单栏 + LaunchAgent + 小时级 snapshot
-- **M2 代码完成 + primary 已上线 mini（HTTPS）**（client 端待 MBP 联调）：
-  - Schema migration v2_mirror（item_mirror / item_mirror_fts / pull_cursor 预留）
-  - `config.json` + `serve` / `primary_url` / `pull.*` 配置
-  - HMAC-SHA256 签名 + 反 replay（5min 窗口）
-  - Hummingbird 2 server：`/health` `/ingest` `/blob` (HEAD/GET/PUT) `/search`，可选 TLS（`tailscale cert` 签发的 PEM）
+- **M2 已上线生产**：mini = primary（HTTPS @ 0.0.0.0:8443，`bobbys-mac-mini.tail69730a.ts.net`）+ MBP（`100.68.44.27`）= client。双向同步在 DB 层验证通过：MBP 复制的项 push 到 mini，MBP 搜索能看到 mini 全部历史
+  - Schema migration v2_mirror（item_mirror / item_mirror_fts / pull_cursor，M3 才真用）
+  - `config.json` + `serve` / `serve_tls` / `primary_url` / `pull.*` 配置
+  - HMAC-SHA256 签名（path-encoded body sha256，middleware 不读 body）+ 反 replay（5min 窗口）
+  - Hummingbird 2 server：`/health` `/ingest` `/blob` (HEAD/GET/PUT) `/search`，TLS via `tailscale cert`
   - Client push worker（actor）+ blob 先于 ingest 顺序保证 + 退避重试
-  - SearchProvider 远端优先 + 本地降级 + UI banner
+  - SearchProvider 远端优先 + 本地降级 + UI banner（区分 .local / .remoteOK / .remoteFallback）
+  - FTS5 snippet 高亮（STX/ETX marker，UI 加粗匹配段）
+  - SearchView debounce 100ms（连打按键合并成 1 次远端请求）
+  - 进程级 URLSession（push + search 共享 TLS 连接池）
   - CLI 子命令：`init-secret` / `retry-failed` / `--help`（SwiftUI App.init 拦截）
   - 集成测试：同进程 server + worker 真 HTTP roundtrip 全覆盖
 - **M3 未开始**：mirror pull worker / `promote-to-primary` / `audit-push` / `migrate-primary`
-- **测试**：63/63 通过（`swift test`）
+- **测试**：66/66 通过（`swift test`）
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
-- **下一站**：把 MBP（`100.68.44.27`）作为 client 加入联调（拷 shared-secret + 配 primary_url 即可，详见 `docs/deploy-multi-mac.md`）；或动手 M3 mirror
+- **下一站**：**M3 mirror pull worker**——M2 client 搜索每次都过 Tailscale 一跳，体感慢；M3 把 mini 全量同步进 client 的 `item_mirror` 表，搜索变纯本地。schema 已就位，需要做 `/since` route + PullWorker actor + 搜索 union mirror。详细拆解见 plans/...moonlit-wave.md
 
 ## 架构与 Non-Goals
 
