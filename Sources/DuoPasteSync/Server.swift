@@ -65,7 +65,8 @@ public struct SyncServer: Sendable {
             deviceID: deviceID,
             ingester: RemoteIngester(database: database),
             blobs: blobs,
-            searchAPI: SearchAPI(database: database)
+            searchAPI: SearchAPI(database: database),
+            sinceAPI: SinceAPI(database: database)
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -105,7 +106,8 @@ public struct SyncServer: Sendable {
         deviceID: String,
         ingester: RemoteIngester,
         blobs: BlobStore,
-        searchAPI: SearchAPI
+        searchAPI: SearchAPI,
+        sinceAPI: SinceAPI
     ) {
         router.get("/health") { _, _ -> Response in
             let payload: [String: String] = [
@@ -226,6 +228,33 @@ public struct SyncServer: Sendable {
             }
         }
 
+        // GET /since?cursor_ns=<int>&cursor_id=<str>&limit=<int>
+        // 按 (ingested_at_ns, id) ASC 增量返回 item 表。空 cursor → 从头全量拉。
+        // 包含软删行（mirror 需要 replay deletion）；过滤 ingested_at_ns IS NULL。
+        // 响应：{ ok, items:[...], next_cursor:{ingested_at_ns,id}, has_more }
+        router.get("/since") { request, _ -> Response in
+            let q = parseSinceQuery(request.uri.queryParameters)
+            do {
+                let page = try sinceAPI.fetch(q)
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "count": page.items.count,
+                    "items": page.items.map(itemToJSON),
+                    "next_cursor": [
+                        "ingested_at_ns": page.nextCursor.ingestedAtNs,
+                        "id": page.nextCursor.id,
+                    ],
+                    "has_more": page.hasMore,
+                ]
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                resp.headers[.contentType] = "application/json"
+                return resp
+            } catch {
+                return errorJSON(.internalServerError, "since failed: \(error)")
+            }
+        }
+
         // GET /search?q=foo&limit=200&offset=0&kinds=text,url&from_ns=...&to_ns=...&pinned=1
         // 一次 SQL 同时拿 item + snippet；返回 { ok, items: [Item + 可选 snippet], count }
         router.get("/search") { request, _ -> Response in
@@ -250,6 +279,20 @@ public struct SyncServer: Sendable {
                 return errorJSON(.internalServerError, "search failed: \(error)")
             }
         }
+    }
+
+    /// 把 URL query 参数转成 SinceQuery。空 cursor_ns / 非法值 → 视作从头拉。
+    /// 跟 parseSearchQuery 一致：limit 在 parse 层 clamp 到 [1, SinceAPI.maxLimit]，
+    /// 避免 wire 接受 0 / 巨大值（SinceAPI 内还有 clamp 兜底，是纵深防御）。
+    static func parseSinceQuery(_ params: FlatDictionary<Substring, Substring>) -> SinceQuery {
+        let cursorNs = params["cursor_ns"].flatMap { Int64($0) } ?? 0
+        let cursorID = params["cursor_id"].map(String.init) ?? ""
+        let rawLimit = params["limit"].flatMap { Int($0) } ?? SinceAPI.defaultLimit
+        let limit = max(1, min(rawLimit, SinceAPI.maxLimit))
+        return SinceQuery(
+            cursor: SinceCursor(ingestedAtNs: cursorNs, id: cursorID),
+            limit: limit
+        )
     }
 
     /// 把 URL query 参数转成 SearchQuery。容错原则：不合法值忽略，不报错——

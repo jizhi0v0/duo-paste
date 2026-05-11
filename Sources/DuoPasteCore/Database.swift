@@ -194,7 +194,34 @@ public struct Database: Sendable {
             """)
         }
 
+        // v3: /since 用的复合索引。WHERE ingested_at_ns IS NOT NULL 跟 SinceAPI 的查询条件
+        // 一致，partial index 占盘小、命中走 index-only seek+scan，30s pull worker 不再
+        // 触发 item 全表扫 + filesort。`(ingested_at_ns, id)` 跟 cursor 的二元 tiebreak 对齐。
+        m.registerMigration("v3_since_index") { db in
+            try db.execute(sql: """
+                CREATE INDEX idx_item_ingested
+                    ON item(ingested_at_ns, id)
+                    WHERE ingested_at_ns IS NOT NULL;
+            """)
+        }
+
         return m
+    }
+
+    /// 在 write 事务内调用，返回**严格大于**当前 MAX(item.ingested_at_ns) 的时间戳。
+    /// 用于 primary 给新 ingest 的 item 打 `ingested_at_ns`，保证：
+    ///
+    ///     commit 顺序 == ingested_at_ns 顺序
+    ///
+    /// 这是 /since cursor 的正确性前提。否则两路 `pool.write` 在 writer 队列里排队时，
+    /// 先打时间戳再排队 commit 会出现 "晚 commit 但 ns 更小" → reader 推进 cursor 后
+    /// 永远漏掉那一行。详见 RemoteIngester / CaptureService 的调用点。
+    ///
+    /// `now` 通常是 `Clock.nowNs()`；wall clock 倒退或同毫秒内多次调用时，本函数会
+    /// 用 `MAX+1` 顶上去保证严格单增。
+    public static func nextIngestNs(_ db: GRDB.Database, now: Int64) throws -> Int64 {
+        let prev = try Int64.fetchOne(db, sql: "SELECT MAX(ingested_at_ns) FROM item") ?? 0
+        return Swift.max(now, prev &+ 1)
     }
 
     /// 一键 WAL checkpoint，用于 snapshot 前刷盘

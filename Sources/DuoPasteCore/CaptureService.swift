@@ -67,21 +67,32 @@ public actor CaptureService {
                 updated.capturedAtNs = now
                 if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }
                 if updated.sourceAppName == nil { updated.sourceAppName = c.sourceAppName }
-                // 客户端模式下重置推送状态，让 push worker 把"刷新时间"也同步过去
                 if role == .client {
+                    // 客户端模式下重置推送状态，让 push worker 把"刷新时间"也同步过去
                     updated.pushState = .pending
                     updated.pushAttempts = 0
                     updated.lastPushError = nil
+                } else {
+                    // primary 上 merge 也要 bump ingested_at_ns，否则 mirror clients
+                    // 已经把这行 cursor 推进过去后再也看不到这次 capturedAt 刷新——
+                    // 见 plan moonlit-wave.md "primary 在 /since 里也回放"
+                    updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 }
                 try updated.update(db)
                 return CaptureResult(outcome: .mergedWithPrevious, item: updated)
             }
 
+            // primary 路径走 nextIngestNs 保证 commit 顺序 = ingested_at_ns 顺序，
+            // /since cursor 才不会漏行（详见 Database.nextIngestNs 注释）。
+            // client 路径 ingested_at_ns 永远 nil——primary 收到 push 时再打。
+            let ingestNs: Int64? = role == .primary
+                ? try DuoPasteCore.Database.nextIngestNs(db, now: now)
+                : nil
             let item = Item(
                 id: UUIDv7.generateString(),
                 originDevice: deviceID,
                 capturedAtNs: now,
-                ingestedAtNs: role == .primary ? now : nil,
+                ingestedAtNs: ingestNs,
                 kind: c.kind,
                 sourceApp: c.sourceAppBundleID,
                 sourceAppName: c.sourceAppName,
@@ -119,16 +130,22 @@ public actor CaptureService {
                     updated.pushState = .pending
                     updated.pushAttempts = 0
                     updated.lastPushError = nil
+                } else {
+                    // 同 ingestText 注释：primary merge 要 bump ingested_at_ns 让 mirror 看见
+                    updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 }
                 try updated.update(db)
                 return CaptureResult(outcome: .mergedWithPrevious, item: updated)
             }
 
+            let ingestNs: Int64? = role == .primary
+                ? try DuoPasteCore.Database.nextIngestNs(db, now: now)
+                : nil
             let item = Item(
                 id: UUIDv7.generateString(),
                 originDevice: deviceID,
                 capturedAtNs: now,
-                ingestedAtNs: role == .primary ? now : nil,
+                ingestedAtNs: ingestNs,
                 kind: c.kind,
                 sourceApp: c.sourceAppBundleID,
                 sourceAppName: c.sourceAppName,

@@ -58,11 +58,12 @@ private func sampleRequest(id: String = UUID().uuidString) -> IngestRequest {
     let r1 = try await ingester.ingest(req)
     #expect(r1.wasNew == true)
 
-    // 同 id 二次推 → wasNew=false，ingested_at_ns 保持第一次的值（不被覆盖）
+    // 同 id 二次推 → wasNew=false，返回值跟库里一致：第一次的 ingested_at_ns，
+    // 不被覆盖也不假冒 now()——client 日志看到的就是 primary 真存的那一刻
     let ingester2 = RemoteIngester(database: db, now: { 2000 })
     let r2 = try await ingester2.ingest(req)
     #expect(r2.wasNew == false)
-    #expect(r2.ingestedAtNs == 2000)  // 返回值用本次时刻，方便日志
+    #expect(r2.ingestedAtNs == 1000)  // 跟下面 stored 一致
 
     let stored = try await db.pool.read { conn in
         try Item.filter(Column("id") == req.id).fetchOne(conn)

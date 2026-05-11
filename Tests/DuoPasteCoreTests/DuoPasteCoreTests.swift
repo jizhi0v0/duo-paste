@@ -142,6 +142,10 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(count == 1)
     let only = try await db.pool.read { conn in try Item.fetchOne(conn)! }
     #expect(only.capturedAtNs == baseNs + 500_000_000)
+    // primary 合并必须 bump ingested_at_ns，否则 /since cursor 已推进的 mirror 永远看不到
+    // 这次 capturedAt 刷新（见 plan moonlit-wave.md "primary 在 /since 里也回放"）
+    #expect(only.ingestedAtNs != nil)
+    #expect(only.ingestedAtNs! >= baseNs + 500_000_000)
 }
 
 @Test func captureDoesNotMergeAcrossWindow() async throws {
