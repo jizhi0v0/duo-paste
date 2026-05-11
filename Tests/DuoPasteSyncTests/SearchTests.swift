@@ -87,6 +87,21 @@ private func sampleItem(
     #expect(outcome.items.count == 2)
 }
 
+@Test func searchProviderPropagatesCancellation() async throws {
+    // Transport 抛 CancellationError → SearchProvider 应原样上抛，**不**降级本地。
+    // 否则 SwiftUI .task(id:) 取消时会显示假的 "primary 离线" banner + 本地结果。
+    let db = try makeDBWithItems([sampleItem(text: "should not appear")])
+    struct CancellingTransport: SearchTransport {
+        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
+            throw CancellationError()
+        }
+    }
+    let provider = SearchProvider(local: SearchAPI(database: db), remote: CancellingTransport())
+    await #expect(throws: CancellationError.self) {
+        _ = try await provider.search(SearchQuery())
+    }
+}
+
 @Test func searchProviderRejectedFallsBackToo() async throws {
     // 401/4xx 也应该回退本地（保活），但 banner 显示具体原因
     let db = try makeDBWithItems([sampleItem(text: "local only")])

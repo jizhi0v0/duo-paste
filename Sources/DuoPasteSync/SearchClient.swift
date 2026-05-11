@@ -57,6 +57,13 @@ extension HTTPIngestClient: SearchTransport {
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: req)
+        } catch is CancellationError {
+            // SwiftUI .task(id:) 用户打字时会 cancel 上一次 refresh——
+            // 这是正常流程，必须传上去让 AppState.refresh 的 catch 静默吃掉，
+            // 不能当 unreachable 触发本地降级（否则会显示 "primary 离线" 假阳性）
+            throw CancellationError()
+        } catch let urlErr as URLError where urlErr.code == .cancelled {
+            throw CancellationError()
         } catch {
             return RemoteSearchResult(outcome: .unreachable(reason: "transport: \(error.localizedDescription)"))
         }
@@ -115,14 +122,15 @@ public struct SearchProvider: Sendable {
         guard let remote else {
             return Outcome(items: try local.search(query), mode: .local)
         }
-        // 有 remote → 尝试远端
-        let result = (try? await remote.searchRemote(query))
-            ?? RemoteSearchResult(outcome: .unreachable(reason: "search threw"))
+        // 有 remote → 尝试远端。注意用 try await（不是 try?）让 CancellationError
+        // 透传——上层 AppState.refresh 已经有 catch is CancellationError 处理，
+        // 不应该被这里当 unreachable 误降级。
+        let result = try await remote.searchRemote(query)
         switch result.outcome {
         case .ok(let items):
             return Outcome(items: items, mode: .remoteOK)
         case .unreachable(let reason), .rejected(let reason):
-            // 任意一种远端失败都降级到本地——保证可用性优先
+            // 真不可达 / 拒收时才降级到本地——保证可用性优先
             let items = try local.search(query)
             return Outcome(items: items, mode: .remoteFallback(reason: reason))
         }
