@@ -200,6 +200,59 @@ macro expansion @Test:26: error: global variable must be a compile-time constant
 
 在 `async throws` 测试或函数里调 `db.pool.read { ... }` 必须 `try await`。sync 重载在 async 上下文里编译不过（报"is async but is not marked with 'await'"）。
 
+### SwiftPM 6.3 / macOS 26 partial-mirror bug——"no versions match" 假阳性
+
+**症状**：fresh clone 后 `swift build` 报 `Dependencies could not be resolved because no versions of '<pkg>' match the requirement X.Y..<Z`，但：
+- `Package.resolved` 锁的版本明明在 GitHub tag 列表里
+- `git ls-remote https://github.com/<owner>/<pkg>.git` 直接能列出全部 tags
+- 错误一个个轮流冒（修一个又冒下一个）
+
+**根因**：Swift 6.3.1 SPM 在 macOS 26 SDK 上对**某些**依赖创建的 bare mirror 配置不完整。对比同项目里的健康 / 坏 mirror（都在 `./.build/repositories/<pkg>-<hash>/config`，注意是项目本地而**不是** `~/Library/Caches/org.swift.swiftpm/repositories/`——Swift 6.3 把 mirror 路径从全局缓存搬进了 `.build/`，老知识失效）：
+
+```
+健康 (e.g. hummingbird):                      坏 (partial):
+  repositoryformatversion = 0                   repositoryformatversion = 1
+  tagOpt = --no-tags                            tagOpt = --no-tags
+  fetch = +refs/*:refs/*    ← 关键              (没有)
+  mirror = true             ← 关键              (没有)
+→ refs/ 有完整 tag 引用                       → refs/ 空，HEAD = ref: refs/heads/.invalid
+                                              → 只拉到 main 分支 HEAD commit
+                                              → SPM 字面上看不到任何 tag
+```
+
+判别：坏 mirror `git -C <dir> fsck` 会报 `invalid HEAD` + `No default references` + 一个孤儿 commit（就是 main 的 tip）。
+
+**修法**——bulk patch + refetch，不动 `Package.swift` / `Package.resolved` / 全局缓存。直接在项目根目录跑：
+
+```sh
+cd .build/repositories
+for d in */; do
+  grep -q "mirror = true" "$d/config" 2>/dev/null && continue
+  git -C "$d" config remote.origin.fetch '+refs/*:refs/*'
+  git -C "$d" config remote.origin.mirror true
+  git -C "$d" fetch origin --quiet && echo "fixed: ${d%/}"
+done
+cd ../..
+swift build
+```
+
+**不要走的歧路**（按出现顺序排，每个都试过无效）：
+1. `swift package resolve --force-resolved-versions`——会暴露另一类 mirror 损坏（孤立 tree），但不能修
+2. `rm -rf ~/Library/Caches/org.swift.swiftpm/...`——SPM 6.3 mirror 不在那；删了无副作用但也无效
+3. `rm -rf ~/Library/Caches/org.swift.swiftpm/manifests/manifest.db*`——manifest cache 重建后结论一样
+4. `rm -rf ~/Library/Caches/org.swift.swiftpm/`（整个清）——同 2，方向不对
+5. `rm -rf .build` 单独清——SPM 重建出来的还是 partial config，立刻复发
+6. 改 `Package.swift` 缩 hummingbird 版本范围——治标且改 lockfile，被项目原则禁止
+
+**SPM 多层缓存的定位顺序**（下次出怪事按这个顺序看）：
+1. `./.build/repositories/<pkg>-<hash>/` — bare mirror（**6.3 真的 mirror 数据在这**）
+2. `./.build/repositories/<pkg>-<hash>/config` — 看有没有 `mirror = true` / `fetch = +refs/*:refs/*`
+3. `./.build/checkouts/<pkg>/` — 解出来的 working copy
+4. `~/Library/Caches/org.swift.swiftpm/manifests/manifest.db` — manifest 解析结果 (SQLite)
+5. `~/Library/org.swift.swiftpm/configuration/` — registry / mirror override（一般是空）
+
+`.build/repositories/` 里的 fix 不持久——下次 `rm -rf .build` 或 `swift package clean` 后 partial config 会复发。每次都按上面 bulk patch 脚本跑一遍。
+
 ## 构建 / 测试速查
 
 ```sh
