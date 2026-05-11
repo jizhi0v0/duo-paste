@@ -128,13 +128,14 @@ private struct SearchResponse: Codable {
     }
 }
 
-/// 选择层：根据 transport 是否存在 + 健康状态，决定打远端还是本地。
+/// 选择层：根据 transport / mirror 状态决定打远端、本机 union 本地、还是仅本机 origin。
 /// AppState 调 `search(_:)`，它返回结果 + 当前使用的模式（用于 UI banner）。
 public struct SearchProvider: Sendable {
     public enum Mode: Sendable, Equatable {
-        case local
-        case remoteOK
-        case remoteFallback(reason: String)
+        case local                                // standalone / pure-primary：纯本机 item
+        case localMirror(stalenessSec: Int)       // pull worker 跑通过：本机 item + item_mirror union
+        case remoteOK                             // 远端命中：UI 不显 banner
+        case remoteFallback(reason: String)       // 远端配了但失败：本机降级 + banner
     }
 
     public struct Outcome: Sendable {
@@ -153,18 +154,36 @@ public struct SearchProvider: Sendable {
 
     public let local: SearchAPI
     public let remote: SearchTransport?
+    /// 闭包返回上次成功完整拉取的 wall-clock ns；非 nil → mirror 可用，走 union 路径。
+    /// 注入 closure 而不是 MirrorStatus 直引用，便于测试 + 解耦层级。
+    public let mirrorLastPullNs: @Sendable () -> Int64?
+    /// 用来算 staleness 的 now。生产用 `Clock.nowNs`；测试可注入固定值。
+    public let nowNs: @Sendable () -> Int64
 
-    public init(local: SearchAPI, remote: SearchTransport?) {
+    public init(
+        local: SearchAPI,
+        remote: SearchTransport?,
+        mirrorLastPullNs: @escaping @Sendable () -> Int64? = { nil },
+        nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() }
+    ) {
         self.local = local
         self.remote = remote
+        self.mirrorLastPullNs = mirrorLastPullNs
+        self.nowNs = nowNs
     }
 
     public func search(_ query: SearchQuery) async throws -> Outcome {
-        // 无 remote → 直接本地（standalone / pure-primary）
+        // 1. Mirror 已就位（pull worker 至少完成过一轮严格追平）→ 直接 union 本地，**不打**远端。
+        //    这是第二刀的核心收益：每次按键不再过 Tailscale。
+        if let last = mirrorLastPullNs() {
+            let staleness = Int(max(0, (nowNs() - last) / 1_000_000_000))
+            return unionLocalOutcome(query: query, stalenessSec: staleness)
+        }
+        // 2. 无 remote → 纯本地（standalone / pure-primary）
         guard let remote else {
             return localOutcome(query: query, mode: .local)
         }
-        // 有 remote → 尝试远端。注意用 try await（不是 try?）让 CancellationError
+        // 3. 有 remote → 尝试远端。注意用 try await（不是 try?）让 CancellationError
         // 透传——上层 AppState.refresh 已经有 catch is CancellationError 处理，
         // 不应该被这里当 unreachable 误降级。
         let result = try await remote.searchRemote(query)
@@ -190,5 +209,13 @@ public struct SearchProvider: Sendable {
             s.map { (item.id, $0) }
         })
         return Outcome(items: hits.map(\.0), mode: mode, snippets: snippets)
+    }
+
+    private func unionLocalOutcome(query: SearchQuery, stalenessSec: Int) -> Outcome {
+        let hits = (try? local.searchUnion(query)) ?? []
+        let snippets = Dictionary(uniqueKeysWithValues: hits.compactMap { (item, s) in
+            s.map { (item.id, $0) }
+        })
+        return Outcome(items: hits.map(\.0), mode: .localMirror(stalenessSec: stalenessSec), snippets: snippets)
     }
 }

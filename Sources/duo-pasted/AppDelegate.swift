@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var snapshotScheduler: SnapshotScheduler!
     private var serverTask: Task<Void, Never>?
     private var pushWorker: PushWorker?
+    private var pullWorker: PullWorker?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
@@ -63,6 +64,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if deps.config.primaryURL != nil {
             startPushWorker()
         }
+        if deps.config.pull.enabled {
+            startPullWorker()
+        }
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · db=\(deps.paths.mainDB.path)\n", stderr)
     }
@@ -90,6 +94,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fputs("push worker → \(primaryURL.absoluteString)\n", stderr)
         } catch {
             fputs("push worker NOT started: \(error)\n", stderr)
+        }
+    }
+
+    /// Pull worker：周期把 primary 全量同步进本地 item_mirror。
+    /// 启用条件：`config.pull.enabled=true` 且 primary_url 非空（Config.validate 已保证）。
+    /// 启动失败（shared-secret / URL 解析）非致命，daemon 仍然能用本机捕获 + 本地搜索。
+    private func startPullWorker() {
+        guard let primaryURL = deps.config.primaryURL else { return }
+        do {
+            let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
+            let auth = HMACAuth(secret: secret)
+            let client = HTTPIngestClient(
+                baseURL: primaryURL,
+                auth: auth,
+                session: AppDependencies.syncURLSession
+            )
+            let intervalSec = max(1, deps.config.pull.intervalSec)
+            let worker = PullWorker(
+                database: deps.database,
+                transport: client,
+                selfDeviceID: deps.deviceID,
+                mirrorStatus: deps.mirrorStatus,
+                config: PullWorker.Config(intervalSec: TimeInterval(intervalSec))
+            )
+            self.pullWorker = worker
+            Task { await worker.start() }
+            fputs("pull worker → \(primaryURL.absoluteString) @ \(intervalSec)s\n", stderr)
+        } catch {
+            fputs("pull worker NOT started: \(error)\n", stderr)
         }
     }
 

@@ -76,10 +76,26 @@ struct SearchView: View {
         .padding(.vertical, 12)
     }
 
-    /// 顶部 banner：standalone / 远端 OK 时不显示；远端 fallback 时黄色提示。
+    /// 顶部 banner：
+    /// - `.local` / `.remoteOK` → 不显示（默认顺畅状态）
+    /// - `.localMirror` → 灰色提示，含 mirror 数据多新（"mirror @ Xm ago"）
+    /// - `.remoteFallback` → 黄色提示 primary 离线
     @ViewBuilder
     private var modeBanner: some View {
-        if case .remoteFallback(let reason) = state.searchMode {
+        switch state.searchMode {
+        case .localMirror(let stalenessSec):
+            HStack(spacing: 6) {
+                Image(systemName: "internaldrive")
+                Text("本地镜像")
+                Text("·").foregroundStyle(.secondary)
+                Text("更新于 \(humanStaleness(stalenessSec)) 前").foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.gray.opacity(0.10))
+        case .remoteFallback(let reason):
             HStack(spacing: 6) {
                 Image(systemName: "wifi.exclamationmark")
                 Text("primary 离线，使用本地结果")
@@ -91,7 +107,15 @@ struct SearchView: View {
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.yellow.opacity(0.15))
+        case .local, .remoteOK:
+            EmptyView()
         }
+    }
+
+    private func humanStaleness(_ sec: Int) -> String {
+        if sec < 60 { return "\(sec)s" }
+        if sec < 3600 { return "\(sec / 60)m" }
+        return "\(sec / 3600)h"
     }
 
     private var emptyView: some View {

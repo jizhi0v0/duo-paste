@@ -125,6 +125,53 @@ private func sampleItem(
     }
 }
 
+/// 测试 SearchProvider 是否调用了 remote。actor 形态满足 Sendable 协议要求 +
+/// 给 await 的 callsCount() 提供线程安全的串行访问。
+private actor CountingSearchTransport: SearchTransport {
+    private var calls = 0
+
+    nonisolated func searchRemote(_ q: SearchQuery) async throws -> RemoteSearchResult {
+        await self.bump()
+        return RemoteSearchResult(outcome: .ok([]))
+    }
+
+    private func bump() { calls += 1 }
+    func callsCount() -> Int { calls }
+}
+
+@Test func searchProviderSkipsRemoteWhenMirrorActive() async throws {
+    // 关键回归保护：mirrorLastPullNs 非 nil → SearchProvider 不应调远端。
+    // 这是第二刀核心收益（不过 Tailscale）的不变量；reorder 即红。
+    let db = try makeDBWithItems([sampleItem(text: "local mirror reachable")])
+    let transport = CountingSearchTransport()
+    let provider = SearchProvider(
+        local: SearchAPI(database: db),
+        remote: transport,
+        mirrorLastPullNs: { 1_000_000_000 },  // 任何非 nil 即视为 mirror 可用
+        nowNs: { 2_000_000_000 }
+    )
+    let outcome = try await provider.search(SearchQuery())
+    #expect(await transport.callsCount() == 0)
+    if case .localMirror(let staleness) = outcome.mode {
+        #expect(staleness == 1)   // (2e9 - 1e9) / 1e9 = 1
+    } else {
+        Issue.record("expected .localMirror, got \(outcome.mode)")
+    }
+}
+
+@Test func searchProviderUsesRemoteWhenMirrorNotReady() async throws {
+    // 反向：mirrorLastPullNs 返回 nil → 必须走远端（标准 M2 行为）
+    let db = try makeDBWithItems([sampleItem(text: "local fallback")])
+    let transport = CountingSearchTransport()
+    let provider = SearchProvider(
+        local: SearchAPI(database: db),
+        remote: transport,
+        mirrorLastPullNs: { nil }
+    )
+    _ = try await provider.search(SearchQuery())
+    #expect(await transport.callsCount() == 1)
+}
+
 @Test func searchProviderRejectedFallsBackToo() async throws {
     // 401/4xx 也应该回退本地（保活），但 banner 显示具体原因
     let db = try makeDBWithItems([sampleItem(text: "local only")])

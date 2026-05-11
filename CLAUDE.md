@@ -1,28 +1,31 @@
 # duo-paste
 
-替换 Paste.app 的自托管剪贴板管理器，Apple-only。M1（单机 Mac）已通过 LaunchAgent 上线 daily-driver；M2（multi-Mac primary/client）所有代码路径已完工，等真上 Mac mini + Tailscale 联调。
+替换 Paste.app 的自托管剪贴板管理器，Apple-only。M1（单机）+ M2（multi-Mac primary/client）已上线 daily-driver；M3 第一刀 + 第二刀（mirror pull worker + 本地 union 搜索）已完工，client 搜索不再过 Tailscale。
 
 正式架构计划：`plans/https-pasteapp-io-macos-ios-paste-moonlit-wave.md`。
 
 ## 项目当前状态
 
 - **M1 完成**：捕获 + SQLite/FTS5 + 内容寻址 blob + SwiftUI 搜索窗（NSPanel HUD）+ ⌥⌘V 全局快捷键 + 菜单栏 + LaunchAgent + 小时级 snapshot
-- **M2 已上线生产**：mini = primary（HTTPS @ 0.0.0.0:8443，`bobbys-mac-mini.tail69730a.ts.net`）+ MBP（`100.68.44.27`）= client。双向同步在 DB 层验证通过：MBP 复制的项 push 到 mini，MBP 搜索能看到 mini 全部历史
-  - Schema migration v2_mirror（item_mirror / item_mirror_fts / pull_cursor，M3 才真用）
-  - `config.json` + `serve` / `serve_tls` / `primary_url` / `pull.*` 配置
-  - HMAC-SHA256 签名（path-encoded body sha256，middleware 不读 body）+ 反 replay（5min 窗口）
-  - Hummingbird 2 server：`/health` `/ingest` `/blob` (HEAD/GET/PUT) `/search`，TLS via `tailscale cert`
-  - Client push worker（actor）+ blob 先于 ingest 顺序保证 + 退避重试
-  - SearchProvider 远端优先 + 本地降级 + UI banner（区分 .local / .remoteOK / .remoteFallback）
-  - FTS5 snippet 高亮（STX/ETX marker，UI 加粗匹配段）
-  - SearchView debounce 100ms（连打按键合并成 1 次远端请求）
-  - 进程级 URLSession（push + search 共享 TLS 连接池）
-  - CLI 子命令：`init-secret` / `retry-failed` / `--help`（SwiftUI App.init 拦截）
-  - 集成测试：同进程 server + worker 真 HTTP roundtrip 全覆盖
-- **M3 未开始**：mirror pull worker / `promote-to-primary` / `audit-push` / `migrate-primary`
-- **测试**：66/66 通过（`swift test`）
+- **M2 已上线生产**：mini = primary（HTTPS @ 0.0.0.0:8443，`bobbys-mac-mini.tail69730a.ts.net`）+ MBP（`100.68.44.27`）= client。双向同步在 DB 层验证通过
+- **M3 第一刀 完成**：`GET /since` 增量 cursor API + 一致性根因修复
+  - `SinceAPI` / `SinceCursor (ns, id)` 二元 cursor / `SincePageWire` Codable wire 形态
+  - `Database.nextIngestNs(db, now:)` 在 writer tx 内 stamp ingested_at_ns，保证 commit 顺序 = ns 顺序（避免 mirror cursor 漏行）；RemoteIngester + CaptureService 全用它
+  - v3 migration：`idx_item_ingested(ingested_at_ns, id) WHERE ingested_at_ns IS NOT NULL` partial index，配 /since cursor 走 index-only seek
+  - `parseSinceQuery` parse 层 clamp limit；handler 返回 `{items, next_cursor, has_more, count}`
+  - primary 上 capture merge 路径也 bump ingested_at_ns，让 mirror 看见合并更新
+- **M3 第二刀 完成**：mirror pull worker + 本地 union 搜索
+  - v4 migration：pull_cursor 加 cursor_id 列（SinceCursor 二元 cursor 持久化）
+  - `MirrorStatus` 共享对象（NSLock）：PullWorker 写 `lastPullNs`/`primaryDeviceID`，SearchProvider 读
+  - `SinceClient` (HTTPIngestClient extension) 实现 `SinceTransport`：`/since` + `/health`（容忍 String/Int64/Double 三种 `now_ms` 编码）
+  - `PullWorker` actor：仿 PushWorker 单 actor 串行 tick。每 tick = `/health` → 比对 persisted primary_id（变了 → 清空 mirror + cursor 重拉）→ `/since` → INSERT OR REPLACE item_mirror（**跳过 origin=self**，让 union 不重叠）→ 更新 pull_cursor。`has_more=true` 立刻接下一页，否则 sleep `pull.interval_sec`（默认 30s）。`lastPullNs` 只在 `!hadTransient && !hasMore` 时设——表示"已严格追平"
+  - `SearchAPI.searchUnion` + `fetchHitsMirror`：item + item_mirror 各超量取 limit+offset，**先按 id dedupe（取 capturedAtNs 最大那份，无视 pinned 状态）**，再按 (pinned DESC, captured_at_ns DESC) 排序，最后裁 limit/offset
+  - `SearchProvider.Mode.localMirror(stalenessSec:)`：`mirrorLastPullNs()` 非 nil → 直接走 `searchUnion`，**不**打远端
+  - UI banner：`.localMirror` 灰色「本地镜像 · 更新于 Xs/m/h 前」；`.remoteFallback` 黄色保留
+- **M3 第三刀 未开始**：`promote-to-primary` / `audit-push` / `migrate-primary` / blob 懒拉 / 时钟偏移检查
+- **测试**：97/97 通过（`swift test`）。新增 PullWorkerTests 含同进程 server + 真 HTTP 全链路；SearchUnionTests 覆盖排序/dedup/pinned/软删/FTS；SearchProviderTests 含 mirror-skip-remote 回归保护
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
-- **下一站**：**M3 mirror pull worker**——M2 client 搜索每次都过 Tailscale 一跳，体感慢；M3 把 mini 全量同步进 client 的 `item_mirror` 表，搜索变纯本地。schema 已就位，需要做 `/since` route + PullWorker actor + 搜索 union mirror。详细拆解见 plans/...moonlit-wave.md
+- **下一站**：**M3 第三刀**——DR 运维子命令 (`promote-to-primary` / `audit-push` / `migrate-primary`) + blob 懒拉 + 时钟偏移 sanity check。详细拆解见 plans/...moonlit-wave.md
 
 ## 架构与 Non-Goals
 
@@ -119,6 +122,28 @@ LaunchAgent 装好后，主 Mac 常驻 release 版 daemon。调试时不能直�
 6. **launchd "languishing" 状态**：短时间内反复 bootout/bootstrap 会触发 launchd 速率限制，`launchctl print` 显示 `state = languishing` + bootstrap 持续报错。等 10-30s 直到 `launchctl print` 返回 `Could not find service`（彻底 boot out 干净）再重新 bootstrap 即可。不要 sudo / 不要改 plist。
 
 ## 关键设计决策（不要回退）
+
+### Mirror 模式：本地 union 路径优先于远端
+
+PullWorker `lastPullNs` 非 nil（至少完成过一轮 `has_more=false` 追平）→ SearchProvider 直接走 `searchUnion(item + item_mirror)`，**跳过远端**。这是 M3 第二刀的核心收益：client 搜索连过 Tailscale 的 100-200ms 延迟都没有了。
+
+不变量保护：`Tests/DuoPasteSyncTests/SearchTests.swift` 有 `searchProviderSkipsRemoteWhenMirrorActive` —— mock 远端 transport，断言 `callsCount() == 0`。reorder `if let last = mirrorLastPullNs()` 跟 `guard let remote else` 的次序就会红。
+
+跨表 dedupe（同 id 在 item 跟 item_mirror 都有，promote-to-primary 过渡期 / pin 状态分歧时常见）：**先**按 `captured_at_ns` 取最新那份，**后**做 (pinned DESC) 排序——否则旧 mirror 行带 pinned=true 会赢过新 own 行的 unpinned 文本。位置：`Search.swift fetchUnion`。
+
+### PullWorker primary 换了的检测
+
+每 tick 第一步 `/health` 拿 `device_id`，跟 `pull_cursor.primary_id` 比。不一致 → `DELETE FROM item_mirror; DELETE FROM pull_cursor` 重拉。这是 plan §c 的 promote-follower 流程兼容性保证。
+
+边界：`/health` 返回 `device_id=""` 当 transient 跳过（不污染 pull_cursor PK）；`now_ms` 解码三种形态都接（String/Int64/Double）—— `SinceClient.HealthResponse`。
+
+### ingested_at_ns 必须在 writer tx 内 stamp
+
+`Database.nextIngestNs(db, now:)` 返回 `max(now, MAX(item.ingested_at_ns)+1)`。**唯一**正确的 stamp 时机是 `pool.write { db in ... }` 闭包内——不能提前到外面算 `now`。
+
+为什么：GRDB DatabasePool 让 reader 并发但 writer 串行。两路并发 `pool.write` 在 writer 队列排队，外面打的 `now` 时间戳跟 commit 顺序可以反过来 → reader 看到 `ns=200` 推进 cursor，之后 `ns=100` 才 commit → `/since` WHERE `ns > 200` 永远漏掉那行 → mirror 漏数据。
+
+调用点：`RemoteIngester.ingest`、`CaptureService.ingestText` / `ingestBlob` 的 primary 路径 + merge 路径。
 
 ### NSPasteboard 自写回环——双层防御
 

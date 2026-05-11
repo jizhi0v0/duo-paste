@@ -12,8 +12,13 @@ final class AppDependencies {
     let deviceID: String
     let captureService: CaptureService
     let searchAPI: SearchAPI
-    /// 搜索选择层。standalone 模式下 remote=nil → 等价直接打本地。
+    /// 搜索选择层。standalone / pure-primary 时 remote=nil → 等价直接打本地。
+    /// `pull.enabled=true` 时 mirrorStatus 通过 PullWorker 更新 → SearchProvider 看到非 nil
+    /// 自动切 union 本地路径，不再过远端。
     let searchProvider: SearchProvider
+    /// Pull worker 跟 SearchProvider 间的非阻塞状态通道。`pull.enabled=false` 时这个对象
+    /// 永远不被 set → SearchProvider 走原 .local / .remoteOK 逻辑。
+    let mirrorStatus: MirrorStatus
 
     init() throws {
         let paths = Paths.makeDefault()
@@ -33,6 +38,8 @@ final class AppDependencies {
         )
         let searchAPI = SearchAPI(database: database)
         self.searchAPI = searchAPI
+        let mirrorStatus = MirrorStatus()
+        self.mirrorStatus = mirrorStatus
 
         // primary_url 配置好且能加载到 shared secret → 准备远端搜索；否则 nil 走本地
         var remote: SearchTransport? = nil
@@ -47,7 +54,11 @@ final class AppDependencies {
                 fputs("search remote disabled: shared-secret load failed\n", stderr)
             }
         }
-        self.searchProvider = SearchProvider(local: searchAPI, remote: remote)
+        self.searchProvider = SearchProvider(
+            local: searchAPI,
+            remote: remote,
+            mirrorLastPullNs: { [mirrorStatus] in mirrorStatus.lastPullNs() }
+        )
     }
 
     /// 进程级共享 URLSession，push worker 和 search 都用同一个——确保 keep-alive

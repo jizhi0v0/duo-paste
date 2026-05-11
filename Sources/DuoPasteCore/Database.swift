@@ -205,6 +205,15 @@ public struct Database: Sendable {
             """)
         }
 
+        // v4: pull_cursor 加 cursor_id。SinceCursor 是 (ns, id) 二元，少了 id 在同 ns 多行
+        // 场景下会反复重拉同 ns 段（INSERT OR REPLACE 幂等但浪费带宽 + 极端情况 limit
+        // 永远卡在同 ns 死循环）。`DEFAULT ''` 对应 SinceCursor.zero 的 id。
+        m.registerMigration("v4_pull_cursor_id") { db in
+            try db.execute(sql: """
+                ALTER TABLE pull_cursor ADD COLUMN cursor_id TEXT NOT NULL DEFAULT '';
+            """)
+        }
+
         return m
     }
 
