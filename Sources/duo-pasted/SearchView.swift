@@ -30,11 +30,20 @@ struct SearchView: View {
         }
         .frame(minWidth: 640, idealWidth: 720, minHeight: 360, idealHeight: 480)
         .background(.thinMaterial)
+        // debounce 100ms：用户连打时上一个 task 被 .task(id:) cancel 掉，新 task
+        // 先 sleep 100ms 再 refresh。停手 100ms 后才真正发远端请求——10 次按键的
+        // 远端 roundtrip 合并成 1 次。CancellationError 自然吞掉。
         .task(id: state.query) {
-            await state.refresh()
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                await state.refresh()
+            } catch {
+                // 被取消（用户继续打字）→ 让下一个 task 接手，啥也不做
+            }
         }
         .onAppear {
             searchFieldFocused = true
+            // onAppear 时不 debounce——首次打开应当立刻 refresh
             Task { await state.refresh() }
         }
         // 注：箭头 / Return / Esc 由 SearchPanelController 的 NSEvent local monitor

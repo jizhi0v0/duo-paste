@@ -38,11 +38,30 @@ final class AppDependencies {
         var remote: SearchTransport? = nil
         if let primaryURL = config.primaryURL {
             if let secret = try? SharedSecret.load(from: paths.sharedSecretFile) {
-                remote = HTTPIngestClient(baseURL: primaryURL, auth: HMACAuth(secret: secret))
+                remote = HTTPIngestClient(
+                    baseURL: primaryURL,
+                    auth: HMACAuth(secret: secret),
+                    session: Self.syncURLSession
+                )
             } else {
                 fputs("search remote disabled: shared-secret load failed\n", stderr)
             }
         }
         self.searchProvider = SearchProvider(local: searchAPI, remote: remote)
     }
+
+    /// 进程级共享 URLSession，push worker 和 search 都用同一个——确保 keep-alive
+    /// 连接池跨用例复用，避免每次新建 TLS 握手。
+    /// timeoutIntervalForRequest=10s：search keystroke 不该卡用户太久，
+    /// 超时即降级本地比让 UI 等死好。
+    static let syncURLSession: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = 30
+        cfg.httpMaximumConnectionsPerHost = 6
+        cfg.urlCache = nil               // search 永远要最新的，不走 URL cache
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.httpAdditionalHeaders = ["User-Agent": "duo-paste/sync"]
+        return URLSession(configuration: cfg)
+    }()
 }

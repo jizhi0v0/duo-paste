@@ -74,7 +74,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
-            let client = HTTPIngestClient(baseURL: primaryURL, auth: auth)
+            let client = HTTPIngestClient(
+                baseURL: primaryURL,
+                auth: auth,
+                session: AppDependencies.syncURLSession
+            )
             let worker = PushWorker(
                 database: deps.database,
                 blobs: deps.blobs,
