@@ -9,10 +9,12 @@ let package = Package(
     products: [
         .library(name: "DuoPasteCore", targets: ["DuoPasteCore"]),
         .library(name: "DuoPasteCapture", targets: ["DuoPasteCapture"]),
+        .library(name: "DuoPasteSync", targets: ["DuoPasteSync"]),
         .executable(name: "duo-pasted", targets: ["duo-pasted"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.9.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
     ],
     targets: [
         .target(
@@ -25,16 +27,33 @@ let package = Package(
             name: "DuoPasteCapture",
             dependencies: ["DuoPasteCore"]
         ),
+        .target(
+            name: "DuoPasteSync",
+            dependencies: [
+                "DuoPasteCore",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdTLS", package: "hummingbird"),
+            ]
+        ),
         .executableTarget(
             name: "duo-pasted",
             dependencies: [
                 "DuoPasteCore",
                 "DuoPasteCapture",
+                "DuoPasteSync",
             ]
         ),
         .testTarget(
             name: "DuoPasteCoreTests",
             dependencies: ["DuoPasteCore"]
+        ),
+        .testTarget(
+            name: "DuoPasteSyncTests",
+            dependencies: [
+                "DuoPasteSync",
+                "DuoPasteCore",
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ]
         ),
     ]
 )

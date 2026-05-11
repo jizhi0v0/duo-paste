@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import DuoPasteCore
+import DuoPasteSync
 
 /// SwiftUI 视图与底层 Database/CaptureService 的桥接。
 /// 持有当前搜索字符串、结果列表和高亮行号；提供 refresh / paste / 监听捕获更新等动作。
@@ -11,6 +12,8 @@ final class AppState {
     var results: [Item] = []
     var selectedID: String?
     var lastError: String?
+    /// 当前搜索源——决定顶部 banner 显示什么。
+    var searchMode: SearchProvider.Mode = .local
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
     var scrollPulse: Int = 0
@@ -43,15 +46,13 @@ final class AppState {
             limit: 200
         )
         do {
-            let items = try await deps.database.pool.read { db in
-                try SearchAPI.fetch(db, query: q)
-            }
-            self.results = items
-            // 保持选中行：如果原选中项仍在列表里则不动，否则选第一项
-            if let id = self.selectedID, items.contains(where: { $0.id == id }) {
-                // ok
+            let outcome = try await deps.searchProvider.search(q)
+            self.results = outcome.items
+            self.searchMode = outcome.mode
+            if let id = self.selectedID, outcome.items.contains(where: { $0.id == id }) {
+                // 保持选中行
             } else {
-                self.selectedID = items.first?.id
+                self.selectedID = outcome.items.first?.id
             }
             self.lastError = nil
         } catch is CancellationError {

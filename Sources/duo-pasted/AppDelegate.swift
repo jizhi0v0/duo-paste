@@ -1,6 +1,7 @@
 import AppKit
 import DuoPasteCore
 import DuoPasteCapture
+import DuoPasteSync
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -11,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: PasteboardWatcher!
     private var hotkey: GlobalHotKey!
     private var snapshotScheduler: SnapshotScheduler!
+    private var serverTask: Task<Void, Never>?
+    private var pushWorker: PushWorker?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
@@ -54,7 +57,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         snapshotScheduler = SnapshotScheduler(deps: deps)
         snapshotScheduler.start()
 
-        fputs("duo-paste UI ready · device=\(deps.deviceID) · db=\(deps.paths.mainDB.path)\n", stderr)
+        if deps.config.serve {
+            startSyncServer()
+        }
+        if deps.config.primaryURL != nil {
+            startPushWorker()
+        }
+
+        fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · db=\(deps.paths.mainDB.path)\n", stderr)
+    }
+
+    /// Push worker：把本机 origin pending → primary。
+    /// Shared secret 加载失败 / config 没有 primary_url 不会到这里——AppDelegate 启动时已 guard。
+    private func startPushWorker() {
+        guard let primaryURL = deps.config.primaryURL else { return }
+        do {
+            let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
+            let auth = HMACAuth(secret: secret)
+            let client = HTTPIngestClient(baseURL: primaryURL, auth: auth)
+            let worker = PushWorker(
+                database: deps.database,
+                blobs: deps.blobs,
+                transport: client,
+                originDevice: deps.deviceID
+            )
+            self.pushWorker = worker
+            Task { await worker.start() }
+            fputs("push worker → \(primaryURL.absoluteString)\n", stderr)
+        } catch {
+            fputs("push worker NOT started: \(error)\n", stderr)
+        }
+    }
+
+    /// 启动 Hummingbird server。loadShared secret 失败 / 端口占用 等都不致命——
+    /// 让 daemon 继续起 UI / 捕获，server 单独失败只在日志里出现，用户能看到。
+    private func startSyncServer() {
+        let cfg = deps.config
+        let secretPath = deps.paths.sharedSecretFile
+        let deviceID = deps.deviceID
+        do {
+            let secret = try SharedSecret.load(from: secretPath)
+            let auth = HMACAuth(secret: secret)
+            let tls: SyncServer.TLSPaths? = {
+                guard cfg.serveTLS, let cert = cfg.tlsCertPath, let key = cfg.tlsKeyPath else {
+                    return nil
+                }
+                return SyncServer.TLSPaths(certPath: cert, keyPath: key)
+            }()
+            let server = SyncServer(
+                deviceID: deviceID,
+                database: deps.database,
+                blobs: deps.blobs,
+                host: cfg.serveHost,
+                port: cfg.servePort,
+                auth: auth,
+                tls: tls
+            )
+            serverTask = Task.detached(priority: .utility) {
+                do {
+                    try await server.run()
+                } catch {
+                    let msg = "sync server crashed: \(error)\n"
+                    FileHandle.standardError.write(Data(msg.utf8))
+                }
+            }
+            fputs("sync server starting on \(cfg.serveHost):\(cfg.servePort)\n", stderr)
+        } catch {
+            fputs("sync server NOT started: \(error)\n", stderr)
+        }
     }
 
     private func handleCapture(_ captured: CapturedPasteboard) {
@@ -63,6 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 _ = try await self.deps.captureService.ingest(captured)
                 await self.state.refresh()
+                self.pushWorker?.wake()    // 有 worker 才唤醒；没配 primary 即 nil
             } catch {
                 fputs("ingest error: \(error)\n", stderr)
             }

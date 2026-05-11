@@ -1,9 +1,12 @@
 import SwiftUI
 import DuoPasteCore
+import DuoPasteSync
 
 @MainActor private let relativeFormatter: RelativeDateTimeFormatter = {
     let f = RelativeDateTimeFormatter()
     f.unitsStyle = .short
+    // .named → 极近时间显示 "now"，避免 RelativeDateTimeFormatter 默认的 "in 0 sec." 反向前缀
+    f.dateTimeStyle = .named
     return f
 }()
 
@@ -17,6 +20,7 @@ struct SearchView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            modeBanner
             Divider()
             if state.results.isEmpty {
                 emptyView
@@ -61,6 +65,24 @@ struct SearchView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    /// 顶部 banner：standalone / 远端 OK 时不显示；远端 fallback 时黄色提示。
+    @ViewBuilder
+    private var modeBanner: some View {
+        if case .remoteFallback(let reason) = state.searchMode {
+            HStack(spacing: 6) {
+                Image(systemName: "wifi.exclamationmark")
+                Text("primary 离线，使用本地结果")
+                Text("·").foregroundStyle(.secondary)
+                Text(reason).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.yellow.opacity(0.15))
+        }
     }
 
     private var emptyView: some View {
@@ -134,7 +156,11 @@ private struct ItemRow: View {
                 HStack(spacing: 6) {
                     Text(item.sourceAppName ?? item.sourceApp ?? "?")
                     Text("·")
-                    Text(relativeTime)
+                    // TimelineView 周期重绘，否则 row 稳定后 Date() 不会被重算，
+                    // 相对时间永远停在初次渲染的瞬间。
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(relativeFormatter.localizedString(for: capturedDate, relativeTo: ctx.date))
+                    }
                     if item.kind == .image, let size = item.blobSize {
                         Text("·")
                         Text(humanSize(size))
@@ -161,9 +187,8 @@ private struct ItemRow: View {
         }
     }
 
-    private var relativeTime: String {
-        let date = Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000)
-        return relativeFormatter.localizedString(for: date, relativeTo: Date())
+    private var capturedDate: Date {
+        Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000)
     }
 
     private func humanSize(_ size: Int64) -> String {

@@ -36,6 +36,51 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     }
 }
 
+@Test func v2MigrationCreatesMirrorTables() throws {
+    let (_, db, _, _) = try makeFixture()
+    try db.pool.read { conn in
+        for name in ["item_mirror", "item_mirror_fts", "pull_cursor"] {
+            let exists = try Bool.fetchOne(conn, sql: """
+                SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)
+            """, arguments: [name]) ?? false
+            #expect(exists, "expected \(name) to exist after migration")
+        }
+    }
+}
+
+@Test func v2MigrationIsIdempotentOnReopen() throws {
+    // 用一个固定 DB 文件，先 open 一次跑 migration，再 open 一次应零变更。
+    let root = tempDir()
+    let paths = Paths(root: root)
+    paths.ensureExists()
+    _ = try Database(path: paths.mainDB, role: .primary)
+    // 第二次打开：GRDB 应跳过已应用的 migration。如果 v2 不幂等会因 CREATE TABLE 重复报错。
+    _ = try Database(path: paths.mainDB, role: .primary)
+}
+
+@Test func mirrorFTSRoundTrip() throws {
+    // 验证 item_mirror 的 FTS trigger 真的会被触发——这是 M3 pull worker 上线前
+    // 唯一能验证 mirror 表 + FTS 是否串通的入口。
+    let (_, db, _, _) = try makeFixture()
+    try db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item_mirror (id, origin_device, captured_at_ns, kind,
+                                     preview, text_full, source_app_name,
+                                     pinned, mirrored_at_ns)
+            VALUES ('m1', 'remote-device', 1000, 'text',
+                    'hello mirror', 'hello mirror world', 'WeChat',
+                    0, 2000);
+        """)
+    }
+    try db.pool.read { conn in
+        let hit = try String.fetchOne(conn, sql: """
+            SELECT id FROM item_mirror
+            WHERE rowid IN (SELECT rowid FROM item_mirror_fts WHERE item_mirror_fts MATCH ?)
+        """, arguments: ["mirror"])
+        #expect(hit == "m1")
+    }
+}
+
 @Test func uuidv7IsMonotonicByMs() {
     let a = UUIDv7.generate(timestampMs: 1_000_000)
     let b = UUIDv7.generate(timestampMs: 2_000_000)

@@ -1,26 +1,38 @@
 # duo-paste
 
-替换 Paste.app 的自托管剪贴板管理器，Apple-only。M1（单机 Mac）已通过 LaunchAgent 上线 daily-driver；M2（多 Mac primary/client 同步 via Tailscale）是下一站。
+替换 Paste.app 的自托管剪贴板管理器，Apple-only。M1（单机 Mac）已通过 LaunchAgent 上线 daily-driver；M2（multi-Mac primary/client）所有代码路径已完工，等真上 Mac mini + Tailscale 联调。
 
 正式架构计划：`plans/https-pasteapp-io-macos-ios-paste-moonlit-wave.md`。
 
 ## 项目当前状态
 
 - **M1 完成**：捕获 + SQLite/FTS5 + 内容寻址 blob + SwiftUI 搜索窗（NSPanel HUD）+ ⌥⌘V 全局快捷键 + 菜单栏 + LaunchAgent + 小时级 snapshot
-- **测试**：13/13 通过（`swift test`）
-- **依赖**：GRDB 7.10.0（SwiftPM 远程依赖）
-- **下一站**：M2 multi-Mac 同步——Mac mini 作 primary 跑 Hummingbird 2 ingest/search API，主 Mac/MBP 作 client 推送，走 Tailscale
+- **M2 代码完成 + primary 已上线 mini（HTTPS）**（client 端待 MBP 联调）：
+  - Schema migration v2_mirror（item_mirror / item_mirror_fts / pull_cursor 预留）
+  - `config.json` + `serve` / `primary_url` / `pull.*` 配置
+  - HMAC-SHA256 签名 + 反 replay（5min 窗口）
+  - Hummingbird 2 server：`/health` `/ingest` `/blob` (HEAD/GET/PUT) `/search`，可选 TLS（`tailscale cert` 签发的 PEM）
+  - Client push worker（actor）+ blob 先于 ingest 顺序保证 + 退避重试
+  - SearchProvider 远端优先 + 本地降级 + UI banner
+  - CLI 子命令：`init-secret` / `retry-failed` / `--help`（SwiftUI App.init 拦截）
+  - 集成测试：同进程 server + worker 真 HTTP roundtrip 全覆盖
+- **M3 未开始**：mirror pull worker / `promote-to-primary` / `audit-push` / `migrate-primary`
+- **测试**：63/63 通过（`swift test`）
+- **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
+- **下一站**：把 MBP（`100.68.44.27`）作为 client 加入联调（拷 shared-secret + 配 primary_url 即可，详见 `docs/deploy-multi-mac.md`）；或动手 M3 mirror
 
 ## 架构与 Non-Goals
 
-- 拓扑（未来）：家里 Mac mini = 永久 primary；主 Mac / MBP / iOS = 客户端
-- **单一归属**：每条剪贴项归属捕获它的设备，primary 只做聚合，从根上消除冲突
+- 拓扑（未来）：家里 Mac mini = 初始 primary；主 Mac / MBP / iOS = 客户端。Primary 不是终身制——任一 mirror client 可 `duo-pasted promote-to-primary` 顶上
+- **单一归属**：每条剪贴项归属捕获它的设备（`origin_device`），primary 只做聚合，从根上消除冲突
+- **写读分离**：写是多 master（每台设备本地 commit 再异步 push），读由 primary 聚合；mirror 模式让 client 可选周期 pull 全量到 `item_mirror` 表（DR + 离线全集搜索）
 - 传输：Tailscale / Surge Ponte 等 P2P 隧道，**不走公网**
 
 **Non-Goals**（被用户明确排除，不要主动建议）：
 - iOS 客户端在 M5 前不做
 - iCloud 加密备份（用户拒绝）
 - 双向同步 / 端到端冲突解决（架构上不需要）
+- 自动 leader election / 共识算法（Mac 数量个位数，promote 走手动子命令）
 
 ## 部署与运行
 
@@ -30,6 +42,39 @@
 ./scripts/install-agent.sh    # 幂等：build release + 拷到 ~/Applications + bootstrap
 ./scripts/uninstall-agent.sh  # 拆掉，不动数据
 ```
+
+### CLI 子命令（直接调装好的二进制）
+
+```sh
+~/Applications/duo-paste/duo-pasted --help          # 子命令列表
+~/Applications/duo-paste/duo-pasted init-secret     # 首次部署：生成 32 字节 shared secret
+~/Applications/duo-paste/duo-pasted retry-failed    # 把 push_state=failed 全部重置回 pending
+```
+
+无参运行 → 进入 SwiftUI daemon 流程（这是 LaunchAgent 的调用方式）。任何已识别的子命令在 SwiftUI 接管 NSApp 之前 exit。
+
+### 多设备配置（M2）
+
+详细步骤见 `docs/deploy-multi-mac.md`。要点：
+
+`config.json` 不存在 → standalone 模式（= M1，零回归）。要起 multi-Mac：
+
+**Primary（mini）**：
+
+```json
+{ "serve": true, "serve_host": "0.0.0.0", "serve_port": 8443 }
+```
+
+**Client（主 Mac / MBP）**：
+
+```json
+{
+  "primary_url": "https://duo-paste-primary.tailXXXX.ts.net:8443",
+  "pull": { "enabled": true, "interval_sec": 30, "eager_blobs": false }
+}
+```
+
+`pull.enabled=true` 才会跑 mirror（DR + 离线全集搜索；M3 才真实现 pull worker，目前只是 schema 占位）。`shared-secret` 文件三台机同份（`scp` 过去 + `chmod 600`）。
 
 ### 关键路径
 
@@ -66,8 +111,9 @@ LaunchAgent 装好后，主 Mac 常驻 release 版 daemon。调试时不能直�
 2. 重装：`./scripts/install-agent.sh`（脚本幂等）
 3. 跑 dev 二进制前先 `launchctl bootout gui/$UID/io.duopaste.agent`，跑完恢复
 4. 日志：`tail -f ~/Library/Logs/duo-paste/duo-pasted.err.log`
-   - 注意：stderr 里有 "UI ready" / "snapshot ok" 这种正常诊断输出，不全是错误
+   - 注意：stderr 里有 "UI ready" / "snapshot ok" / `[HummingbirdCore] Server started` 这种正常诊断输出，不全是错误
 5. 如果 bootstrap 报 `5: Input/output error`，sleep 2s 后手动 `launchctl bootstrap ... && launchctl kickstart -k ...`
+6. **launchd "languishing" 状态**：短时间内反复 bootout/bootstrap 会触发 launchd 速率限制，`launchctl print` 显示 `state = languishing` + bootstrap 持续报错。等 10-30s 直到 `launchctl print` 返回 `Could not find service`（彻底 boot out 干净）再重新 bootstrap 即可。不要 sudo / 不要改 plist。
 
 ## 关键设计决策（不要回退）
 
@@ -105,6 +151,22 @@ GRDB 的 `pool.write { ... }` 自动包事务，SQLite 禁止事务内 VACUUM。
 - NSPasteboard 没有 KVO/通知 API，只能 200ms 轮询 `changeCount`
 - 类型优先级：`file > image > rtf > html > url > string`（同一次复制同时存在多 type 时取最高优先级）
 - concealed/transient 类型直接 skip（密码管理器约定，见 `skipMarkerTypes`）
+
+### HMAC 签名：path-encoded body sha256，middleware 不读 body
+
+签名输入：`<ts_ms>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`，hex 在 header `X-DP-Body-SHA256` 里发出。中间件**只**校验 header 上的 hex 跟签名匹配——**不读 body**（让 multi-MB blob 不占中间件内存）。Handler 读完 body 必须**自己**再 sha256 跟 header 对比，否则攻击者可伪造合法签名 + 任意 body。`/ingest` 和 `/blob/{sha}` 的 handler 都做了二次校验；`/blob` 的还多校验 path sha = body sha = header sha 三方一致（content-addressed 契约）。位置：`AuthMiddleware.swift` + `Server.swift` 各 handler。
+
+### Push worker 不能用共享 AsyncStream.Iterator 跨 Task
+
+Swift 6 strict concurrency 拒绝把同一个 iterator 实例 capture 进多个 child task（`group.addTask`）。当前方案：`PushWorker` 持有 `currentSleep: Task<Void, Error>?`，每 tick 起一个新 sleep task，`wake()` nonisolated 调用 actor method 取消这个 task 让 sleep 提前结束。注意 `wake()` 必须 `nonisolated`，否则外部回调拿不到非阻塞接口。位置：`PushWorker.runLoop` / `cancelCurrentSleep`。
+
+### Server 序列化 Item：pinned 必须是 Bool，不能是 0/1
+
+`Item.Codable` 的 `pinned: Bool` 期望 JSON true/false。一开始误用 `pinned ? 1 : 0` 让 client 端 `JSONDecoder().decode(Item.self)` 报 typeMismatch。除此之外 `push_state` / `push_attempts` client 内部字段虽然没语义，但 Item.Codable 标了必填，server 也要原样下发。位置：`Server.itemToJSON`。
+
+### CLI 子命令在 SwiftUI 接管之前 exit
+
+`@main DuoPasteApp.init()` 里第一行调 `CLI.dispatchAndExitIfApplicable()`。命中 `init-secret` / `retry-failed` / `--help` 则跑完直接 `exit(0|1)`，根本不让 SwiftUI 拉起 NSApp。无参 / 未识别参数返回，daemon 流程照常。子命令实现住在 `DuoPasteCore.Admin`（纯函数，便于单测），CLI 只做 argv 解析 + exit。
 
 ## 已知环境坑
 
