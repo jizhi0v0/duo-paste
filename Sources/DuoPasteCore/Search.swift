@@ -50,34 +50,59 @@ public struct SearchAPI: Sendable {
     public static let snippetStartMarker = "\u{02}"
     public static let snippetEndMarker   = "\u{03}"
 
-    /// FTS5 snippet：对给定 item ids 子集，返回 id → 包围匹配词的上下文片段。
-    /// 仅 FTS 查询（query.text 非空）时有意义；其它情况返回空 map。
-    public func snippets(forItemIDs ids: [String], query q: SearchQuery) throws -> [String: String] {
-        guard let text = q.text, let match = Self.ftsQuery(from: text), !ids.isEmpty else {
-            return [:]
+    /// 一次 SQL 同时返回 item + FTS snippet——比 search() + snippets() 两次查询快一倍以上。
+    /// snippet 仅当 query.text 非空时填；其它情况第二元素为 nil。
+    /// max tokens=8：紧密围绕匹配词，SwiftUI `lineLimit(2)` 一定能显示到高亮段。
+    public func searchHits(_ q: SearchQuery) throws -> [(Item, String?)] {
+        try database.pool.read { db in
+            try Self.fetchHits(db, query: q)
         }
-        return try database.pool.read { db in
-            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
-            var args: [DatabaseValueConvertible] = ids
+    }
+
+    static func fetchHits(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
+        var wheres: [String] = []
+        var args: [DatabaseValueConvertible] = []
+
+        if !q.includeDeleted { wheres.append("item.deleted_at_ns IS NULL") }
+        if let from = q.fromNs { wheres.append("item.captured_at_ns >= ?"); args.append(from) }
+        if let to = q.toNs { wheres.append("item.captured_at_ns <= ?"); args.append(to) }
+        if !q.kinds.isEmpty {
+            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
+            wheres.append("item.kind IN (\(p))")
+            args.append(contentsOf: q.kinds.map { $0.rawValue })
+        }
+        if q.pinnedOnly { wheres.append("item.pinned = 1") }
+
+        let useFTS: Bool
+        if let text = q.text, let match = ftsQuery(from: text) {
+            useFTS = true
+            wheres.append("item_fts MATCH ?")
             args.append(match)
-            // snippet(<fts>, <col>, <start>, <end>, <ellipsis>, <max tokens>)
-            // col=-1 表示从所有 FTS 列里选（实际命中哪列就用哪列）
-            let sql = """
-                SELECT item.id,
-                       snippet(item_fts, -1, char(2), char(3), '…', 16) AS s
-                FROM item
-                JOIN item_fts ON item_fts.rowid = item.rowid
-                WHERE item.id IN (\(placeholders))
-                  AND item_fts MATCH ?
-            """
-            var map: [String: String] = [:]
-            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
-            for row in rows {
-                if let id: String = row["id"], let s: String = row["s"] {
-                    map[id] = s
-                }
-            }
-            return map
+        } else {
+            useFTS = false
+        }
+
+        let join = useFTS ? "JOIN item_fts ON item_fts.rowid = item.rowid" : ""
+        let snippetCol = useFTS
+            ? ", snippet(item_fts, -1, char(2), char(3), '…', 8) AS _snippet"
+            : ""
+        let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
+        let sql = """
+            SELECT item.*\(snippetCol)
+            FROM item
+            \(join)
+            \(whereClause)
+            ORDER BY item.pinned DESC, item.captured_at_ns DESC
+            LIMIT ? OFFSET ?
+        """
+        args.append(q.limit)
+        args.append(q.offset)
+
+        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+        return try rows.map { row -> (Item, String?) in
+            let item = try Item(row: row)
+            let snippet: String? = useFTS ? row["_snippet"] : nil
+            return (item, snippet)
         }
     }
 

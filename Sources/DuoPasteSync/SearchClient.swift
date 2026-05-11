@@ -162,9 +162,7 @@ public struct SearchProvider: Sendable {
     public func search(_ query: SearchQuery) async throws -> Outcome {
         // 无 remote → 直接本地（standalone / pure-primary）
         guard let remote else {
-            let items = try local.search(query)
-            let snippets = (try? local.snippets(forItemIDs: items.map(\.id), query: query)) ?? [:]
-            return Outcome(items: items, mode: .local, snippets: snippets)
+            return localOutcome(query: query, mode: .local)
         }
         // 有 remote → 尝试远端。注意用 try await（不是 try?）让 CancellationError
         // 透传——上层 AppState.refresh 已经有 catch is CancellationError 处理，
@@ -181,13 +179,16 @@ public struct SearchProvider: Sendable {
             )
         case .unreachable(let reason), .rejected(let reason):
             // 真不可达 / 拒收时才降级到本地——保证可用性优先
-            let items = try local.search(query)
-            let snippets = (try? local.snippets(forItemIDs: items.map(\.id), query: query)) ?? [:]
-            return Outcome(
-                items: items,
-                mode: .remoteFallback(reason: reason),
-                snippets: snippets
-            )
+            return localOutcome(query: query, mode: .remoteFallback(reason: reason))
         }
+    }
+
+    private func localOutcome(query: SearchQuery, mode: Mode) -> Outcome {
+        // 一次 SQL 同时拿 items + snippets——比之前 search() + snippets() 两次查询快一倍
+        let hits = (try? local.searchHits(query)) ?? []
+        let snippets = Dictionary(uniqueKeysWithValues: hits.compactMap { (item, s) in
+            s.map { (item.id, $0) }
+        })
+        return Outcome(items: hits.map(\.0), mode: mode, snippets: snippets)
     }
 }
