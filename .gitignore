@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+.local-deps/
+*.xcodeproj/
+Packages/
+xcuserdata/
+DerivedData/
+.DS_Store
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
