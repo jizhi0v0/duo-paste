@@ -41,24 +41,44 @@ final class AppState {
     }
 
     func refresh() async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let q = SearchQuery(
-            text: query.isEmpty ? nil : query,
+            text: trimmed.isEmpty ? nil : trimmed,
             limit: 200
         )
         do {
             let outcome = try await deps.searchProvider.search(q)
             self.results = outcome.items
             self.searchMode = outcome.mode
-            if let id = self.selectedID, outcome.items.contains(where: { $0.id == id }) {
-                // 保持选中行
-            } else {
-                self.selectedID = outcome.items.first?.id
-            }
+            updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
             self.lastError = nil
         } catch is CancellationError {
             // 用户在打字，新查询正在替换旧的，正常
         } catch {
             self.lastError = "\(error)"
+        }
+    }
+
+    /// 列表刷新后调整选中行：
+    /// - **query 空**（首次打开 / 清空搜索）→ 强制选第一项（最新捕获），并触发滚回顶部
+    /// - **query 非空 + 原选中行仍在结果里** → 保持选中（让"缩小关键词"流不丢焦点）
+    /// - **query 非空 + 原选中行不在结果里** → 选第一项
+    private func updateSelection(forItems items: [Item], queryIsEmpty: Bool) {
+        let newSelection: String?
+        if queryIsEmpty {
+            newSelection = items.first?.id
+        } else if let id = self.selectedID, items.contains(where: { $0.id == id }) {
+            newSelection = id  // preserve
+        } else {
+            newSelection = items.first?.id
+        }
+        if newSelection != self.selectedID {
+            self.selectedID = newSelection
+            // selection 跳到非临近行（清空搜索时常见），SearchView 需要重新滚到选中项；
+            // scrollPulse 是唯一让它滚动的入口
+            if newSelection != nil {
+                self.scrollPulse &+= 1
+            }
         }
     }
 }
