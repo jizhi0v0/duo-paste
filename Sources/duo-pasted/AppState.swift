@@ -10,6 +10,9 @@ import DuoPasteSync
 final class AppState {
     var query: String = ""
     var results: [Item] = []
+    /// `id → snippet`（含 STX/ETX 高亮标记）。仅 query 非空 + FTS 命中时有内容。
+    /// SearchView ItemRow 用 `snippet(for:)` 拿；为 nil 时 fallback 到 item.preview。
+    var snippets: [String: String] = [:]
     var selectedID: String?
     var lastError: String?
     /// 当前搜索源——决定顶部 banner 显示什么。
@@ -22,6 +25,13 @@ final class AppState {
 
     init(deps: AppDependencies) {
         self.deps = deps
+        // 同步预填本地最新 200 条，避免 panel 首次打开 SwiftUI 第一帧渲染
+        // 时 results=[] → 看到 "0 条" 闪一下。Panel 触发 .task 后会异步 refresh
+        // 一次（可能从 remote 拿更新），把这里的结果替换/扩展。
+        // 用本地不走 searchProvider，绕开 remote 慢路径——0 ms 同步可拿到结果。
+        let initial = (try? deps.searchAPI.search(SearchQuery(limit: 200))) ?? []
+        self.results = initial
+        self.selectedID = initial.first?.id
     }
 
     /// 当前应该粘贴的项：优先选中项，否则取列表首项。
@@ -49,6 +59,7 @@ final class AppState {
         do {
             let outcome = try await deps.searchProvider.search(q)
             self.results = outcome.items
+            self.snippets = outcome.snippets
             self.searchMode = outcome.mode
             updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
             self.lastError = nil

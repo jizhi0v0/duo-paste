@@ -45,6 +45,42 @@ public struct SearchAPI: Sendable {
         }
     }
 
+    /// 匹配词高亮分隔符。STX/ETX 是 ASCII 控制字符，几乎不会出现在剪贴板真实文本里——
+    /// UI 拿到字符串按这两个 marker 切片、夹在中间的部分加粗。
+    public static let snippetStartMarker = "\u{02}"
+    public static let snippetEndMarker   = "\u{03}"
+
+    /// FTS5 snippet：对给定 item ids 子集，返回 id → 包围匹配词的上下文片段。
+    /// 仅 FTS 查询（query.text 非空）时有意义；其它情况返回空 map。
+    public func snippets(forItemIDs ids: [String], query q: SearchQuery) throws -> [String: String] {
+        guard let text = q.text, let match = Self.ftsQuery(from: text), !ids.isEmpty else {
+            return [:]
+        }
+        return try database.pool.read { db in
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            var args: [DatabaseValueConvertible] = ids
+            args.append(match)
+            // snippet(<fts>, <col>, <start>, <end>, <ellipsis>, <max tokens>)
+            // col=-1 表示从所有 FTS 列里选（实际命中哪列就用哪列）
+            let sql = """
+                SELECT item.id,
+                       snippet(item_fts, -1, char(2), char(3), '…', 16) AS s
+                FROM item
+                JOIN item_fts ON item_fts.rowid = item.rowid
+                WHERE item.id IN (\(placeholders))
+                  AND item_fts MATCH ?
+            """
+            var map: [String: String] = [:]
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+            for row in rows {
+                if let id: String = row["id"], let s: String = row["s"] {
+                    map[id] = s
+                }
+            }
+            return map
+        }
+    }
+
     /// 把用户输入的自由文本转成 FTS5 MATCH 表达式。
     /// 策略：按空白拆词，每个 token 转义双引号后作为前缀短语，AND 连接。
     /// 比如 `foo bar"baz` → `"foo"* AND "bar""baz"*`

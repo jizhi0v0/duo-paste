@@ -106,7 +106,8 @@ struct SearchView: View {
                     ForEach(state.results) { item in
                         ItemRow(
                             item: item,
-                            isSelected: item.id == state.selectedID
+                            isSelected: item.id == state.selectedID,
+                            snippet: state.snippets[item.id]
                         )
                         .contentShape(Rectangle())
                         .id(item.id)
@@ -141,6 +142,8 @@ struct SearchView: View {
 private struct ItemRow: View {
     let item: Item
     let isSelected: Bool
+    /// 含 STX/ETX 高亮标记的 FTS snippet。仅 query 非空 + 命中时非 nil。
+    let snippet: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -149,7 +152,7 @@ private struct ItemRow: View {
                 .foregroundStyle(isSelected ? Color.white : Color.accentColor)
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.preview ?? "")
+                previewText
                     .lineLimit(2)
                     .font(.system(size: 13))
                     .foregroundStyle(isSelected ? Color.white : .primary)
@@ -189,6 +192,42 @@ private struct ItemRow: View {
 
     private var capturedDate: Date {
         Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000)
+    }
+
+    /// 优先用 snippet（FTS 命中片段，匹配词加粗），否则回退到 preview。
+    /// snippet 用 STX/ETX 做标记：拆成 plain / bold 交替的 Text 链。
+    /// 注意返回类型 `Text`（不能用 @ViewBuilder 的 _ConditionalContent，要支持
+    /// `.lineLimit(2)` 这类只对 Text 生效的修饰）
+    private var previewText: Text {
+        if let s = snippet, !s.isEmpty {
+            return highlightedText(from: s)
+        }
+        return Text(item.preview ?? "")
+    }
+
+    private func highlightedText(from snippet: String) -> Text {
+        // snippet 形如 "abc \u{02}match\u{03} def \u{02}more\u{03} ghi"
+        var result = Text("")
+        var rest = snippet[...]
+        while let startRange = rest.range(of: "\u{02}") {
+            let beforeStart = rest[..<startRange.lowerBound]
+            result = result + Text(String(beforeStart))
+            let afterStart = rest[startRange.upperBound...]
+            if let endRange = afterStart.range(of: "\u{03}") {
+                let matched = afterStart[..<endRange.lowerBound]
+                result = result + Text(String(matched)).bold()
+                rest = afterStart[endRange.upperBound...]
+            } else {
+                // 没找到收尾 marker——把剩下的全当 plain（防御性，不应发生）
+                result = result + Text(String(afterStart))
+                rest = ""[...]
+                break
+            }
+        }
+        if !rest.isEmpty {
+            result = result + Text(String(rest))
+        }
+        return result
     }
 
     private func humanSize(_ size: Int64) -> String {

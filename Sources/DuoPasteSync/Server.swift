@@ -227,15 +227,22 @@ public struct SyncServer: Sendable {
         }
 
         // GET /search?q=foo&limit=200&offset=0&kinds=text,url&from_ns=...&to_ns=...&pinned=1
-        // 直接复用 SearchAPI.fetch；返回 { ok, items: [...], count }
+        // 复用 SearchAPI.fetch；q 非空时附 FTS snippet 给每个 item。
+        // 返回 { ok, items: [Item + 可选 snippet], count }
         router.get("/search") { request, _ -> Response in
             let q = parseSearchQuery(request.uri.queryParameters)
             do {
                 let items = try searchAPI.search(q)
+                let snippets = (try? searchAPI.snippets(forItemIDs: items.map(\.id), query: q)) ?? [:]
+                let itemsJSON = items.map { item -> [String: Any] in
+                    var d = itemToJSON(item)
+                    if let s = snippets[item.id] { d["snippet"] = s }
+                    return d
+                }
                 let payload: [String: Any] = [
                     "ok": true,
                     "count": items.count,
-                    "items": items.map { itemToJSON($0) },
+                    "items": itemsJSON,
                 ]
                 let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
                 var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))

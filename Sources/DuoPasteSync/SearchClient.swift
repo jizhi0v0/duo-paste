@@ -9,12 +9,22 @@ public protocol SearchTransport: Sendable {
 
 public struct RemoteSearchResult: Sendable {
     public enum Outcome: Sendable {
-        case ok([Item])
+        case ok([SearchHit])
         case unreachable(reason: String)    // 网络 / 5xx：可降级本地
         case rejected(reason: String)       // 4xx / 401：配置错或签名错，本地降级 + UI 提示
     }
     public let outcome: Outcome
     public init(outcome: Outcome) { self.outcome = outcome }
+}
+
+/// 远端 /search 响应里每条结果：Item + 可选 snippet（仅 q 非空时填）。
+public struct SearchHit: Sendable {
+    public let item: Item
+    public let snippet: String?
+    public init(item: Item, snippet: String?) {
+        self.item = item
+        self.snippet = snippet
+    }
 }
 
 extension HTTPIngestClient: SearchTransport {
@@ -74,7 +84,10 @@ extension HTTPIngestClient: SearchTransport {
         case 200...299:
             do {
                 let parsed = try JSONDecoder().decode(SearchResponse.self, from: data)
-                return RemoteSearchResult(outcome: .ok(parsed.items))
+                let hits = parsed.items.map { wire -> SearchHit in
+                    SearchHit(item: wire.item, snippet: wire.snippet)
+                }
+                return RemoteSearchResult(outcome: .ok(hits))
             } catch {
                 // 响应解析失败当 unreachable——可能服务端版本不兼容
                 return RemoteSearchResult(outcome: .unreachable(reason: "decode: \(error)"))
@@ -88,11 +101,31 @@ extension HTTPIngestClient: SearchTransport {
     }
 }
 
-/// 服务端 /search 响应结构。Items 复用 DuoPasteCore.Item 的 snake_case Codable。
+/// 服务端 /search 响应结构。每个 item 是 Item 的字段拼上可选 `snippet`——
+/// 用嵌套 decoder 把 snippet 拆出来，剩下交给 Item.Codable 解。
 private struct SearchResponse: Codable {
     let ok: Bool
     let count: Int
-    let items: [Item]
+    let items: [Wire]
+
+    struct Wire: Codable {
+        let item: Item
+        let snippet: String?
+
+        init(from decoder: Decoder) throws {
+            self.item = try Item(from: decoder)
+            let c = try decoder.container(keyedBy: SnippetKey.self)
+            self.snippet = try c.decodeIfPresent(String.self, forKey: .snippet)
+        }
+        func encode(to encoder: Encoder) throws {
+            try item.encode(to: encoder)
+            if let snippet {
+                var c = encoder.container(keyedBy: SnippetKey.self)
+                try c.encode(snippet, forKey: .snippet)
+            }
+        }
+        enum SnippetKey: String, CodingKey { case snippet }
+    }
 }
 
 /// 选择层：根据 transport 是否存在 + 健康状态，决定打远端还是本地。
@@ -107,6 +140,15 @@ public struct SearchProvider: Sendable {
     public struct Outcome: Sendable {
         public let items: [Item]
         public let mode: Mode
+        /// `id → snippet`，仅 query.text 非空时填；query 为空时为空 map。
+        /// snippet 含 STX/ETX 标记包围匹配词，UI 端切片渲染加粗。
+        public let snippets: [String: String]
+
+        public init(items: [Item], mode: Mode, snippets: [String: String] = [:]) {
+            self.items = items
+            self.mode = mode
+            self.snippets = snippets
+        }
     }
 
     public let local: SearchAPI
@@ -120,19 +162,32 @@ public struct SearchProvider: Sendable {
     public func search(_ query: SearchQuery) async throws -> Outcome {
         // 无 remote → 直接本地（standalone / pure-primary）
         guard let remote else {
-            return Outcome(items: try local.search(query), mode: .local)
+            let items = try local.search(query)
+            let snippets = (try? local.snippets(forItemIDs: items.map(\.id), query: query)) ?? [:]
+            return Outcome(items: items, mode: .local, snippets: snippets)
         }
         // 有 remote → 尝试远端。注意用 try await（不是 try?）让 CancellationError
         // 透传——上层 AppState.refresh 已经有 catch is CancellationError 处理，
         // 不应该被这里当 unreachable 误降级。
         let result = try await remote.searchRemote(query)
         switch result.outcome {
-        case .ok(let items):
-            return Outcome(items: items, mode: .remoteOK)
+        case .ok(let hits):
+            return Outcome(
+                items: hits.map(\.item),
+                mode: .remoteOK,
+                snippets: Dictionary(uniqueKeysWithValues: hits.compactMap { h in
+                    h.snippet.map { (h.item.id, $0) }
+                })
+            )
         case .unreachable(let reason), .rejected(let reason):
             // 真不可达 / 拒收时才降级到本地——保证可用性优先
             let items = try local.search(query)
-            return Outcome(items: items, mode: .remoteFallback(reason: reason))
+            let snippets = (try? local.snippets(forItemIDs: items.map(\.id), query: query)) ?? [:]
+            return Outcome(
+                items: items,
+                mode: .remoteFallback(reason: reason),
+                snippets: snippets
+            )
         }
     }
 }

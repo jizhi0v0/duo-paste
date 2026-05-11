@@ -66,7 +66,7 @@ private func sampleItem(
     struct OKTransport: SearchTransport {
         let remoteItem: Item
         func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
-            RemoteSearchResult(outcome: .ok([remoteItem]))
+            RemoteSearchResult(outcome: .ok([SearchHit(item: remoteItem, snippet: nil)]))
         }
     }
     let provider = SearchProvider(
@@ -77,6 +77,29 @@ private func sampleItem(
     #expect(outcome.mode == .remoteOK)
     #expect(outcome.items.count == 1)
     #expect(outcome.items.first?.textFull == "from remote")
+}
+
+@Test func searchProviderLocalReturnsSnippets() async throws {
+    // Provider 走本地路径时，应当为命中项填上 snippet（含 STX/ETX 标记）
+    let db = try makeDBWithItems([
+        sampleItem(id: "s1", text: "this is a foo bar baz quux test"),
+        sampleItem(id: "s2", text: "another row without keyword"),
+    ])
+    let provider = SearchProvider(local: SearchAPI(database: db), remote: nil)
+    let outcome = try await provider.search(SearchQuery(text: "foo"))
+    #expect(outcome.items.count == 1)
+    let snippet = outcome.snippets["s1"]
+    #expect(snippet != nil)
+    #expect(snippet?.contains("\u{02}") == true)  // STX 起始标记
+    #expect(snippet?.contains("\u{03}") == true)  // ETX 终止标记
+    #expect(snippet?.contains("foo") == true)
+}
+
+@Test func searchProviderEmptyQueryHasNoSnippets() async throws {
+    let db = try makeDBWithItems([sampleItem(text: "anything")])
+    let provider = SearchProvider(local: SearchAPI(database: db), remote: nil)
+    let outcome = try await provider.search(SearchQuery())
+    #expect(outcome.snippets.isEmpty)
 }
 
 @Test func searchProviderLocalOnlyWhenNoRemote() async throws {
@@ -155,18 +178,20 @@ private func sampleItem(
 
     // 文本 "hello" 应该命中 server-1
     let textHit = try await client.searchRemote(SearchQuery(text: "hello"))
-    if case .ok(let items) = textHit.outcome {
-        #expect(items.count == 1)
-        #expect(items.first?.id == "server-1")
+    if case .ok(let hits) = textHit.outcome {
+        #expect(hits.count == 1)
+        #expect(hits.first?.item.id == "server-1")
+        // FTS 查询时 server 应该附 snippet
+        #expect(hits.first?.snippet?.contains("\u{02}") == true)
     } else {
         Issue.record("expected .ok for text query")
     }
 
     // kind 过滤
     let urlOnly = try await client.searchRemote(SearchQuery(kinds: [.url]))
-    if case .ok(let items) = urlOnly.outcome {
-        #expect(items.count == 1)
-        #expect(items.first?.id == "server-3")
+    if case .ok(let hits) = urlOnly.outcome {
+        #expect(hits.count == 1)
+        #expect(hits.first?.item.id == "server-3")
     } else {
         Issue.record("expected .ok for kind filter")
     }
