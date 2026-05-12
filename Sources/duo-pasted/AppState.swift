@@ -41,6 +41,16 @@ final class AppState {
     /// 不持久化——重启就清，是 "刚才有点东西没存下来" 的实时提示。
     var recentSkip: SkipNotice?
 
+    /// blob 懒拉状态。`.fetching` 时 panel 顶部 spinner overlay；
+    /// `.failed` 时 banner 显示错误文案 + 用户 Esc 或 Enter 重试
+    var pasteProgress: PasteProgress = .idle
+
+    enum PasteProgress: Equatable, Sendable {
+        case idle
+        case fetching(itemID: String, sizeHint: Int64?)  // sizeHint=blobSize 可知时让 UI 显示进度
+        case failed(reason: String)
+    }
+
     let deps: AppDependencies
 
     /// 单次跳过的提示。`bytes` / `limit` 单位字节，UI 端 humanize。`kind` 决定文案。

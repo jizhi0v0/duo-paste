@@ -23,18 +23,23 @@
   - `SearchProvider.Mode.localMirror(stalenessSec:)`：`mirrorLastPullNs()` 非 nil → 直接走 `searchUnion`，**不**打远端
   - UI banner：`.localMirror` 灰色「本地镜像 · 更新于 Xs/m/h 前」；`.remoteFallback` 黄色保留
 - **Capture 字节守门 完成**：`config.capture.{max_blob_mb=32, max_text_kb=512}` 默认。意外复制超大对象跳过入库（NSPasteboard 自身不受影响，Cmd+V 仍正常）。UI 端 orange skipBanner 5 分钟自动消失 + 手动 ✕ 关闭。详见下文设计决策段
-- **M3 第三刀 完成**（PR#4 + PR#7 + PR#8 + PR#10 + migrate-primary 已就位）：
+- **M3 完成**（PR#4 + PR#7 + PR#8 + PR#10 + PR#11 + blob 懒拉已就位）：
   - **时钟偏移 sanity check**：PullWorker 每 tick 在 `/health` 拿 `primary.now_ms` 跟本机 wall-clock 比对，通过 `MirrorStatus.clockSkewMs()` 暴露给 UI；|skew| ≥ 30s 时 log warn + `SearchView.clockSkewBanner` 黄色提示（HMAC 容忍 ±5 分钟，30s 是早期预警）
   - **audit-push 子命令**：`duo-pasted audit-push [--sample N]` 拿本机 own-origin item 跟 primary `/since` 全量对账。输出 push_state 分布 + missing on primary + failed 详情 + **Continuity dedup absorbed**（acked 但 id 不在 primary，内容在跨 origin 行 ±5s 找到）+ **stale on primary**（同 id 但 pinned / deletedAtNs / capturedAtNs diverge，RemoteIngester 不更新已有行造成）+ **dedupAbsorbedThenDeleted**（吸收源后被软删，单独成桶让操作员判断是否预期）。exit 码：missing/failed/stale 任一非 0 → 1
   - **promote-to-primary 子命令**（PR#7）：`duo-pasted promote-to-primary [--serve-host H] [--serve-port P]` 把本机从 client 提升为 primary。一个 writer tx 内：(1) `INSERT OR IGNORE INTO item SELECT ... FROM item_mirror` 把 mirror 抬进 item（保留 origin_device，新行 push_state='acked'），(2) 清空 item_mirror + pull_cursor，(3) 写 `primary_lineage` 两行——`(self, now, NULL)` 开新任期 + `(old_primary, 0, now)` 闭老任期（started=0=未知起点）。然后用 `Config.write` 改 config.json：`serve=true`、移除 primary_url、`pull.enabled=false`，**保留未知字段**（capture / tls / 用户手动加的注释 key 都不丢）。子命令不动 LaunchAgent，打印 kickstart 提示
   - **v5 migration**：`primary_lineage(device_id TEXT, started_at_ns INTEGER, ended_at_ns INTEGER, PK(device_id, started_at_ns))`。PR#7 埋数据；PR#8 切 audit-push：按 row.capturedAtNs 落在 `[started_at_ns, ended_at_ns)` 区间确定该 push 时刻的 active primary，dedup 候选必须 origin 严格 == 这个 device_id。空 lineage / 时间未覆盖 / expected==self 的 stale 边界回退 `origin != self` 启发式保单 primary 部署零回归
   - **migrate-primary 子命令**：`duo-pasted migrate-primary [--new-primary-host HOST]` 在老 primary 上跑 prepare 阶段：校验 primary 模式 + daemon 不在跑 + VACUUM INTO 落一份 snapshot 到 `snapshots/`（复用 `Snapshot.filename` 命名）+ walk `blobs/` 统计 files/bytes + 读 item/item_mirror 行数。命令本身只读（除快照副产物），不动 DB/config/blobs；输出 rsync 命令模板 + 新机配置步骤 + 其他 client 后续动作（改 primary_url + audit-push 补齐）。**MVP 不写 lineage** —— 新 primary 接管行没人写，单 primary 部署 audit-push 不受影响，多次换 primary 链路下可能产生跨任期 dedup 误判（plan §b 原文也没要求；后续可加 `--demote-and-record` flag 补）
-  - 仍未做：blob 懒拉（M3 收尾剩余）
+  - **blob 懒拉**：两条互补路径覆盖"mirror client 上图片 paste-back"痛点
+    - **Lazy (paste-back)**：`AppDelegate.pasteBack` 在 image kind + 本机 `BlobStore` 缺字节时起 `currentPasteTask`：UI banner `.fetching(spinner)` → `BlobFetcher.getBlob` (2 次 backoff 2s/4s，总超时 5s) → `BlobStore.putVerified` (sha 校验防 MITM) → `Copyback.write` + `panel.hide`。失败 → banner `.failed(reason)`，panel 保持显示让用户看错误。多次按 Enter 自动 cancel 旧 task 避免重复 GET 竞争 BlobStore.put
+    - **Eager (`pull.eager_blobs=true`)**：PullWorker `applyPage` 同事务收集本页 image/file + deleted_at_ns IS NULL 的 sha 集合；tick 完 cursor 已 commit 后 best-effort 循环 GET missing blobs → `putVerified`。失败 only log，**不阻塞 cursor 推进**——下次 tick 同 sha 自然重试。已存在的 sha 直接 short-circuit 走 BlobStore.exists 不发请求
+    - **新协议 `BlobFetcher`**：`HTTPIngestClient.getBlob` 实现 GET /blob + HMAC + 200 时本地重算 sha 校验防字节篡改。返回 `.found(Data)` / `.notFound`；4xx 非 404 / 5xx / sha mismatch 走 `GetBlobError`（rejected / transient / shaMismatch）。新增 `BlobStore.putVerified` 防御接口先校验 expected sha 再落盘
+    - **UI 入口契约改动**：`SearchPanelController.installKeyMonitor` 的 Enter case 不再立刻 `self.hide()`——把 "何时 hide" 交给 onPaste 回调实现。AppDelegate.pasteBack 在同步路径完成后 `panel.hide()`、慢路径（image + missing）由 currentPasteTask 完成时再 hide。不变量：panel 持有引用 = 控制权
+- M3 全部完成；下一站 M4
 - **RTF 三层降级 完成**（PR#3 + PR#5 合作）：watcher 抓 RTF 时优先 (a) pasteboard 自带非空 .string → 直接用；(b) raw RTF 字节 ≤ `maxTextBytes` cap → `decodeRTFToPlain` 用 NSAttributedString 解出 plain；(c) 失败/全空白/raw 太大 → 兜底存 raw rtf 让 CaptureService 字节守门拦下。`PasteboardWatcher.maxRawRTFBytes` 由 AppDelegate 注入 `deps.config.capture.maxTextBytes`，避免 50MB RTF 在 @MainActor 轮询路径上同步分配巨型 NSAttributedString
 - **搜索 prefix boost 完成**（PR#6）：搜索排序契约 `(pinned DESC, prefix DESC, captured_at_ns DESC)`。`preview` 起始命中 = 2 分 / `text_full` 起始命中 = 1 分 / 否则 0。**24h 时间窗**：只对 24h 内的项生效，跨天老内容哪怕起头匹配也按时间倒序排——剪贴板心智是"搜=找最近用过的"。SQL 端三条路径（`fetchHits` / `fetchHitsMirror` / `fetch`）+ Swift 端 `fetchUnion.prefixScore` 全部对称实现，回归测试见 `SearchPrefixBoostTests.swift`
-- **测试**：218/218 通过（`swift test`，含 AdminMigrateTests 11 条）。AdminPromoteTests 18 条 + AdminMigrateTests 11 条覆盖：拒绝 standalone/client 模式 / daemon-running 检查 / 快照落地 + item 计数 / blob 递归统计 / 空 blobs 边界 / blobs 目录不存在边界 / item_mirror 残留如实报告 / config + DB 只读 invariant / 多次跑产出不同快照。注意 PullWorker HTTP 端到端测试**已知偶发并发 flake**（端口/DB 竞争），单跑 `--filter PullWorker` 必绿
+- **测试**：236 个测试（含 BlobStoreTests 4 + BlobLazyPullTests 10）。BlobLazyPullTests 覆盖 `eager_blobs` 拉 missing + off skip / 已有字节短路 / tombstone 跳过 / own-origin 跳过 / fetcher 失败不回滚 mirror / notFound 不致命 + HTTPIngestClient.getBlob 端到端（200/404/401）。BlobStoreTests 覆盖 putVerified 接受/拒绝/已存在短路/byteOrder。PullWorker HTTP 端到端 + 部分 in-memory eager 测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），跟 `swift test --filter PullWorker` / `--filter BlobLazyPull` 单独验证
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
-- **下一站**：blob 懒拉（M3 收尾最后一刀，PullWorker 默认 `eager_blobs=false` 后 SearchProvider 按需 `GET /blob/<sha>`）。M4 导出 + UX 打磨。详细拆解见 plans/...moonlit-wave.md
+- **下一站**：M4 导出（Markdown/JSON/原始 SQLite）+ UX 打磨（类型/时间筛选 / pinned UI / 快捷键自定义）。详细拆解见 plans/...moonlit-wave.md
 
 ## 架构与 Non-Goals
 
@@ -200,6 +205,24 @@ RTF 抓取走三层降级：
 5. **blob 校验只统计不算 sha**——递归 walk `blobs/` 算文件数 + 字节数。**不**重算每个 sha256（10 万 blob × 100KB 跑半小时不切实际）。靠 rsync `--checksum` 在传输时校验。如果操作员要"传完后核对"，CLI 输出里有 `blobsTotalFiles` + `blobsTotalBytes` 让新机跑 `find blobs -type f | wc -l` + `du -sb blobs` 自己比。
 
 6. **`walkBlobsDir` 跳过非 regular file** —— BlobStore.put 只写 regular file，但用户可能手动放 symlink / pipe / 目录在 blobs 下。统计只算 regular file 让结果可解释。目录不存在时返回 (0, 0) 不抛错，让命令对"全新 primary 机器没 blobs/"边界鲁棒。回归测试 `migrateHandlesEmptyBlobsDir` / `migrateHandlesMissingBlobsDir`。
+
+### blob 懒拉的不变量
+
+`pull.eager_blobs` 字段（默认 false）+ `AppDelegate.pasteBack` lazy 路径 + `PullWorker.fetchBlobsEager` 三处协同。重要不变量：
+
+1. **content-addressed 接收方必须重算 sha** —— `HTTPIngestClient.getBlob` 200 时本地重算 SHA256 比 path-sha；不匹配抛 `GetBlobError.shaMismatch`。理由：HMAC 签名只保 request 完整性，不保 response body；MITM 或 server bug 给错字节会污染本机 BlobStore。`BlobStore.putVerified` 第二层兜底（lazy / eager 两条路径都调它）。回归测试 `putVerifiedRejectsMismatchedSha` / `httpGetBlobReturnsBytesOn200`（本地校验隐含在通过路径里）
+
+2. **eager 失败不回滚 mirror** —— PullWorker.tick 内 `applyPage` 已经在 writer tx 内 commit mirror 行 + cursor，**之后**才调 `fetchBlobsEager`。eager 失败 only log，不抛、不让整个 tick 标 transient。下次 tick 同样 sha 自然重试（BlobStore.exists short-circuit 让已 mirror 但只缺 blob 的 sha 在每 tick 被重试一次）。回归测试 `eagerBlobsFailureDoesNotRevertMirror`
+
+3. **eager 不拉 tombstone 的 blob** —— `applyPage.mirroredShas` 收集时过滤 `item.deletedAtNs != nil`。primary 上软删行的 blob 通常已被清，拉 404 没意义且污染日志。回归测试 `eagerBlobsSkipsTombstone`
+
+4. **eager 不拉 origin=self 的 blob** —— own-origin 行根本不入 mirror（PullWorker 现有契约），applyPage `for item in page.items { if item.originDevice == device { continue } }` 会让这些 item 不被 INSERT，mirroredShas 收集自然跳过。回归测试 `eagerBlobsSkipsOwnOriginRows`
+
+5. **lazy paste 同步阻塞 panel，不 async 关 panel 后再写 pasteboard** —— `SearchPanelController.installKeyMonitor` 的 Enter case 不再立刻 `self.hide()`；hide 责任移交 onPaste 回调实现方（AppDelegate.pasteBack）。同步路径（非 image / blob 已在）完成后 `panel.hide()`；慢路径起 `currentPasteTask` 完成后再 hide。**不要回退**——async 关 panel + 后台写 pasteboard 会让用户切到目标 app 后 paste 时已脱离原 context，体感"延迟到达"，并且 NSPasteboard 写完不代表内容到位（Cmd+V 时机错位会失败）
+
+6. **lazy 多次 Enter 自动 cancel 旧 task** —— `AppDelegate.currentPasteTask` 保存上一次 Task，`pasteBack` 调用时 `currentPasteTask?.cancel()` 再起新的。防 "拉一半再按 Enter" 重复 GET 同 sha 竞争 BlobStore.put（put 是原子 rename，重复其实安全；但避免浪费带宽 + 让 UI 状态机简单）
+
+7. **lazy 重试有界、总超时 5s** —— `fetchBlobLazy` 内 `backoffs: [0, 2, 4]`（第一次立即 + 两次 backoff）；每次循环先看 `Date() > deadline` 早退。理由：Tailscale 几 MB 图片正常 < 1s，3+s 大概率网络异常；让用户 5s 内得到反馈（spinner 还是 failed banner）。`.transient` 错误进入下一轮重试；`.rejected` / `.shaMismatch` / `.notFound` 立即 fail（不可恢复）
 
 ### PullWorker primary 换了的检测
 

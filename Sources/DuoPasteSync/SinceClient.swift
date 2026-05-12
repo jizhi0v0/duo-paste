@@ -13,6 +13,16 @@ public protocol SinceTransport: Sendable {
     func fetchPrimaryHealth() async throws -> PrimaryHealthResult
 }
 
+/// PullWorker eager_blobs 路径用的最小依赖。生产由 HTTPIngestClient 顺路实现
+/// （它的 IngestTransport.getBlob 已经在 PushClient.swift 里），测试可独立 mock。
+///
+/// **签名故意跟 IngestTransport.getBlob 一致**——HTTPIngestClient 一份实现满足两个
+/// 协议。BlobFetcher 单独存在让 PullWorker 不用吃 IngestTransport 的 ingest/putBlob
+/// 这两个跟 pull 无关的方法
+public protocol BlobFetcher: Sendable {
+    func getBlob(sha256: String) async throws -> GetBlobOutcome
+}
+
 public struct RemoteSinceResult: Sendable {
     public enum Outcome: Sendable {
         case ok(SincePageWire)
@@ -69,6 +79,9 @@ private struct HealthResponse: Codable {
         try c.encode(String(nowMs), forKey: .nowMs)
     }
 }
+
+// HTTPIngestClient 已经在 PushClient.swift 实现 getBlob——这里仅声明 protocol 一致
+extension HTTPIngestClient: BlobFetcher {}
 
 extension HTTPIngestClient: SinceTransport {
     public func fetchSince(cursor: SinceCursor, limit: Int) async throws -> RemoteSinceResult {

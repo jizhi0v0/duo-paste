@@ -25,6 +25,32 @@ public protocol IngestTransport: Sendable {
     /// data 的 sha256 必须等于 `sha256` 参数——content-addressed 契约。
     /// 返回 outcome：acked / rejected / transient，语义同 ingest。
     func putBlob(sha256: String, data: Data) async throws -> IngestResult
+    /// 从 primary 拉 blob 字节。content-addressed：调用方负责校验返回字节的 sha256
+    /// 跟请求 sha 匹配（HTTPIngestClient 内部已校验；fake 实现也应当校验）。
+    /// - 返回 `.found(data)`：200，blob 字节获取成功
+    /// - 返回 `.notFound`：404，primary 也没字节（image/file 历史在 promote-to-primary
+    ///   "missing blobs" 场景下不可恢复）
+    /// - throw GetBlobError：4xx 非 404 / 5xx / 网络 / sha 校验失败。调用方判断是否重试
+    func getBlob(sha256: String) async throws -> GetBlobOutcome
+}
+
+public enum GetBlobOutcome: Sendable {
+    case found(Data)
+    case notFound
+}
+
+public enum GetBlobError: Error, CustomStringConvertible, Sendable {
+    case rejected(reason: String)         // 4xx 非 404（鉴权 / 格式 / 拒绝）：重试无意义
+    case transient(reason: String)        // 5xx / 网络 / 超时：可重试
+    case shaMismatch(expected: String, actual: String)  // primary 返回字节 sha 不匹配——可能是 MITM 或字节流截断
+
+    public var description: String {
+        switch self {
+        case .rejected(let r): return "blob fetch rejected: \(r)"
+        case .transient(let r): return "blob fetch transient: \(r)"
+        case .shaMismatch(let e, let a): return "blob sha mismatch: expected=\(e) actual=\(a)"
+        }
+    }
 }
 
 /// 业务层结果（屏蔽 HTTP 细节）。和 IngestResponse 不同：
@@ -155,6 +181,49 @@ public struct HTTPIngestClient: IngestTransport {
             return IngestResult(outcome: .rejected(reason: "blob put rejected: \(msg)"))
         default:
             return IngestResult(outcome: .transient(reason: "blob put http \(http.statusCode)"))
+        }
+    }
+
+    public func getBlob(sha256: String) async throws -> GetBlobOutcome {
+        let path = "/blob/\(sha256)"
+        let ts = now()
+        // GET body 为空，bodyHash = empty hash
+        let sig = auth.sign(timestampMs: ts, method: "GET", path: path,
+                            bodyHashHex: HMACAuth.emptyBodyHashHex)
+        var url = baseURL
+        url.append(path: path)
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
+        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
+        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: req)
+        } catch {
+            throw GetBlobError.transient(reason: "blob get transport: \(error.localizedDescription)")
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw GetBlobError.transient(reason: "blob get non-http")
+        }
+        switch http.statusCode {
+        case 200:
+            // **必须**重算 sha 校验：content-addressed 契约要求；防 MITM 字节篡改 + 防 server
+            // 实现 bug 给错 sha 的字节让客户端污染本地 BlobStore
+            let actual = HMACAuth.sha256Hex(data)
+            guard actual == sha256 else {
+                throw GetBlobError.shaMismatch(expected: sha256, actual: actual)
+            }
+            return .found(data)
+        case 404:
+            return .notFound
+        case 400, 401, 403, 422:
+            let msg = String(data: data, encoding: .utf8) ?? "http \(http.statusCode)"
+            throw GetBlobError.rejected(reason: msg)
+        default:
+            throw GetBlobError.transient(reason: "blob get http \(http.statusCode)")
         }
     }
 
