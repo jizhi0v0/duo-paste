@@ -22,8 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 当前在跑的 lazy paste task。多次按 Enter 时先 cancel 旧 task 再起新的，
     /// 避免重复拉同一 sha 的字节竞争 BlobStore.put
     private var currentPasteTask: Task<Void, Never>?
-    /// lazy 拉超时（5s）。Tailscale 几 MB 图片正常 < 1s；3+s 大概率网络异常
-    private static let lazyBlobTimeoutSec: TimeInterval = 5
+    /// lazy 拉超时（5s）。Tailscale 几 MB 图片正常 < 1s；3+s 大概率网络异常。
+    /// nonisolated 让 TaskGroup 的 sleeper task 能 capture（详 fetchBlobLazy）
+    nonisolated static let lazyBlobTimeoutSec: TimeInterval = 5
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
@@ -40,9 +41,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         state = AppState(deps: deps)
-        panel = SearchPanelController(state: state) { [weak self] item in
-            self?.pasteBack(item)
-        }
+        panel = SearchPanelController(
+            state: state,
+            onPaste: { [weak self] item in self?.pasteBack(item) },
+            onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() }
+        )
         statusBar = StatusBarController { [weak self] in
             self?.panel.toggle()
         }
@@ -77,6 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if deps.config.pull.enabled {
             startPullWorker()
         }
+        // lazy paste-back blob fetcher 跟 PullWorker 独立——只要配了 primary_url
+        // + shared-secret，即使 pull.enabled=false（用户不想拉全量元数据）也能
+        // 在 paste 时按需拉单个 blob。P1 review fix：原实现把 fetcher 绑在
+        // startPullWorker 里，pull.enabled=false 时 image paste 永远失败
+        setupPasteBlobFetcher()
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · db=\(deps.paths.mainDB.path)\n", stderr)
     }
@@ -135,12 +143,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             )
             self.pullWorker = worker
-            // lazy paste-back 复用同一个 client（同 baseURL + auth + session 共享连接池）
-            self.pasteBlobFetcher = client
             Task { await worker.start() }
             fputs("pull worker → \(primaryURL.absoluteString) @ \(intervalSec)s\n", stderr)
         } catch {
             fputs("pull worker NOT started: \(error)\n", stderr)
+        }
+    }
+
+    /// lazy paste-back blob fetcher 初始化——跟 PullWorker / PushWorker 独立。
+    /// 只要 config 配了 primary_url + shared-secret 可加载就建一个 HTTPIngestClient
+    /// 给 pasteBack 用，**不依赖** pull.enabled / serve 配置。**这是 paste-back
+    /// 不可降级的最低要求**：用户已经选中图片按 Enter 了，没 fetcher 等于挂掉
+    private func setupPasteBlobFetcher() {
+        guard let primaryURL = deps.config.primaryURL else { return }
+        do {
+            let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
+            let auth = HMACAuth(secret: secret)
+            self.pasteBlobFetcher = HTTPIngestClient(
+                baseURL: primaryURL,
+                auth: auth,
+                session: AppDependencies.syncURLSession
+            )
+            fputs("paste blob fetcher → \(primaryURL.absoluteString)\n", stderr)
+        } catch {
+            fputs("paste blob fetcher NOT initialized: \(error)\n", stderr)
         }
     }
 
@@ -244,6 +270,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// SearchPanelController.onDismiss 回调——panel hide（Esc / focus 切走 / 主动 hide）
+    /// 时 cancel 进行中的 lazy paste task + 重置 progress 状态。
+    /// **不变量**：所有 panel 关闭路径都触发此回调，避免 task 在 panel 关闭后继续把
+    /// 字节写进 NSPasteboard（孤儿写入，用户在另一 app context 莫名得到 paste），
+    /// 也避免 .failed banner 残留到下次 panel 打开。
+    /// 成功路径 `currentPasteTask` 完成时 panel.hide() 也走这里，但此刻 task 已 nil
+    /// 出来或已自然结束——cancel 一个已完成的 task 无副作用
+    private func cancelLazyPasteIfAny() {
+        currentPasteTask?.cancel()
+        currentPasteTask = nil
+        state.pasteProgress = .idle
+    }
+
     /// 真正写 NSPasteboard 那一步——blob 字节已到位（或非 image kind）
     private func performLocalPaste(_ item: Item) {
         let wrote = Copyback.write(item: item, blobs: deps.blobs)
@@ -257,12 +296,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 不抛错——把 GetBlobError / timeout / cancellation 统一压缩成 LazyOutcome
     private enum LazyOutcome { case success; case failure(reason: String) }
 
+    /// 用 TaskGroup 让"重试循环"跟"5s 超时"竞争——先完成的赢，另一边被 cancel。
+    /// **不能**只靠 fetchBlobLazyInner 内的 `Date() > deadline` 早退检查——URLSession
+    /// 单个 request 默认 60s timeout，如果服务端 hang 在 connection 已建立但不返回数据
+    /// 的状态，inner 循环根本没机会 check Date()。group cancel 会让 URLSession 抛
+    /// URLError.cancelled 立即返回，是唯一能保证 5s 内一定有结果的姿态
     private func fetchBlobLazy(sha: String, fetcher: BlobFetcher) async -> LazyOutcome {
-        let deadline = Date().addingTimeInterval(Self.lazyBlobTimeoutSec)
+        do {
+            return try await withThrowingTaskGroup(of: LazyOutcome.self) { group in
+                group.addTask { [weak self] in
+                    guard let self else { return .failure(reason: "已取消") }
+                    return await self.fetchBlobLazyInner(sha: sha, fetcher: fetcher)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(Self.lazyBlobTimeoutSec * 1_000_000_000))
+                    return .failure(reason: "拉取超时 (\(Int(Self.lazyBlobTimeoutSec))s)")
+                }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
+        } catch is CancellationError {
+            return .failure(reason: "已取消")
+        } catch {
+            return .failure(reason: "未知错误: \(error)")
+        }
+    }
+
+    /// 内部重试循环。`fetchBlobLazy` 外面已经用 TaskGroup 包了 5s 总超时；这里只负责
+    /// transient 错误的 2 次 backoff 重试。每次循环开头 check `Task.isCancelled`——
+    /// group cancel 时尽快退出
+    private func fetchBlobLazyInner(sha: String, fetcher: BlobFetcher) async -> LazyOutcome {
         let backoffs: [TimeInterval] = [0, 2, 4]  // 第 1 次立即；第 2/3 次前 sleep
         for (attempt, delay) in backoffs.enumerated() {
             if Task.isCancelled { return .failure(reason: "已取消") }
-            if Date() > deadline { return .failure(reason: "拉取超时 (\(Int(Self.lazyBlobTimeoutSec))s)") }
             if delay > 0 {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -278,28 +345,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         _ = try deps.blobs.putVerified(data, expectedSha256: sha)
                         return .success
                     } catch {
-                        // sha 校验失败 / 写盘失败：sha mismatch 是 server 给错字节（不可恢复），
-                        // 写盘失败更罕见（磁盘满）—— 都不重试
                         return .failure(reason: "落盘失败: \(error)")
                     }
                 case .notFound:
-                    // primary 也没字节，不可恢复——promote 时缺 blob 场景
                     return .failure(reason: "primary 上无此图片字节 (sha=\(sha.prefix(8))...)")
                 }
             } catch let err as GetBlobError {
                 switch err {
                 case .rejected(let r):
-                    // 4xx：HMAC 失败 / config 错误，重试无意义
                     return .failure(reason: "鉴权拒绝: \(r)")
                 case .shaMismatch(let expected, let actual):
                     return .failure(reason: "primary 返回字节 sha 不一致 (expected \(expected.prefix(8))... got \(actual.prefix(8))...)")
                 case .transient(let r):
-                    // 5xx / 网络：进入下一轮重试，除非已超 deadline
                     if attempt == backoffs.count - 1 {
                         return .failure(reason: "网络异常 (重试 \(backoffs.count) 次仍失败): \(r)")
                     }
                     continue
                 }
+            } catch is CancellationError {
+                return .failure(reason: "已取消")
             } catch {
                 return .failure(reason: "未知错误: \(error)")
             }

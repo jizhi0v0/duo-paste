@@ -10,12 +10,18 @@ import DuoPasteCore
 final class SearchPanelController: NSObject, NSWindowDelegate {
     private let state: AppState
     private let onPaste: (Item) -> Void
+    /// panel hide / dismiss 路径调用——AppDelegate 用它 cancel 进行中的 lazy paste
+    /// task + 重置 state.pasteProgress。覆盖三条触发点：Esc 键 / windowDidResignKey
+    /// （焦点切走）/ 主动调 hide() 的其它入口
+    private let onDismiss: () -> Void
     private var panel: NSPanel?
     private var localKeyMonitor: Any?
 
-    init(state: AppState, onPaste: @escaping (Item) -> Void) {
+    init(state: AppState, onPaste: @escaping (Item) -> Void,
+         onDismiss: @escaping () -> Void = {}) {
         self.state = state
         self.onPaste = onPaste
+        self.onDismiss = onDismiss
     }
 
     var isVisible: Bool {
@@ -45,6 +51,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     func hide() {
         panel?.orderOut(nil)
         removeKeyMonitor()
+        // 调用方负责 cancel 进行中的 lazy paste task + 重置 pasteProgress 状态。
+        // 不放在 hide 内部直接操作 state，让 controller 跟 paste 业务解耦
+        onDismiss()
     }
 
     /// 装 NSEvent 本地监听器：箭头/Return/Esc 在 TextField 看到之前被截走，
