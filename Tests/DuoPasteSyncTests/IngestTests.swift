@@ -119,6 +119,161 @@ private func sampleRequest(id: String = UUID().uuidString) -> IngestRequest {
     }
 }
 
+// MARK: - 跨设备 Continuity dedup
+
+/// 在 primary 本机插一条 origin=primary 的 own item，用于模拟「primary 自家也通过
+/// macOS Universal Clipboard 同步 capture 了同一份内容」的状态。
+private func insertOwnItem(
+    _ db: DuoDB,
+    primaryID: String,
+    capturedAtNs: Int64,
+    text: String = "hello world",
+    blobSha256: String? = nil,
+    kind: ItemKind = .text
+) throws {
+    let it = Item(
+        id: "primary-local-" + UUID().uuidString,
+        originDevice: primaryID,
+        capturedAtNs: capturedAtNs,
+        ingestedAtNs: capturedAtNs,
+        kind: kind,
+        sourceAppName: "Zed",
+        preview: text,
+        textFull: text,
+        blobSha256: blobSha256,
+        pushState: .acked
+    )
+    try db.pool.write { conn in try it.insert(conn) }
+}
+
+@Test func ingestRejectsCrossDeviceContinuityDuplicate() async throws {
+    // 场景：mini = primary 通过 Universal Clipboard 在 capturedAt=T 时自家 capture 了一份；
+    // mbp = client 紧接着把同内容 push 过来（capturedAt 偏移 +100ms，模拟 Continuity 同步延迟）。
+    // dedup 应拒收：wasNew=false + dedupReason 非 nil，mbp 那条**不进** primary item 表。
+    let db = try tempDB()
+    let primaryID = "primary-mini"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    try insertOwnItem(db, primaryID: primaryID, capturedAtNs: baseline)
+
+    let ingester = RemoteIngester(
+        database: db,
+        selfDeviceID: primaryID,
+        crossDeviceWindowNs: 5_000_000_000,
+        now: { baseline + 200_000_000 }
+    )
+    var req = sampleRequest(id: "mbp-1")
+    req.originDevice = "mbp-client"
+    req.capturedAtNs = baseline + 100_000_000   // +100ms
+    req.textFull = "hello world"
+    req.preview = "hello world"
+
+    let result = try await ingester.ingest(req)
+    #expect(result.wasNew == false)
+    #expect(result.dedupReason != nil)
+
+    let mbpStored = try await db.pool.read { conn in
+        try Item.filter(Column("id") == "mbp-1").fetchOne(conn)
+    }
+    #expect(mbpStored == nil)
+}
+
+@Test func ingestAcceptsSameContentOutsideDedupWindow() async throws {
+    // 窗口外（>5s）同内容 push 应正常入库——不是 Continuity 副本，是真正的"同内容再复制一次"。
+    let db = try tempDB()
+    let primaryID = "primary-mini"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    try insertOwnItem(db, primaryID: primaryID, capturedAtNs: baseline)
+
+    let ingester = RemoteIngester(
+        database: db,
+        selfDeviceID: primaryID,
+        crossDeviceWindowNs: 5_000_000_000,
+        now: { baseline + 60_000_000_000 }
+    )
+    var req = sampleRequest(id: "mbp-late")
+    req.originDevice = "mbp-client"
+    req.capturedAtNs = baseline + 10_000_000_000  // +10s，远超 5s 窗口
+    req.textFull = "hello world"
+
+    let result = try await ingester.ingest(req)
+    #expect(result.wasNew == true)
+    #expect(result.dedupReason == nil)
+}
+
+@Test func ingestDedupSkippedWhenSelfDeviceIDEmpty() async throws {
+    // 向后兼容：老调用方不传 selfDeviceID 时，dedup 层应完全 off，
+    // 行为退化到原有 id-only 幂等逻辑。
+    let db = try tempDB()
+    let primaryID = "primary-mini"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    try insertOwnItem(db, primaryID: primaryID, capturedAtNs: baseline)
+
+    let ingester = RemoteIngester(database: db)   // selfDeviceID=""
+    var req = sampleRequest(id: "no-dedup-1")
+    req.originDevice = "mbp-client"
+    req.capturedAtNs = baseline + 100_000_000
+    req.textFull = "hello world"
+
+    let result = try await ingester.ingest(req)
+    #expect(result.wasNew == true)
+    #expect(result.dedupReason == nil)
+}
+
+@Test func ingestDedupSkippedWhenWindowZero() async throws {
+    // crossDeviceWindowNs=0 显式关闭 dedup 层，即便 selfID 给了同内容也照样入库。
+    let db = try tempDB()
+    let primaryID = "primary-mini"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    try insertOwnItem(db, primaryID: primaryID, capturedAtNs: baseline)
+
+    let ingester = RemoteIngester(
+        database: db,
+        selfDeviceID: primaryID,
+        crossDeviceWindowNs: 0,
+        now: { baseline + 200_000_000 }
+    )
+    var req = sampleRequest(id: "off-1")
+    req.originDevice = "mbp-client"
+    req.capturedAtNs = baseline + 100_000_000
+    req.textFull = "hello world"
+
+    let result = try await ingester.ingest(req)
+    #expect(result.wasNew == true)
+    #expect(result.dedupReason == nil)
+}
+
+@Test func ingestDedupHonorsBlobSha256() async throws {
+    // 图片 / 文件 kind 走 blob_sha256 比对，不靠 text_full（textFull 此时存的是 filename）。
+    let db = try tempDB()
+    let primaryID = "primary-mini"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    let sha = String(repeating: "a", count: 64)
+    try insertOwnItem(
+        db, primaryID: primaryID, capturedAtNs: baseline,
+        text: "screenshot.png", blobSha256: sha, kind: .image
+    )
+
+    let ingester = RemoteIngester(
+        database: db,
+        selfDeviceID: primaryID,
+        crossDeviceWindowNs: 5_000_000_000,
+        now: { baseline + 200_000_000 }
+    )
+    var req = sampleRequest(id: "mbp-blob")
+    req.originDevice = "mbp-client"
+    req.capturedAtNs = baseline + 100_000_000
+    req.kind = .image
+    req.textFull = "screenshot.png"   // 故意改 filename 不同——dedup 应**仍**按 sha256 命中
+    req.preview = "different-name.png"
+    req.blobSha256 = sha
+    req.blobSize = 1024
+    req.blobMime = "image/png"
+
+    let result = try await ingester.ingest(req)
+    #expect(result.wasNew == false)
+    #expect(result.dedupReason != nil)
+}
+
 @Test func ingestRequestJSONRoundTrip() throws {
     // wire format 单测：确保 snake_case JSON 能精确 round-trip
     let req = sampleRequest(id: "rt-1")

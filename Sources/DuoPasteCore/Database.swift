@@ -233,6 +233,50 @@ public struct Database: Sendable {
         return Swift.max(now, prev &+ 1)
     }
 
+    /// 在 item 表里找「本机近时间已有同内容」候选，用于 sync 层跨设备 dedup。
+    ///
+    /// 场景：mbp + mini 同一 Apple ID 登录开了 macOS Universal Clipboard，mbp 复制内容 X
+    /// 后 100-200ms 内 mini 端 watcher 通过 Continuity 同步看到 changeCount 变化，也独立
+    /// capture 了 X（origin=mini）。然后两边各自 push/pull 这条，UI union 看到 id 不同
+    /// 但内容相同的两条——byID dedup 救不了。
+    ///
+    /// 治本思路（A）：primary 的 RemoteIngester 收 push 时调本函数查"本机 origin=primary
+    /// 自己的同内容在 ±windowNs 内是否已存"，命中 → 把这次 push 当 Continuity 副本拒收。
+    /// 治本思路（B）：client 的 PullWorker 把 origin≠self 的 mirror 行写表前调本函数查
+    /// "本机 origin=self 同内容是否已存"，命中 → skip mirror 写入。
+    ///
+    /// 两端都需要 hook，单端救不全：A 让 primary item 表干净但 mbp UI 还会看到自己 own
+    /// + mini mirror；B 让 client UI 干净但 primary item 表仍有冗余。
+    ///
+    /// blob 类型按 sha256 比对；text 类型按 text_full 全等比对（不算 hash 避免存额外字段
+    /// 同时 text_full ≤ 512KB capture cap 比对成本可接受）。`ownDeviceID` 限定只看自家
+    /// origin——找别人的会跟正常 mirror sync 路径耦合（PullWorker 已经在写 mirror）。
+    public static func findNearbyOwnContent(
+        _ db: GRDB.Database,
+        kind: ItemKind,
+        textFull: String?,
+        blobSha256: String?,
+        ownDeviceID: String,
+        capturedAtNs: Int64,
+        windowNs: Int64
+    ) throws -> Item? {
+        let floor = capturedAtNs &- windowNs
+        let ceiling = capturedAtNs &+ windowNs
+        let base = Item
+            .filter(Column("kind") == kind.rawValue)
+            .filter(Column("origin_device") == ownDeviceID)
+            .filter(Column("captured_at_ns") >= floor)
+            .filter(Column("captured_at_ns") <= ceiling)
+            .filter(Column("deleted_at_ns") == nil)
+            .order(Column("captured_at_ns").desc)
+
+        if let sha = blobSha256, !sha.isEmpty {
+            return try base.filter(Column("blob_sha256") == sha).fetchOne(db)
+        }
+        guard let text = textFull, !text.isEmpty else { return nil }
+        return try base.filter(Column("text_full") == text).fetchOne(db)
+    }
+
     /// 一键 WAL checkpoint，用于 snapshot 前刷盘
     public func checkpoint() throws {
         _ = try pool.writeWithoutTransaction { db in
