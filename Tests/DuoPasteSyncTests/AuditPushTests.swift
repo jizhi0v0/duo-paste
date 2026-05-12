@@ -209,6 +209,44 @@ private func pageOf(_ ids: [String], originDevice: String = "other", capturedAtN
     #expect(report.dedupAbsorbedSamples.first?.absorbedByID == "mini-xyz")
 }
 
+@Test func auditSplitsAbsorbedBySoftDeleteState() async throws {
+    // 吸收源在 primary 是软删 → 归入 dedupAbsorbedThenDeleted，不混入 dedupAbsorbed 主计数。
+    // 同时另一条吸收源活着 → 归 dedupAbsorbed。两桶不重叠
+    let db = try makeClientDB()
+    try await insertItem(db, id: "mbp-alive", origin: "mbp", pushState: .acked,
+                         capturedAtNs: 10_000_000_000, textFull: "alive")
+    try await insertItem(db, id: "mbp-tomb", origin: "mbp", pushState: .acked,
+                         capturedAtNs: 10_000_000_000, textFull: "tomb")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: "mbp",
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 2,
+                items: [
+                    Item(id: "mini-alive", originDevice: "mini",
+                         capturedAtNs: 8_000_000_000, ingestedAtNs: 8_000_000_000,
+                         kind: .text, preview: "alive", textFull: "alive",
+                         deletedAtNs: nil, pushState: .acked),
+                    Item(id: "mini-tomb", originDevice: "mini",
+                         capturedAtNs: 8_000_000_000, ingestedAtNs: 8_000_000_000,
+                         kind: .text, preview: "tomb", textFull: "tomb",
+                         deletedAtNs: 9_500_000_000, pushState: .acked),
+                ],
+                nextCursor: SinceCursor(ingestedAtNs: 8_000_000_000, id: "mini-tomb"),
+                hasMore: false
+            )
+        }
+    )
+    #expect(report.missingTotal == 0)
+    #expect(report.dedupAbsorbed == 1)
+    #expect(report.dedupAbsorbedSamples.first?.localID == "mbp-alive")
+    #expect(report.dedupAbsorbedSamples.first?.absorbedByID == "mini-alive")
+    #expect(report.dedupAbsorbedThenDeleted == 1)
+    #expect(report.dedupAbsorbedThenDeletedSamples.first?.localID == "mbp-tomb")
+    #expect(report.dedupAbsorbedThenDeletedSamples.first?.absorbedByID == "mini-tomb")
+}
+
 @Test func auditDoesNotTreatSameOriginContentMatchAsAbsorbed() async throws {
     // 反例：primary 有同内容但 origin == 本机 selfDeviceID（不可能是 Continuity dedup 触发的，
     // 那条路径只对跨设备本地行有效）。audit 应保守报 missing 而不是误判为 absorbed。

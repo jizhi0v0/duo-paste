@@ -403,7 +403,7 @@ duo-paste/
   - `pull.enabled=true` 时 AppDelegate 启 PullWorker，SearchProvider 知道 mirror 在 → 优先打本地（不再每次 keystroke 过网络）
   - UI banner: 区分 "mirror @ cursor 14m ago" / "primary 离线" / "本机 only"
 - 第二刀（运维 + DR）：
-  - `duo-pasted promote-to-primary` —— mirror 表提升为 item 表 + 改 config + 重启
+  - `duo-pasted promote-to-primary` —— mirror 表提升为 item 表 + 改 config + 重启；**record primary tenure/lineage**（device_id + from_ns + to_ns 序列）写到独立表，供 audit-push 后续做精确 Continuity-dedup 候选过滤（当前 audit 只用 `origin != self` 启发式，多 primary lineage 下会偏宽松）
   - `duo-pasted audit-push` —— 扫本地 origin 项，问新 primary 缺哪些再 re-push
   - `duo-pasted migrate-primary` —— rsync DB + blobs 到新 primary 的脚手架
 - 第三刀（优化）：

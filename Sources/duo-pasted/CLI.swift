@@ -166,6 +166,13 @@ enum CLI {
                 lines.append("  - \(s.localID) → \(s.absorbedByID)")
             }
         }
+        if r.dedupAbsorbedThenDeleted > 0 {
+            lines.append("")
+            lines.append("continuity dedup absorbed (后被软删): \(r.dedupAbsorbedThenDeleted)\(r.dedupAbsorbedThenDeleted > sampleLimit ? " (展示前 \(sampleLimit) 条)" : "") · 吸收源已被 tombstone，确认是否预期删除")
+            for s in r.dedupAbsorbedThenDeletedSamples {
+                lines.append("  - \(s.localID) → \(s.absorbedByID) (deleted)")
+            }
+        }
         if r.staleTotal > 0 {
             lines.append("")
             lines.append("stale on primary: \(r.staleTotal)\(r.staleTotal > sampleLimit ? " (展示前 \(sampleLimit) 条)" : "") · 本地 state 已变但 primary 未更新（RemoteIngester 当前不更新已有行）")

@@ -75,6 +75,12 @@ public enum AuditPush {
         /// 的总数 + 样本。属于预期行为不计入 missing，但仍打印让操作员知情。
         public let dedupAbsorbed: Int
         public let dedupAbsorbedSamples: [DedupSample]
+        /// dedupAbsorbed 的子集：吸收源 primary 行后来被软删（`deletedAtNs != nil`）。
+        /// 语义上仍是"曾经到达过 primary"——数据没丢——但 canonical 事件已被 tombstone，
+        /// 跟"活着的吸收源"性质不同：可能是误删 / 旧清理脚本 / 跨设备状态分歧。
+        /// 单独成桶让操作员可见，非零时主动确认是不是预期。
+        public let dedupAbsorbedThenDeleted: Int
+        public let dedupAbsorbedThenDeletedSamples: [DedupSample]
         /// 同 id 存在但 state diverge（pinned / deletedAtNs / capturedAtNs > primary）的总数 + 样本。
         /// 当前 RemoteIngester 不更新已有行，这类 stale 通过 push 无法自愈，promote 前必须知道。
         public let staleTotal: Int
@@ -91,6 +97,8 @@ public enum AuditPush {
             failedSamples: [FailedSample],
             dedupAbsorbed: Int,
             dedupAbsorbedSamples: [DedupSample],
+            dedupAbsorbedThenDeleted: Int,
+            dedupAbsorbedThenDeletedSamples: [DedupSample],
             staleTotal: Int,
             staleSamples: [StaleSample]
         ) {
@@ -104,6 +112,8 @@ public enum AuditPush {
             self.failedSamples = failedSamples
             self.dedupAbsorbed = dedupAbsorbed
             self.dedupAbsorbedSamples = dedupAbsorbedSamples
+            self.dedupAbsorbedThenDeleted = dedupAbsorbedThenDeleted
+            self.dedupAbsorbedThenDeletedSamples = dedupAbsorbedThenDeletedSamples
             self.staleTotal = staleTotal
             self.staleSamples = staleSamples
         }
@@ -155,7 +165,9 @@ public enum AuditPush {
                 primaryByID[it.id] = it
                 if let key = contentKey(kind: it.kind, blobSha256: it.blobSha256, textFull: it.textFull) {
                     primaryByContent[key, default: []].append(
-                        ContentEntry(id: it.id, originDevice: it.originDevice, capturedAtNs: it.capturedAtNs)
+                        ContentEntry(id: it.id, originDevice: it.originDevice,
+                                     capturedAtNs: it.capturedAtNs,
+                                     deletedAtNs: it.deletedAtNs)
                     )
                 }
             }
@@ -196,8 +208,10 @@ public enum AuditPush {
         var missing: [String] = []
         var failedSamples: [Report.FailedSample] = []
         var dedupSamples: [Report.DedupSample] = []
+        var dedupDeletedSamples: [Report.DedupSample] = []
         var staleSamples: [Report.StaleSample] = []
         var dedupCount = 0
+        var dedupDeletedCount = 0
         var staleCount = 0
 
         for row in local {
@@ -237,7 +251,7 @@ public enum AuditPush {
             } else {
                 // id 不在 primary：可能是 Continuity dedup 吸收（acked 且跨 origin 同内容匹配），
                 // 或真 missing（pending/failed 未推送，或 acked 但找不到吸收源 → 可能 primary 丢数据）
-                var absorbedBy: String? = nil
+                var absorbedEntry: ContentEntry? = nil
                 if row.pushState == "acked",
                    let key = contentKey(kind: row.kind, blobSha256: row.blobSha256, textFull: row.textFull) {
                     let candidates = primaryByContent[key] ?? []
@@ -246,16 +260,29 @@ public enum AuditPush {
                     // 严格按 RemoteIngester.crossDeviceWindowNs 契约：dedup 只对 origin != 推送方
                     // 的本地 own-origin 行触发。所以 audit 匹配也要排除"本机自家 origin"——本机
                     // 自家两条同内容根本不会触发 RemoteIngester 的 dedup 路径，看到不算吸收
-                    absorbedBy = candidates.first(where: { entry in
+                    // TODO(promote-lineage): once promote-to-primary records primary tenure history,
+                    // restrict this to the primary device_id active when the local row was pushed.
+                    // Today, single-primary deployments make origin != self equivalent in practice.
+                    absorbedEntry = candidates.first(where: { entry in
                         entry.originDevice != selfDeviceID
                             && entry.capturedAtNs >= floor
                             && entry.capturedAtNs <= ceiling
-                    })?.id
+                    })
                 }
-                if let absorbedBy {
-                    dedupCount += 1
-                    if dedupSamples.count < sampleLimit {
-                        dedupSamples.append(.init(localID: row.id, absorbedByID: absorbedBy))
+                if let absorbedEntry {
+                    // /since 会下发软删行（tombstone）。被 tombstone 的吸收源在性质上跟"活着的
+                    // 吸收源"不同——前者 canonical 事件已被显式删，可能是误删 / 旧清理脚本 /
+                    // 跨设备 pin 分歧。分桶让操作员可见，不混到 dedupAbsorbed 主计数里
+                    if absorbedEntry.deletedAtNs != nil {
+                        dedupDeletedCount += 1
+                        if dedupDeletedSamples.count < sampleLimit {
+                            dedupDeletedSamples.append(.init(localID: row.id, absorbedByID: absorbedEntry.id))
+                        }
+                    } else {
+                        dedupCount += 1
+                        if dedupSamples.count < sampleLimit {
+                            dedupSamples.append(.init(localID: row.id, absorbedByID: absorbedEntry.id))
+                        }
                     }
                 } else {
                     missing.append(row.id)
@@ -273,6 +300,8 @@ public enum AuditPush {
             failedSamples: failedSamples,
             dedupAbsorbed: dedupCount,
             dedupAbsorbedSamples: dedupSamples,
+            dedupAbsorbedThenDeleted: dedupDeletedCount,
+            dedupAbsorbedThenDeletedSamples: dedupDeletedSamples,
             staleTotal: staleCount,
             staleSamples: staleSamples
         )
@@ -297,6 +326,7 @@ public enum AuditPush {
         let id: String
         let originDevice: String
         let capturedAtNs: Int64
+        let deletedAtNs: Int64?
     }
 
     /// 同 `Database.findNearbyOwnContent` 的内容指纹规则：blob 类型按 sha256 比对，
