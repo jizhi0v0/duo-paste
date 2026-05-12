@@ -15,6 +15,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serverTask: Task<Void, Never>?
     private var pushWorker: PushWorker?
     private var pullWorker: PullWorker?
+    /// lazy blob 拉取：image kind + 本机 BlobStore 缺字节时按需 GET /blob/<sha> 到本地。
+    /// 跟 PullWorker / PushWorker 共享 HTTPIngestClient 配置（同一 baseURL + auth），
+    /// nil → standalone 模式或 startPullWorker 失败，pasteBack 缺字节时显示错误而非干跑
+    private var pasteBlobFetcher: BlobFetcher?
+    /// 当前在跑的 lazy paste task。多次按 Enter 时先 cancel 旧 task 再起新的，
+    /// 避免重复拉同一 sha 的字节竞争 BlobStore.put
+    private var currentPasteTask: Task<Void, Never>?
+    /// lazy 拉超时（5s）。Tailscale 几 MB 图片正常 < 1s；3+s 大概率网络异常
+    private static let lazyBlobTimeoutSec: TimeInterval = 5
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
@@ -118,9 +127,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 selfDeviceID: deps.deviceID,
                 mirrorStatus: deps.mirrorStatus,
                 pasteSuppressions: deps.pasteSuppressions,
-                config: PullWorker.Config(intervalSec: TimeInterval(intervalSec))
+                blobFetcher: client,
+                blobs: deps.blobs,
+                config: PullWorker.Config(
+                    intervalSec: TimeInterval(intervalSec),
+                    eagerBlobs: deps.config.pull.eagerBlobs
+                )
             )
             self.pullWorker = worker
+            // lazy paste-back 复用同一个 client（同 baseURL + auth + session 共享连接池）
+            self.pasteBlobFetcher = client
             Task { await worker.start() }
             fputs("pull worker → \(primaryURL.absoluteString) @ \(intervalSec)s\n", stderr)
         } catch {
@@ -188,18 +204,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pasteBack(_ item: Item) {
+        // 多次按 Enter（拉一半再按 Enter）→ cancel 旧 task，避免重复 GET 同 sha 竞争 BlobStore.put
+        currentPasteTask?.cancel()
+        currentPasteTask = nil
+        state.pasteProgress = .idle
+
+        // 快路径：非 image 或 blob 本机已有 → 同步 Copyback.write + 关 panel
+        if item.kind != .image
+            || (item.blobSha256.map { deps.blobs.exists(sha256: $0) } ?? true)
+        {
+            performLocalPaste(item)
+            panel.hide()
+            return
+        }
+
+        // 慢路径：image kind + 本机 BlobStore 没字节 → 起异步 task 拉 blob
+        guard let fetcher = pasteBlobFetcher,
+              let sha = item.blobSha256
+        else {
+            // 没 fetcher（standalone / pull 启动失败）→ 没法补救，显示错误让用户知道
+            state.pasteProgress = .failed(reason: "图片在本机未缓存，且未配置 primary 拉取通道")
+            return
+        }
+
+        state.pasteProgress = .fetching(itemID: item.id, sizeHint: item.blobSize)
+        currentPasteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.fetchBlobLazy(sha: sha, fetcher: fetcher)
+            if Task.isCancelled { return }
+            switch outcome {
+            case .success:
+                self.state.pasteProgress = .idle
+                self.performLocalPaste(item)
+                self.panel.hide()
+            case .failure(let reason):
+                self.state.pasteProgress = .failed(reason: reason)
+                // 保持 panel 显示让用户看错误——Esc 关、Enter 重试都由现有 key monitor 处理
+            }
+        }
+    }
+
+    /// 真正写 NSPasteboard 那一步——blob 字节已到位（或非 image kind）
+    private func performLocalPaste(_ item: Item) {
         let wrote = Copyback.write(item: item, blobs: deps.blobs)
-        // 把 watcher 内部的 lastChangeCount 推到当前——即使 Copyback 失败也要做：
-        // Copyback 内部已 clearContents()，changeCount 已 bump，不抑制下次 tick 会把
-        // 这次空 pasteboard 当新捕获。
         watcher.suppressUpToCurrent()
-        // 跨设备 paste-echo 抑制：本机 paste 的内容如果通过 Universal Clipboard 被对端
-        // capture 后再 push 回来，PullWorker 命中此 set → skip 不写 mirror。
-        // **必须**只在 Copyback 真写成功时 record——blob 缺失（lazy-pull 前的窗口期常见）
-        // 时 Copyback 返回 false 跳出，此时根本没内容去 echo；若仍 record 了 fp，对端**合法**
-        // 的同内容独立 capture 反而会被误杀。
         if wrote, let fp = PasteSuppressionSet.fingerprint(forItem: item) {
             deps.pasteSuppressions.record(fingerprint: fp, ttlSec: 300)
         }
+    }
+
+    /// lazy GET /blob 拿字节落盘。封装 transient 重试（2 次 2s/4s backoff）+ 总体超时 5s。
+    /// 不抛错——把 GetBlobError / timeout / cancellation 统一压缩成 LazyOutcome
+    private enum LazyOutcome { case success; case failure(reason: String) }
+
+    private func fetchBlobLazy(sha: String, fetcher: BlobFetcher) async -> LazyOutcome {
+        let deadline = Date().addingTimeInterval(Self.lazyBlobTimeoutSec)
+        let backoffs: [TimeInterval] = [0, 2, 4]  // 第 1 次立即；第 2/3 次前 sleep
+        for (attempt, delay) in backoffs.enumerated() {
+            if Task.isCancelled { return .failure(reason: "已取消") }
+            if Date() > deadline { return .failure(reason: "拉取超时 (\(Int(Self.lazyBlobTimeoutSec))s)") }
+            if delay > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } catch {
+                    return .failure(reason: "已取消")
+                }
+            }
+            do {
+                let r = try await fetcher.getBlob(sha256: sha)
+                switch r {
+                case .found(let data):
+                    do {
+                        _ = try deps.blobs.putVerified(data, expectedSha256: sha)
+                        return .success
+                    } catch {
+                        // sha 校验失败 / 写盘失败：sha mismatch 是 server 给错字节（不可恢复），
+                        // 写盘失败更罕见（磁盘满）—— 都不重试
+                        return .failure(reason: "落盘失败: \(error)")
+                    }
+                case .notFound:
+                    // primary 也没字节，不可恢复——promote 时缺 blob 场景
+                    return .failure(reason: "primary 上无此图片字节 (sha=\(sha.prefix(8))...)")
+                }
+            } catch let err as GetBlobError {
+                switch err {
+                case .rejected(let r):
+                    // 4xx：HMAC 失败 / config 错误，重试无意义
+                    return .failure(reason: "鉴权拒绝: \(r)")
+                case .shaMismatch(let expected, let actual):
+                    return .failure(reason: "primary 返回字节 sha 不一致 (expected \(expected.prefix(8))... got \(actual.prefix(8))...)")
+                case .transient(let r):
+                    // 5xx / 网络：进入下一轮重试，除非已超 deadline
+                    if attempt == backoffs.count - 1 {
+                        return .failure(reason: "网络异常 (重试 \(backoffs.count) 次仍失败): \(r)")
+                    }
+                    continue
+                }
+            } catch {
+                return .failure(reason: "未知错误: \(error)")
+            }
+        }
+        return .failure(reason: "拉取失败")
     }
 }

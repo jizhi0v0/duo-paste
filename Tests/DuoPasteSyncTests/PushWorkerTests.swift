@@ -55,6 +55,10 @@ private actor FakeTransport: IngestTransport {
         await recordBlob(sha256)
         return IngestResult(outcome: await blobOutcomeFor(sha256))
     }
+    // PushWorker 用不到 getBlob——本测试只关心 push 行为。Default 实现：永远 404
+    nonisolated func getBlob(sha256: String) async throws -> GetBlobOutcome {
+        return .notFound
+    }
     private func record(_ id: String) { calls.append((id, Date())) }
     private func recordBlob(_ sha: String) { blobCalls.append((sha, Date())) }
     private func outcomeFor(_ id: String) -> IngestResult.Outcome {

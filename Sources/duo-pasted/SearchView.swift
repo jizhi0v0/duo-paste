@@ -54,6 +54,7 @@ struct SearchView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            pasteProgressBanner
             skipBanner
             modeBanner
             clockSkewBanner
@@ -165,6 +166,52 @@ struct SearchView: View {
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.orange.opacity(0.18))
+        }
+    }
+
+    /// blob 懒拉过程中的状态条：
+    /// - `.idle` → 不显示
+    /// - `.fetching` → 蓝色 spinner + "拉取图片…"（含 sizeHint 可知时）
+    /// - `.failed` → 红色 banner 显示错误文案；Esc 关闭 panel 或 Enter 重试由 key monitor 处理
+    @ViewBuilder
+    private var pasteProgressBanner: some View {
+        switch state.pasteProgress {
+        case .idle:
+            EmptyView()
+        case .fetching(_, let sizeHint):
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                if let s = sizeHint, s > 0 {
+                    Text("拉取图片字节（约 \(humanBytes(Int(s)))）…")
+                } else {
+                    Text("拉取图片字节…")
+                }
+                Spacer()
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.15))
+        case .failed(let reason):
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle")
+                Text("图片粘贴失败：\(reason)")
+                Spacer()
+                Button {
+                    state.pasteProgress = .idle
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.red.opacity(0.18))
         }
     }
 

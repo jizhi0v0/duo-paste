@@ -34,13 +34,20 @@ public actor PullWorker {
         /// 立刻 401，但快到边界就该提醒了。
         public var clockSkewWarnMs: Int64
 
+        /// `pull.eager_blobs=true` 时 PullWorker 拉完一页 metadata 后顺路 GET 这一页里
+        /// 本机 BlobStore 没字节的 blob_sha256（去重）。失败不抛、不阻塞 cursor 推进——
+        /// 下次 tick 拉同样的 sha 再试。**默认 false**（lazy 路径覆盖 paste-back 即可，
+        /// eager 是图片密集 + 大盘场景的可选优化）
+        public var eagerBlobs: Bool
+
         public init(
             intervalSec: TimeInterval = 30,
             batchLimit: Int = 500,
             initialBackoffSec: TimeInterval = 2,
             maxBackoffSec: TimeInterval = 120,
             crossDeviceDedupWindowNs: Int64 = 5_000_000_000,
-            clockSkewWarnMs: Int64 = 30_000
+            clockSkewWarnMs: Int64 = 30_000,
+            eagerBlobs: Bool = false
         ) {
             self.intervalSec = intervalSec
             self.batchLimit = batchLimit
@@ -48,6 +55,7 @@ public actor PullWorker {
             self.maxBackoffSec = maxBackoffSec
             self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
             self.clockSkewWarnMs = clockSkewWarnMs
+            self.eagerBlobs = eagerBlobs
         }
 
         public static let `default` = Config()
@@ -61,6 +69,11 @@ public actor PullWorker {
     /// 又被对端 watcher capture 推回来时，PullWorker 在 applyPage 里查这个 set，命中 skip。
     /// nil = 抑制功能未启用（standalone / 测试不传）。
     private let pasteSuppressions: PasteSuppressionSet?
+    /// eager_blobs=true 时用于拉 blob 字节。nil → 即使 config.eagerBlobs=true 也 no-op
+    /// （让测试可以独立控制；生产 AppDelegate 始终注入 HTTPIngestClient）
+    private let blobFetcher: BlobFetcher?
+    /// eager_blobs=true 时把拉回的字节写入这里。nil → 同 blobFetcher
+    private let blobs: BlobStore?
     private let config: Config
     private let nowNs: @Sendable () -> Int64
     private let log: @Sendable (String) -> Void
@@ -75,6 +88,8 @@ public actor PullWorker {
         selfDeviceID: String,
         mirrorStatus: MirrorStatus,
         pasteSuppressions: PasteSuppressionSet? = nil,
+        blobFetcher: BlobFetcher? = nil,
+        blobs: BlobStore? = nil,
         config: Config = .default,
         nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() },
         log: @escaping @Sendable (String) -> Void = { msg in
@@ -86,6 +101,8 @@ public actor PullWorker {
         self.selfDeviceID = selfDeviceID
         self.mirrorStatus = mirrorStatus
         self.pasteSuppressions = pasteSuppressions
+        self.blobFetcher = blobFetcher
+        self.blobs = blobs
         self.config = config
         self.nowNs = nowNs
         self.log = log
@@ -255,6 +272,9 @@ public actor PullWorker {
                 result.skippedDedup = applied.dedupSkipped
                 result.skippedPasteEcho = applied.pasteEchoSkipped
                 result.hasMore = page.hasMore
+                // eager_blobs 路径：tx 已提交、cursor 已推进，eager 失败不回滚 mirror。
+                // 顺序故意——blob 字节是"用户体验加速"，不是 mirror 正确性的一部分
+                await fetchBlobsEager(applied.mirroredShas)
             } catch {
                 log("apply page failed: \(error)")
                 result.hadTransient = true
@@ -299,6 +319,11 @@ public actor PullWorker {
         var written: Int
         var dedupSkipped: Int
         var pasteEchoSkipped: Int
+        /// 这一页实际写入 mirror 的行里**有 blob 字节需求**的 sha 集合（去重）。
+        /// 包含：deleted_at_ns IS NULL（tombstone 不需要字节）+ blob_sha256 非空 +
+        /// item.kind 含 image/file（其它 kind 即使 sha 非空也不该有 blob 上传过）。
+        /// 不在 writer tx 内做 BlobStore.exists 检查——那是 IO，应当留到 eager 阶段
+        var mirroredShas: Set<String>
     }
 
     /// 写 item_mirror + 更新 pull_cursor，单事务。返回实际入表行数（扣除 origin=self + 跨设备 dedup skip + paste-echo skip）。
@@ -311,6 +336,7 @@ public actor PullWorker {
             var written = 0
             var dedupSkipped = 0
             var pasteEchoSkipped = 0
+            var mirroredShas: Set<String> = []
             for item in page.items {
                 // 跳过自家 origin —— 已经在 item 表里，搜索 UNION 时不重叠
                 if item.originDevice == device { continue }
@@ -381,6 +407,12 @@ public actor PullWorker {
                     now,
                 ])
                 written += 1
+                // 收集本页 blob 需求集合（eager 阶段后处理）。kind=image/file 才有意义；
+                // 软删行（tombstone）跳过——它代表"primary 上已删"，没字节也合理
+                if let sha = item.blobSha256, item.deletedAtNs == nil,
+                   item.kind == .image || item.kind == .file {
+                    mirroredShas.insert(sha)
+                }
             }
             // UPSERT cursor。SQLite 3.24+ ON CONFLICT 语法，macOS 14 自带 SQLite > 3.24 OK。
             try db.execute(sql: """
@@ -391,7 +423,59 @@ public actor PullWorker {
                     cursor_id = excluded.cursor_id,
                     updated_at_ns = excluded.updated_at_ns
             """, arguments: [primaryID, page.nextCursor.ingestedAtNs, page.nextCursor.id, now])
-            return ApplyOutcome(written: written, dedupSkipped: dedupSkipped, pasteEchoSkipped: pasteEchoSkipped)
+            return ApplyOutcome(
+                written: written,
+                dedupSkipped: dedupSkipped,
+                pasteEchoSkipped: pasteEchoSkipped,
+                mirroredShas: mirroredShas
+            )
+        }
+    }
+
+    /// eager_blobs 路径：拉这一页 mirror 行涉及的 blob 字节到本机 BlobStore。
+    /// **best-effort**：任何 sha 失败 only log，不 throw、不影响 cursor 推进（cursor 已经
+    /// 在 applyPage tx 内 commit）。下次 tick 这些 sha 仍 missing 会再次尝试——指数 backoff
+    /// 由整体 tick 层接管（transient 失败时整体 tick 标 hadTransient），eager 阶段不自己重试
+    private func fetchBlobsEager(_ shas: Set<String>) async {
+        guard config.eagerBlobs,
+              let fetcher = blobFetcher,
+              let store = blobs,
+              !shas.isEmpty else {
+            return
+        }
+        var fetched = 0
+        var skipped = 0
+        var failed = 0
+        for sha in shas {
+            if Task.isCancelled { break }
+            // 本机已有字节 → 跳过（PullWorker 多 tick 间幂等的关键 short-circuit）
+            if store.exists(sha256: sha) {
+                skipped += 1
+                continue
+            }
+            do {
+                let outcome = try await fetcher.getBlob(sha256: sha)
+                switch outcome {
+                case .found(let data):
+                    do {
+                        _ = try store.putVerified(data, expectedSha256: sha)
+                        fetched += 1
+                    } catch {
+                        log("eager blob put failed sha=\(sha): \(error)")
+                        failed += 1
+                    }
+                case .notFound:
+                    // primary 也没字节——promote-to-primary 缺 blob 场景下的合法情况
+                    log("eager blob notFound on primary sha=\(sha)")
+                    failed += 1
+                }
+            } catch {
+                log("eager blob fetch failed sha=\(sha): \(error)")
+                failed += 1
+            }
+        }
+        if fetched + failed > 0 {
+            log("eager blobs fetched=\(fetched) skipped=\(skipped) failed=\(failed)")
         }
     }
 }

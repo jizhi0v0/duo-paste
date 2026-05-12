@@ -73,8 +73,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 case 125: self.state.navigate(by: 1)            // ↓
                 case 36, 76:                                    // Return / Enter
                     if let item = self.state.currentItem {
+                        // 不在这里 hide——把"何时 hide"交给 onPaste 回调实现方。
+                        // image kind + blob 缺字节走 lazy 拉路径时 panel 要保持可见显示
+                        // spinner overlay；同步路径由 AppDelegate.pasteBack 拿 panel 引用
+                        // 自己关
                         self.onPaste(item)
-                        self.hide()
                     }
                 case 53: self.hide()                            // Esc
                 default: break
@@ -123,8 +126,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             state: state,
             onPaste: { [weak self] item in
                 guard let self else { return }
+                // 同上：不在这里 hide；onPaste 回调实现方决定（lazy 路径要 keep panel
+                // 显示 spinner，同步路径在完成后调 controller.hide）
                 self.onPaste(item)
-                self.hide()
             },
             onClose: { [weak self] in
                 self?.hide()
