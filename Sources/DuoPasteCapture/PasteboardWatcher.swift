@@ -148,6 +148,23 @@ public final class PasteboardWatcher {
 
         // 3) RTF
         if let rtf = pasteboard.string(forType: .rtf) {
+            // RTF 降级：剪贴板历史里展示 `{\rtf1\ansi\ansicpg... \cocoartf...}` 这种 raw
+            // markup 完全没意义——搜索命中不了、preview 噪声大、bundle name 也只是 host
+            // app（Codex/Claude Desktop/Notes/Mail 等）。只要 .string 有非空 plain，优先
+            // 用 plain 入 text 类。代价：失去"按原样 paste 回带样式"——但本仓库定位是
+            // 剪贴板历史检索，不是富文本中转站；况且 Copyback 已经在多数情况下双写
+            // rtf+string，对端粘贴体验由对端 app 决定。
+            if let plain = pasteboard.string(forType: .string),
+               !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                return CapturedPasteboard(
+                    kind: .text,
+                    text: plain,
+                    sourceAppBundleID: bundleID,
+                    sourceAppName: appName,
+                    capturedAtNs: capturedAtNs
+                )
+            }
             return CapturedPasteboard(
                 kind: .rtf,
                 text: rtf,
