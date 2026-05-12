@@ -60,9 +60,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hotkey = GlobalHotKey()
         do {
-            try hotkey.register { [weak self] in
+            // Config.validate 已经守过合法字符集，这里 translate 失败属程序员错误
+            let translated = try HotkeyTranslation.translate(deps.config.hotkey)
+            try hotkey.register(
+                keyCode: translated.keyCode,
+                carbonModifiers: translated.modifiers
+            ) { [weak self] in
                 self?.panel.toggle()
             }
+            fputs("hotkey registered: \(deps.config.hotkey.modifiers.joined(separator: "+"))+\(deps.config.hotkey.key)\n", stderr)
         } catch {
             fputs("hotkey register failed: \(error)\n", stderr)
             // 没有快捷键也能用菜单栏入口，不致命
