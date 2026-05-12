@@ -56,6 +56,7 @@ struct SearchView: View {
             header
             skipBanner
             modeBanner
+            clockSkewBanner
             // Spotlight 风格不要硬 Divider，用一条细发丝线代替
             Rectangle()
                 .fill(Color.primary.opacity(0.08))
@@ -216,6 +217,32 @@ struct SearchView: View {
         case .local, .remoteOK:
             EmptyView()
         }
+    }
+
+    /// 时钟偏移 banner：|skew| 超过阈值才显示。HMAC 签名容忍 ±5 分钟 skew，所以这是早期预警：
+    /// 用户能看到偏移大小 → 提示去 NTP / sleep 设置排查，免得后面收到 401 才找原因。
+    @ViewBuilder
+    private var clockSkewBanner: some View {
+        if let skew = state.clockSkewMs, abs(skew) >= state.clockSkewWarnMs {
+            HStack(spacing: 6) {
+                Image(systemName: "clock.badge.exclamationmark")
+                Text("时钟偏移：primary 比本机\(skew > 0 ? "快" : "慢") \(humanSkew(abs(skew)))")
+                Text("·").foregroundStyle(.secondary)
+                Text("接近 5 分钟会签名失败").foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.yellow.opacity(0.15))
+        }
+    }
+
+    private func humanSkew(_ ms: Int64) -> String {
+        if ms < 1_000 { return "\(ms)ms" }
+        let sec = ms / 1_000
+        if sec < 60 { return "\(sec)s" }
+        return "\(sec / 60)m\(sec % 60)s"
     }
 
     private func humanStaleness(_ sec: Int) -> String {

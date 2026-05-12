@@ -14,6 +14,7 @@ public final class MirrorStatus: @unchecked Sendable {
     private let lock = NSLock()
     private var _lastPullNs: Int64?
     private var _primaryDeviceID: String?
+    private var _clockSkewMs: Int64?
 
     public init() {}
 
@@ -39,5 +40,20 @@ public final class MirrorStatus: @unchecked Sendable {
     public func setPrimaryDeviceID(_ id: String?) {
         lock.lock(); defer { lock.unlock() }
         _primaryDeviceID = id
+    }
+
+    /// 上一轮 /health 探测到的 primary wall-clock 相对本机的偏移（毫秒）。
+    /// 正值 = primary 比本机快；负值 = primary 比本机慢。nil = 还没探测过 / 探测失败。
+    ///
+    /// HMAC 签名带 timestamp_ms，本身已经容许 ±5 分钟 skew；这个值给 UI 做"预警"用——
+    /// 偏移接近窗口边界时显式提醒用户，比 401 拒签后再排查友好。
+    public func clockSkewMs() -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        return _clockSkewMs
+    }
+
+    public func setClockSkewMs(_ ms: Int64?) {
+        lock.lock(); defer { lock.unlock() }
+        _clockSkewMs = ms
     }
 }

@@ -29,6 +29,13 @@ final class AppState {
     /// 原因：NSPanel 被复用（orderOut 不销毁 hosting view），onAppear / .task(id:query)
     /// 在 reshow 时不会再 fire，焦点会丢、stale results 不会刷新。
     var openPulse: Int = 0
+    /// PullWorker 上一轮探测到的 primary 时钟偏移（毫秒，signed）。
+    /// nil = 还没探测过 / 未启用 pull。banner 阈值由 `clockSkewWarnMs` 决定，
+    /// AppState 不做阈值判断，只透传给 SearchView 显示。
+    var clockSkewMs: Int64?
+    /// 触发 banner 的偏移阈值（毫秒）。跟 PullWorker.Config.clockSkewWarnMs 保持一致。
+    /// 这里冗余存一份是为了让 UI 不依赖 sync 模块的内部 const。
+    var clockSkewWarnMs: Int64 = 30_000
     /// 最近一次 capture 被跳过的提示（超过 CaptureLimits）。
     /// 5 分钟内有值 → SearchView 顶部黄色 banner；用户能手动 ✕ 关闭立即清掉。
     /// 不持久化——重启就清，是 "刚才有点东西没存下来" 的实时提示。
@@ -107,6 +114,9 @@ final class AppState {
             self.snippets = outcome.snippets
             self.searchMode = outcome.mode
             self.totalCount = outcome.totalCount
+            // 每次 refresh 顺便快照 mirror 时钟偏移——PullWorker 在后台 30s 一次刷新，
+            // SearchView banner 用这个值
+            self.clockSkewMs = deps.mirrorStatus.clockSkewMs()
             updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
             self.lastError = nil
         } catch is CancellationError {
