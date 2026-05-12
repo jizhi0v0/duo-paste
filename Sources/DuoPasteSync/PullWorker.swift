@@ -286,16 +286,29 @@ public actor PullWorker {
                 // 这次拉来的是 Universal Clipboard 副本，skip 不写 mirror，UI 只显单条 own。
                 // windowNs=0 关闭这层；本设备没装 Continuity 或没开 Universal Clipboard 时
                 // findNearbyOwnContent 永远命中不了，开销几乎为零（走 captured_at_ns 索引）。
+                //
+                // 关键约束：dedup 只对**首次入 mirror** 的行生效。如果 item_mirror 已有此 id，
+                // /since 这次推过来是 state update（典型场景：primary 标软删 / pin 状态变 /
+                // captured_at_ns merge bump 后回放），**必须**让 INSERT OR REPLACE 跑过去
+                // 把新状态盖上——否则 race 进入 mirror 的 stale row 永远不会被标软删，UI
+                // 还会持续搜得到（即便 primary 已删）。
                 if windowNs > 0 {
-                    if let _ = try DuoPasteCore.Database.findNearbyOwnContent(
+                    let alreadyMirrored = try Int.fetchOne(
                         db,
-                        kind: item.kind,
-                        textFull: item.textFull,
-                        blobSha256: item.blobSha256,
-                        ownDeviceID: device,
-                        capturedAtNs: item.capturedAtNs,
-                        windowNs: windowNs
-                    ) {
+                        sql: "SELECT 1 FROM item_mirror WHERE id = ?",
+                        arguments: [item.id]
+                    ) != nil
+                    if !alreadyMirrored,
+                       try DuoPasteCore.Database.findNearbyOwnContent(
+                           db,
+                           kind: item.kind,
+                           textFull: item.textFull,
+                           blobSha256: item.blobSha256,
+                           ownDeviceID: device,
+                           capturedAtNs: item.capturedAtNs,
+                           windowNs: windowNs
+                       ) != nil
+                    {
                         dedupSkipped += 1
                         continue
                     }
