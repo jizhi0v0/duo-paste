@@ -306,7 +306,6 @@ private func insertMirrorRow(
     #expect(ShellTemplate.isSafeHost("mini"))
     #expect(ShellTemplate.isSafeHost("bobbys-mac-mini.tail69730a.ts.net"))
     #expect(ShellTemplate.isSafeHost("100.68.44.27"))
-    #expect(ShellTemplate.isSafeHost("host:8443"))
     #expect(ShellTemplate.isSafeHost("foo_bar.example-com.local"))
 }
 
@@ -322,6 +321,18 @@ private func insertMirrorRow(
     #expect(!ShellTemplate.isSafeHost("host\nnewline"))
     #expect(!ShellTemplate.isSafeHost("host/slash"))
     #expect(!ShellTemplate.isSafeHost("host\\back"))
+    // 拒绝 host:port —— ssh/scp 端口要走 -p / -P，不能嵌进 user@host: 字符串
+    // （否则 scp 会把 :port 当成路径分隔符）
+    #expect(!ShellTemplate.isSafeHost("host:8443"))
+    #expect(!ShellTemplate.isSafeHost("[::1]"))
+}
+
+@Test func shellTemplateRejectsOverLongHost() throws {
+    // FQDN 上限 253 chars。等长 OK，超 1 拒绝
+    let ok = String(repeating: "a", count: 253)
+    let tooLong = String(repeating: "a", count: 254)
+    #expect(ShellTemplate.isSafeHost(ok))
+    #expect(!ShellTemplate.isSafeHost(tooLong))
 }
 
 @Test func shellTemplateSingleQuoteEscapesEmbeddedQuotes() throws {
