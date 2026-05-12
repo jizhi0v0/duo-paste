@@ -21,6 +21,52 @@ final class AppState {
     /// - 空 query → 库（或 union 后）里全部条数
     /// - 有 query → FTS 命中总数
     var totalCount: Int = 0
+    /// 类型筛选。空集 = 全部（不带 WHERE 过滤）；非空 = SearchQuery.kinds IN (...)
+    /// chip 行 UI 多选 toggle，状态变化触发 refresh
+    var selectedKinds: Set<ItemKind> = []
+    /// 时间窗筛选。`.all` = 不带 fromNs；其他换算成 SearchQuery.fromNs
+    var timeRange: TimeRange = .all
+
+    /// 时间窗选项。换算成 SearchQuery.fromNs（toNs 始终 nil = 不卡上界）。
+    /// 注：用 wall-clock 算窗口起点，时钟偏移大时窗口范围会跟实际感受偏离——
+    /// 但 mirror 端 ingested_at_ns 已对齐 primary，主要影响是 own-origin item 在
+    /// client 上的"24h 窗"边界，秒级偏差不影响心智
+    enum TimeRange: String, CaseIterable, Identifiable, Sendable {
+        case all
+        case day
+        case week
+        case month
+
+        public var id: String { rawValue }
+
+        func fromNs(now: Date = Date()) -> Int64? {
+            let secondsAgo: TimeInterval
+            switch self {
+            case .all: return nil
+            case .day:   secondsAgo = 24 * 3600
+            case .week:  secondsAgo = 7 * 24 * 3600
+            case .month: secondsAgo = 30 * 24 * 3600
+            }
+            return Int64((now.timeIntervalSince1970 - secondsAgo) * 1_000_000_000)
+        }
+
+        var label: String {
+            switch self {
+            case .all:   "全部时间"
+            case .day:   "最近 24 小时"
+            case .week:  "最近 7 天"
+            case .month: "最近 30 天"
+            }
+        }
+    }
+
+    /// 任意筛选维度变化都要触发 SearchView .task(id:) 重新发请求。
+    /// 拼成一个紧凑字符串而非 Hashable struct——避免给 ItemKind / TimeRange 加 Hashable
+    /// 约束链（其实都已经满足，但用 String 也省去 SwiftUI Equatable 比较的实例化）
+    var filterID: String {
+        let kindsStr = selectedKinds.map { $0.rawValue }.sorted().joined(separator: ",")
+        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)"
+    }
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
     var scrollPulse: Int = 0
@@ -116,6 +162,8 @@ final class AppState {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let q = SearchQuery(
             text: trimmed.isEmpty ? nil : trimmed,
+            fromNs: timeRange.fromNs(),
+            kinds: Array(selectedKinds),
             limit: 200
         )
         do {

@@ -54,6 +54,7 @@ struct SearchView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            filterBar
             pasteProgressBanner
             skipBanner
             modeBanner
@@ -82,15 +83,16 @@ struct SearchView: View {
         // 让内容延伸到 NSPanel titlebar 区域（fullSizeContentView 把 contentView 占位让出来，
         // 但 SwiftUI 默认仍把 titlebar 计入 top safe area，所以 header 上方会留 ~28pt 空白）
         .ignoresSafeArea()
-        // debounce 100ms：用户连打时上一个 task 被 .task(id:) cancel 掉，新 task
+        // debounce 100ms：用户连打 / 切 chip 时上一个 task 被 .task(id:) cancel 掉，新 task
         // 先 sleep 100ms 再 refresh。停手 100ms 后才真正发远端请求——10 次按键的
         // 远端 roundtrip 合并成 1 次。CancellationError 自然吞掉。
-        .task(id: state.query) {
+        // id 用 filterID（query + kinds + timeRange 联合指纹），任一维度变化都触发新 fetch
+        .task(id: state.filterID) {
             do {
                 try await Task.sleep(nanoseconds: 100_000_000)
                 await state.refresh()
             } catch {
-                // 被取消（用户继续打字）→ 让下一个 task 接手，啥也不做
+                // 被取消（用户继续打字 / 改筛选）→ 让下一个 task 接手，啥也不做
             }
         }
         .onAppear {
@@ -140,6 +142,89 @@ struct SearchView: View {
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 20)
+    }
+
+    /// 类型 chip 行 + 时间窗下拉。
+    ///
+    /// - 类型 chip 多选：空 = 全部（不带 IN 过滤）。pill 风格，选中状态 accent 填充
+    /// - 时间窗放右侧 Menu：单选「全部 / 24h / 7d / 30d」
+    ///
+    /// chip 顺序按 ItemKind 出现频次手排（text 最常用 → 排最左），不按 enum 声明序。
+    /// 改 chip 时不要按 ItemKind.allCases 遍历——枚举序 (text/rtf/html/url/image/file)
+    /// 把 rtf/html 推到前面会让用户每次都要扫过去找"图片"
+    private var filterBar: some View {
+        HStack(spacing: 6) {
+            ForEach(filterChipKinds, id: \.self) { kind in
+                KindChip(
+                    kind: kind,
+                    isSelected: state.selectedKinds.contains(kind),
+                    onTap: { toggleKind(kind) }
+                )
+            }
+            if !state.selectedKinds.isEmpty {
+                Button {
+                    state.selectedKinds.removeAll()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("清除类型筛选")
+            }
+            Spacer()
+            timeRangeMenu
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 10)
+    }
+
+    /// chip 排列顺序：剪贴板使用频次心智（文本/图片/链接最常用 → 排前面）
+    private var filterChipKinds: [ItemKind] {
+        [.text, .image, .url, .file, .rtf, .html]
+    }
+
+    private func toggleKind(_ kind: ItemKind) {
+        if state.selectedKinds.contains(kind) {
+            state.selectedKinds.remove(kind)
+        } else {
+            state.selectedKinds.insert(kind)
+        }
+    }
+
+    private var timeRangeMenu: some View {
+        Menu {
+            ForEach(AppState.TimeRange.allCases) { range in
+                Button {
+                    state.timeRange = range
+                } label: {
+                    if state.timeRange == range {
+                        Label(range.label, systemImage: "checkmark")
+                    } else {
+                        Text(range.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "clock")
+                    .font(.system(size: 11))
+                Text(state.timeRange.label)
+                    .font(.system(size: 12))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundStyle(state.timeRange == .all ? .secondary : Color.accentColor)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(state.timeRange == .all ? Color.primary.opacity(0.06) : Color.accentColor.opacity(0.15))
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
     }
 
     /// 体积超限 banner：5 分钟内有 skip → 黄色提示「最近一次复制太大没存」。
@@ -349,6 +434,55 @@ struct SearchView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+/// 类型 chip 单元。pill capsule，选中状态 accent 填充 + 白字。
+/// 单击 toggle 选中状态。视觉跟 timeRangeMenu 的 capsule 保持一致——padding / radius 同步
+private struct KindChip: View {
+    let kind: ItemKind
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.system(size: 11))
+                Text(label)
+                    .font(.system(size: 12))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(isSelected ? Color.white : .primary)
+            .background(
+                Capsule()
+                    .fill(isSelected ? Color.accentColor : Color.primary.opacity(0.06))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var label: String {
+        switch kind {
+        case .text: "文本"
+        case .rtf: "富文本"
+        case .html: "HTML"
+        case .url: "链接"
+        case .image: "图片"
+        case .file: "文件"
+        }
+    }
+
+    private var symbol: String {
+        switch kind {
+        case .text: "text.alignleft"
+        case .rtf: "doc.richtext"
+        case .html: "chevron.left.forwardslash.chevron.right"
+        case .url: "link"
+        case .image: "photo"
+        case .file: "doc"
         }
     }
 }
