@@ -194,8 +194,12 @@ public enum AuditPush {
         //    用来判定每条 own-origin 行被 push 时刻的 active primary device_id——只有
         //    那个 device 的 own 行才可能是 Continuity dedup 吸收源。
         let lineage = try await database.pool.read { db -> [LineageEntry] in
+            // ORDER BY 让多 entry 共存时读出顺序稳定，便于排查；
+            // activePrimaryDeviceID 不依赖该顺序（自带确定性 tiebreak），但任何依赖隐式
+            // 行序的下游逻辑日后改动也不会因 SQLite 行序未定义而变出 nondeterminism
             try Row.fetchAll(db, sql: """
                 SELECT device_id, started_at_ns, ended_at_ns FROM primary_lineage
+                ORDER BY started_at_ns, ended_at_ns, device_id
             """).map { row in
                 LineageEntry(
                     deviceID: row["device_id"] ?? "",
@@ -367,10 +371,17 @@ public enum AuditPush {
     /// `primary_lineage` 表的内存形态。`startedAtNs == 0` 表示"未知何时开始"
     /// （`Admin.promoteToPrimary` 闭老 primary 任期时使用的 sentinel）。
     /// `endedAtNs == nil` 表示任期当前仍开（self 的开新任期行）。
-    private struct LineageEntry {
+    // internal 以便 @testable import 直接构造测试 fixture 喂给 activePrimaryDeviceID
+    struct LineageEntry {
         let deviceID: String
         let startedAtNs: Int64
         let endedAtNs: Int64?
+
+        init(deviceID: String, startedAtNs: Int64, endedAtNs: Int64?) {
+            self.deviceID = deviceID
+            self.startedAtNs = startedAtNs
+            self.endedAtNs = endedAtNs
+        }
     }
 
     /// 给定一个 push 时刻 `t`，从 lineage 里挑出覆盖该时刻的 active primary。
@@ -383,9 +394,19 @@ public enum AuditPush {
     ///   回 client → 本地 lineage 仍记 self 任期开着）。严格匹配 self 会让所有 candidate 都
     ///   被拒，把合法吸收源误算成 missing，因此 stale 边界落到回退路径
     ///
-    /// 多 entry 覆盖同一时间点时（不规范的 lineage，但防御性处理）取 startedAtNs 最大的
-    /// 那条——最具体的开始时间最可能反映真实任期切换点。
-    private static func activePrimaryDeviceID(
+    /// 多 entry 覆盖同一时间点时（不规范但可发生的 lineage）排序规则（按优先级降序，**完全确定**）：
+    /// 1. `startedAtNs` 大者优先——最具体的开始时间最可能反映真实任期切换点
+    /// 2. `endedAtNs` 小者优先（nil 视作 +∞ 放最后）——开放任期信息量最少，已结束的闭区间
+    ///    更接近"t 落在哪段任期切换里"的具体判断
+    /// 3. `deviceID` 字典序——兜底，确保任何输入都有唯一解
+    ///
+    /// 为什么要 tiebreak：同 device 多次 promote 会产生多行 `(*, 0, *)` sentinel（promote 闭老
+    /// 任期写 started_at_ns=0）。t 落在多行共同覆盖区间时，规则 1 会平（都 0），落到规则 2/3
+    /// 决出。没有 tiebreak 时 `max(by:)` 在平局返回的元素未定义，audit 两次跑可能在 B/B' 之间
+    /// 切换，dedupAbsorbed 桶分布不稳定。
+    // internal（非 private）以便 @testable import 可以直接喂任意 lineage 数组单元测
+    // tiebreak，绕过 AuditPush.run 里 SQL `ORDER BY` 把读出顺序固定的副作用。
+    static func activePrimaryDeviceID(
         at t: Int64, lineage: [LineageEntry], selfDeviceID: String
     ) -> String? {
         let active = lineage
@@ -394,7 +415,21 @@ public enum AuditPush {
                 let endedOK = e.endedAtNs == nil || t < e.endedAtNs!
                 return startedOK && endedOK
             }
-            .max(by: { $0.startedAtNs < $1.startedAtNs })
+            .max(by: { a, b in
+                // max(by:) 返回 "排序后最后一个"——这里 by 表示 a < b，true 时 a 排前面。
+                // 期望最终选中规则 1/2/3 都"赢"的那个，所以 a < b 当且仅当 a 在三条规则上弱于 b：
+                if a.startedAtNs != b.startedAtNs {
+                    return a.startedAtNs < b.startedAtNs
+                }
+                // startedAtNs 平，比 endedAtNs：小者优先 → a > b 时 a 输
+                let aEnded = a.endedAtNs ?? Int64.max
+                let bEnded = b.endedAtNs ?? Int64.max
+                if aEnded != bEnded {
+                    return aEnded > bEnded
+                }
+                // 全平，按 deviceID 字典序兜底：小者优先 → a > b 时 a 输
+                return a.deviceID > b.deviceID
+            })
         guard let device = active?.deviceID, !device.isEmpty, device != selfDeviceID else {
             return nil
         }
