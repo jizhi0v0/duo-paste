@@ -48,9 +48,15 @@ enum CLI {
                                   里配 primary_url + 本机有 shared-secret。
 
           promote-to-primary [--serve-host H] [--serve-port P]
+                             [--allow-missing-blobs]
                                   把本机从 client 升级为 primary：item_mirror → item、
-                                  清空 mirror/pull_cursor、写 primary_lineage、改 config.json
+                                  stamp own-origin null ingested_at_ns、清空 mirror/
+                                  pull_cursor、写 primary_lineage、改 config.json
                                   （serve=true, primary_url 移除, pull.enabled=false）。
+                                  默认预检 blob 缺失：mirror 元数据齐但本机 BlobStore 没
+                                  字节的 sha 会让 promote 中止（DR 操作不该静默丢
+                                  image/file 历史）。--allow-missing-blobs 跳过此检查
+                                  让 promote 继续，缺失会被报告但不能自愈。
                                   仅在 client 模式下可用。完成后需手动 kickstart daemon
                                   让新配置生效，并到其他 client 改 primary_url。
         """
@@ -203,6 +209,7 @@ enum CLI {
     private static func runPromoteToPrimary(args: [String]) {
         var serveHost: String? = nil
         var servePort: Int? = nil
+        var allowMissingBlobs = false
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -222,6 +229,9 @@ enum CLI {
                     FileHandle.standardError.write(Data("promote-to-primary: --serve-port 缺值或越界 (1-65535)\n".utf8))
                     exit(1)
                 }
+            case "--allow-missing-blobs":
+                allowMissingBlobs = true
+                i += 1
             default:
                 FileHandle.standardError.write(Data("promote-to-primary: 未知参数 \(args[i])\n".utf8))
                 exit(1)
@@ -238,15 +248,18 @@ enum CLI {
         }
 
         let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+        let blobs = BlobStore(root: paths.blobsDir)
         let result: Admin.PromoteResult
         do {
             result = try Admin.promoteToPrimary(
                 dbPath: paths.mainDB,
                 configPath: paths.configFile,
+                blobs: blobs,
                 selfDeviceID: deviceID,
                 now: now,
                 serveHost: serveHost,
-                servePort: servePort
+                servePort: servePort,
+                allowMissingBlobs: allowMissingBlobs
             )
         } catch {
             FileHandle.standardError.write(Data("promote-to-primary failed: \(error)\n".utf8))
@@ -257,6 +270,7 @@ enum CLI {
         lines.append("promote-to-primary done")
         lines.append("  promoted (mirror → item):       \(result.promotedRows) rows")
         lines.append("  cleared item_mirror:            \(result.mirrorClearedRows) rows")
+        lines.append("  stamped ingested_at_ns:         \(result.stampedRows) rows (含 client 路径老 own-origin)")
         if let old = result.oldPrimaryURL {
             lines.append("  old primary_url removed:        \(old.absoluteString)")
         }
@@ -267,6 +281,15 @@ enum CLI {
         }
         lines.append("  lineage opened self tenure:     device_id=\(deviceID) started_at_ns=\(now)")
         lines.append("  config rewritten:               \(result.configWrittenTo.path)")
+        if result.missingBlobsTotal > 0 {
+            lines.append("")
+            lines.append("⚠ WARNING: \(result.missingBlobsTotal) 个 blob 在本机 BlobStore 缺失")
+            lines.append("  image/file 类历史在 /blob/<sha> 上将返回 404。示例 sha：")
+            for sha in result.missingBlobsSamples {
+                lines.append("    - \(sha)")
+            }
+            lines.append("  --allow-missing-blobs 让 promote 继续，但缺失字节没法自愈。")
+        }
         lines.append("")
         lines.append("下一步：")
         lines.append("  1. 重启 daemon 读新 config：")
