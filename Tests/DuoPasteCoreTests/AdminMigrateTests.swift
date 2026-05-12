@@ -300,6 +300,41 @@ private func insertMirrorRow(
     #expect(countAfter == countBefore)
 }
 
+// MARK: - ShellTemplate（migrate-primary 命令模板渲染用）
+
+@Test func shellTemplateAcceptsValidHostnames() throws {
+    #expect(ShellTemplate.isSafeHost("mini"))
+    #expect(ShellTemplate.isSafeHost("bobbys-mac-mini.tail69730a.ts.net"))
+    #expect(ShellTemplate.isSafeHost("100.68.44.27"))
+    #expect(ShellTemplate.isSafeHost("host:8443"))
+    #expect(ShellTemplate.isSafeHost("foo_bar.example-com.local"))
+}
+
+@Test func shellTemplateRejectsShellMetacharacters() throws {
+    #expect(!ShellTemplate.isSafeHost(""))
+    #expect(!ShellTemplate.isSafeHost("mini; rm -rf ~"))
+    #expect(!ShellTemplate.isSafeHost("$(touch /tmp/pwned)"))
+    #expect(!ShellTemplate.isSafeHost("`whoami`"))
+    #expect(!ShellTemplate.isSafeHost("host with space"))
+    #expect(!ShellTemplate.isSafeHost("host'name"))
+    #expect(!ShellTemplate.isSafeHost("host\"name"))
+    #expect(!ShellTemplate.isSafeHost("host|cat /etc/passwd"))
+    #expect(!ShellTemplate.isSafeHost("host\nnewline"))
+    #expect(!ShellTemplate.isSafeHost("host/slash"))
+    #expect(!ShellTemplate.isSafeHost("host\\back"))
+}
+
+@Test func shellTemplateSingleQuoteEscapesEmbeddedQuotes() throws {
+    #expect(ShellTemplate.singleQuote("simple") == "'simple'")
+    #expect(ShellTemplate.singleQuote("/Users/bob/path") == "'/Users/bob/path'")
+    // 内部 ' → '\''（POSIX 标准 single-quote escape）
+    #expect(ShellTemplate.singleQuote("it's") == "'it'\\''s'")
+    // 含空格 / 元字符 / 多个引号也安全
+    #expect(ShellTemplate.singleQuote("a 'b' c") == "'a '\\''b'\\'' c'")
+    #expect(ShellTemplate.singleQuote("$(evil)") == "'$(evil)'")
+    #expect(ShellTemplate.singleQuote("") == "''")
+}
+
 @Test func migrateRunsTwiceProducesTwoDistinctSnapshots() throws {
     // 同一秒内两次跑——文件名按秒级，理论上可能撞名。这条用 DateFormatter 验：
     // 实际场景操作员手跑两次至少差几秒；本测试用不同 now 显式让快照名不同

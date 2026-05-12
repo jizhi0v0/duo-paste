@@ -329,7 +329,17 @@ enum CLI {
             switch args[i] {
             case "--new-primary-host":
                 if i + 1 < args.count {
-                    newHost = args[i + 1]
+                    let h = args[i + 1]
+                    // 严格 hostname 校验：拒绝 shell 元字符，防止打印的 rsync/ssh 模板
+                    // 在被操作员复制到 shell 后被解释成命令注入（"mini; rm -rf ~" 之类）。
+                    // 允许字符集：hostname / IP / Tailscale MagicDNS / 可选端口
+                    if !ShellTemplate.isSafeHost(h) {
+                        FileHandle.standardError.write(Data(
+                            "migrate-primary: --new-primary-host 含非法字符（只允许 A-Za-z0-9 . - _ :）\n".utf8
+                        ))
+                        exit(1)
+                    }
+                    newHost = h
                     i += 2
                 } else {
                     FileHandle.standardError.write(Data("migrate-primary: --new-primary-host 缺值\n".utf8))
@@ -363,6 +373,8 @@ enum CLI {
 
     private static func printMigrateReport(_ r: Admin.MigratePrimaryResult, newHost: String?) {
         let hostPlaceholder = newHost ?? "<NEW-HOST>"
+        let snapshotShellPath = ShellTemplate.singleQuote(r.snapshotPath.path)
+        let blobsShellPath = ShellTemplate.singleQuote(r.blobsRoot.path)
         let totalBytes = r.snapshotBytes + r.blobsTotalBytes
         var lines: [String] = []
         lines.append("migrate-primary · snapshot 已落地")
@@ -383,10 +395,10 @@ enum CLI {
         lines.append("       # 新机上先建好目标目录：")
         lines.append("       ssh user@\(hostPlaceholder) 'mkdir -p ~/Library/Application\\ Support/duo-paste/{db,blobs}'")
         lines.append("       # 拷快照（重命名为 main.sqlite 让 daemon 直接接管）：")
-        lines.append("       scp '\(r.snapshotPath.path)' \\")
+        lines.append("       scp \(snapshotShellPath) \\")
         lines.append("           user@\(hostPlaceholder):~/Library/Application\\ Support/duo-paste/db/main.sqlite")
         lines.append("       # 拷 blobs（--checksum 让 rsync 自己校验，跳过用 --size-only 加速）：")
-        lines.append("       rsync -avh --checksum '\(r.blobsRoot.path)/' \\")
+        lines.append("       rsync -avh --checksum \(blobsShellPath)/ \\")
         lines.append("           user@\(hostPlaceholder):~/Library/Application\\ Support/duo-paste/blobs/")
         lines.append("  2. 在新机上：")
         lines.append("     - 拷一份 shared-secret 文件（三台机必须同份，0600 权限）")
@@ -415,6 +427,7 @@ enum CLI {
         if v >= kb { return String(format: "%.1f KB", v / kb) }
         return "\(b) B"
     }
+
 
     private static func runRetryFailed() {
         let paths = Paths.makeDefault()

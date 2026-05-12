@@ -324,7 +324,11 @@ public enum Admin {
     ///    `daemonRunning`；为 true → throw `daemonRunning`。**必须停**的理由：VACUUM INTO
     ///    技术上能在 WAL 下拿到一致快照点，但快照之后 daemon 继续 ingest 新行——这些行
     ///    在快照里没有，rsync 完成时新机数据落后老机一段时间，等于静默丢数据
-    /// 3. 打开 DB（role=.primary）
+    /// 3. 打开 DB（role=.primary）。**注意**：`Database.init` 会跑 GRDB migrator 把 schema
+    ///    推到最新版本——这是 binary 升级的正常副作用（跟 daemon 启动同一行为），且让快照
+    ///    带上最新 schema。"命令只读"契约指**业务数据**（item / item_mirror / pull_cursor /
+    ///    primary_lineage 等表的行内容不改），不包括 GRDB schema 演进；测试也只断言行数
+    ///    与 config 文件字节不变，不断言 sqlite_master 不变
     /// 4. `Snapshot.takeSnapshot` 落 `~/.../snapshots/duo-paste-YYYYMMDD-HHmmss.sqlite`，
     ///    复用现成的 prune 策略 + 文件名风格
     /// 5. 读 snapshot 文件字节数 (`URL.fileSize`)
@@ -376,17 +380,14 @@ public enum Admin {
             try conn.execute(sql: "VACUUM INTO ?", arguments: [snapshotURL.path])
         }
 
-        // 快照字节数
-        let snapshotBytes: Int64
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: snapshotURL.path)
-            snapshotBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-        } catch {
-            snapshotBytes = 0
-        }
+        // 快照字节数。VACUUM INTO 成功但 stat 失败说明文件 / 文件系统出大问题
+        // （权限被改、文件刚被删、磁盘 unmount）——CLI 看到 "成功"+0 字节快照会
+        // 误以为命令 OK 但快照不可信，必须让错误传播
+        let attrs = try FileManager.default.attributesOfItem(atPath: snapshotURL.path)
+        let snapshotBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
 
         // walk blobs/
-        let (blobFiles, blobBytes) = walkBlobsDir(blobsRoot)
+        let (blobFiles, blobBytes) = try walkBlobsDir(blobsRoot)
 
         // 行数
         let (itemCount, mirrorCount) = try db.pool.read { conn -> (Int, Int) in
@@ -408,24 +409,28 @@ public enum Admin {
 
     /// 递归扫 blobs 目录算 (regular file count, sum of size)。目录不存在 → (0, 0)。
     /// **只**计 regular file，跳过 directory / symlink 之类——blobs/ 由 BlobStore.put 写入
-    /// 永远是 regular file，但用户手动放别的东西时不要把目录大小算进总字节数
-    private static func walkBlobsDir(_ root: URL) -> (files: Int, bytes: Int64) {
+    /// 永远是 regular file，但用户手动放别的东西时不要把目录大小算进总字节数。
+    ///
+    /// **不**用 `.skipsHiddenFiles`：rsync 默认会拷贝隐藏文件，inventory 数字要跟传输内容
+    /// 对齐，操作员靠这个比对老 / 新机一致性。
+    ///
+    /// `resourceValues` 失败现在 throw 而不是 silently skip——失败说明 FS 异常（权限、文件
+    /// 被删、磁盘问题），统计结果不可信时不应静默返回低估值让操作员误以为传输量很小
+    private static func walkBlobsDir(_ root: URL) throws -> (files: Int, bytes: Int64) {
         let fm = FileManager.default
         guard fm.fileExists(atPath: root.path) else { return (0, 0) }
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             return (0, 0)
         }
         var files = 0
         var bytes: Int64 = 0
         for case let url as URL in enumerator {
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                  values.isRegularFile == true else {
-                continue
-            }
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true else { continue }
             files += 1
             bytes += Int64(values.fileSize ?? 0)
         }
