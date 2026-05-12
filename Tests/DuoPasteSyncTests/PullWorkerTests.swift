@@ -240,6 +240,122 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     #expect(calls.first?.0 == SinceCursor.zero)
 }
 
+@Test func pullWorkerSkipsCrossDeviceContinuityDuplicate() async throws {
+    // 场景：mbp = client 复制内容 X 后通过 macOS Universal Clipboard，mini = primary 也
+    // 独立 capture 了一份。primary push /since 把 mini 的 X 推给 mbp 时，mbp PullWorker
+    // 应该发现"本机 origin=self 同内容已存（窗口内）"→ skip 不写 mirror。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    // mbp 自己 capture 了一条 (origin=mbp, capturedAt=baseline)
+    try await db.pool.write { conn in
+        let own = Item(
+            id: "own-1", originDevice: selfID,
+            capturedAtNs: baseline, ingestedAtNs: nil,  // client 自家 capture，ingested_at_ns 还没打
+            kind: .text, preview: "shared text", textFull: "shared text",
+            pushState: .pending
+        )
+        try own.insert(conn)
+    }
+    // primary 那边也 capture 了一份（origin=mini, capturedAt baseline+100ms），通过 /since 推过来
+    let mirrorItem = mkItem(
+        id: "mini-side", origin: "mini-primary",
+        ingestedAtNs: baseline + 100_000_000, text: "shared text"
+    )
+    // 重要：mkItem 默认让 capturedAtNs = ingestedAtNs，所以 mirrorItem.capturedAtNs = baseline+100ms
+    // 跟 own 的 capturedAt 差 100ms < 5s 窗口 → 应被 dedup
+    let transport = FakeSinceTransport(
+        pages: [page(items: [mirrorItem], nextNs: baseline + 100_000_000, nextID: "mini-side", hasMore: false)],
+        healthDeviceID: "mini-primary"
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
+    )
+    await runWorkerBriefly(worker)
+
+    // mirror 表应该是空的——dedup skip 了
+    let mirrorCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? -1
+    }
+    #expect(mirrorCount == 0)
+    // own 那条还在
+    let ownStill = try await db.pool.read { conn in
+        try Item.filter(Column("id") == "own-1").fetchOne(conn)
+    }
+    #expect(ownStill != nil)
+}
+
+@Test func pullWorkerWritesMirrorWhenNoOwnDuplicate() async throws {
+    // 反向回归：本机 item 表里没有同内容时，mirror 行应正常写入（dedup 不能误伤）。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    let mirrorItem = mkItem(
+        id: "mini-only", origin: "mini-primary",
+        ingestedAtNs: baseline, text: "unique remote content"
+    )
+    let transport = FakeSinceTransport(
+        pages: [page(items: [mirrorItem], nextNs: baseline, nextID: "mini-only", hasMore: false)],
+        healthDeviceID: "mini-primary"
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
+    )
+    await runWorkerBriefly(worker)
+
+    let mirrorCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='mini-only'") ?? -1
+    }
+    #expect(mirrorCount == 1)
+}
+
+@Test func pullWorkerWritesMirrorOutsideDedupWindow() async throws {
+    // own 同内容存在但 capturedAt 超 5s 之外——是真正的"不同时刻"，不是 Continuity 副本。
+    // mirror 应正常入库（用户能看到"我之前也复制过同样的"）。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    try await db.pool.write { conn in
+        let own = Item(
+            id: "own-old", originDevice: selfID,
+            capturedAtNs: baseline, ingestedAtNs: nil,
+            kind: .text, preview: "same text", textFull: "same text",
+            pushState: .pending
+        )
+        try own.insert(conn)
+    }
+    let mirrorItem = mkItem(
+        id: "mini-late", origin: "mini-primary",
+        ingestedAtNs: baseline + 10_000_000_000,  // +10s
+        text: "same text"
+    )
+    let transport = FakeSinceTransport(
+        pages: [page(items: [mirrorItem], nextNs: baseline + 10_000_000_000, nextID: "mini-late", hasMore: false)],
+        healthDeviceID: "mini-primary"
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
+    )
+    await runWorkerBriefly(worker)
+
+    let mirrorCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='mini-late'") ?? -1
+    }
+    #expect(mirrorCount == 1)
+}
+
 @Test func pullWorkerHandlesSoftDeletedRows() async throws {
     // /since 含 deleted_at_ns 非空的行：mirror 应该写入（mirror 表也支持软删，
     // searchUnion 的 fetchHitsMirror 会过滤掉）

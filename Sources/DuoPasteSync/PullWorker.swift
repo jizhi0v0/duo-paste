@@ -21,17 +21,24 @@ public actor PullWorker {
         public var batchLimit: Int
         public var initialBackoffSec: TimeInterval
         public var maxBackoffSec: TimeInterval
+        /// 跨设备 Continuity dedup 时间窗（纳秒）。0 = 关闭这个 dedup 层。
+        /// 配合 RemoteIngester 的同名字段，PullWorker 写 item_mirror 前查本机 item 表
+        /// 有无 origin=self 同内容在窗口内已存——命中则 skip mirror 入库，UI union
+        /// 看到的就是单条 own。Universal Clipboard 同步通常 < 1s，5s buffer 充足。
+        public var crossDeviceDedupWindowNs: Int64
 
         public init(
             intervalSec: TimeInterval = 30,
             batchLimit: Int = 500,
             initialBackoffSec: TimeInterval = 2,
-            maxBackoffSec: TimeInterval = 120
+            maxBackoffSec: TimeInterval = 120,
+            crossDeviceDedupWindowNs: Int64 = 5_000_000_000
         ) {
             self.intervalSec = intervalSec
             self.batchLimit = batchLimit
             self.initialBackoffSec = initialBackoffSec
             self.maxBackoffSec = maxBackoffSec
+            self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
         }
 
         public static let `default` = Config()
@@ -122,8 +129,8 @@ public actor PullWorker {
                 sleepSec = config.intervalSec
             }
 
-            if r.applied > 0 || r.hadTransient {
-                log("tick applied=\(r.applied) hasMore=\(r.hasMore) transient=\(r.hadTransient) sleep=\(sleepSec)")
+            if r.applied > 0 || r.skippedDedup > 0 || r.hadTransient {
+                log("tick applied=\(r.applied) dedup-skip=\(r.skippedDedup) hasMore=\(r.hasMore) transient=\(r.hadTransient) sleep=\(sleepSec)")
             }
 
             if sleepSec > 0 {
@@ -139,7 +146,8 @@ public actor PullWorker {
     }
 
     private struct TickResult: Sendable {
-        var applied: Int = 0    // 实际写入 item_mirror 的行数（已扣除 origin=self skip）
+        var applied: Int = 0    // 实际写入 item_mirror 的行数（已扣除 origin=self + 跨设备 dedup skip）
+        var skippedDedup: Int = 0  // 跨设备 Continuity dedup skip 数（诊断用，本机已有同内容 own item）
         var hasMore: Bool = false
         var hadTransient: Bool = false
     }
@@ -214,7 +222,9 @@ public actor PullWorker {
         switch sinceRes.outcome {
         case .ok(let page):
             do {
-                result.applied = try await applyPage(page, primaryID: currentPrimaryID)
+                let applied = try await applyPage(page, primaryID: currentPrimaryID)
+                result.applied = applied.written
+                result.skippedDedup = applied.dedupSkipped
                 result.hasMore = page.hasMore
             } catch {
                 log("apply page failed: \(error)")
@@ -256,15 +266,40 @@ public actor PullWorker {
         }
     }
 
-    /// 写 item_mirror + 更新 pull_cursor，单事务。返回实际入表行数（扣除 origin=self skip）。
-    private func applyPage(_ page: SincePageWire, primaryID: String) async throws -> Int {
+    private struct ApplyOutcome {
+        var written: Int
+        var dedupSkipped: Int
+    }
+
+    /// 写 item_mirror + 更新 pull_cursor，单事务。返回实际入表行数（扣除 origin=self + 跨设备 dedup skip）。
+    private func applyPage(_ page: SincePageWire, primaryID: String) async throws -> ApplyOutcome {
         let device = selfDeviceID
         let now = nowNs()
-        return try await database.pool.write { db -> Int in
+        let windowNs = config.crossDeviceDedupWindowNs
+        return try await database.pool.write { db -> ApplyOutcome in
             var written = 0
+            var dedupSkipped = 0
             for item in page.items {
                 // 跳过自家 origin —— 已经在 item 表里，搜索 UNION 时不重叠
                 if item.originDevice == device { continue }
+                // 跨设备 Continuity dedup：本机 origin=self 同内容在 ±window 内已存 →
+                // 这次拉来的是 Universal Clipboard 副本，skip 不写 mirror，UI 只显单条 own。
+                // windowNs=0 关闭这层；本设备没装 Continuity 或没开 Universal Clipboard 时
+                // findNearbyOwnContent 永远命中不了，开销几乎为零（走 captured_at_ns 索引）。
+                if windowNs > 0 {
+                    if let _ = try DuoPasteCore.Database.findNearbyOwnContent(
+                        db,
+                        kind: item.kind,
+                        textFull: item.textFull,
+                        blobSha256: item.blobSha256,
+                        ownDeviceID: device,
+                        capturedAtNs: item.capturedAtNs,
+                        windowNs: windowNs
+                    ) {
+                        dedupSkipped += 1
+                        continue
+                    }
+                }
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO item_mirror
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
@@ -300,7 +335,7 @@ public actor PullWorker {
                     cursor_id = excluded.cursor_id,
                     updated_at_ns = excluded.updated_at_ns
             """, arguments: [primaryID, page.nextCursor.ingestedAtNs, page.nextCursor.id, now])
-            return written
+            return ApplyOutcome(written: written, dedupSkipped: dedupSkipped)
         }
     }
 }

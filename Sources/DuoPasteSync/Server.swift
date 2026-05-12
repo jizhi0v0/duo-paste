@@ -63,7 +63,7 @@ public struct SyncServer: Sendable {
         Self.registerRoutes(
             on: router,
             deviceID: deviceID,
-            ingester: RemoteIngester(database: database),
+            ingester: RemoteIngester(database: database, selfDeviceID: deviceID),
             blobs: blobs,
             searchAPI: SearchAPI(database: database),
             sinceAPI: SinceAPI(database: database)
