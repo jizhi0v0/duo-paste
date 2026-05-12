@@ -39,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         watcher = PasteboardWatcher(
+            maxRawRTFBytes: deps.config.capture.maxTextBytes,
             onCapture: { [weak self] captured in
                 self?.handleCapture(captured)
             }
