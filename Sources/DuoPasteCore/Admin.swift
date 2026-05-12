@@ -14,6 +14,9 @@ public enum Admin {
         case alreadyExists(path: URL)
         case randomFailed(osstatus: Int32)
         case notInClientMode(currentSummary: String)
+        /// migrate-primary 仅老 primary 上跑（serve=true && primary_url=nil）。
+        /// 在 client / standalone 模式下调用会拒绝——不在 primary 模式下没有 DB 可迁移
+        case notInPrimaryMode(currentSummary: String)
         case readConfigFailed(underlying: String)
         case writeConfigFailed(underlying: String)
         case invalidPostConfig(reason: String)
@@ -21,9 +24,12 @@ public enum Admin {
         /// PullWorker 默认 eager_blobs=false 只镜像元数据，本机变 primary 后这些 blob 在
         /// `/blob/<sha>` 上是 404。默认拒绝；`allowMissingBlobs=true` 跳过此检查并继续。
         case missingBlobs(totalMissing: Int, samples: [String])
-        /// LaunchAgent daemon 还在跑——promote 期间 daemon 仍以 client 角色 capture 新行
-        /// （那些行 ingested_at_ns=nil，stamp 阶段已经过去，PushWorker promote 后不启动），
-        /// 这些行将永远不被 /since 暴露。要求用户先 `launchctl bootout` 停掉再重试。
+        /// LaunchAgent daemon 还在跑——
+        /// - promote 路径：daemon 仍以 client 角色 capture 新行（那些行 ingested_at_ns=nil，
+        ///   stamp 阶段已经过去，PushWorker promote 后不启动），这些行将永远不被 /since 暴露
+        /// - migrate 路径：daemon 仍以 primary 角色继续 ingest，VACUUM INTO snapshot 完成
+        ///   后老 primary 又有新行，rsync 到新机时这部分数据丢失
+        /// 两条路径都要求先 `launchctl bootout` 停掉再重试
         case daemonRunning(label: String)
 
         public var description: String {
@@ -32,6 +38,8 @@ public enum Admin {
             case .randomFailed(let s):  return "SecRandomCopyBytes 失败 (OSStatus=\(s))"
             case .notInClientMode(let s):
                 return "promote-to-primary 仅在 client 模式下可用（当前：\(s)）"
+            case .notInPrimaryMode(let s):
+                return "migrate-primary 仅在 primary 模式下可用（当前：\(s)）"
             case .readConfigFailed(let u):
                 return "读 config 失败：\(u)"
             case .writeConfigFailed(let u):
@@ -45,13 +53,32 @@ public enum Admin {
                     + "image/file 类历史在 promote 后会 404。"
                     + "若可接受丢失，加 --allow-missing-blobs 重跑。"
             case .daemonRunning(let label):
-                return "promote 中止：daemon (\(label)) 还在跑。"
-                    + "promote 期间 daemon 仍以 client 角色 capture 出的新行将永远不被 "
-                    + "/since 暴露。先停 daemon：\n"
+                return "操作中止：daemon (\(label)) 还在跑。"
+                    + "在 promote/migrate 路径上 daemon 继续 capture/ingest 会让本次操作之后"
+                    + "落地的数据被静默丢弃。先停 daemon：\n"
                     + "  launchctl bootout gui/$UID/\(label)\n"
-                    + "再重试 promote-to-primary。"
+                    + "再重试。"
             }
         }
+    }
+
+    public struct MigratePrimaryResult: Equatable, Sendable {
+        /// VACUUM INTO 落地的快照文件绝对路径。CLI 把这个路径拼进 rsync 命令模板。
+        public let snapshotPath: URL
+        /// 快照文件字节数，让操作员对"要传多大"心里有数
+        public let snapshotBytes: Int64
+        /// blobs 内容寻址目录的根路径，rsync 时整体拷贝
+        public let blobsRoot: URL
+        /// blobs 目录下的文件总数（递归）
+        public let blobsTotalFiles: Int
+        /// blobs 目录下的字节总数（递归）
+        public let blobsTotalBytes: Int64
+        /// 当前 item 表行数（含软删 tombstone），信息性
+        public let itemRowCount: Int
+        /// 当前 item_mirror 行数。primary 模式下应该是 0；非 0 说明本机历史上曾是 client，
+        /// 残留没清干净——VACUUM INTO 出去的快照会带上这些 mirror 行，新 primary 上跑
+        /// promote-to-primary 时它们会被合并进 item。信息性披露
+        public let itemMirrorRowCount: Int
     }
 
     public struct PromoteResult: Equatable, Sendable {
@@ -271,6 +298,143 @@ public enum Admin {
             missingBlobsTotal: missingTotal,
             missingBlobsSamples: missingSamples
         )
+    }
+
+    /// 计划内换 primary 的 **prepare** 阶段（详 plan §b）：在**老 primary** 上跑，落一份
+    /// 一致性快照 + 统计 blobs，让操作员手动 rsync 到新机器。命令本身是只读操作（除了
+    /// 写出 snapshot 文件这个副产物），不动 DB / config / blobs/。
+    ///
+    /// **为什么不做"自动 rsync"**：跨机 rsync 需要 ssh 凭证 + 网络可达 + 防火墙策略，把
+    /// 这层封进 Swift 命令容易卡在 ssh-agent / known_hosts / Tailscale ACL 等边界条件
+    /// 上调试困难。打印命令模板让操作员 sshrsync 手跑反而最可控
+    ///
+    /// **为什么不自动改本机 config**：老 primary 跑完 migrate 后用途不定（彻底退役 / 改
+    /// 为新 primary 的 client / 留着不动）。跟 promoteToPrimary 不同——promote 是抢救动作
+    /// 有强假设，migrate 是计划内，操作员可能有各种后续打算，命令不该擅自决定
+    ///
+    /// **lineage 限制（MVP 已知缺口）**：plan §b 原文没要求写 lineage 行。本命令也不写。
+    /// 后果：rsync 到新机后，新 primary DB 里没有"新 primary 接管"的 lineage 记录，其它
+    /// client 跑 audit-push 时 `activePrimaryDeviceID` 找不到新 primary 任期 → 回退到
+    /// `origin != self` 启发式。单 primary 部署下足够；多次换 primary 链路下可能产生
+    /// 跨任期 dedup 误判。后续可加 `--demote-and-record` flag 让命令也写 lineage
+    ///
+    /// 流程：
+    /// 1. 校验当前 config 为 primary 模式（`serve == true && primary_url == nil`）
+    /// 2. **daemon-running 检查**：调用方（CLI 层）通过 `launchctl list` 拿状态后传
+    ///    `daemonRunning`；为 true → throw `daemonRunning`。**必须停**的理由：VACUUM INTO
+    ///    技术上能在 WAL 下拿到一致快照点，但快照之后 daemon 继续 ingest 新行——这些行
+    ///    在快照里没有，rsync 完成时新机数据落后老机一段时间，等于静默丢数据
+    /// 3. 打开 DB（role=.primary）。**注意**：`Database.init` 会跑 GRDB migrator 把 schema
+    ///    推到最新版本——这是 binary 升级的正常副作用（跟 daemon 启动同一行为），且让快照
+    ///    带上最新 schema。"命令只读"契约指**业务数据**（item / item_mirror / pull_cursor /
+    ///    primary_lineage 等表的行内容不改），不包括 GRDB schema 演进；测试也只断言行数
+    ///    与 config 文件字节不变，不断言 sqlite_master 不变
+    /// 4. `Snapshot.takeSnapshot` 落 `~/.../snapshots/duo-paste-YYYYMMDD-HHmmss.sqlite`，
+    ///    复用现成的 prune 策略 + 文件名风格
+    /// 5. 读 snapshot 文件字节数 (`URL.fileSize`)
+    /// 6. 递归 walk `blobs/` 目录算 (file count, total bytes)。**不**做内容校验
+    ///    （sha256 重算 10 万个 blob 跑半小时），rsync `--checksum` 兜底
+    /// 7. 读 item / item_mirror 行数（信息性）
+    /// 8. 返回 result。不动 config、不动 DB、不动 blobs
+    public static func migratePrimary(
+        dbPath: URL,
+        configPath: URL,
+        blobsRoot: URL,
+        snapshotsDir: URL,
+        now: Date = Date(),
+        daemonRunning: Bool = false,
+        daemonLabel: String = "io.duopaste.agent"
+    ) throws -> MigratePrimaryResult {
+        let current: Config
+        do {
+            current = try Config.load(from: configPath)
+        } catch {
+            throw AdminError.readConfigFailed(underlying: String(describing: error))
+        }
+
+        // primary 模式判别 = `serve == true && primary_url == nil`。Config.validate 已经
+        // 拦截 `serve && primary_url != nil` 的非法组合，所以这里看 serve+primary 就够
+        guard current.serve && current.primaryURL == nil else {
+            throw AdminError.notInPrimaryMode(currentSummary: current.summary)
+        }
+
+        if daemonRunning {
+            throw AdminError.daemonRunning(label: daemonLabel)
+        }
+
+        // 打开本机 primary DB。Database.init 跑 migrator 确保 schema 最新——VACUUM INTO 出来
+        // 的快照拷到新机后能直接被相同 binary 接管
+        let db = try Database(path: dbPath, role: .primary)
+
+        // 让 snapshot 父目录存在。CLI 一般传 Paths.snapshotsDir，已经在 Paths.ensureExists()
+        // 里建过；测试 fixture 可能跳过，所以这里兜底
+        try FileManager.default.createDirectory(
+            at: snapshotsDir, withIntermediateDirectories: true
+        )
+        // 复用 Snapshot.filename 的命名风格（duo-paste-YYYYMMDD-HHmmss.sqlite），让快照
+        // 文件在 snapshots/ 目录里与小时级 snapshot 同形态，享用现有 prune 策略
+        let snapshotURL = snapshotsDir.appendingPathComponent(
+            Snapshot.filename(for: now)
+        )
+        _ = try db.pool.writeWithoutTransaction { conn in
+            try conn.execute(sql: "VACUUM INTO ?", arguments: [snapshotURL.path])
+        }
+
+        // 快照字节数。VACUUM INTO 成功但 stat 失败说明文件 / 文件系统出大问题
+        // （权限被改、文件刚被删、磁盘 unmount）——CLI 看到 "成功"+0 字节快照会
+        // 误以为命令 OK 但快照不可信，必须让错误传播
+        let attrs = try FileManager.default.attributesOfItem(atPath: snapshotURL.path)
+        let snapshotBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+
+        // walk blobs/
+        let (blobFiles, blobBytes) = try walkBlobsDir(blobsRoot)
+
+        // 行数
+        let (itemCount, mirrorCount) = try db.pool.read { conn -> (Int, Int) in
+            let i = try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? 0
+            let m = try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? 0
+            return (i, m)
+        }
+
+        return MigratePrimaryResult(
+            snapshotPath: snapshotURL,
+            snapshotBytes: snapshotBytes,
+            blobsRoot: blobsRoot,
+            blobsTotalFiles: blobFiles,
+            blobsTotalBytes: blobBytes,
+            itemRowCount: itemCount,
+            itemMirrorRowCount: mirrorCount
+        )
+    }
+
+    /// 递归扫 blobs 目录算 (regular file count, sum of size)。目录不存在 → (0, 0)。
+    /// **只**计 regular file，跳过 directory / symlink 之类——blobs/ 由 BlobStore.put 写入
+    /// 永远是 regular file，但用户手动放别的东西时不要把目录大小算进总字节数。
+    ///
+    /// **不**用 `.skipsHiddenFiles`：rsync 默认会拷贝隐藏文件，inventory 数字要跟传输内容
+    /// 对齐，操作员靠这个比对老 / 新机一致性。
+    ///
+    /// `resourceValues` 失败现在 throw 而不是 silently skip——失败说明 FS 异常（权限、文件
+    /// 被删、磁盘问题），统计结果不可信时不应静默返回低估值让操作员误以为传输量很小
+    private static func walkBlobsDir(_ root: URL) throws -> (files: Int, bytes: Int64) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: root.path) else { return (0, 0) }
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: []
+        ) else {
+            return (0, 0)
+        }
+        var files = 0
+        var bytes: Int64 = 0
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true else { continue }
+            files += 1
+            bytes += Int64(values.fileSize ?? 0)
+        }
+        return (files, bytes)
     }
 
     /// 扫 item + item_mirror 里 `blob_sha256 IS NOT NULL AND deleted_at_ns IS NULL` 的行，

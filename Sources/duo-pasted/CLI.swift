@@ -19,6 +19,8 @@ enum CLI {
             runAuditPush(args: rest)
         case "promote-to-primary":
             runPromoteToPrimary(args: rest)
+        case "migrate-primary":
+            runMigratePrimary(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -59,6 +61,18 @@ enum CLI {
                                   让 promote 继续，缺失会被报告但不能自愈。
                                   仅在 client 模式下可用。完成后需手动 kickstart daemon
                                   让新配置生效，并到其他 client 改 primary_url。
+
+          migrate-primary [--new-primary-host HOST]
+                                  计划内换 primary 的 prepare 阶段：在老 primary 上跑，
+                                  VACUUM INTO 落一份一致性 snapshot 到 snapshots/，
+                                  统计 blobs/ 文件数和字节数 + item 行数，然后打印
+                                  rsync 命令模板 + 新机配置步骤 + 其他 client 后续动作。
+                                  本命令是只读操作（除了写 snapshot 文件这个副产物），
+                                  不动 DB / config / blobs/。
+                                  --new-primary-host 是可选 hint，只用于美化 rsync 命令
+                                  模板里的 user@host 占位符；省略时模板用 <NEW-HOST>。
+                                  仅在 primary 模式下可用。daemon 必须先停（避免 snapshot
+                                  之后 ingest 新行被 rsync 漏掉）。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -307,6 +321,113 @@ enum CLI {
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
         exit(0)
     }
+
+    private static func runMigratePrimary(args: [String]) {
+        var newHost: String? = nil
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--new-primary-host":
+                if i + 1 < args.count {
+                    let h = args[i + 1]
+                    // 严格 hostname 校验：拒绝 shell 元字符，防止打印的 rsync/ssh 模板
+                    // 在被操作员复制到 shell 后被解释成命令注入（"mini; rm -rf ~" 之类）。
+                    // 允许字符集：hostname / IP / Tailscale MagicDNS / 可选端口
+                    if !ShellTemplate.isSafeHost(h) {
+                        FileHandle.standardError.write(Data(
+                            "migrate-primary: --new-primary-host 含非法字符（只允许 A-Za-z0-9 . - _ :）\n".utf8
+                        ))
+                        exit(1)
+                    }
+                    newHost = h
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("migrate-primary: --new-primary-host 缺值\n".utf8))
+                    exit(1)
+                }
+            default:
+                FileHandle.standardError.write(Data("migrate-primary: 未知参数 \(args[i])\n".utf8))
+                exit(1)
+            }
+        }
+
+        let paths = Paths.makeDefault()
+        let daemonRunning = LaunchAgent.isRunning(label: LaunchAgent.duoPastedLabel)
+        let result: Admin.MigratePrimaryResult
+        do {
+            result = try Admin.migratePrimary(
+                dbPath: paths.mainDB,
+                configPath: paths.configFile,
+                blobsRoot: paths.blobsDir,
+                snapshotsDir: paths.snapshotsDir,
+                daemonRunning: daemonRunning,
+                daemonLabel: LaunchAgent.duoPastedLabel
+            )
+        } catch {
+            FileHandle.standardError.write(Data("migrate-primary failed: \(error)\n".utf8))
+            exit(1)
+        }
+        printMigrateReport(result, newHost: newHost)
+        exit(0)
+    }
+
+    private static func printMigrateReport(_ r: Admin.MigratePrimaryResult, newHost: String?) {
+        let hostPlaceholder = newHost ?? "<NEW-HOST>"
+        let snapshotShellPath = ShellTemplate.singleQuote(r.snapshotPath.path)
+        let blobsShellPath = ShellTemplate.singleQuote(r.blobsRoot.path)
+        let totalBytes = r.snapshotBytes + r.blobsTotalBytes
+        var lines: [String] = []
+        lines.append("migrate-primary · snapshot 已落地")
+        lines.append("")
+        lines.append("快照：")
+        lines.append("  \(r.snapshotPath.path)")
+        lines.append("  \(formatBytes(r.snapshotBytes)) · item=\(r.itemRowCount) 行" +
+                     (r.itemMirrorRowCount > 0 ? " · ⚠ item_mirror=\(r.itemMirrorRowCount) 行（本机历史 client 残留，会被一起迁过去）" : ""))
+        lines.append("")
+        lines.append("Blobs：")
+        lines.append("  \(r.blobsRoot.path)")
+        lines.append("  \(r.blobsTotalFiles) 个文件 · \(formatBytes(r.blobsTotalBytes))")
+        lines.append("")
+        lines.append("传输总量预估：\(formatBytes(totalBytes))（snapshot + blobs）")
+        lines.append("")
+        lines.append("下一步（手动执行）：")
+        lines.append("  1. 把 snapshot + blobs/ rsync 到新机：")
+        lines.append("       # 新机上先建好目标目录：")
+        lines.append("       ssh user@\(hostPlaceholder) 'mkdir -p ~/Library/Application\\ Support/duo-paste/{db,blobs}'")
+        lines.append("       # 拷快照（重命名为 main.sqlite 让 daemon 直接接管）：")
+        lines.append("       scp \(snapshotShellPath) \\")
+        lines.append("           user@\(hostPlaceholder):~/Library/Application\\ Support/duo-paste/db/main.sqlite")
+        lines.append("       # 拷 blobs（--checksum 让 rsync 自己校验，跳过用 --size-only 加速）：")
+        lines.append("       rsync -avh --checksum \(blobsShellPath)/ \\")
+        lines.append("           user@\(hostPlaceholder):~/Library/Application\\ Support/duo-paste/blobs/")
+        lines.append("  2. 在新机上：")
+        lines.append("     - 拷一份 shared-secret 文件（三台机必须同份，0600 权限）")
+        lines.append("     - 写 config.json：{ \"serve\": true, \"serve_host\": \"0.0.0.0\", \"serve_port\": 8443 }")
+        lines.append("     - ./scripts/install-agent.sh 装 LaunchAgent 起 daemon")
+        lines.append("  3. 在其他 client 上：")
+        lines.append("     - 改 config.json 的 primary_url 指向新机的可达地址")
+        lines.append("     - launchctl kickstart -k gui/$UID/\(LaunchAgent.duoPastedLabel) 重启")
+        lines.append("     - 跑 `duo-pasted audit-push` 验证 own-origin item 在新 primary 上齐全")
+        lines.append("")
+        lines.append("提醒：本命令未修改本机 config / DB / blobs，老 primary 可保留或手动退役。")
+        lines.append("      lineage 表的「新 primary 接管」行未写——audit-push 单 primary 部署不受影响，")
+        lines.append("      多次换 primary 链路下可能产生跨任期 dedup 误判。")
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    /// 把字节数渲染成人类可读字符串（1.2 GB / 350 MB / 12 KB / 800 B）。
+    /// 用于 migrate-primary 报告，操作员主要关心传输总量量级
+    private static func formatBytes(_ b: Int64) -> String {
+        let kb: Double = 1024
+        let mb = kb * 1024
+        let gb = mb * 1024
+        let v = Double(b)
+        if v >= gb { return String(format: "%.2f GB", v / gb) }
+        if v >= mb { return String(format: "%.2f MB", v / mb) }
+        if v >= kb { return String(format: "%.1f KB", v / kb) }
+        return "\(b) B"
+    }
+
 
     private static func runRetryFailed() {
         let paths = Paths.makeDefault()

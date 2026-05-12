@@ -1,22 +1,30 @@
 import Foundation
 
-/// LaunchAgent 状态查询。CLI 入口（promote-to-primary 等）用它把 daemon 在跑的情况
-/// 拦下来——promote 期间 daemon 仍在 client mode 跑，会在 stamping 完成后窗口里继续
-/// capture 出 ingested_at_ns=nil 的新行，那些行不会被后续 push、也不会再次 stamp，
-/// /since 永远过滤掉。
+/// LaunchAgent 状态查询。CLI 入口（promote-to-primary / migrate-primary）用它拦下
+/// daemon 仍 loaded 的情况——这两条路径都不能容忍 daemon 在命令执行**期间或之后**
+/// 还会跑：
+/// - promote：daemon 仍以 client 角色 capture 出 ingested_at_ns=nil 的新行，那些行
+///   不被后续 push、不再 stamp，/since 永远过滤掉
+/// - migrate：daemon 在 VACUUM INTO 之后继续以 primary 角色 ingest，rsync 完成时
+///   新机数据落后老机一段时间 = 静默丢数据
 ///
-/// 检测方式：`launchctl list <label>` 在 service 存在时输出含 `"PID"` 字段当且仅当
-/// 实际有进程在跑（idle/未启动的 LaunchAgent 不输出 PID）。任何错误（命令不存在、
-/// service 没 bootstrap 过、parse 失败）都返回 false，把 promote 放行——dev 场景
-/// `swift run` 起的 daemon 不在 launchctl 管理下，用户自己负责（CLAUDE.md 已写"跑 dev
-/// 二进制前先 launchctl bootout"）。
+/// 检测方式：`launchctl list <label>` 在 service 已 bootstrap（loaded）时 exit 0，
+/// 已 bootout（unloaded）时 exit non-zero。我们**只看 exit code 不看 PID**——
+/// KeepAlive=true 的 LaunchAgent 在 daemon crash / 速率限制 / SIGTERM 之间的窗口里
+/// "PID 字段暂时缺失但 service 仍 loaded"，launchd 会自动重启它。如果只看 PID 字段
+/// 这种 idle 窗口会被误判为 "不在跑"，命令放行后 daemon 立刻被 launchd 复活继续
+/// capture/ingest。**load 即 refuse** 才是正确语义
+///
+/// 任何执行错误（命令不存在、parse 失败）都返回 false 放行 dev 场景——`swift run`
+/// 起的 daemon 不在 launchctl 管理下，CLAUDE.md 已写"跑 dev 二进制前先 launchctl bootout"
+/// 是用户责任
 enum LaunchAgent {
     static func isRunning(label: String) -> Bool {
         let p = Process()
         p.launchPath = "/bin/launchctl"
         p.arguments = ["list", label]
-        let stdout = Pipe()
-        p.standardOutput = stdout
+        // 不读 stdout/stderr——只关心 exit code。Pipe 占位防止子进程的输出污染父进程
+        p.standardOutput = Pipe()
         p.standardError = Pipe()
         do {
             try p.run()
@@ -24,19 +32,9 @@ enum LaunchAgent {
             return false
         }
         p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return false }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        let s = String(data: data, encoding: .utf8) ?? ""
-        // launchctl list 输出格式：
-        //   {
-        //       "LimitLoadToSessionType" = "Aqua";
-        //       "Label" = "io.duopaste.agent";
-        //       "PID" = 12345;          ← 进程在跑
-        //       "LastExitStatus" = 0;
-        //       ...
-        //   };
-        // idle 状态没有 PID 字段。用 regex 精确匹配 `"PID" =` 避免误中 plist key 之类
-        return s.range(of: #""PID"\s*="#, options: .regularExpression) != nil
+        // exit 0 = service loaded（含 idle）→ daemon 随时可能（或正在）跑 → refuse
+        // exit non-zero = service 未 bootstrap 或已 bootout → 安全
+        return p.terminationStatus == 0
     }
 
     /// duo-pasted LaunchAgent 的固定 label，定义在 scripts/install-agent.sh 写出的 plist 里
