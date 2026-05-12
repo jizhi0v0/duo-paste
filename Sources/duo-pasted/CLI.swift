@@ -297,8 +297,10 @@ enum CLI {
         }
         lines.append("")
         lines.append("下一步：")
-        lines.append("  1. 重启 daemon 读新 config：")
-        lines.append("       launchctl kickstart -k gui/$UID/io.duopaste.agent")
+        lines.append("  1. 装回 LaunchAgent 并以新 config 拉起 daemon（与 install-agent.sh 一致）：")
+        lines.append("       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/\(LaunchAgent.duoPastedLabel).plist")
+        lines.append("       launchctl kickstart  -k gui/$UID/\(LaunchAgent.duoPastedLabel)")
+        lines.append("     （若 daemon 不是通过 launchctl bootout 停掉而是仍处于 loaded 状态，跳过 bootstrap、直接 kickstart 即可）")
         lines.append("  2. 到其他 client 把 config.json 里的 primary_url 改成本机的可达地址，")
         lines.append("     然后跑 `duo-pasted audit-push` 补『老 primary acked 但 mirror 未拉到』的洞。")
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
