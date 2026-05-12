@@ -607,6 +607,69 @@ private func insertLineage(
     #expect(report.missingTotal == 0)
 }
 
+@Test func auditLineageMultipleZeroStartedTiebreak() async throws {
+    // 同 device 多次 promote 会产生多行 `(*, 0, *)` sentinel：
+    //   - A 第一次 promote 把 B 闭成 `(B, 0, T1)`
+    //   - A 手动降级后 A' 再 promote 又把 B' 闭成 `(B', 0, T2)`，T1 < T2
+    // probe `t` 落在 `(0, T1)` 区间时 B 和 B' 都覆盖且 startedAtNs 都=0 → 必须靠 endedAtNs
+    // tiebreak 决出。规则：endedAtNs 小者优先（最具体的闭区间最接近 t 的真实任期切换点）→
+    // 选中 B（endedAtNs=T1）。
+    //
+    // 没 tiebreak 时 `max(by: startedAtNs<)` 在平局返回未定义元素，两次跑结果可能在 B/B' 之间
+    // 摇摆，dedupAbsorbed 样本的 absorbedByID 不稳定。这条锁定确定性。
+    let selfID = "air"
+    let tProbe: Int64 = 5_000_000_000        // 落在 (0, T1) 内
+    let t1: Int64 = 10_000_000_000           // B 任期结束点
+    let t2: Int64 = 20_000_000_000           // B' 任期结束点（> t1）
+
+    // 同一组数据 + 两种 lineage 插入顺序跑两遍，断言结果一致（验证不依赖隐式行序）
+    func runOnce(lineageOrder: [(String, Int64, Int64?)]) async throws -> AuditPush.Report {
+        let db = try makeClientDB()
+        for (dev, started, ended) in lineageOrder {
+            try await insertLineage(db, deviceID: dev, startedAtNs: started, endedAtNs: ended)
+        }
+        // self 推一条 "hello" 在 tProbe 时刻
+        try await insertItem(db, id: "air-x", origin: selfID, pushState: .acked,
+                             capturedAtNs: tProbe, textFull: "hello")
+        return try await AuditPush.run(
+            database: db,
+            selfDeviceID: selfID,
+            fetchPage: { _, _ in
+                SincePageWire(
+                    ok: true, count: 2,
+                    items: [
+                        // B-origin 同内容、5s 窗内（capturedAt=tProbe+1s）。规则 2 选中这条
+                        Item(id: "b-row", originDevice: "B",
+                             capturedAtNs: tProbe &+ 1_000_000_000,
+                             ingestedAtNs: tProbe &+ 1_000_000_000,
+                             kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                        // B'-origin 同内容、5s 窗内（capturedAt=tProbe+2s）。tiebreak 规则
+                        // 输给 B（endedAtNs=t2 > t1），不应被选中
+                        Item(id: "bprime-row", originDevice: "B'",
+                             capturedAtNs: tProbe &+ 2_000_000_000,
+                             ingestedAtNs: tProbe &+ 2_000_000_000,
+                             kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                    ],
+                    nextCursor: SinceCursor(ingestedAtNs: tProbe &+ 2_000_000_000, id: "bprime-row"),
+                    hasMore: false
+                )
+            }
+        )
+    }
+
+    // 顺序 1：B 先 B' 后
+    let r1 = try await runOnce(lineageOrder: [("B", 0, t1), ("B'", 0, t2)])
+    #expect(r1.dedupAbsorbed == 1)
+    #expect(r1.dedupAbsorbedSamples.first?.absorbedByID == "b-row")
+    #expect(r1.missingTotal == 0)
+
+    // 顺序 2：B' 先 B 后（验证插入顺序变更不影响结果）
+    let r2 = try await runOnce(lineageOrder: [("B'", 0, t2), ("B", 0, t1)])
+    #expect(r2.dedupAbsorbed == 1)
+    #expect(r2.dedupAbsorbedSamples.first?.absorbedByID == "b-row")
+    #expect(r2.missingTotal == 0)
+}
+
 @Test func auditDoesNotReportStaleWhenPrimaryAhead() async throws {
     // primary 自家有 merge 行为 → primary 的 capturedAtNs 可能比 local 高。
     // 这是 primary 的合法状态，不应该被 audit 当 stale 报。audit 关心的是
