@@ -298,13 +298,15 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     let baseline: Int64 = 1_700_000_000_000_000_000
     let echoed = mkItem(
         id: "mini-echo", origin: "mini-primary",
-        ingestedAtNs: baseline, text: "shared text"
+        ingestedAtNs: baseline + 1_000_000_000,   // echo: capturedAt 比 record 晚 1s
+        text: "shared text"
     )
     let transport = FakeSinceTransport(
-        pages: [page(items: [echoed], nextNs: baseline, nextID: "mini-echo", hasMore: false)],
+        pages: [page(items: [echoed], nextNs: baseline + 1_000_000_000, nextID: "mini-echo", hasMore: false)],
         healthDeviceID: "mini-primary"
     )
-    let suppressions = PasteSuppressionSet()
+    // 注入固定 nowNs = baseline，让 suppression record 的锚点正好在 baseline
+    let suppressions = PasteSuppressionSet(nowNs: { baseline })
     // 模拟 pasteBack：把 "shared text" 指纹塞进 set
     suppressions.record(
         fingerprint: PasteSuppressionSet.fingerprint(text: "shared text"),
@@ -325,6 +327,54 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? -1
     }
     #expect(mirrorCount == 0)
+}
+
+@Test func pullWorkerCatchUpDoesNotSuppressHistoricalRowSameContent() async throws {
+    // P2 review 回归：client 离线一段时间后 catch-up，恰好 paste 了一个常见短串 X，
+    // /since 拉到一条**历史**的同内容 X 行（captured_at_ns 远早于 paste record）。
+    // 之前 suppression 只看 fp → 误杀历史行 + cursor 仍前进 → 那条行永远拉不回来。
+    // 修复后：suppression 要求 candidate.capturedAtNs >= recordedAtNs - skew，
+    // 历史行不满足 → 正常写 mirror。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let pasteRecordNs: Int64 = 1_780_000_000_000_000_000   // 用户 paste 时刻
+    let historicalCapturedNs = pasteRecordNs - 7 * 24 * 3600 * 1_000_000_000  // 一周前
+    let historicalItem = Item(
+        id: "old-row", originDevice: "mini-primary",
+        capturedAtNs: historicalCapturedNs,
+        ingestedAtNs: historicalCapturedNs + 1_000_000,
+        kind: .text, preview: "ok", textFull: "ok",
+        pushState: .acked
+    )
+    let transport = FakeSinceTransport(
+        pages: [page(
+            items: [historicalItem],
+            nextNs: historicalCapturedNs + 1_000_000,
+            nextID: "old-row",
+            hasMore: false
+        )],
+        healthDeviceID: "mini-primary"
+    )
+    let suppressions = PasteSuppressionSet(nowNs: { pasteRecordNs })
+    suppressions.record(
+        fingerprint: PasteSuppressionSet.fingerprint(text: "ok"),
+        ttlSec: 300
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        pasteSuppressions: suppressions,
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
+    )
+    await runWorkerBriefly(worker)
+
+    // 历史行应该正常写入 mirror —— 不被 suppression 误杀
+    let mirrorCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='old-row'") ?? -1
+    }
+    #expect(mirrorCount == 1)
 }
 
 @Test func pullWorkerPasteEchoDoesNotBlockAlreadyMirroredRowUpdate() async throws {
@@ -357,7 +407,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         pages: [page(items: [softDelete], nextNs: baseline + 1_000_000_000, nextID: "mini-echo", hasMore: false)],
         healthDeviceID: "mini-primary"
     )
-    let suppressions = PasteSuppressionSet()
+    let suppressions = PasteSuppressionSet(nowNs: { baseline })
     // suppression 命中（模拟用户最近又 paste 了一次"shared text"）
     suppressions.record(
         fingerprint: PasteSuppressionSet.fingerprint(text: "shared text"),

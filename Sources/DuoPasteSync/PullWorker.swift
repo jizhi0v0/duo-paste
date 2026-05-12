@@ -304,9 +304,15 @@ public actor PullWorker {
                 let alreadyMirrored: Bool = try {
                     try Int.fetchOne(db, sql: "SELECT 1 FROM item_mirror WHERE id = ?", arguments: [item.id]) != nil
                 }()
+                // 候选 capturedAtNs 必须传给 suppression：shouldSuppress 还要求 capturedAt
+                // 在 record 时刻之后（容 5s skew），否则 catch-up 时同内容的历史行会被
+                // 永久误杀（cursor 已推进，再也拉不回来）。这是 P2 review fix。
                 if !alreadyMirrored, let suppressions,
                    let fp = PasteSuppressionSet.fingerprint(forItem: item),
-                   suppressions.contains(fp)
+                   suppressions.shouldSuppress(
+                       fingerprint: fp,
+                       candidateCapturedAtNs: item.capturedAtNs
+                   )
                 {
                     pasteEchoSkipped += 1
                     continue

@@ -2,18 +2,25 @@ import Foundation
 import CryptoKit
 
 /// 跨设备 paste-echo 抑制器：本机 pasteBack 写 NSPasteboard 后，把这次 paste 的内容指纹
-/// 暂存在内存里；PullWorker 收到对端通过 Universal Clipboard "反弹"回来的同内容 mirror
-/// 行时查这个集合，命中则 skip 不写 mirror，避免历史里出现一条"我刚 paste 的副本"。
+/// + 记录时刻 暂存在内存里；PullWorker 收到对端通过 Universal Clipboard "反弹"回来的同内容
+/// mirror 行时查这个集合，命中则 skip 不写 mirror，避免历史里出现一条"我刚 paste 的副本"。
 ///
 /// 为什么 RemoteIngester / PullWorker 现有的 `crossDeviceDedupWindowNs` 防不住这个：
 /// 那层 dedup 找的是「本机 origin=self 同内容 own item 在 ±窗口内是否已存」。但 paste
 /// 路径**不会**写本机 own item（pasteBack 只动 NSPasteboard，watcher 被 suppressUpToCurrent
 /// 跳过），所以 dedup 找不到锚点 → 反弹的 mirror 行被照样写入。
 ///
+/// **关键约束（P2 回归保护）**：命中需要同时满足 `fp 匹配` + `候选行 captured_at_ns >=
+/// 记录时刻 - 5s skew`。原因：纯按 fp 匹配会在「client 离线一段时间后 catch-up」时把
+/// **历史**的、内容碰巧相同的合法 mirror 行也 skip，且 cursor 仍然前进 → 那条行永远
+/// 进不了 mirror（除非 promote-primary 触发清空）。加上"captured 必须在 record 之后"的
+/// 约束后：echo 路径（对端 Continuity capture 发生在本机 paste 之后 ≤1s）满足；历史路径
+/// 不满足，安全放行。
+///
 /// 时间窗口：典型路径是 paste → Continuity 同步 ≤1s → 对端 watcher capture → 对端 push 到
 /// primary（若对端是 client）→ 本机 PullWorker 下一次 tick 拉到。最坏情况受 PullWorker
 /// `intervalSec`（默认 30s）+ 对端 push 节奏支配。300s 默认给足 buffer，内存代价是每次
-/// paste 一个 ~80B 条目。
+/// paste 一个 ~96B 条目。
 ///
 /// 线程安全：NSLock。读写都低频（每次 paste 一次写，每次 PullWorker tick 几次读），
 /// 完全没竞争。`@unchecked Sendable` 跟 [[mirror-status]] 一样的模式。
@@ -26,42 +33,69 @@ public final class PasteSuppressionSet: @unchecked Sendable {
     /// 概率近 0 但廉价就避免。
     public typealias Fingerprint = String
 
+    /// 单条 entry：除了过期时间，还要记下"是什么时刻 record 的"——查询时跟候选行
+    /// `captured_at_ns` 比对，挡 catch-up 误杀历史行。
+    private struct Entry {
+        var expireAtNs: Int64
+        var recordedAtNs: Int64
+    }
+
     private let lock = NSLock()
-    private var entries: [Fingerprint: Date] = [:]   // fp → expireAt
-    private let nowDate: @Sendable () -> Date
+    private var entries: [Fingerprint: Entry] = [:]
+    private let nowNs: @Sendable () -> Int64
 
-    public init(nowDate: @escaping @Sendable () -> Date = { Date() }) {
-        self.nowDate = nowDate
+    /// 候选行 captured 时间相对 paste record 时间的容忍 skew（纳秒）。
+    /// 默认 5s：覆盖典型 NTP 同步下两台 Mac 的时钟漂移。Continuity 同步本身 < 1s，
+    /// 真 echo 几乎总是 candidate > record（mini watcher tick 之后才 stamp）。
+    public static let defaultSkewNs: Int64 = 5_000_000_000
+
+    public init(nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() }) {
+        self.nowNs = nowNs
     }
 
-    /// 记下一次 paste 的指纹，TTL 秒后自动过期。重复 record 同一指纹 → 取较晚的 expireAt。
+    /// 记下一次 paste 的指纹，TTL 秒后自动过期。重复 record 同一指纹 → 刷新到本次的
+    /// recordedAtNs（更新锚点）+ 取较晚的 expireAt（不缩窗口）。
     public func record(fingerprint: Fingerprint, ttlSec: TimeInterval) {
-        let expireAt = nowDate().addingTimeInterval(ttlSec)
+        let now = nowNs()
+        let newExpire = now + Int64(ttlSec * 1_000_000_000)
         lock.lock(); defer { lock.unlock() }
-        if let existing = entries[fingerprint], existing > expireAt {
-            return  // 已有的窗口更长，不缩
+        let expireAt: Int64
+        if let existing = entries[fingerprint], existing.expireAtNs > newExpire {
+            expireAt = existing.expireAtNs
+        } else {
+            expireAt = newExpire
         }
-        entries[fingerprint] = expireAt
-        pruneExpiredLocked()
+        // 锚点（recordedAtNs）总是刷新到最新一次 paste 时刻——下次再 paste 同串就把
+        // 锚点往后挪，旧的对端 echo 不再误"早于锚点"
+        entries[fingerprint] = Entry(expireAtNs: expireAt, recordedAtNs: now)
+        pruneExpiredLocked(now: now)
     }
 
-    /// 命中即返 true。同时机会主义清理过期 entry。
-    public func contains(_ fingerprint: Fingerprint) -> Bool {
+    /// 是否应当抑制候选行。要求 fp 在窗口内 **且** 候选 captured_at_ns >= record - skew。
+    /// 第二条挡 catch-up 误杀（同内容历史行 captured 远早于本次 paste record）。
+    public func shouldSuppress(
+        fingerprint: Fingerprint,
+        candidateCapturedAtNs: Int64,
+        skewNs: Int64 = PasteSuppressionSet.defaultSkewNs
+    ) -> Bool {
+        let now = nowNs()
         lock.lock(); defer { lock.unlock() }
-        pruneExpiredLocked()
-        return entries[fingerprint] != nil
+        pruneExpiredLocked(now: now)
+        guard let entry = entries[fingerprint] else { return false }
+        // 候选行 captured 必须 >= recordedAtNs - skew —— 否则是历史行碰撞，放行
+        return candidateCapturedAtNs >= entry.recordedAtNs - skewNs
     }
 
     /// 测试用：当前活跃 entry 数（已清过期后）。
     public func activeCount() -> Int {
+        let now = nowNs()
         lock.lock(); defer { lock.unlock() }
-        pruneExpiredLocked()
+        pruneExpiredLocked(now: now)
         return entries.count
     }
 
-    private func pruneExpiredLocked() {
-        let now = nowDate()
-        entries = entries.filter { $0.value > now }
+    private func pruneExpiredLocked(now: Int64) {
+        entries = entries.filter { $0.value.expireAtNs > now }
     }
 
     // MARK: - Fingerprint helpers
@@ -89,5 +123,4 @@ public final class PasteSuppressionSet: @unchecked Sendable {
         }
         return nil
     }
-
 }
