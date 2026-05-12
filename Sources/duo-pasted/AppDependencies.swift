@@ -34,7 +34,8 @@ final class AppDependencies {
         self.captureService = CaptureService(
             database: database,
             blobs: blobs,
-            deviceID: deviceID
+            deviceID: deviceID,
+            limits: config.capture
         )
         let searchAPI = SearchAPI(database: database)
         self.searchAPI = searchAPI

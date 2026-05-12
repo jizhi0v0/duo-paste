@@ -20,6 +20,7 @@ struct SearchView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            skipBanner
             modeBanner
             Divider()
             if state.results.isEmpty {
@@ -74,6 +75,44 @@ struct SearchView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    /// 体积超限 banner：5 分钟内有 skip → 黄色提示「最近一次复制太大没存」。
+    /// ✕ 可关；不持久化，重启就清。这是 capture cap 的可见出口——光 stderr log
+    /// 用户感知不到，会以为"daemon 挂了 / bug"。
+    @ViewBuilder
+    private var skipBanner: some View {
+        if let skip = state.recentSkip,
+           Date().timeIntervalSince(skip.occurredAt) < 300 {
+            HStack(spacing: 6) {
+                Image(systemName: "tray.full")
+                Text(skipDescription(skip))
+                Spacer()
+                Button {
+                    state.dismissSkip()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.18))
+        }
+    }
+
+    private func skipDescription(_ s: AppState.SkipNotice) -> String {
+        let kindLabel = s.kind == .blob ? "图片/文件" : "文本"
+        return "刚才有一段\(kindLabel)太大没入库（\(humanBytes(s.bytes)) > \(humanBytes(s.limit))）；剪贴板本身正常，可直接 Cmd+V 粘贴"
+    }
+
+    private func humanBytes(_ n: Int) -> String {
+        if n < 1024 { return "\(n) B" }
+        if n < 1024 * 1024 { return String(format: "%.0f KB", Double(n) / 1024) }
+        return String(format: "%.1f MB", Double(n) / 1024 / 1024)
     }
 
     /// 顶部 banner：

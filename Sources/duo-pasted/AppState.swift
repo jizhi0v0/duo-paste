@@ -20,8 +20,41 @@ final class AppState {
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
     var scrollPulse: Int = 0
+    /// 最近一次 capture 被跳过的提示（超过 CaptureLimits）。
+    /// 5 分钟内有值 → SearchView 顶部黄色 banner；用户能手动 ✕ 关闭立即清掉。
+    /// 不持久化——重启就清，是 "刚才有点东西没存下来" 的实时提示。
+    var recentSkip: SkipNotice?
 
     let deps: AppDependencies
+
+    /// 单次跳过的提示。`bytes` / `limit` 单位字节，UI 端 humanize。`kind` 决定文案。
+    struct SkipNotice: Equatable, Sendable {
+        enum Kind: Sendable { case text, blob }
+        let kind: Kind
+        let bytes: Int
+        let limit: Int
+        let occurredAt: Date
+    }
+
+    /// 由 AppDelegate.handleCapture 在拿到 `.skippedTooLarge` outcome 时调用。
+    /// 副作用：5 分钟后自动清掉（如果还没被新的 skip 覆盖 / 用户没手动 ✕）——
+    /// 否则 SwiftUI 不会自己重新求值 `Date().timeIntervalSince() < 300`，banner 永驻。
+    func recordSkip(kind: SkipNotice.Kind, bytes: Int, limit: Int) {
+        let notice = SkipNotice(kind: kind, bytes: bytes, limit: limit, occurredAt: Date())
+        self.recentSkip = notice
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
+            // 仅当 recentSkip 仍是本次塞进去的那条时才清；中间被新 skip 覆盖或被
+            // dismissSkip 清掉 → 不该再动
+            if self?.recentSkip == notice {
+                self?.recentSkip = nil
+            }
+        }
+    }
+
+    func dismissSkip() {
+        self.recentSkip = nil
+    }
 
     init(deps: AppDependencies) {
         self.deps = deps

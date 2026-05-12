@@ -3,11 +3,21 @@ import CryptoKit
 import GRDB
 
 public struct CaptureResult: Sendable {
-    public enum Outcome: Sendable {
+    public enum Outcome: Sendable, Equatable {
         case inserted
         case mergedWithPrevious   // 与最近一条同内容近时间重复，仅刷新 captured_at
         case skippedEmpty
+        /// 超过 CaptureLimits 上限：意外捕获巨型对象（4K 长截图 / Cmd+A 大日志等）。
+        /// `bytes` 是观察到的实际大小，`limit` 是当时生效的阈值，`kind` 区分 text/blob。
+        /// macOS pasteboard 自身**不**受影响，Cmd+V 仍可正常粘贴——只是不进 duo-paste 历史。
+        case skippedTooLarge(kind: SkipKind, bytes: Int, limit: Int)
     }
+
+    public enum SkipKind: Sendable, Equatable {
+        case text
+        case blob
+    }
+
     public let outcome: Outcome
     public let item: Item?
 }
@@ -18,17 +28,21 @@ public actor CaptureService {
     public let deviceID: String
     /// 同内容合并窗口（纳秒）。默认 2s。
     public let mergeWindowNs: Int64
+    /// 捕获字节守门。超过 → 返回 `.skippedTooLarge`，不写 DB 不写 blob。
+    public let limits: Config.CaptureLimits
 
     public init(
         database: Database,
         blobs: BlobStore,
         deviceID: String,
-        mergeWindowNs: Int64 = 2 * 1_000_000_000
+        mergeWindowNs: Int64 = 2 * 1_000_000_000,
+        limits: Config.CaptureLimits = .default
     ) {
         self.database = database
         self.blobs = blobs
         self.deviceID = deviceID
         self.mergeWindowNs = mergeWindowNs
+        self.limits = limits
     }
 
     @discardableResult
@@ -39,10 +53,28 @@ public actor CaptureService {
             guard let blob = captured.blob, !blob.isEmpty else {
                 return CaptureResult(outcome: .skippedEmpty, item: nil)
             }
+            // 守门：blob 字节 > limit → 跳过。
+            // 重要：限的是从 NSPasteboard 读出的字节，不影响 NSPasteboard 自身——
+            // 用户 Cmd+V 仍可立即粘贴这个 80MB 截图，只是它不进 ⌥⌘V 历史。
+            if blob.count > limits.maxBlobBytes {
+                return CaptureResult(
+                    outcome: .skippedTooLarge(kind: .blob, bytes: blob.count, limit: limits.maxBlobBytes),
+                    item: nil
+                )
+            }
             return try ingestBlob(captured, blob: blob)
         }
         guard let text = captured.text, !text.isEmpty else {
             return CaptureResult(outcome: .skippedEmpty, item: nil)
+        }
+        // 守门：text UTF-8 字节 > limit → 跳过。`.file` kind 走的也是这条，
+        // 但文件路径字符串永远 < 1KB，512KB 默认 cap 0 风险误伤。
+        let textBytes = text.utf8.count
+        if textBytes > limits.maxTextBytes {
+            return CaptureResult(
+                outcome: .skippedTooLarge(kind: .text, bytes: textBytes, limit: limits.maxTextBytes),
+                item: nil
+            )
         }
         return try ingestText(captured, text: text)
     }

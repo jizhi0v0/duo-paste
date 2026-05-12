@@ -22,8 +22,9 @@
   - `SearchAPI.searchUnion` + `fetchHitsMirror`：item + item_mirror 各超量取 limit+offset，**先按 id dedupe（取 capturedAtNs 最大那份，无视 pinned 状态）**，再按 (pinned DESC, captured_at_ns DESC) 排序，最后裁 limit/offset
   - `SearchProvider.Mode.localMirror(stalenessSec:)`：`mirrorLastPullNs()` 非 nil → 直接走 `searchUnion`，**不**打远端
   - UI banner：`.localMirror` 灰色「本地镜像 · 更新于 Xs/m/h 前」；`.remoteFallback` 黄色保留
+- **Capture 字节守门 完成**：`config.capture.{max_blob_mb=32, max_text_kb=512}` 默认。意外复制超大对象跳过入库（NSPasteboard 自身不受影响，Cmd+V 仍正常）。UI 端 orange skipBanner 5 分钟自动消失 + 手动 ✕ 关闭。详见下文设计决策段
 - **M3 第三刀 未开始**：`promote-to-primary` / `audit-push` / `migrate-primary` / blob 懒拉 / 时钟偏移检查
-- **测试**：97/97 通过（`swift test`）。新增 PullWorkerTests 含同进程 server + 真 HTTP 全链路；SearchUnionTests 覆盖排序/dedup/pinned/软删/FTS；SearchProviderTests 含 mirror-skip-remote 回归保护
+- **测试**：107/107 通过（`swift test`）。新增 PullWorkerTests 含同进程 server + 真 HTTP 全链路；SearchUnionTests 覆盖排序/dedup/pinned/软删/FTS；SearchProviderTests 含 mirror-skip-remote 回归保护
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
 - **下一站**：**M3 第三刀**——DR 运维子命令 (`promote-to-primary` / `audit-push` / `migrate-primary`) + blob 懒拉 + 时钟偏移 sanity check。详细拆解见 plans/...moonlit-wave.md
 
@@ -122,6 +123,16 @@ LaunchAgent 装好后，主 Mac 常驻 release 版 daemon。调试时不能直�
 6. **launchd "languishing" 状态**：短时间内反复 bootout/bootstrap 会触发 launchd 速率限制，`launchctl print` 显示 `state = languishing` + bootstrap 持续报错。等 10-30s 直到 `launchctl print` 返回 `Could not find service`（彻底 boot out 干净）再重新 bootstrap 即可。不要 sudo / 不要改 plist。
 
 ## 关键设计决策（不要回退）
+
+### Capture 字节守门（防意外 Cmd+C 巨物）
+
+`config.capture.{max_blob_mb=32, max_text_kb=512}` 默认值。意外复制 4K 长截图 / Cmd+A 大日志 / Figma 多 MB 嵌入资源 → CaptureService 跳过入库，返回 `.skippedTooLarge`，**NSPasteboard 自身不受影响**（用户 Cmd+V 立即正常粘贴）。
+
+文件路径走 `.file` kind + 字符串形式（< 1KB），永远过文本 cap。所以 Finder 复制 50GB 工程文件夹零受影响。
+
+UI 反馈：AppState.recentSkip + SearchView orange skipBanner（含 ✕ 关闭按钮 + 5 分钟自动消失 Task）。文案明确说"剪贴板本身正常可直接 Cmd+V 粘贴"——防止用户以为 daemon 挂了。
+
+**作用域注意**：是 per-device capture policy 不是 sync-wide invariant。Primary `/ingest` `/blob` handler 只校验 body 总上限（1MB / 64MB），不重新校验单字段大小。HMAC + 共享 secret = 已认证内部边界，threat model 允许 trust。所以 A 设备配 max_text_kb=900 推一条 900KB，primary + 其他 client mirror 都接受。这是有意的，不是漏洞。
 
 ### Mirror 模式：本地 union 路径优先于远端
 

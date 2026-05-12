@@ -168,7 +168,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { [weak self] in
             guard let self else { return }
             do {
-                _ = try await self.deps.captureService.ingest(captured)
+                let result = try await self.deps.captureService.ingest(captured)
+                // 体积超限：在 AppState 留个标记 → SearchView 黄 banner 提示。
+                // 这是 cap 的可见出口——光 stderr log 用户感知不到，但搜索时找不到
+                // 刚复制的东西会以为"是不是 daemon 挂了"。
+                if case .skippedTooLarge(let kind, let bytes, let limit) = result.outcome {
+                    let appStateKind: AppState.SkipNotice.Kind = (kind == .text) ? .text : .blob
+                    self.state.recordSkip(kind: appStateKind, bytes: bytes, limit: limit)
+                    fputs("capture skipped (too large): \(kind) \(bytes)B > \(limit)B\n", stderr)
+                }
                 await self.state.refresh()
                 self.pushWorker?.wake()    // 有 worker 才唤醒；没配 primary 即 nil
             } catch {

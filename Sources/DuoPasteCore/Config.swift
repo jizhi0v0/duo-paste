@@ -31,8 +31,63 @@ public struct Config: Codable, Sendable, Equatable {
 
     public var pull: PullConfig
 
+    /// 捕获守门：blob / text 字节上限。超过 → 跳过捕获（不写 DB 不写 blob），
+    /// macOS pasteboard 自身仍可正常 Cmd+V 粘贴——只是不进 duo-paste 历史。
+    /// 默认值见 CaptureLimits.default。
+    public var capture: CaptureLimits
+
     /// Keychain 里 shared secret 的 account 名。HMAC 签名用。primary_url 为空时不需要。
     public var sharedSecretKeychainAccount: String?
+
+    /// 捕获字节守门。意外 Cmd+C 巨型对象（4K 长截图 / Cmd+A 大日志）→ 跳过入库，
+    /// macOS 剪贴板自身正常工作（Cmd+V 立刻粘贴），只是不进 duo-paste 历史。
+    ///
+    /// 默认：blob 32MB / text 512KB。涵盖正常截图 + 留头部缓冲到 server cap
+    /// (/blob=64MB, /ingest=1MB)。详见 CLAUDE.md "capture cap 默认值"。
+    ///
+    /// **作用域**：这是 *per-device capture policy*，不是 sync-wide invariant。Primary 的
+    /// /ingest / /blob handler 不重新校验单字段大小——只校验 body 总上限
+    /// (ingestBodyLimit=1MB / blobBodyLimit=64MB)。所以理论上 A 设备配 max_text_kb=900
+    /// 推一条 900KB 文本，primary + 别的 client mirror 都接受。HMAC 签名 + 共享 secret
+    /// 是已认证内部边界，threat model 允许 trust——server 总上限挡住极端 DoS 即可。
+    public struct CaptureLimits: Codable, Sendable, Equatable {
+        /// Blob (image / binary 等通过 pasteboard 拿到字节流的类型) 上限，字节。
+        public var maxBlobBytes: Int
+        /// Text (text/rtf/html/url) UTF-8 字节上限。
+        /// 注意：跟 server `/ingest` body 1MB 上限留头部缓冲——
+        /// JSON 编码 + 元数据（id / origin_device / source_app / preview...）
+        /// 大约占 200B-1KB + escape 膨胀 ~1.3x，512KB 文本编码后 body 约 700KB。
+        public var maxTextBytes: Int
+
+        public static let `default` = CaptureLimits(
+            maxBlobBytes: 32 * 1024 * 1024,
+            maxTextBytes: 512 * 1024
+        )
+
+        public init(maxBlobBytes: Int, maxTextBytes: Int) {
+            self.maxBlobBytes = maxBlobBytes
+            self.maxTextBytes = maxTextBytes
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case maxBlobMB = "max_blob_mb"
+            case maxTextKB = "max_text_kb"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let blobMB = try c.decodeIfPresent(Int.self, forKey: .maxBlobMB) ?? 32
+            let textKB = try c.decodeIfPresent(Int.self, forKey: .maxTextKB) ?? 512
+            self.maxBlobBytes = blobMB * 1024 * 1024
+            self.maxTextBytes = textKB * 1024
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(maxBlobBytes / (1024 * 1024), forKey: .maxBlobMB)
+            try c.encode(maxTextBytes / 1024, forKey: .maxTextKB)
+        }
+    }
 
     public struct PullConfig: Codable, Sendable, Equatable {
         /// true → 启动 pull worker，周期拉 primary 全量到 item_mirror。
@@ -65,6 +120,7 @@ public struct Config: Codable, Sendable, Equatable {
         tlsKeyPath: nil,
         primaryURL: nil,
         pull: .default,
+        capture: .default,
         sharedSecretKeychainAccount: nil
     )
 
@@ -77,6 +133,7 @@ public struct Config: Codable, Sendable, Equatable {
         tlsKeyPath: String?,
         primaryURL: URL?,
         pull: PullConfig,
+        capture: CaptureLimits = .default,
         sharedSecretKeychainAccount: String?
     ) {
         self.serve = serve
@@ -87,6 +144,7 @@ public struct Config: Codable, Sendable, Equatable {
         self.tlsKeyPath = tlsKeyPath
         self.primaryURL = primaryURL
         self.pull = pull
+        self.capture = capture
         self.sharedSecretKeychainAccount = sharedSecretKeychainAccount
     }
 
@@ -99,6 +157,7 @@ public struct Config: Codable, Sendable, Equatable {
         case tlsKeyPath = "tls_key_path"
         case primaryURL = "primary_url"
         case pull
+        case capture
         case sharedSecretKeychainAccount = "shared_secret_keychain_account"
     }
 
@@ -125,6 +184,7 @@ public struct Config: Codable, Sendable, Equatable {
             self.primaryURL = nil
         }
         self.pull = try c.decodeIfPresent(PullConfig.self, forKey: .pull) ?? .default
+        self.capture = try c.decodeIfPresent(CaptureLimits.self, forKey: .capture) ?? .default
         self.sharedSecretKeychainAccount = try c.decodeIfPresent(
             String.self, forKey: .sharedSecretKeychainAccount
         )
@@ -168,6 +228,12 @@ public struct Config: Codable, Sendable, Equatable {
         }
         if pull.intervalSec < 1 {
             throw ConfigError.invalidCombination("pull.interval_sec 必须 >= 1")
+        }
+        if capture.maxBlobBytes < 1 {
+            throw ConfigError.invalidCombination("capture.max_blob_mb 必须 >= 1")
+        }
+        if capture.maxTextBytes < 1 {
+            throw ConfigError.invalidCombination("capture.max_text_kb 必须 >= 1")
         }
         if serve && !(1...65535).contains(servePort) {
             throw ConfigError.invalidCombination("serve_port 超界 (1-65535)：\(servePort)")
