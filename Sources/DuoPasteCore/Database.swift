@@ -219,9 +219,10 @@ public struct Database: Sendable {
         //   2. (old_primary_id, 0, now)            ── 闭老 primary 任期（started=0 = "未知何时开始"）
         // PK = (device_id, started_at_ns) 让一个 device 多次任期可记。
         //
-        // audit-push 后续读这张表把"曾经/现在作为 primary 接收别人 origin 推送的 device"
-        // 排除出 Continuity-dedup 候选——多 primary lineage 下，"origin != self" 启发式
-        // 会把这些误判成跨设备同内容 dedup 源。详 AuditPush.swift TODO(promote-lineage)。
+        // audit-push 读这张表按 row.capturedAtNs 落在哪段 `[started_at_ns, ended_at_ns)`
+        // 区间挑出该时刻的 active primary，dedup 候选必须 origin 严格 == 这个 device_id。
+        // 跨任期碰撞被挡住；空 lineage / 时间未覆盖 / 期望 primary == self 的 stale 边界
+        // 回退 "origin != self" 启发式保单 primary 部署零回归。详 AuditPush.swift。
         //
         // 本 migration 只建表；写入逻辑在 Admin.promoteToPrimary。
         m.registerMigration("v5_primary_lineage") { db in

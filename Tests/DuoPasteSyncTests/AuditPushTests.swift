@@ -567,6 +567,46 @@ private func insertLineage(
     #expect(report.missingTotal == 0)
 }
 
+@Test func auditLineageHalfOpenBoundary() async throws {
+    // Half-open `[started, ended)` 右开端点。锁定 `t < endedAtNs` 不能被改成 `t <= endedAtNs`。
+    //
+    // 单 entry lineage `(mini, 0, T)` + candidate origin = "mbp"（既非 mini 也非 self）让两条
+    // 路径输出严格不同：
+    //   - 正确 `<`：t == T → mini 不覆盖（右端点开）→ activePrimary=nil → 回退 `origin != self`
+    //     → mbp ≠ air → 吸收成立 → dedupAbsorbed=1, missingTotal=0
+    //   - 误改 `<=`：t == T → mini 覆盖 → expected=mini → candidate origin "mbp" ≠ mini → 拒收
+    //     → missingTotal=1
+    //
+    // 不能跟 mbp 任期共享 boundary timestamp——那会让 `max(by: startedAtNs)` 在 `<=` 误改下
+    // 仍选 mbp，掩盖 off-by-one
+    let db = try makeClientDB()
+    let selfID = "air"
+    let tBoundary: Int64 = 15_000_000_000
+    try await insertLineage(db, deviceID: "mini", startedAtNs: 0, endedAtNs: tBoundary)
+    try await insertItem(db, id: "air-x", origin: selfID, pushState: .acked,
+                         capturedAtNs: tBoundary, textFull: "hello")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: selfID,
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 1,
+                items: [
+                    Item(id: "mbp-other", originDevice: "mbp",
+                         capturedAtNs: tBoundary &+ 500_000_000,
+                         ingestedAtNs: tBoundary &+ 500_000_000,
+                         kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                ],
+                nextCursor: SinceCursor(ingestedAtNs: tBoundary &+ 500_000_000, id: "mbp-other"),
+                hasMore: false
+            )
+        }
+    )
+    #expect(report.dedupAbsorbed == 1)
+    #expect(report.dedupAbsorbedSamples.first?.absorbedByID == "mbp-other")
+    #expect(report.missingTotal == 0)
+}
+
 @Test func auditDoesNotReportStaleWhenPrimaryAhead() async throws {
     // primary 自家有 merge 行为 → primary 的 capturedAtNs 可能比 local 高。
     // 这是 primary 的合法状态，不应该被 audit 当 stale 报。audit 关心的是
