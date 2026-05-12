@@ -58,20 +58,27 @@ public struct Config: Codable, Sendable, Equatable {
         /// JSON 编码 + 元数据（id / origin_device / source_app / preview...）
         /// 大约占 200B-1KB + escape 膨胀 ~1.3x，512KB 文本编码后 body 约 700KB。
         public var maxTextBytes: Int
+        /// 同内容合并窗口（秒）。窗口内同 kind+content 的重复复制只刷 captured_at_ns，
+        /// 不插新行。默认 300（5 分钟），覆盖"网页 selection overlay 反复写入"、
+        /// "用户短时间内重复复制相同内容"这类场景。
+        public var mergeWindowSec: Int
 
         public static let `default` = CaptureLimits(
             maxBlobBytes: 32 * 1024 * 1024,
-            maxTextBytes: 512 * 1024
+            maxTextBytes: 512 * 1024,
+            mergeWindowSec: 300
         )
 
-        public init(maxBlobBytes: Int, maxTextBytes: Int) {
+        public init(maxBlobBytes: Int, maxTextBytes: Int, mergeWindowSec: Int = 300) {
             self.maxBlobBytes = maxBlobBytes
             self.maxTextBytes = maxTextBytes
+            self.mergeWindowSec = mergeWindowSec
         }
 
         enum CodingKeys: String, CodingKey {
             case maxBlobMB = "max_blob_mb"
             case maxTextKB = "max_text_kb"
+            case mergeWindowSec = "merge_window_sec"
         }
 
         public init(from decoder: Decoder) throws {
@@ -80,12 +87,14 @@ public struct Config: Codable, Sendable, Equatable {
             let textKB = try c.decodeIfPresent(Int.self, forKey: .maxTextKB) ?? 512
             self.maxBlobBytes = blobMB * 1024 * 1024
             self.maxTextBytes = textKB * 1024
+            self.mergeWindowSec = try c.decodeIfPresent(Int.self, forKey: .mergeWindowSec) ?? 300
         }
 
         public func encode(to encoder: Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             try c.encode(maxBlobBytes / (1024 * 1024), forKey: .maxBlobMB)
             try c.encode(maxTextBytes / 1024, forKey: .maxTextKB)
+            try c.encode(mergeWindowSec, forKey: .mergeWindowSec)
         }
     }
 
@@ -234,6 +243,9 @@ public struct Config: Codable, Sendable, Equatable {
         }
         if capture.maxTextBytes < 1 {
             throw ConfigError.invalidCombination("capture.max_text_kb 必须 >= 1")
+        }
+        if capture.mergeWindowSec < 0 {
+            throw ConfigError.invalidCombination("capture.merge_window_sec 必须 >= 0")
         }
         if serve && !(1...65535).contains(servePort) {
             throw ConfigError.invalidCombination("serve_port 超界 (1-65535)：\(servePort)")

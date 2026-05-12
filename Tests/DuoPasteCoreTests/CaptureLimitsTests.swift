@@ -145,6 +145,49 @@ private func makeService(limits: Config.CaptureLimits) throws -> (CaptureService
     let d = Config.CaptureLimits.default
     #expect(d.maxBlobBytes == 32 * 1024 * 1024)
     #expect(d.maxTextBytes == 512 * 1024)
+    #expect(d.mergeWindowSec == 300)
+}
+
+@Test func captureServiceMergeWindowDerivedFromLimits() async throws {
+    // 关键契约：CaptureService 默认从 limits.mergeWindowSec 推导窗口，
+    // 不再固定 2s。同内容 200s 后再次 ingest 应当 merge（300s 窗口内）
+    let limits = Config.CaptureLimits(
+        maxBlobBytes: 1024, maxTextBytes: 1024, mergeWindowSec: 300
+    )
+    let (service, db) = try makeService(limits: limits)
+    let now: Int64 = 1_700_000_000_000_000_000
+    let later = now + 200 * 1_000_000_000  // 200s 后
+    let c1 = CapturedPasteboard(kind: .text, text: "same", capturedAtNs: now)
+    let c2 = CapturedPasteboard(kind: .text, text: "same", capturedAtNs: later)
+    let r1 = try await service.ingest(c1)
+    #expect(r1.outcome == .inserted)
+    let r2 = try await service.ingest(c2)
+    #expect(r2.outcome == .mergedWithPrevious)
+    let count = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+    }
+    #expect(count == 1)
+}
+
+@Test func captureServiceMergeWindowZeroDisablesMerge() async throws {
+    let limits = Config.CaptureLimits(
+        maxBlobBytes: 1024, maxTextBytes: 1024, mergeWindowSec: 0
+    )
+    let (service, db) = try makeService(limits: limits)
+    // 同 ns 也不 merge（窗口 = now - 0 = now，不包含 captured_at_ns == now 的旧行）
+    // 用稍微靠后的 ns 模拟两次复制
+    let r1 = try await service.ingest(CapturedPasteboard(
+        kind: .text, text: "same", capturedAtNs: 1_700_000_000_000_000_000
+    ))
+    #expect(r1.outcome == .inserted)
+    let r2 = try await service.ingest(CapturedPasteboard(
+        kind: .text, text: "same", capturedAtNs: 1_700_000_000_000_000_001
+    ))
+    #expect(r2.outcome == .inserted)
+    let count = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+    }
+    #expect(count == 2)
 }
 
 @Test func captureLimitsDecodeFromJSON() throws {

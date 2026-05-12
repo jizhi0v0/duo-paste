@@ -105,6 +105,38 @@ private func tmpConfig(_ json: String) throws -> URL {
     }
 }
 
+@Test func captureMergeWindowDefaultsTo300() throws {
+    let url = try tmpConfig("{}")
+    let cfg = try Config.load(from: url)
+    #expect(cfg.capture.mergeWindowSec == 300)
+}
+
+@Test func captureMergeWindowReadsFromConfig() throws {
+    let url = try tmpConfig("""
+    { "capture": { "merge_window_sec": 600 } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.capture.mergeWindowSec == 600)
+}
+
+@Test func captureMergeWindowZeroAllowed() throws {
+    // 0 = 关闭 merge（任何重复都新插），仍属合法配置
+    let url = try tmpConfig("""
+    { "capture": { "merge_window_sec": 0 } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.capture.mergeWindowSec == 0)
+}
+
+@Test func captureMergeWindowNegativeRejected() throws {
+    let url = try tmpConfig("""
+    { "capture": { "merge_window_sec": -1 } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
 @Test func configEmptyPrimaryURLStringTreatedAsNil() throws {
     // 用户手抖把 primary_url 留空字符串，应当走默认（standalone），不报错
     let url = try tmpConfig("""

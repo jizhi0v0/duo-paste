@@ -72,14 +72,18 @@ public final class PasteboardWatcher {
         guard let captured = extract(capturedAtNs: capturedAtNs) else {
             return
         }
-        // 诊断：可疑 capture 把 NSPasteboard types 全打出来。两种触发：
+        // 诊断：可疑 capture 把 NSPasteboard types 全打出来。三种触发：
         // (1) ≤8 字符的短文本——「Paste.app 跳过但我们 capture」的不对称定位
         // (2) RTF kind——常见误抓自 Telegram/Notes/Mail 这类 styled-text app 的后台写入
+        // (3) HTML kind——本应被 looksLikeWebViewHTML 降级，真走到 .html 的都是值得记
+        //     的反例（原生富文本 app 或我们漏掉的 web view 写入形态）
         // 用途：识别漏配的 type marker（应进 skipMarkerTypes），或定位 frontmost 时序错位
         let shouldLog: Bool
         if let t = captured.text, t.count <= 8, captured.kind == .text {
             shouldLog = true
         } else if captured.kind == .rtf {
+            shouldLog = true
+        } else if captured.kind == .html {
             shouldLog = true
         } else {
             shouldLog = false
@@ -155,6 +159,22 @@ public final class PasteboardWatcher {
 
         // 4) HTML
         if let html = pasteboard.string(forType: .html) {
+            // web view selection 降级：WebKit / Chromium 系（浏览器 + Electron + Codex /
+            // ChatGPT / Claude Desktop 等）写 HTML 时前面会塞 <meta charset='utf-8'>，
+            // 内容是带 inline style + data-* 属性的一坨 markup——对剪贴板管理器毫无用处。
+            // 此时如果 .string 也有非空 plain text，优先用 plain，丢 markup。
+            if looksLikeWebViewHTML(html),
+               let plain = pasteboard.string(forType: .string),
+               !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                return CapturedPasteboard(
+                    kind: .text,
+                    text: plain,
+                    sourceAppBundleID: bundleID,
+                    sourceAppName: appName,
+                    capturedAtNs: capturedAtNs
+                )
+            }
             return CapturedPasteboard(
                 kind: .html,
                 text: html,

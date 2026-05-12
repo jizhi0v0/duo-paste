@@ -149,7 +149,17 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 }
 
 @Test func captureDoesNotMergeAcrossWindow() async throws {
-    let (_, db, _, service) = try makeFixture()
+    // 验证「跨窗口必定分裂」的策略不变量，跟具体窗口数值解耦：
+    // 显式构 2s 窗口的 service，间隔 3s 复制同一内容 → 应当分裂为两行
+    let root = tempDir()
+    let paths = Paths(root: root)
+    paths.ensureExists()
+    let db = try Database(path: paths.mainDB, role: .primary)
+    let blobs = BlobStore(root: paths.blobsDir)
+    let service = CaptureService(
+        database: db, blobs: blobs, deviceID: "device-test",
+        mergeWindowNs: 2 * 1_000_000_000
+    )
     let baseNs: Int64 = 6_000_000_000_000_000_000
     let first = CapturedPasteboard(kind: .text, text: "dup", capturedAtNs: baseNs)
     let later = CapturedPasteboard(kind: .text, text: "dup", capturedAtNs: baseNs + 3 * 1_000_000_000) // +3s

@@ -26,22 +26,24 @@ public actor CaptureService {
     public let database: Database
     public let blobs: BlobStore
     public let deviceID: String
-    /// 同内容合并窗口（纳秒）。默认 2s。
+    /// 同内容合并窗口（纳秒）。默认从 limits.mergeWindowSec 推导（300s）。
+    /// 显式参数仅用于测试覆盖：生产路径走 config.capture.merge_window_sec。
     public let mergeWindowNs: Int64
-    /// 捕获字节守门。超过 → 返回 `.skippedTooLarge`，不写 DB 不写 blob。
+    /// 捕获字节守门 + 合并窗口配置源。
     public let limits: Config.CaptureLimits
 
     public init(
         database: Database,
         blobs: BlobStore,
         deviceID: String,
-        mergeWindowNs: Int64 = 2 * 1_000_000_000,
+        mergeWindowNs: Int64? = nil,
         limits: Config.CaptureLimits = .default
     ) {
         self.database = database
         self.blobs = blobs
         self.deviceID = deviceID
-        self.mergeWindowNs = mergeWindowNs
+        // 显式 mergeWindowNs 用于测试；生产从 limits.mergeWindowSec 推导。
+        self.mergeWindowNs = mergeWindowNs ?? Int64(limits.mergeWindowSec) * 1_000_000_000
         self.limits = limits
     }
 
