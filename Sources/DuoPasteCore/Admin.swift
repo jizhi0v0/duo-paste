@@ -229,9 +229,11 @@ public enum Admin {
                 VALUES (?, ?, NULL)
             """, arguments: [selfDeviceID, now])
 
-            // 闭老 primary 任期。started_at_ns=0 表示"未知起点"——audit-push 的 lineage 查询
-            // 用 `device_id IN (...)` 不依赖 started 的精确值。oldID == self 时（本机以前曾
-            // 作为 primary，被自己再 promote 一次的边界情况）不重写，避免覆盖更准确的旧记录。
+            // 闭老 primary 任期。started_at_ns=0 表示"未知起点"——audit-push 读全量 lineage，
+            // 用 `(started_at_ns == 0 || started_at_ns <= t) && (ended_at_ns == nil || t < ended_at_ns)`
+            // 做区间覆盖判断，所以 started=0 sentinel 能覆盖 ended 之前的所有时刻。oldID == self
+            // 时（本机以前曾作为 primary，被自己再 promote 一次的边界情况）不重写，避免覆盖更准确
+            // 的旧记录。
             if let oldID, !oldID.isEmpty, oldID != selfDeviceID {
                 try conn.execute(sql: """
                     INSERT OR IGNORE INTO primary_lineage(device_id, started_at_ns, ended_at_ns)

@@ -616,13 +616,21 @@ private func insertLineage(
     // 选中 B（endedAtNs=T1）。
     //
     // 没 tiebreak 时 `max(by: startedAtNs<)` 在平局返回未定义元素，两次跑结果可能在 B/B' 之间
-    // 摇摆，dedupAbsorbed 样本的 absorbedByID 不稳定。这条锁定确定性。
+    // 摇摆，dedupAbsorbed 样本的 absorbedByID 不稳定。这条锁定端到端的确定性。
+    //
+    // 关键防"假绿"——candidates 把**期望输的** bprime-row 放第一位：
+    //   - tiebreak 正常 → expectedAbsorberOrigin=="B" → 严格匹配跳过 bprime → 选中 b-row ✓
+    //   - tiebreak 退化返回 nil → fallback `origin != selfDeviceID` → candidates.first 选第一个
+    //     满足条件的，即 **bprime-row** → 断言 `absorbedByID == "b-row"` fail，捕获退化
+    // 单元层 tiebreak 不依赖 SQL ORDER BY 的覆盖见 `auditPrimaryDeviceIDTiebreak*` 系列
     let selfID = "air"
     let tProbe: Int64 = 5_000_000_000        // 落在 (0, T1) 内
     let t1: Int64 = 10_000_000_000           // B 任期结束点
     let t2: Int64 = 20_000_000_000           // B' 任期结束点（> t1）
 
-    // 同一组数据 + 两种 lineage 插入顺序跑两遍，断言结果一致（验证不依赖隐式行序）
+    // 同一组数据 + 两种 lineage 插入顺序跑两遍。AuditPush.run 内 SQL 有 `ORDER BY started, ended,
+    // device` 把读出顺序固定，所以两次 run 给 activePrimaryDeviceID 的输入顺序其实是一样的——
+    // 这两次只断言端到端稳定，**不**等于验证了 tiebreak 输入顺序无关性（那条靠直接单元测覆盖）
     func runOnce(lineageOrder: [(String, Int64, Int64?)]) async throws -> AuditPush.Report {
         let db = try makeClientDB()
         for (dev, started, ended) in lineageOrder {
@@ -638,19 +646,21 @@ private func insertLineage(
                 SincePageWire(
                     ok: true, count: 2,
                     items: [
-                        // B-origin 同内容、5s 窗内（capturedAt=tProbe+1s）。规则 2 选中这条
-                        Item(id: "b-row", originDevice: "B",
-                             capturedAtNs: tProbe &+ 1_000_000_000,
-                             ingestedAtNs: tProbe &+ 1_000_000_000,
-                             kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
-                        // B'-origin 同内容、5s 窗内（capturedAt=tProbe+2s）。tiebreak 规则
-                        // 输给 B（endedAtNs=t2 > t1），不应被选中
+                        // 期望**输**的 B'-origin 放第一位：tiebreak 退化走 fallback 时
+                        // `candidates.first(where: origin != self)` 会先撞到这条 → 断言失败
+                        // → 假绿被捕获。tiebreak 正常时 expectedAbsorberOrigin=="B"，严格
+                        // 匹配会跳过这条
                         Item(id: "bprime-row", originDevice: "B'",
                              capturedAtNs: tProbe &+ 2_000_000_000,
                              ingestedAtNs: tProbe &+ 2_000_000_000,
                              kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                        // 期望**赢**的 B-origin（endedAtNs=t1 < t2）放第二位
+                        Item(id: "b-row", originDevice: "B",
+                             capturedAtNs: tProbe &+ 1_000_000_000,
+                             ingestedAtNs: tProbe &+ 1_000_000_000,
+                             kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
                     ],
-                    nextCursor: SinceCursor(ingestedAtNs: tProbe &+ 2_000_000_000, id: "bprime-row"),
+                    nextCursor: SinceCursor(ingestedAtNs: tProbe &+ 2_000_000_000, id: "b-row"),
                     hasMore: false
                 )
             }
@@ -668,6 +678,105 @@ private func insertLineage(
     #expect(r2.dedupAbsorbed == 1)
     #expect(r2.dedupAbsorbedSamples.first?.absorbedByID == "b-row")
     #expect(r2.missingTotal == 0)
+}
+
+// MARK: - activePrimaryDeviceID 直接单元测试
+//
+// 这一组绕过 `AuditPush.run` 里的 SQL `ORDER BY`，直接给 internal 的
+// `activePrimaryDeviceID(at:lineage:selfDeviceID:)` 喂任意顺序的 LineageEntry 数组——
+// 这是验证 tiebreak 在不同输入顺序下确定性的**唯一**正确测试层级。
+// 端到端的 `auditLineageMultipleZeroStartedTiebreak` 测的是集成稳定性，但因 SQL 有序读
+// 不能真正暴露 input-order-dependent 退化。
+
+@Test func auditPrimaryDeviceIDTiebreakByEndedAtNsAscending() async throws {
+    // 同 startedAtNs (=0)、不同 endedAtNs：规则 2 选 endedAtNs **小者**
+    let selfID = "air"
+    let t: Int64 = 5_000_000_000
+    let entries: [AuditPush.LineageEntry] = [
+        .init(deviceID: "B",  startedAtNs: 0, endedAtNs: 10_000_000_000),  // 期望赢
+        .init(deviceID: "B'", startedAtNs: 0, endedAtNs: 20_000_000_000),
+    ]
+    // 两种输入顺序都应该返回 "B"
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries, selfDeviceID: selfID) == "B")
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries.reversed(), selfDeviceID: selfID) == "B")
+}
+
+@Test func auditPrimaryDeviceIDTiebreakOpenVsClosedPrefersClosed() async throws {
+    // endedAtNs == nil（开放任期）vs endedAtNs == Int64（闭区间）：nil 视作 +∞，闭区间赢
+    // 这是规则 2 的关键 case——sentinel `(*, 0, nil)` 行不应该胜过已经闭合的具体任期
+    let selfID = "air"
+    let t: Int64 = 5_000_000_000
+    let entries: [AuditPush.LineageEntry] = [
+        .init(deviceID: "Open",   startedAtNs: 0, endedAtNs: nil),                // +∞，输
+        .init(deviceID: "Closed", startedAtNs: 0, endedAtNs: 100_000_000_000),    // 期望赢
+    ]
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries, selfDeviceID: selfID) == "Closed")
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries.reversed(), selfDeviceID: selfID) == "Closed")
+}
+
+@Test func auditPrimaryDeviceIDTiebreakByDeviceIDAscending() async throws {
+    // 全平：同 startedAtNs、同 endedAtNs、不同 deviceID → 规则 3 取字典序**小者**
+    let selfID = "air"
+    let t: Int64 = 5_000_000_000
+    let entries: [AuditPush.LineageEntry] = [
+        .init(deviceID: "Zed",   startedAtNs: 0, endedAtNs: 10_000_000_000),
+        .init(deviceID: "Alpha", startedAtNs: 0, endedAtNs: 10_000_000_000),  // 期望赢
+        .init(deviceID: "Mid",   startedAtNs: 0, endedAtNs: 10_000_000_000),
+    ]
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries, selfDeviceID: selfID) == "Alpha")
+    // 任意排列都应该返回同一个结果——枚举所有 3! 种顺序验证完全确定性
+    let perms: [[AuditPush.LineageEntry]] = [
+        [entries[0], entries[1], entries[2]],
+        [entries[0], entries[2], entries[1]],
+        [entries[1], entries[0], entries[2]],
+        [entries[1], entries[2], entries[0]],
+        [entries[2], entries[0], entries[1]],
+        [entries[2], entries[1], entries[0]],
+    ]
+    for p in perms {
+        #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: p, selfDeviceID: selfID) == "Alpha")
+    }
+}
+
+@Test func auditPrimaryDeviceIDTiebreakByStartedAtNsDescending() async throws {
+    // 规则 1：不同 startedAtNs → 大者优先（最具体的开始时间反映最近一次任期切换）
+    // 同时验证规则 1 优先于规则 2、3
+    let selfID = "air"
+    let t: Int64 = 100_000_000_000
+    let entries: [AuditPush.LineageEntry] = [
+        // 老任期 (started=0) endedAtNs 更小但**输**给具体 started 的新任期——这条专门防
+        // "把规则优先级颠倒（先比 endedAtNs 后比 startedAtNs）"那种实现退化
+        .init(deviceID: "OldZ", startedAtNs: 0, endedAtNs: 200_000_000_000),
+        .init(deviceID: "New",  startedAtNs: 50_000_000_000, endedAtNs: nil),  // 期望赢
+    ]
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries, selfDeviceID: selfID) == "New")
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries.reversed(), selfDeviceID: selfID) == "New")
+}
+
+@Test func auditPrimaryDeviceIDReturnsNilWhenExpectedIsSelf() async throws {
+    // 期望 active primary == selfDeviceID 时返回 nil → 让调用方回退 `origin != self` 启发式
+    // 边界场景：self 曾 promote 过、又手动改 config 回 client → 本地 lineage 仍记 self 任期开着
+    let selfID = "air"
+    let t: Int64 = 5_000_000_000
+    let entries: [AuditPush.LineageEntry] = [
+        .init(deviceID: selfID, startedAtNs: 0, endedAtNs: nil),
+    ]
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries, selfDeviceID: selfID) == nil)
+}
+
+@Test func auditPrimaryDeviceIDReturnsNilWhenLineageEmpty() async throws {
+    #expect(AuditPush.activePrimaryDeviceID(at: 5_000_000_000, lineage: [], selfDeviceID: "air") == nil)
+}
+
+@Test func auditPrimaryDeviceIDReturnsNilWhenNoEntryCoversT() async throws {
+    // 所有任期都在 t 之后开始或之前结束 → 无覆盖 → nil → 回退启发式
+    let selfID = "air"
+    let t: Int64 = 5_000_000_000
+    let entries: [AuditPush.LineageEntry] = [
+        .init(deviceID: "Future", startedAtNs: 10_000_000_000, endedAtNs: nil),
+        .init(deviceID: "Past",   startedAtNs: 0, endedAtNs: 3_000_000_000),
+    ]
+    #expect(AuditPush.activePrimaryDeviceID(at: t, lineage: entries, selfDeviceID: selfID) == nil)
 }
 
 @Test func auditDoesNotReportStaleWhenPrimaryAhead() async throws {

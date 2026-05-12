@@ -371,10 +371,17 @@ public enum AuditPush {
     /// `primary_lineage` 表的内存形态。`startedAtNs == 0` 表示"未知何时开始"
     /// （`Admin.promoteToPrimary` 闭老 primary 任期时使用的 sentinel）。
     /// `endedAtNs == nil` 表示任期当前仍开（self 的开新任期行）。
-    private struct LineageEntry {
+    // internal 以便 @testable import 直接构造测试 fixture 喂给 activePrimaryDeviceID
+    struct LineageEntry {
         let deviceID: String
         let startedAtNs: Int64
         let endedAtNs: Int64?
+
+        init(deviceID: String, startedAtNs: Int64, endedAtNs: Int64?) {
+            self.deviceID = deviceID
+            self.startedAtNs = startedAtNs
+            self.endedAtNs = endedAtNs
+        }
     }
 
     /// 给定一个 push 时刻 `t`，从 lineage 里挑出覆盖该时刻的 active primary。
@@ -397,7 +404,9 @@ public enum AuditPush {
     /// 任期写 started_at_ns=0）。t 落在多行共同覆盖区间时，规则 1 会平（都 0），落到规则 2/3
     /// 决出。没有 tiebreak 时 `max(by:)` 在平局返回的元素未定义，audit 两次跑可能在 B/B' 之间
     /// 切换，dedupAbsorbed 桶分布不稳定。
-    private static func activePrimaryDeviceID(
+    // internal（非 private）以便 @testable import 可以直接喂任意 lineage 数组单元测
+    // tiebreak，绕过 AuditPush.run 里 SQL `ORDER BY` 把读出顺序固定的副作用。
+    static func activePrimaryDeviceID(
         at t: Int64, lineage: [LineageEntry], selfDeviceID: String
     ) -> String? {
         let active = lineage
