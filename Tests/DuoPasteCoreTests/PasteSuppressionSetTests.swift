@@ -67,19 +67,27 @@ struct PasteSuppressionSetTests {
         #expect(set.activeCount() == 0)
     }
 
-    @Test func repeatedRecordKeepsLongerWindowAndRefreshesAnchor() {
+    @Test func multipleAnchorsEachKeepOwnTTL() {
+        // 多锚点：每个 paste 独立 TTL，互不传染。
+        // - T0 record ttl=100 → 锚点 a0 活到 T+100s
+        // - T+50s record ttl=10 → 锚点 a1 活到 T+60s
+        // - T+65s：a1 过期，a0 仍活；a1 附近的 candidate 不再 suppress，a0 附近仍 suppress
         let clock = MutableNsClock(1_700_000_000_000_000_000)
         let set = PasteSuppressionSet(nowNs: { clock.now() })
         let fp = PasteSuppressionSet.fingerprint(text: "x")
-        set.record(fingerprint: fp, ttlSec: 100)  // expire at +100s
-        // 推进 50s，再 record 一个 ttl=10（expire +60s < 已有 +100s）
+        let a0 = clock.now()
+        set.record(fingerprint: fp, ttlSec: 100)
         clock.advance(seconds: 50)
-        let secondRecordedAt = clock.now()
+        let a1 = clock.now()
         set.record(fingerprint: fp, ttlSec: 10)
-        // 再推 30s（now=+80s）：原 +100s 仍有效，短 ttl 不应缩窗口
-        clock.advance(seconds: 30)
-        // 锚点已被刷新到 +50s 那次，所以 candidate 在 +50s 后任意时间都算 fresh echo
-        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: secondRecordedAt + 100))
+        // T+55s（两锚点都活）：两锚点附近 echo 都命中
+        clock.advance(seconds: 5)
+        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: a0 + 1_000_000_000))
+        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: a1 + 1_000_000_000))
+        // T+65s：a1 已过期（自 ttl=10s），a0 仍活
+        clock.advance(seconds: 10)
+        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: a0 + 1_000_000_000))
+        #expect(!set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: a1 + 1_000_000_000))
     }
 
     // MARK: - P2 review 回归：catch-up 时同内容历史行不应被误杀
@@ -126,27 +134,87 @@ struct PasteSuppressionSetTests {
 
     @Test func candidateAfterEchoWindowIsNotSuppressed() {
         // 场景：用户在 MBP paste "ok"（record 在 T0），TTL 300s 内 entry 还活着。
-        // 过了 120s（远超 60s 默认 echo window），用户切到 mini 在某个上下文里独立
+        // 过了 30s（远超 10s 默认 echo window），用户切到 mini 在某个上下文里独立
         // 复制了一个"ok"——这是新的合法 capture，**不**是 paste echo。应放行入 mirror。
         let clock = MutableNsClock(1_700_000_000_000_000_000)
         let set = PasteSuppressionSet(nowNs: { clock.now() })
         let fp = PasteSuppressionSet.fingerprint(text: "ok")
         let recordTime = clock.now()
         set.record(fingerprint: fp, ttlSec: 300)
-        // 候选 captured = record + 120s，超过 60s 默认 echo window
-        let candidate = recordTime + 120 * 1_000_000_000
+        // 候选 captured = record + 30s，超过 10s 默认 echo window
+        let candidate = recordTime + 30 * 1_000_000_000
         #expect(!set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: candidate))
     }
 
+    // MARK: - P2 回归：同 fp 多次 paste 之间夹着延迟 echo 不应漏过
+
+    @Test func earlyEchoStillSuppressedAfterSecondPasteRefreshesAnchor() {
+        // 场景：T0 paste "A" → 对端 captured ≈ T0+1s，但本机 PullWorker 还没拉到。
+        // T20s 用户又 paste 同内容 "A"。若 record 只保留最新锚点 T20，那么 T0+1s
+        // 的 candidate < T20 - 5s skew → 不再 suppression → echo 漏进 mirror。
+        // 现在保留 earliest=T0，下界用 earliest-skew → T0+1s 仍命中。
+        let clock = MutableNsClock(1_700_000_000_000_000_000)
+        let set = PasteSuppressionSet(nowNs: { clock.now() })
+        let fp = PasteSuppressionSet.fingerprint(text: "A")
+        let firstPasteAt = clock.now()
+        set.record(fingerprint: fp, ttlSec: 300)
+        // 第一次 paste 的对端 echo (captured ≈ T0+1s)
+        let earlyEchoCaptured = firstPasteAt + 1 * 1_000_000_000
+        // 用户在 +20s 又 paste 同内容
+        clock.advance(seconds: 20)
+        set.record(fingerprint: fp, ttlSec: 300)
+        // 这时 PullWorker 终于拉到第一次 paste 那条 echo，应仍被 suppression 命中
+        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: earlyEchoCaptured))
+    }
+
     @Test func candidateWithinEchoWindowIsSuppressed() {
-        // 正向：echo 窗口内（默认 60s）的候选应被抑制。
+        // 正向：echo 窗口内（默认 10s）的候选应被抑制。
+        // Continuity 反弹典型 < 1s + 对端 watcher tick 200ms + push 节奏，3s 是典型值。
         let clock = MutableNsClock(1_700_000_000_000_000_000)
         let set = PasteSuppressionSet(nowNs: { clock.now() })
         let fp = PasteSuppressionSet.fingerprint(text: "ok")
         let recordTime = clock.now()
         set.record(fingerprint: fp, ttlSec: 300)
-        let candidate = recordTime + 30 * 1_000_000_000   // +30s，典型 PullWorker tick
+        let candidate = recordTime + 3 * 1_000_000_000   // +3s，典型 echo 时延
         #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: candidate))
+    }
+
+    // MARK: - P2 回归：两次 paste 之间的真空区合法 capture 必须放行
+
+    @Test func independentCaptureBetweenTwoPasteWindowsIsNotSuppressed() {
+        // 场景：T0 paste "A"。T+30s 用户在对端独立 Cmd+C 了字符串 "A"（短串碰撞），
+        // 这条 captured_at_ns=T+30s 的 mirror 行是合法的、跟本机两次 paste 都不是
+        // echo 关系。T+60s 用户又 paste "A"。
+        //
+        // hull 方案 (`[earliest-skew, latest+echo]`) 会把 T+30s 误杀。
+        // 多锚点 OR 方案：两段窗口中间真空，T+30s 放行。
+        let clock = MutableNsClock(1_700_000_000_000_000_000)
+        let set = PasteSuppressionSet(nowNs: { clock.now() })
+        let fp = PasteSuppressionSet.fingerprint(text: "A")
+        let t0 = clock.now()
+        set.record(fingerprint: fp, ttlSec: 300)
+        clock.advance(seconds: 60)
+        set.record(fingerprint: fp, ttlSec: 300)
+        // 候选 captured = T0 + 30s，落在两个锚点 (T0, T+60s) 之间真空区
+        // 锚点 a0 = T0：窗口 [T0-5s, T0+10s] → 不覆盖 T0+30s
+        // 锚点 a1 = T+60s：窗口 [T+55s, T+70s] → 不覆盖 T0+30s
+        let independentCapture = t0 + 30 * 1_000_000_000
+        #expect(!set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: independentCapture))
+    }
+
+    @Test func anchorListIsBoundedByMaxAnchors() {
+        // 病态：同串短时间内连续 paste 远超上限。entry 不应无界增长。
+        let clock = MutableNsClock(1_700_000_000_000_000_000)
+        let set = PasteSuppressionSet(nowNs: { clock.now() })
+        let fp = PasteSuppressionSet.fingerprint(text: "spam")
+        let n = PasteSuppressionSet.maxAnchorsPerFingerprint + 5
+        for _ in 0..<n {
+            set.record(fingerprint: fp, ttlSec: 300)
+            clock.advance(seconds: 1)  // 间隔够远不会自然过期
+        }
+        // entry 仍只有 1 个 fp，最新若干锚点应仍命中本次 echo
+        #expect(set.activeCount() == 1)
+        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: clock.now()))
     }
 
     // MARK: - Fingerprint helpers
