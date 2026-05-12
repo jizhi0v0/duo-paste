@@ -122,6 +122,33 @@ struct PasteSuppressionSetTests {
         #expect(!set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: echoBeyondSkew))
     }
 
+    // MARK: - P2 review #2 回归：未来合法同内容 capture 不应被误杀
+
+    @Test func candidateAfterEchoWindowIsNotSuppressed() {
+        // 场景：用户在 MBP paste "ok"（record 在 T0），TTL 300s 内 entry 还活着。
+        // 过了 120s（远超 60s 默认 echo window），用户切到 mini 在某个上下文里独立
+        // 复制了一个"ok"——这是新的合法 capture，**不**是 paste echo。应放行入 mirror。
+        let clock = MutableNsClock(1_700_000_000_000_000_000)
+        let set = PasteSuppressionSet(nowNs: { clock.now() })
+        let fp = PasteSuppressionSet.fingerprint(text: "ok")
+        let recordTime = clock.now()
+        set.record(fingerprint: fp, ttlSec: 300)
+        // 候选 captured = record + 120s，超过 60s 默认 echo window
+        let candidate = recordTime + 120 * 1_000_000_000
+        #expect(!set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: candidate))
+    }
+
+    @Test func candidateWithinEchoWindowIsSuppressed() {
+        // 正向：echo 窗口内（默认 60s）的候选应被抑制。
+        let clock = MutableNsClock(1_700_000_000_000_000_000)
+        let set = PasteSuppressionSet(nowNs: { clock.now() })
+        let fp = PasteSuppressionSet.fingerprint(text: "ok")
+        let recordTime = clock.now()
+        set.record(fingerprint: fp, ttlSec: 300)
+        let candidate = recordTime + 30 * 1_000_000_000   // +30s，典型 PullWorker tick
+        #expect(set.shouldSuppress(fingerprint: fp, candidateCapturedAtNs: candidate))
+    }
+
     // MARK: - Fingerprint helpers
 
     @Test func fingerprintForItemPrefersBlobForImage() {

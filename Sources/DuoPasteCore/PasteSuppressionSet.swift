@@ -49,6 +49,16 @@ public final class PasteSuppressionSet: @unchecked Sendable {
     /// 真 echo 几乎总是 candidate > record（mini watcher tick 之后才 stamp）。
     public static let defaultSkewNs: Int64 = 5_000_000_000
 
+    /// "echo 窗口"上界（纳秒）。候选 captured 在 `[record - skew, record + echoWindow]`
+    /// 之内才视为 echo 抑制。默认 60s——覆盖 Continuity sync (< 1s) + PullWorker 30s 默认
+    /// tick + 若干余量。
+    ///
+    /// **跟内存 TTL 解耦的关键**：内存 TTL（pasteBack 传给 record 的 ttlSec）只决定
+    /// "entry 在内存里存多久"；echo window 是单独的"什么 capture 时刻才算 echo"。
+    /// 否则会把"paste 之后几分钟用户在对端独立 Cmd+C 同内容"也当 echo 永久 skip——
+    /// 这是 P2 review #2 的回归保护。
+    public static let defaultEchoWindowNs: Int64 = 60_000_000_000
+
     public init(nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() }) {
         self.nowNs = nowNs
     }
@@ -71,19 +81,25 @@ public final class PasteSuppressionSet: @unchecked Sendable {
         pruneExpiredLocked(now: now)
     }
 
-    /// 是否应当抑制候选行。要求 fp 在窗口内 **且** 候选 captured_at_ns >= record - skew。
-    /// 第二条挡 catch-up 误杀（同内容历史行 captured 远早于本次 paste record）。
+    /// 是否应当抑制候选行。要求 fp 在窗口内 **且** 候选 captured_at_ns 落在
+    /// `[recordedAtNs - skewNs, recordedAtNs + echoWindowNs]` 区间内。
+    ///
+    /// - 下界（`record - skew`）：挡 catch-up 误杀历史行（同内容碰撞但 captured 远早于本次 paste）
+    /// - 上界（`record + echoWindow`）：挡未来的合法独立同内容捕获（用户分钟后在对端 Cmd+C
+    ///   同样的串，跟本次 paste 不是 echo 关系，必须放行）
     public func shouldSuppress(
         fingerprint: Fingerprint,
         candidateCapturedAtNs: Int64,
-        skewNs: Int64 = PasteSuppressionSet.defaultSkewNs
+        skewNs: Int64 = PasteSuppressionSet.defaultSkewNs,
+        echoWindowNs: Int64 = PasteSuppressionSet.defaultEchoWindowNs
     ) -> Bool {
         let now = nowNs()
         lock.lock(); defer { lock.unlock() }
         pruneExpiredLocked(now: now)
         guard let entry = entries[fingerprint] else { return false }
-        // 候选行 captured 必须 >= recordedAtNs - skew —— 否则是历史行碰撞，放行
-        return candidateCapturedAtNs >= entry.recordedAtNs - skewNs
+        let lo = entry.recordedAtNs - skewNs
+        let hi = entry.recordedAtNs + echoWindowNs
+        return candidateCapturedAtNs >= lo && candidateCapturedAtNs <= hi
     }
 
     /// 测试用：当前活跃 entry 数（已清过期后）。

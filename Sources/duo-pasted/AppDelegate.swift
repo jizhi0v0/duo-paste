@@ -187,14 +187,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pasteBack(_ item: Item) {
-        Copyback.write(item: item, blobs: deps.blobs)
-        // 把 watcher 内部的 lastChangeCount 推到当前，
-        // 这样下次 tick 自然认为"没变化"，避免把粘回的内容当成新捕获。
+        let wrote = Copyback.write(item: item, blobs: deps.blobs)
+        // 把 watcher 内部的 lastChangeCount 推到当前——即使 Copyback 失败也要做：
+        // Copyback 内部已 clearContents()，changeCount 已 bump，不抑制下次 tick 会把
+        // 这次空 pasteboard 当新捕获。
         watcher.suppressUpToCurrent()
         // 跨设备 paste-echo 抑制：本机 paste 的内容如果通过 Universal Clipboard 被对端
         // capture 后再 push 回来，PullWorker 命中此 set → skip 不写 mirror。
-        // TTL 300s = max(pullInterval) + 对端 capture/push 节奏 + buffer，覆盖 30s 默认间隔最坏路径。
-        if let fp = PasteSuppressionSet.fingerprint(forItem: item) {
+        // **必须**只在 Copyback 真写成功时 record——blob 缺失（lazy-pull 前的窗口期常见）
+        // 时 Copyback 返回 false 跳出，此时根本没内容去 echo；若仍 record 了 fp，对端**合法**
+        // 的同内容独立 capture 反而会被误杀。
+        if wrote, let fp = PasteSuppressionSet.fingerprint(forItem: item) {
             deps.pasteSuppressions.record(fingerprint: fp, ttlSec: 300)
         }
     }
