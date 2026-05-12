@@ -158,12 +158,13 @@ PullWorker `lastPullNs` 非 nil（至少完成过一轮 `has_more=false` 追平�
 
 ### NSPasteboard 自写回环——双层防御
 
-剪贴板管理器自己粘回内容会触发自己的监听器看到 changeCount 变化。曾试过"记 `pb.changeCount` 再等值比较"方案，实测**不稳**（写多 type 或写时机微妙错位都会漏）。当前两层：
+剪贴板管理器自己粘回内容会触发自己的监听器看到 changeCount 变化。曾试过"记 `pb.changeCount` 再等值比较"方案，实测**不稳**（写多 type 或写时机微妙错位都会漏）。当前防御：
 
-1. **写后立刻** `watcher.suppressUpToCurrent()`——把 watcher 内部 `lastChangeCount` 推到当前 `pasteboard.changeCount`，下一 tick 自然 `cc == lastChangeCount` 跳过。位置：`AppDelegate.pasteBack(_:)`
-2. **Watcher.extract() 顶端**：`frontApp.pid == ProcessInfo.processInfo.processIdentifier → return nil`——搜索面板打开期间任何剪贴板活动都不入库（用户在搜索框 Cmd+C 也不污染）
+**写后立刻** `watcher.suppressUpToCurrent()`——把 watcher 内部 `lastChangeCount` 推到当前 `pasteboard.changeCount`，下一 tick 自然 `cc == lastChangeCount` 跳过。位置：`AppDelegate.pasteBack(_:)`。
 
-**不要**重新引入 `lastSelfWriteChangeCount` 静态比较方案；**不要**删 self-pid 过滤。
+**不要**重新引入 `lastSelfWriteChangeCount` 静态比较方案。
+
+> 历史：曾有第二层防御——`Watcher.extract()` 顶端 `frontApp.pid == self.pid → return nil`，意在防止"搜索框 Cmd+C 污染历史"。**已撤掉**（2026-05）。撤销原因：用户实际场景里更常想把搜索框里的串作为新剪贴板项入库（剪贴板管理器本质就是"复制就该被记录"）；self-pid 跳过的副作用是把 self frontmost 期间的 changeCount 吃掉但永不补，搜索结果永远 0 条。pasteBack 已经有 suppressUpToCurrent 做隔离，self-pid 过滤是多余且有害的。不要再加回去。
 
 ### SwiftUI TextField + 列表导航——NSEvent local monitor
 

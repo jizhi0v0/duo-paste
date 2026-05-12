@@ -19,6 +19,8 @@ final class AppDependencies {
     /// Pull worker 跟 SearchProvider 间的非阻塞状态通道。`pull.enabled=false` 时这个对象
     /// 永远不被 set → SearchProvider 走原 .local / .remoteOK 逻辑。
     let mirrorStatus: MirrorStatus
+    /// 跨设备 paste-echo 抑制集合。AppDelegate.pasteBack 写入；PullWorker 应用 mirror 时查。
+    let pasteSuppressions: PasteSuppressionSet
 
     init() throws {
         let paths = Paths.makeDefault()
@@ -41,6 +43,7 @@ final class AppDependencies {
         self.searchAPI = searchAPI
         let mirrorStatus = MirrorStatus()
         self.mirrorStatus = mirrorStatus
+        self.pasteSuppressions = PasteSuppressionSet()
 
         // primary_url 配置好且能加载到 shared secret → 准备远端搜索；否则 nil 走本地
         var remote: SearchTransport? = nil

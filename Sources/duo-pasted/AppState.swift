@@ -24,6 +24,11 @@ final class AppState {
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
     var scrollPulse: Int = 0
+    /// 面板每次显示的脉冲计数。SearchPanelController.show() 每次 +1。
+    /// SearchView 用 .onChange 监听：把 TextField 焦点抢回来 + 立即 kick 一次 refresh。
+    /// 原因：NSPanel 被复用（orderOut 不销毁 hosting view），onAppear / .task(id:query)
+    /// 在 reshow 时不会再 fire，焦点会丢、stale results 不会刷新。
+    var openPulse: Int = 0
     /// 最近一次 capture 被跳过的提示（超过 CaptureLimits）。
     /// 5 分钟内有值 → SearchView 顶部黄色 banner；用户能手动 ✕ 关闭立即清掉。
     /// 不持久化——重启就清，是 "刚才有点东西没存下来" 的实时提示。

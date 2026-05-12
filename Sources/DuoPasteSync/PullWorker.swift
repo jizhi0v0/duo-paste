@@ -48,6 +48,10 @@ public actor PullWorker {
     private let transport: SinceTransport
     private let selfDeviceID: String
     private let mirrorStatus: MirrorStatus
+    /// 跨设备 paste-echo 抑制：本机 pasteBack 写 NSPasteboard 后通过 Continuity 反弹到对端
+    /// 又被对端 watcher capture 推回来时，PullWorker 在 applyPage 里查这个 set，命中 skip。
+    /// nil = 抑制功能未启用（standalone / 测试不传）。
+    private let pasteSuppressions: PasteSuppressionSet?
     private let config: Config
     private let nowNs: @Sendable () -> Int64
     private let log: @Sendable (String) -> Void
@@ -61,6 +65,7 @@ public actor PullWorker {
         transport: SinceTransport,
         selfDeviceID: String,
         mirrorStatus: MirrorStatus,
+        pasteSuppressions: PasteSuppressionSet? = nil,
         config: Config = .default,
         nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() },
         log: @escaping @Sendable (String) -> Void = { msg in
@@ -71,6 +76,7 @@ public actor PullWorker {
         self.transport = transport
         self.selfDeviceID = selfDeviceID
         self.mirrorStatus = mirrorStatus
+        self.pasteSuppressions = pasteSuppressions
         self.config = config
         self.nowNs = nowNs
         self.log = log
@@ -129,8 +135,8 @@ public actor PullWorker {
                 sleepSec = config.intervalSec
             }
 
-            if r.applied > 0 || r.skippedDedup > 0 || r.hadTransient {
-                log("tick applied=\(r.applied) dedup-skip=\(r.skippedDedup) hasMore=\(r.hasMore) transient=\(r.hadTransient) sleep=\(sleepSec)")
+            if r.applied > 0 || r.skippedDedup > 0 || r.skippedPasteEcho > 0 || r.hadTransient {
+                log("tick applied=\(r.applied) dedup-skip=\(r.skippedDedup) paste-echo-skip=\(r.skippedPasteEcho) hasMore=\(r.hasMore) transient=\(r.hadTransient) sleep=\(sleepSec)")
             }
 
             if sleepSec > 0 {
@@ -146,8 +152,9 @@ public actor PullWorker {
     }
 
     private struct TickResult: Sendable {
-        var applied: Int = 0    // 实际写入 item_mirror 的行数（已扣除 origin=self + 跨设备 dedup skip）
+        var applied: Int = 0    // 实际写入 item_mirror 的行数（已扣除 origin=self + 跨设备 dedup skip + paste-echo skip）
         var skippedDedup: Int = 0  // 跨设备 Continuity dedup skip 数（诊断用，本机已有同内容 own item）
+        var skippedPasteEcho: Int = 0  // PasteSuppressionSet 命中 skip 数（本机刚 paste 过，对端 Continuity 反弹回来）
         var hasMore: Bool = false
         var hadTransient: Bool = false
     }
@@ -225,6 +232,7 @@ public actor PullWorker {
                 let applied = try await applyPage(page, primaryID: currentPrimaryID)
                 result.applied = applied.written
                 result.skippedDedup = applied.dedupSkipped
+                result.skippedPasteEcho = applied.pasteEchoSkipped
                 result.hasMore = page.hasMore
             } catch {
                 log("apply page failed: \(error)")
@@ -269,49 +277,63 @@ public actor PullWorker {
     private struct ApplyOutcome {
         var written: Int
         var dedupSkipped: Int
+        var pasteEchoSkipped: Int
     }
 
-    /// 写 item_mirror + 更新 pull_cursor，单事务。返回实际入表行数（扣除 origin=self + 跨设备 dedup skip）。
+    /// 写 item_mirror + 更新 pull_cursor，单事务。返回实际入表行数（扣除 origin=self + 跨设备 dedup skip + paste-echo skip）。
     private func applyPage(_ page: SincePageWire, primaryID: String) async throws -> ApplyOutcome {
         let device = selfDeviceID
         let now = nowNs()
         let windowNs = config.crossDeviceDedupWindowNs
+        let suppressions = pasteSuppressions
         return try await database.pool.write { db -> ApplyOutcome in
             var written = 0
             var dedupSkipped = 0
+            var pasteEchoSkipped = 0
             for item in page.items {
                 // 跳过自家 origin —— 已经在 item 表里，搜索 UNION 时不重叠
                 if item.originDevice == device { continue }
+                // Paste-echo 抑制（PasteSuppressionSet）：本机刚 pasteBack 写过的内容，被对端通过
+                // Universal Clipboard 同步走 + 对端 watcher capture，再通过 /since 推回来。
+                // 这条理应不进 mirror（避免历史里出现一条"我刚 paste 的副本"）。
+                // 跟下面的 crossDeviceDedup 路径正交：dedup 需要本机有 own item 当锚点；
+                // paste 路径不写 own item，所以只能靠这个内存 set。
+                //
+                // 跟 dedup 一样：只对**首次入 mirror** 生效。已 mirrored 的 id 是 state update
+                // （软删 / pin 变更回放），必须放过。
+                let alreadyMirrored: Bool = try {
+                    try Int.fetchOne(db, sql: "SELECT 1 FROM item_mirror WHERE id = ?", arguments: [item.id]) != nil
+                }()
+                // 候选 capturedAtNs 必须传给 suppression：shouldSuppress 还要求 capturedAt
+                // 在 record 时刻之后（容 5s skew），否则 catch-up 时同内容的历史行会被
+                // 永久误杀（cursor 已推进，再也拉不回来）。这是 P2 review fix。
+                if !alreadyMirrored, let suppressions,
+                   let fp = PasteSuppressionSet.fingerprint(forItem: item),
+                   suppressions.shouldSuppress(
+                       fingerprint: fp,
+                       candidateCapturedAtNs: item.capturedAtNs
+                   )
+                {
+                    pasteEchoSkipped += 1
+                    continue
+                }
                 // 跨设备 Continuity dedup：本机 origin=self 同内容在 ±window 内已存 →
                 // 这次拉来的是 Universal Clipboard 副本，skip 不写 mirror，UI 只显单条 own。
                 // windowNs=0 关闭这层；本设备没装 Continuity 或没开 Universal Clipboard 时
                 // findNearbyOwnContent 永远命中不了，开销几乎为零（走 captured_at_ns 索引）。
-                //
-                // 关键约束：dedup 只对**首次入 mirror** 的行生效。如果 item_mirror 已有此 id，
-                // /since 这次推过来是 state update（典型场景：primary 标软删 / pin 状态变 /
-                // captured_at_ns merge bump 后回放），**必须**让 INSERT OR REPLACE 跑过去
-                // 把新状态盖上——否则 race 进入 mirror 的 stale row 永远不会被标软删，UI
-                // 还会持续搜得到（即便 primary 已删）。
-                if windowNs > 0 {
-                    let alreadyMirrored = try Int.fetchOne(
-                        db,
-                        sql: "SELECT 1 FROM item_mirror WHERE id = ?",
-                        arguments: [item.id]
-                    ) != nil
-                    if !alreadyMirrored,
-                       try DuoPasteCore.Database.findNearbyOwnContent(
-                           db,
-                           kind: item.kind,
-                           textFull: item.textFull,
-                           blobSha256: item.blobSha256,
-                           ownDeviceID: device,
-                           capturedAtNs: item.capturedAtNs,
-                           windowNs: windowNs
-                       ) != nil
-                    {
-                        dedupSkipped += 1
-                        continue
-                    }
+                if windowNs > 0, !alreadyMirrored,
+                   try DuoPasteCore.Database.findNearbyOwnContent(
+                       db,
+                       kind: item.kind,
+                       textFull: item.textFull,
+                       blobSha256: item.blobSha256,
+                       ownDeviceID: device,
+                       capturedAtNs: item.capturedAtNs,
+                       windowNs: windowNs
+                   ) != nil
+                {
+                    dedupSkipped += 1
+                    continue
                 }
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO item_mirror
@@ -348,7 +370,7 @@ public actor PullWorker {
                     cursor_id = excluded.cursor_id,
                     updated_at_ns = excluded.updated_at_ns
             """, arguments: [primaryID, page.nextCursor.ingestedAtNs, page.nextCursor.id, now])
-            return ApplyOutcome(written: written, dedupSkipped: dedupSkipped)
+            return ApplyOutcome(written: written, dedupSkipped: dedupSkipped, pasteEchoSkipped: pasteEchoSkipped)
         }
     }
 }

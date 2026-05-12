@@ -289,6 +289,147 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     #expect(ownStill != nil)
 }
 
+@Test func pullWorkerSkipsPasteEchoViaSuppressionSet() async throws {
+    // 场景：本机 pasteBack "shared text" 后通过 macOS Universal Clipboard 反弹到对端，
+    // 对端 watcher capture 后 push 回来。本机没有 own item（paste 不写 own）→
+    // crossDeviceDedup 的 own-item dedup 找不到锚点，必须靠 PasteSuppressionSet 拦截。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+    let echoed = mkItem(
+        id: "mini-echo", origin: "mini-primary",
+        ingestedAtNs: baseline + 1_000_000_000,   // echo: capturedAt 比 record 晚 1s
+        text: "shared text"
+    )
+    let transport = FakeSinceTransport(
+        pages: [page(items: [echoed], nextNs: baseline + 1_000_000_000, nextID: "mini-echo", hasMore: false)],
+        healthDeviceID: "mini-primary"
+    )
+    // 注入固定 nowNs = baseline，让 suppression record 的锚点正好在 baseline
+    let suppressions = PasteSuppressionSet(nowNs: { baseline })
+    // 模拟 pasteBack：把 "shared text" 指纹塞进 set
+    suppressions.record(
+        fingerprint: PasteSuppressionSet.fingerprint(text: "shared text"),
+        ttlSec: 60
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        pasteSuppressions: suppressions,
+        // crossDeviceDedupWindowNs=0：明确排除 own-item dedup 路径，保证测的是 paste-echo 拦截
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
+    )
+    await runWorkerBriefly(worker)
+
+    let mirrorCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? -1
+    }
+    #expect(mirrorCount == 0)
+}
+
+@Test func pullWorkerCatchUpDoesNotSuppressHistoricalRowSameContent() async throws {
+    // P2 review 回归：client 离线一段时间后 catch-up，恰好 paste 了一个常见短串 X，
+    // /since 拉到一条**历史**的同内容 X 行（captured_at_ns 远早于 paste record）。
+    // 之前 suppression 只看 fp → 误杀历史行 + cursor 仍前进 → 那条行永远拉不回来。
+    // 修复后：suppression 要求 candidate.capturedAtNs >= recordedAtNs - skew，
+    // 历史行不满足 → 正常写 mirror。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let pasteRecordNs: Int64 = 1_780_000_000_000_000_000   // 用户 paste 时刻
+    let historicalCapturedNs = pasteRecordNs - 7 * 24 * 3600 * 1_000_000_000  // 一周前
+    let historicalItem = Item(
+        id: "old-row", originDevice: "mini-primary",
+        capturedAtNs: historicalCapturedNs,
+        ingestedAtNs: historicalCapturedNs + 1_000_000,
+        kind: .text, preview: "ok", textFull: "ok",
+        pushState: .acked
+    )
+    let transport = FakeSinceTransport(
+        pages: [page(
+            items: [historicalItem],
+            nextNs: historicalCapturedNs + 1_000_000,
+            nextID: "old-row",
+            hasMore: false
+        )],
+        healthDeviceID: "mini-primary"
+    )
+    let suppressions = PasteSuppressionSet(nowNs: { pasteRecordNs })
+    suppressions.record(
+        fingerprint: PasteSuppressionSet.fingerprint(text: "ok"),
+        ttlSec: 300
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        pasteSuppressions: suppressions,
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
+    )
+    await runWorkerBriefly(worker)
+
+    // 历史行应该正常写入 mirror —— 不被 suppression 误杀
+    let mirrorCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='old-row'") ?? -1
+    }
+    #expect(mirrorCount == 1)
+}
+
+@Test func pullWorkerPasteEchoDoesNotBlockAlreadyMirroredRowUpdate() async throws {
+    // 回归：paste-echo 抑制只对**首次入 mirror** 生效。若 item_mirror 已有此 id
+    // （race 中 mirror 先写、suppression 才 record；或 paste 同一历史项第二次），
+    // 后续 state update（软删 / pin 变更）必须能盖上 mirror 行，不被 suppression 误挡。
+    let db = try makeClientDB()
+    let selfID = "mbp-self"
+    let baseline: Int64 = 1_700_000_000_000_000_000
+
+    // 预置 mirror 表里已有 (id="mini-echo", "shared text") 一行
+    try await db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item_mirror
+              (id, origin_device, captured_at_ns, ingested_at_ns, kind,
+               source_app, source_app_name, preview, text_full,
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, mirrored_at_ns)
+            VALUES (?, 'mini-primary', ?, ?, 'text', NULL, NULL, 'shared text', 'shared text',
+                    NULL, NULL, NULL, 0, NULL, ?)
+        """, arguments: ["mini-echo", baseline, baseline, baseline])
+    }
+    // primary 推过来一次软删（同 id，新 ingested_at_ns）
+    let softDelete = Item(
+        id: "mini-echo", originDevice: "mini-primary",
+        capturedAtNs: baseline, ingestedAtNs: baseline + 1_000_000_000,
+        kind: .text, preview: "shared text", textFull: "shared text",
+        deletedAtNs: baseline + 1_000_000_000, pushState: .acked
+    )
+    let transport = FakeSinceTransport(
+        pages: [page(items: [softDelete], nextNs: baseline + 1_000_000_000, nextID: "mini-echo", hasMore: false)],
+        healthDeviceID: "mini-primary"
+    )
+    let suppressions = PasteSuppressionSet(nowNs: { baseline })
+    // suppression 命中（模拟用户最近又 paste 了一次"shared text"）
+    suppressions.record(
+        fingerprint: PasteSuppressionSet.fingerprint(text: "shared text"),
+        ttlSec: 60
+    )
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: selfID,
+        mirrorStatus: MirrorStatus(),
+        pasteSuppressions: suppressions,
+        config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
+    )
+    await runWorkerBriefly(worker)
+
+    // mirror 行应被软删盖上，不被 suppression 误挡
+    let deletedAt: Int64? = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item_mirror WHERE id='mini-echo'")
+    }
+    #expect(deletedAt == baseline + 1_000_000_000)
+}
+
 @Test func pullWorkerWritesMirrorWhenNoOwnDuplicate() async throws {
     // 反向回归：本机 item 表里没有同内容时，mirror 行应正常写入（dedup 不能误伤）。
     let db = try makeClientDB()
