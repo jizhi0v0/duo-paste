@@ -90,7 +90,7 @@
 }
 ```
 
-`pull.enabled=true` 才会跑 mirror（DR + 离线全集搜索；M3 才真实现 pull worker，目前只是 schema 占位）。`shared-secret` 文件三台机同份（`scp` 过去 + `chmod 600`）。
+`pull.enabled=true` 才会启动 PullWorker mirror（DR + 离线全集搜索；实现细节见上方"M3 第二刀 完成"段）。`shared-secret` 文件三台机同份（`scp` 过去 + `chmod 600`）。
 
 ### 关键路径
 
