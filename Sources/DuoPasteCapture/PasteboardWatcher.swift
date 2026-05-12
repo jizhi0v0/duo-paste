@@ -99,11 +99,11 @@ public final class PasteboardWatcher {
 
     private func extract(capturedAtNs: Int64) -> CapturedPasteboard? {
         let frontApp = NSWorkspace.shared.frontmostApplication
-        // 自己是前台时（搜索面板打开期间）任何剪贴板变化都不入库，
-        // 否则用户在搜索框里选中文本一 Cmd+C 就会污染历史
-        if frontApp?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
-            return nil
-        }
+        // 注：早期版本会在 frontApp.pid == self.pid 时直接 return nil，理由是"搜索框
+        // Cmd+C 不污染历史"。但实测用户更常的诉求是把搜索框里的串作为新剪贴板项入库
+        // （剪贴板管理器本质就是"复制就该被记录"）。self-pid 跳过的副作用：那次
+        // changeCount 被吃掉再也不补，搜索结果永远 0 条。已取消跳过；pasteBack 路径
+        // 自己用 suppressUpToCurrent 保护，不依赖 self-pid 过滤。
         let bundleID = frontApp?.bundleIdentifier
         let appName = frontApp?.localizedName
 

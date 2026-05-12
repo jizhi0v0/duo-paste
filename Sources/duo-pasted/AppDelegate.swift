@@ -116,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 transport: client,
                 selfDeviceID: deps.deviceID,
                 mirrorStatus: deps.mirrorStatus,
+                pasteSuppressions: deps.pasteSuppressions,
                 config: PullWorker.Config(intervalSec: TimeInterval(intervalSec))
             )
             self.pullWorker = worker
@@ -190,5 +191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 把 watcher 内部的 lastChangeCount 推到当前，
         // 这样下次 tick 自然认为"没变化"，避免把粘回的内容当成新捕获。
         watcher.suppressUpToCurrent()
+        // 跨设备 paste-echo 抑制：本机 paste 的内容如果通过 Universal Clipboard 被对端
+        // capture 后再 push 回来，PullWorker 命中此 set → skip 不写 mirror。
+        // TTL 300s = max(pullInterval) + 对端 capture/push 节奏 + buffer，覆盖 30s 默认间隔最坏路径。
+        if let fp = PasteSuppressionSet.fingerprint(forItem: item) {
+            deps.pasteSuppressions.record(fingerprint: fp, ttlSec: 300)
+        }
     }
 }

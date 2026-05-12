@@ -38,6 +38,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         p.makeKeyAndOrderFront(nil)
         installKeyMonitor()
+        // 触发 SearchView 重新抢焦点 + kick refresh（panel 被复用，onAppear 不再 fire）
+        state.openPulse &+= 1
     }
 
     func hide() {
