@@ -43,12 +43,14 @@ private func mkItem(
 private actor FakeSinceTransport: SinceTransport {
     private var pages: [SincePageWire]
     private var healthDeviceID: String
+    private var healthNowMs: Int64
     private(set) var fetchSinceCalls: [(SinceCursor, Int)] = []
     private(set) var healthCalls: Int = 0
 
-    init(pages: [SincePageWire], healthDeviceID: String) {
+    init(pages: [SincePageWire], healthDeviceID: String, healthNowMs: Int64 = 1_000) {
         self.pages = pages
         self.healthDeviceID = healthDeviceID
+        self.healthNowMs = healthNowMs
     }
 
     func setHealthDeviceID(_ id: String) {
@@ -74,7 +76,7 @@ private actor FakeSinceTransport: SinceTransport {
 
     private func _fetchPrimaryHealth() async -> PrimaryHealthResult {
         healthCalls += 1
-        return PrimaryHealthResult(outcome: .ok(deviceID: healthDeviceID, nowMs: 1_000))
+        return PrimaryHealthResult(outcome: .ok(deviceID: healthDeviceID, nowMs: healthNowMs))
     }
 }
 
@@ -579,6 +581,51 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         try Row.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item_mirror WHERE id='dead'")
     }
     #expect(row?["deleted_at_ns"] as Int64? == 999)
+}
+
+@Test func pullWorkerRecordsClockSkewFromHealth() async throws {
+    // /health 报 primary now_ms 比本机快 45s → MirrorStatus.clockSkewMs() 应反映出来。
+    // 用 nowNs 注入固定值让 skew 计算可预测：local = 1_000_000 ms，primary = 1_045_000 ms。
+    let db = try makeClientDB()
+    let primaryNowMs: Int64 = 1_045_000
+    let localNowNs: Int64 = 1_000_000 * 1_000_000  // 1_000_000 ms in ns
+    let transport = FakeSinceTransport(
+        pages: [page(items: [], nextNs: 0, nextID: "", hasMore: false)],
+        healthDeviceID: "primary",
+        healthNowMs: primaryNowMs
+    )
+    let status = MirrorStatus()
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: "client-self",
+        mirrorStatus: status,
+        config: PullWorker.Config(intervalSec: 60, clockSkewWarnMs: 30_000),
+        nowNs: { localNowNs }
+    )
+    await runWorkerBriefly(worker)
+    #expect(status.clockSkewMs() == 45_000)
+}
+
+@Test func pullWorkerRecordsNegativeClockSkew() async throws {
+    // 反向：primary 比本机慢 60s。
+    let db = try makeClientDB()
+    let transport = FakeSinceTransport(
+        pages: [page(items: [], nextNs: 0, nextID: "", hasMore: false)],
+        healthDeviceID: "primary",
+        healthNowMs: 940_000
+    )
+    let status = MirrorStatus()
+    let worker = PullWorker(
+        database: db,
+        transport: transport,
+        selfDeviceID: "self",
+        mirrorStatus: status,
+        config: PullWorker.Config(intervalSec: 60),
+        nowNs: { 1_000_000 * 1_000_000 }
+    )
+    await runWorkerBriefly(worker)
+    #expect(status.clockSkewMs() == -60_000)
 }
 
 @Test func pullWorkerHTTPEndToEnd() async throws {

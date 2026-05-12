@@ -26,19 +26,28 @@ public actor PullWorker {
         /// 有无 origin=self 同内容在窗口内已存——命中则 skip mirror 入库，UI union
         /// 看到的就是单条 own。Universal Clipboard 同步通常 < 1s，5s buffer 充足。
         public var crossDeviceDedupWindowNs: Int64
+        /// 时钟偏移告警阈值（毫秒）。|primary.now_ms - local.now_ms| 超过这个值 →
+        /// log warn + 通过 MirrorStatus 暴露给 UI banner。
+        ///
+        /// HMAC 签名容忍 ±5 分钟 skew（300_000 ms），所以 30s 是"健康但要注意"的早期信号。
+        /// 用户场景：mini 长期休眠 / 路由器走不同 NTP 源 / 虚机时钟漂移；这些都不至于
+        /// 立刻 401，但快到边界就该提醒了。
+        public var clockSkewWarnMs: Int64
 
         public init(
             intervalSec: TimeInterval = 30,
             batchLimit: Int = 500,
             initialBackoffSec: TimeInterval = 2,
             maxBackoffSec: TimeInterval = 120,
-            crossDeviceDedupWindowNs: Int64 = 5_000_000_000
+            crossDeviceDedupWindowNs: Int64 = 5_000_000_000,
+            clockSkewWarnMs: Int64 = 30_000
         ) {
             self.intervalSec = intervalSec
             self.batchLimit = batchLimit
             self.initialBackoffSec = initialBackoffSec
             self.maxBackoffSec = maxBackoffSec
             self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
+            self.clockSkewWarnMs = clockSkewWarnMs
         }
 
         public static let `default` = Config()
@@ -174,8 +183,9 @@ public actor PullWorker {
             return result
         }
         let currentPrimaryID: String
+        let primaryNowMs: Int64
         switch healthRes.outcome {
-        case .ok(let id, _):
+        case .ok(let id, let nowMs):
             // 拒绝空 device_id：会污染 pull_cursor.primary_id 主键 + 在 reconcile 里假阳性触发
             // mirror 清空。理论上 server 永远不会返回空（DeviceID.loadOrCreate 保证），
             // 但万一旧版 / 篡改 / 网络中间件改包，guard 在这里。
@@ -185,6 +195,7 @@ public actor PullWorker {
                 return result
             }
             currentPrimaryID = id
+            primaryNowMs = nowMs
         case .unreachable(let r):
             log("health unreachable: \(r)")
             result.hadTransient = true
@@ -195,6 +206,16 @@ public actor PullWorker {
             return result
         }
         mirrorStatus.setPrimaryDeviceID(currentPrimaryID)
+
+        // 1b. 时钟偏移 sanity check。primary now_ms vs local wall-clock，单位毫秒（signed）。
+        // 用本地 wall-clock（nowNs / 1e6）跟 primary now_ms 比；rountrip 半程当 0，对 30s 阈值
+        // 影响 < 100ms 量级可忽略。
+        let localNowMs = nowNs() / 1_000_000
+        let skew = primaryNowMs - localNowMs
+        mirrorStatus.setClockSkewMs(skew)
+        if abs(skew) >= config.clockSkewWarnMs {
+            log("clock skew warn: primary=\(primaryNowMs)ms local=\(localNowMs)ms diff=\(skew)ms (threshold=\(config.clockSkewWarnMs)ms)")
+        }
 
         // 2. 检测 primary 换了 → 清空 mirror + cursor
         do {
