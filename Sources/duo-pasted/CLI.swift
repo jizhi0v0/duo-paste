@@ -130,8 +130,10 @@ enum CLI {
             exit(1)
         }
         printAuditReport(report, primaryURL: primaryURL, sampleLimit: sampleLimit)
-        // exit 码：missing 非 0 或 failed 非 0 → 1，便于脚本接管
-        exit((report.missingTotal > 0 || report.failed > 0) ? 1 : 0)
+        // exit 码：missing / failed / stale 任一非 0 → 1，便于脚本接管。
+        // dedupAbsorbed 是预期行为不计入。stale 走 exit 1 是因为 RemoteIngester 当前不更新已有
+        // 行，操作员需要先解决（手动重 push、或 promote 之后才能"修正"primary 状态）
+        exit((report.missingTotal > 0 || report.failed > 0 || report.staleTotal > 0) ? 1 : 0)
     }
 
     /// async → sync 桥。CLI 路径上没有 runtime；用 DispatchSemaphore + 一个分离 task。
@@ -156,6 +158,20 @@ enum CLI {
         lines.append("missing on primary: \(r.missingTotal)\(r.missingTotal > sampleLimit ? " (展示前 \(sampleLimit) 条)" : "")")
         for id in r.missingOnPrimary {
             lines.append("  - \(id)")
+        }
+        if r.dedupAbsorbed > 0 {
+            lines.append("")
+            lines.append("continuity dedup absorbed: \(r.dedupAbsorbed)\(r.dedupAbsorbed > sampleLimit ? " (展示前 \(sampleLimit) 条)" : "") · 预期行为，跨设备同内容被 primary 用别的 id 承接")
+            for s in r.dedupAbsorbedSamples {
+                lines.append("  - \(s.localID) → \(s.absorbedByID)")
+            }
+        }
+        if r.staleTotal > 0 {
+            lines.append("")
+            lines.append("stale on primary: \(r.staleTotal)\(r.staleTotal > sampleLimit ? " (展示前 \(sampleLimit) 条)" : "") · 本地 state 已变但 primary 未更新（RemoteIngester 当前不更新已有行）")
+            for s in r.staleSamples {
+                lines.append("  - \(s.id): \(s.reasons.joined(separator: ", "))")
+            }
         }
         if !r.failedSamples.isEmpty {
             lines.append("")
