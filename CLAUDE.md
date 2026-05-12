@@ -19,14 +19,19 @@
   - `MirrorStatus` 共享对象（NSLock）：PullWorker 写 `lastPullNs`/`primaryDeviceID`，SearchProvider 读
   - `SinceClient` (HTTPIngestClient extension) 实现 `SinceTransport`：`/since` + `/health`（容忍 String/Int64/Double 三种 `now_ms` 编码）
   - `PullWorker` actor：仿 PushWorker 单 actor 串行 tick。每 tick = `/health` → 比对 persisted primary_id（变了 → 清空 mirror + cursor 重拉）→ `/since` → INSERT OR REPLACE item_mirror（**跳过 origin=self**，让 union 不重叠）→ 更新 pull_cursor。`has_more=true` 立刻接下一页，否则 sleep `pull.interval_sec`（默认 30s）。`lastPullNs` 只在 `!hadTransient && !hasMore` 时设——表示"已严格追平"
-  - `SearchAPI.searchUnion` + `fetchHitsMirror`：item + item_mirror 各超量取 limit+offset，**先按 id dedupe（取 capturedAtNs 最大那份，无视 pinned 状态）**，再按 (pinned DESC, captured_at_ns DESC) 排序，最后裁 limit/offset
+  - `SearchAPI.searchUnion` + `fetchHitsMirror`：item + item_mirror 各超量取 limit+offset，**先按 id dedupe（取 capturedAtNs 最大那份，无视 pinned 状态）**，再按 (pinned DESC, prefix DESC, captured_at_ns DESC) 排序，最后裁 limit/offset
   - `SearchProvider.Mode.localMirror(stalenessSec:)`：`mirrorLastPullNs()` 非 nil → 直接走 `searchUnion`，**不**打远端
   - UI banner：`.localMirror` 灰色「本地镜像 · 更新于 Xs/m/h 前」；`.remoteFallback` 黄色保留
 - **Capture 字节守门 完成**：`config.capture.{max_blob_mb=32, max_text_kb=512}` 默认。意外复制超大对象跳过入库（NSPasteboard 自身不受影响，Cmd+V 仍正常）。UI 端 orange skipBanner 5 分钟自动消失 + 手动 ✕ 关闭。详见下文设计决策段
-- **M3 第三刀 未开始**：`promote-to-primary` / `audit-push` / `migrate-primary` / blob 懒拉 / 时钟偏移检查
-- **测试**：107/107 通过（`swift test`）。新增 PullWorkerTests 含同进程 server + 真 HTTP 全链路；SearchUnionTests 覆盖排序/dedup/pinned/软删/FTS；SearchProviderTests 含 mirror-skip-remote 回归保护
+- **M3 第三刀 部分完成**（PR#4 已 merge）：
+  - **时钟偏移 sanity check**：PullWorker 每 tick 在 `/health` 拿 `primary.now_ms` 跟本机 wall-clock 比对，通过 `MirrorStatus.clockSkewMs()` 暴露给 UI；|skew| ≥ 30s 时 log warn + `SearchView.clockSkewBanner` 黄色提示（HMAC 容忍 ±5 分钟，30s 是早期预警）
+  - **audit-push 子命令**：`duo-pasted audit-push [--sample N]` 拿本机 own-origin item 跟 primary `/since` 全量对账。输出 push_state 分布 + missing on primary + failed 详情 + **Continuity dedup absorbed**（acked 但 id 不在 primary，内容在跨 origin 行 ±5s 找到）+ **stale on primary**（同 id 但 pinned / deletedAtNs / capturedAtNs diverge，RemoteIngester 不更新已有行造成）+ **dedupAbsorbedThenDeleted**（吸收源后被软删，单独成桶让操作员判断是否预期）。exit 码：missing/failed/stale 任一非 0 → 1
+  - 仍未做：`promote-to-primary` / `migrate-primary` / blob 懒拉（M3 第三刀剩余部分）
+- **RTF 三层降级 完成**（PR#3 + PR#5 合作）：watcher 抓 RTF 时优先 (a) pasteboard 自带非空 .string → 直接用；(b) raw RTF 字节 ≤ `maxTextBytes` cap → `decodeRTFToPlain` 用 NSAttributedString 解出 plain；(c) 失败/全空白/raw 太大 → 兜底存 raw rtf 让 CaptureService 字节守门拦下。`PasteboardWatcher.maxRawRTFBytes` 由 AppDelegate 注入 `deps.config.capture.maxTextBytes`，避免 50MB RTF 在 @MainActor 轮询路径上同步分配巨型 NSAttributedString
+- **搜索 prefix boost 完成**（PR#6）：搜索排序契约 `(pinned DESC, prefix DESC, captured_at_ns DESC)`。`preview` 起始命中 = 2 分 / `text_full` 起始命中 = 1 分 / 否则 0。**24h 时间窗**：只对 24h 内的项生效，跨天老内容哪怕起头匹配也按时间倒序排——剪贴板心智是"搜=找最近用过的"。SQL 端三条路径（`fetchHits` / `fetchHitsMirror` / `fetch`）+ Swift 端 `fetchUnion.prefixScore` 全部对称实现，回归测试见 `SearchPrefixBoostTests.swift`
+- **测试**：175/175 通过（`swift test`）。在 107 基线上新增：AuditPushTests（dedup / stale / soft-delete / 跨 origin / 边界）、PullWorker 时钟偏移正负向、SearchPrefixBoostTests 4 条覆盖排序契约。注意 PullWorker HTTP 端到端测试**已知偶发并发 flake**（端口/DB 竞争），单跑 `--filter PullWorker` 必绿
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
-- **下一站**：**M3 第三刀**——DR 运维子命令 (`promote-to-primary` / `audit-push` / `migrate-primary`) + blob 懒拉 + 时钟偏移 sanity check。详细拆解见 plans/...moonlit-wave.md
+- **下一站**：M3 第三刀剩余部分——`promote-to-primary` / `migrate-primary` 子命令 + blob 懒拉。promote 落地时**顺手 record primary tenure/lineage**，让 audit-push 后续做精确 Continuity-dedup 候选过滤（当前用 `origin != self` 启发式，多 primary lineage 下偏宽松，见 `AuditPush.swift` 的 `TODO(promote-lineage)`）。详细拆解见 plans/...moonlit-wave.md
 
 ## 架构与 Non-Goals
 
@@ -141,6 +146,25 @@ PullWorker `lastPullNs` 非 nil（至少完成过一轮 `has_more=false` 追平�
 不变量保护：`Tests/DuoPasteSyncTests/SearchTests.swift` 有 `searchProviderSkipsRemoteWhenMirrorActive` —— mock 远端 transport，断言 `callsCount() == 0`。reorder `if let last = mirrorLastPullNs()` 跟 `guard let remote else` 的次序就会红。
 
 跨表 dedupe（同 id 在 item 跟 item_mirror 都有，promote-to-primary 过渡期 / pin 状态分歧时常见）：**先**按 `captured_at_ns` 取最新那份，**后**做 (pinned DESC) 排序——否则旧 mirror 行带 pinned=true 会赢过新 own 行的 unpinned 文本。位置：`Search.swift fetchUnion`。
+
+### 搜索排序契约：pinned > prefix(24h) > time
+
+完整排序：`(pinned DESC, prefix_score DESC, captured_at_ns DESC)`。prefix_score：preview 以 query 起始 = 2 / text_full 起始 = 1 / 否则 0。**仅对 24h 内的项生效**——跨天老内容哪怕起头匹配也走纯时间倒序，剪贴板心智是"搜=找最近用过的"，不希望陈年老条目被翻上来。
+
+SQL 端三处必须对称：`fetchHits` / `fetchHitsMirror` / `fetch`，每处 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 计算 `_prefix` 列 + `CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1e9 - captured_at_ns) < 86400e9 THEN _prefix ELSE 0 END DESC` 包进 ORDER BY。prefix 占位符必须 `args.insert(at: 0)`（SELECT 列表的 `?` 出现在所有 WHERE/LIMIT 占位符之前）。
+
+Swift 端 `fetchUnion.prefixScore` 跟 SQL 端口径**必须**一致——跨表 dedup 后 SQL 算的 `_prefix` 列已丢，重算。回归测试 `SearchPrefixBoostTests.swift` 4 条覆盖：单表 boost / pinned 优先 / 24h 窗外不 boost / union 跨表保留优先级。改动任何一条排序都要先看测试是否仍通过。
+
+### RTF 三层降级 + raw-size 守门
+
+RTF 抓取走三层降级：
+1. pasteboard 同时写 `.string` 非空 → 直接用 plain
+2. raw RTF 字节 ≤ `maxRawRTFBytes`（= `config.capture.maxTextBytes`，默认 512KB）→ `decodeRTFToPlain` 用 NSAttributedString 解出 plain
+3. 解析失败 / 全空白 / raw 超 cap → 兜底存 raw rtf，让 CaptureService 字节守门拦下
+
+`maxRawRTFBytes` guard 是 PR#5 review 要求的修复：watcher 跑在 `@MainActor` 轮询路径上，`NSAttributedString(data:options:[.documentType:.rtf])` 同步解析 50MB markup 会在 UI 线程分配巨型 attributed string；用 raw-size guard 提前跳过 decode，让兜底层走到 CaptureService 字节守门时被拦下（decoded plain ≤ raw RTF，所以这种 case 解出来也大概率仍超 cap，无解码价值）。
+
+**不要回退**：把 `maxRawRTFBytes` 默认调大或去掉 guard 等于让 main actor 在 RTF 路径上裸跑——卡顿出现时极难溯源（轮询每 200ms 一次，单次 spike 会被淹没在 Instruments 噪声里）。
 
 ### PullWorker primary 换了的检测
 
@@ -297,6 +321,6 @@ swift build
 
 ```sh
 swift build              # debug
-swift test               # 跑 13 个测试
+swift test               # 175/175（PullWorker HTTP 偶发 flake，单跑 --filter PullWorker 必绿）
 swift build -c release   # release（install 脚本自动跑）
 ```
