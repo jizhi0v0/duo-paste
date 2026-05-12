@@ -398,6 +398,175 @@ private func pageOf(_ ids: [String], originDevice: String = "other", capturedAtN
     #expect(report.staleSamples.first?.reasons.contains(where: { $0.contains("captured_at_ns") }) == true)
 }
 
+// MARK: - lineage-aware 吸收源过滤
+
+private func insertLineage(
+    _ db: DuoDB, deviceID: String, startedAtNs: Int64, endedAtNs: Int64?
+) async throws {
+    try await db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO primary_lineage(device_id, started_at_ns, ended_at_ns)
+            VALUES (?, ?, ?)
+        """, arguments: [deviceID, startedAtNs, endedAtNs])
+    }
+}
+
+@Test func auditLineageAwareRestrictsAbsorberToActivePrimary() async throws {
+    // 跨任期内容碰撞场景。lineage 记录 mini 任期到 T_promote 结束、mbp 任期 T_promote 开始。
+    // self=air 推一条 "hello" 在 T_air_push（mbp 任期内）→ 只有 mbp-origin 行才能算合法吸收，
+    // mini 的同内容历史行在 5s 窗口内但 lineage 说它已不是 primary，必须被严格匹配挡掉。
+    // 老 `origin != self` 启发式会同时让 mini 和 mbp 都通过，误算为 mini 吸收 → 这条测试
+    // 锁定新行为：candidates 里同时有 mini-origin 和 mbp-origin 时只选 active primary
+    let db = try makeClientDB()
+    let selfID = "air"
+    let tPromote: Int64 = 15_000_000_000
+    try await insertLineage(db, deviceID: "mini", startedAtNs: 0, endedAtNs: tPromote)
+    try await insertLineage(db, deviceID: "mbp", startedAtNs: tPromote, endedAtNs: nil)
+    // air push 在 mbp 任期内（capturedAtNs > tPromote）。期望 absorber=mbp-origin
+    try await insertItem(db, id: "air-x", origin: selfID, pushState: .acked,
+                         capturedAtNs: 16_000_000_000, textFull: "hello")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: selfID,
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 2,
+                items: [
+                    // 干扰项：mini-origin 同内容、在 5s 窗内（capturedAt=12s 距 16s=4s）。
+                    // 老启发式会吸收，lineage-aware 必须挡掉
+                    Item(id: "mini-old", originDevice: "mini",
+                         capturedAtNs: 12_000_000_000, ingestedAtNs: 12_000_000_000,
+                         kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                    // 合法吸收源：mbp-origin，5s 窗内、且 mbp 是 capturedAt=16s 的 active primary
+                    Item(id: "mbp-new", originDevice: "mbp",
+                         capturedAtNs: 15_500_000_000, ingestedAtNs: 15_500_000_000,
+                         kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                ],
+                nextCursor: SinceCursor(ingestedAtNs: 15_500_000_000, id: "mbp-new"),
+                hasMore: false
+            )
+        }
+    )
+    #expect(report.missingTotal == 0)
+    #expect(report.dedupAbsorbed == 1)
+    #expect(report.dedupAbsorbedSamples.first?.absorbedByID == "mbp-new")
+}
+
+@Test func auditLineageAwareRejectsWrongTenureCandidate() async throws {
+    // 只有错任期的 candidate（mini-origin 在 mbp 任期内推的 row）→ 严格匹配挡掉 → missing。
+    // 区别 "正确任期吸收源在但被错选" vs "压根没合法吸收源"，第二种应正确报 missing
+    let db = try makeClientDB()
+    let selfID = "air"
+    let tPromote: Int64 = 15_000_000_000
+    try await insertLineage(db, deviceID: "mini", startedAtNs: 0, endedAtNs: tPromote)
+    try await insertLineage(db, deviceID: "mbp", startedAtNs: tPromote, endedAtNs: nil)
+    try await insertItem(db, id: "air-x", origin: selfID, pushState: .acked,
+                         capturedAtNs: 16_000_000_000, textFull: "hello")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: selfID,
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 1,
+                items: [
+                    // 只有 mini-origin（错任期），mbp 任期内应该 mbp-origin 才合法
+                    Item(id: "mini-only", originDevice: "mini",
+                         capturedAtNs: 15_500_000_000, ingestedAtNs: 15_500_000_000,
+                         kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                ],
+                nextCursor: SinceCursor(ingestedAtNs: 15_500_000_000, id: "mini-only"),
+                hasMore: false
+            )
+        }
+    )
+    #expect(report.dedupAbsorbed == 0)
+    #expect(report.missingTotal == 1)
+    #expect(report.missingOnPrimary == ["air-x"])
+}
+
+@Test func auditLineageAwareAcceptsHistoricTenureAbsorber() async throws {
+    // air 在 mini 任期早期（capturedAtNs=8s < tPromote=15s）push "hello"，mini-origin 同内容
+    // 在 5s 窗内 → 正确识别为 mini 吸收。验证 startedAtNs=0 sentinel "未知起点" 能匹配 t < 15s
+    let db = try makeClientDB()
+    let selfID = "air"
+    let tPromote: Int64 = 15_000_000_000
+    try await insertLineage(db, deviceID: "mini", startedAtNs: 0, endedAtNs: tPromote)
+    try await insertLineage(db, deviceID: "mbp", startedAtNs: tPromote, endedAtNs: nil)
+    try await insertItem(db, id: "air-x", origin: selfID, pushState: .acked,
+                         capturedAtNs: 8_000_000_000, textFull: "hello")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: selfID,
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 1,
+                items: [
+                    Item(id: "mini-old", originDevice: "mini",
+                         capturedAtNs: 8_500_000_000, ingestedAtNs: 8_500_000_000,
+                         kind: .text, preview: "hello", textFull: "hello", pushState: .acked),
+                ],
+                nextCursor: SinceCursor(ingestedAtNs: 8_500_000_000, id: "mini-old"),
+                hasMore: false
+            )
+        }
+    )
+    #expect(report.dedupAbsorbed == 1)
+    #expect(report.dedupAbsorbedSamples.first?.absorbedByID == "mini-old")
+    #expect(report.missingTotal == 0)
+}
+
+@Test func auditLineageFallbackWhenTimeNotCovered() async throws {
+    // lineage 只覆盖未来时段（startedAtNs=100s 未来）。row push 在 10s（早于所有任期）
+    // → activePrimaryDeviceID 返回 nil → 回退 origin != self 启发式 → mini-origin 同内容吸收
+    let db = try makeClientDB()
+    try await insertLineage(db, deviceID: "mbp", startedAtNs: 100_000_000_000, endedAtNs: nil)
+    try await insertItem(db, id: "air-x", origin: "air", pushState: .acked,
+                         capturedAtNs: 10_000_000_000, textFull: "hello")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: "air",
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 1,
+                items: [Item(id: "mini-y", originDevice: "mini",
+                             capturedAtNs: 9_500_000_000, ingestedAtNs: 9_500_000_000,
+                             kind: .text, preview: "hello", textFull: "hello", pushState: .acked)],
+                nextCursor: SinceCursor(ingestedAtNs: 9_500_000_000, id: "mini-y"),
+                hasMore: false
+            )
+        }
+    )
+    #expect(report.dedupAbsorbed == 1)
+}
+
+@Test func auditLineageFallbackWhenActivePrimaryIsSelf() async throws {
+    // self 曾 promote 过，lineage (self, T_promote, NULL) 仍 "开着"；之后手动改 config 回
+    // client 跑 audit。严格匹配会让 expected=self 拒所有 candidate → 误报 missing。
+    // activePrimaryDeviceID 见 expected == selfDeviceID 时返回 nil → 回退 origin != self 启发式
+    let db = try makeClientDB()
+    let selfID = "mbp"
+    try await insertLineage(db, deviceID: selfID, startedAtNs: 5_000_000_000, endedAtNs: nil)
+    try await insertItem(db, id: "mbp-x", origin: selfID, pushState: .acked,
+                         capturedAtNs: 10_000_000_000, textFull: "hello")
+    let report = try await AuditPush.run(
+        database: db,
+        selfDeviceID: selfID,
+        fetchPage: { _, _ in
+            SincePageWire(
+                ok: true, count: 1,
+                items: [Item(id: "mini-y", originDevice: "mini",
+                             capturedAtNs: 9_500_000_000, ingestedAtNs: 9_500_000_000,
+                             kind: .text, preview: "hello", textFull: "hello", pushState: .acked)],
+                nextCursor: SinceCursor(ingestedAtNs: 9_500_000_000, id: "mini-y"),
+                hasMore: false
+            )
+        }
+    )
+    // 回退到 origin != self → mini != mbp → 吸收成立
+    #expect(report.dedupAbsorbed == 1)
+    #expect(report.missingTotal == 0)
+}
+
 @Test func auditDoesNotReportStaleWhenPrimaryAhead() async throws {
     // primary 自家有 merge 行为 → primary 的 capturedAtNs 可能比 local 高。
     // 这是 primary 的合法状态，不应该被 audit 当 stale 报。audit 关心的是
