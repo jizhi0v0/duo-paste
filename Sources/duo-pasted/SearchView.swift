@@ -99,7 +99,13 @@ struct SearchView: View {
         // panel 被复用（orderOut 不销毁 hosting view），每次 show() bump openPulse
         // → 这里把焦点抢回 TextField + 立即 refresh，避免 reshow 时光标不见 / 看到 stale results
         .onChange(of: state.openPulse) { _, _ in
-            searchFieldFocused = true
+            // panel 复用：上次 hide 不会重置 @FocusState，再赋 true 是无效赋值，
+            // 光标不会重新装回 field editor（表现为没有闪烁的输入提示）。
+            // 先掀掉再下一 runloop 装回，强制 SwiftUI 走一次 focus 变化。
+            searchFieldFocused = false
+            DispatchQueue.main.async {
+                searchFieldFocused = true
+            }
             Task { await state.refresh() }
         }
         // 注：箭头 / Return / Esc 由 SearchPanelController 的 NSEvent local monitor
