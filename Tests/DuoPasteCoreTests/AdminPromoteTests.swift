@@ -620,6 +620,113 @@ private func insertMirrorRow(
     #expect(result.promotedRows == 1)
 }
 
+// MARK: - P1 review fix: daemon-running 安全检查
+
+@Test func promoteRefusesWhenDaemonRunning() throws {
+    // daemon 在跑时 promote 必须 throw daemonRunning（CLI 层会调 launchctl 检测后传 true）。
+    // 设计语义：promote 期间 daemon 仍以 client mode capture 新行，ingested_at_ns=nil 永远
+    // 卡在 /since 之外；强制让用户先 bootout
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    try writeClientConfig(to: paths.configFile)
+
+    var caught: Admin.AdminError? = nil
+    do {
+        _ = try Admin.promoteToPrimary(
+            dbPath: paths.mainDB,
+            configPath: paths.configFile,
+            blobs: BlobStore(root: paths.blobsDir),
+            selfDeviceID: "self-dev",
+            now: 1,
+            daemonRunning: true,
+            daemonLabel: "io.duopaste.agent"
+        )
+    } catch let e as Admin.AdminError {
+        caught = e
+    }
+    guard case .daemonRunning(let label) = caught else {
+        Issue.record("expected daemonRunning, got \(String(describing: caught))")
+        return
+    }
+    #expect(label == "io.duopaste.agent")
+
+    // config 没被改：仍是 client 状态
+    let cfg = try Config.load(from: paths.configFile)
+    #expect(cfg.primaryURL != nil)
+    #expect(cfg.serve == false)
+}
+
+@Test func promoteProceedsWhenDaemonNotRunning() throws {
+    // 默认 daemonRunning=false（dev 场景 / 用户已 bootout）→ promote 正常进入
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    try writeClientConfig(to: paths.configFile)
+
+    let result = try Admin.promoteToPrimary(
+        dbPath: paths.mainDB,
+        configPath: paths.configFile,
+        blobs: BlobStore(root: paths.blobsDir),
+        selfDeviceID: "self-dev",
+        now: 1,
+        daemonRunning: false
+    )
+    #expect(result.configWrittenTo == paths.configFile)
+}
+
+// MARK: - P2 review fix: nested config 字段保留
+
+@Test func promotePreservesNestedUserConfigFields() throws {
+    // pull / capture 子 dict 里用户/未来加的扩展 key 必须保留，不能因为 Config.write
+    // 全量 replace 子 dict 而丢掉
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    try writeClientConfig(to: paths.configFile, extraKeys: [
+        "pull": [
+            "enabled": true,
+            "interval_sec": 30,
+            "eager_blobs": false,
+            "x_pull_custom": "保留我",
+            "future_max_concurrency": 4,
+        ],
+        "capture": [
+            "max_blob_mb": 16,
+            "max_text_kb": 900,
+            "merge_window_sec": 600,
+            "x_capture_note": "图片优先",
+            "future_dedupe_strategy": "fuzzy",
+        ],
+    ])
+
+    _ = try Admin.promoteToPrimary(
+        dbPath: paths.mainDB,
+        configPath: paths.configFile,
+        blobs: BlobStore(root: paths.blobsDir),
+        selfDeviceID: "self-dev",
+        now: 1
+    )
+
+    // 已知字段更新正确
+    let cfg = try Config.load(from: paths.configFile)
+    #expect(cfg.capture.maxBlobBytes == 16 * 1024 * 1024)
+    #expect(cfg.capture.maxTextBytes == 900 * 1024)
+    #expect(cfg.pull.enabled == false)  // promote 后 pull 应关闭
+
+    // 嵌套未知字段保留
+    let raw = try JSONSerialization.jsonObject(with: Data(contentsOf: paths.configFile)) as! [String: Any]
+    let pull = raw["pull"] as? [String: Any]
+    #expect((pull?["x_pull_custom"] as? String) == "保留我")
+    #expect((pull?["future_max_concurrency"] as? Int) == 4)
+    #expect((pull?["enabled"] as? Bool) == false)
+
+    let capture = raw["capture"] as? [String: Any]
+    #expect((capture?["x_capture_note"] as? String) == "图片优先")
+    #expect((capture?["future_dedupe_strategy"] as? String) == "fuzzy")
+    #expect((capture?["max_blob_mb"] as? Int) == 16)
+}
+
 // MARK: - Helpers
 
 private struct LineageRow: FetchableRecord, Decodable {

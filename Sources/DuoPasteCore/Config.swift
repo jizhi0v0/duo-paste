@@ -201,10 +201,12 @@ public struct Config: Codable, Sendable, Equatable {
 
     /// 把 cfg 序列化写到 `path`（atomic + 0600 权限）。
     ///
-    /// **保留未知字段**：如果 path 已存在且能解析成 JSON dict，先用原 dict 做 base，再用 cfg
-    /// 的字段覆盖。这样：
-    /// - 用户/运维往 config.json 手动加的非 Config 字段不被吞掉（注释 key、调试开关等）
-    /// - 未来加新字段时，老版本 daemon 写回时也不会误删新字段
+    /// **保留未知字段**（含嵌套）：如果 path 已存在且能解析成 JSON dict，先用原 dict 做 base，
+    /// 再用 cfg 的字段**逐 key 覆盖**——top-level 和 `pull` / `capture` 子 dict 都是 merge 而
+    /// 非 replace。这样：
+    /// - 用户/运维往 config.json 手动加的非 Config 字段不被吞掉（顶层注释 key、调试开关等）
+    /// - `pull` / `capture` 子段内的未知键也不丢（未来新增字段、运维手动加的注解都安全）
+    /// - 老版本 daemon 写回时不会误删新版本字段
     ///
     /// 写入前调 `validate()`，非法字段组合直接 throw，不写半成品文件。
     ///
@@ -227,16 +229,21 @@ public struct Config: Codable, Sendable, Equatable {
         Self.setOrRemove(&dict, CodingKeys.tlsCertPath.rawValue, cfg.tlsCertPath)
         Self.setOrRemove(&dict, CodingKeys.tlsKeyPath.rawValue, cfg.tlsKeyPath)
         Self.setOrRemove(&dict, CodingKeys.primaryURL.rawValue, cfg.primaryURL?.absoluteString)
-        dict[CodingKeys.pull.rawValue] = [
-            "enabled": cfg.pull.enabled,
-            "interval_sec": cfg.pull.intervalSec,
-            "eager_blobs": cfg.pull.eagerBlobs,
-        ]
-        dict[CodingKeys.capture.rawValue] = [
-            "max_blob_mb": cfg.capture.maxBlobBytes / (1024 * 1024),
-            "max_text_kb": cfg.capture.maxTextBytes / 1024,
-            "merge_window_sec": cfg.capture.mergeWindowSec,
-        ]
+
+        // P2 review fix: nested merge——读原 sub-dict 做 base 后只覆盖目标 key，保留任何
+        // 未来字段或用户手动加的 sub-keys（之前是整段 replace，会丢嵌套未知字段）
+        var pullDict = (dict[CodingKeys.pull.rawValue] as? [String: Any]) ?? [:]
+        pullDict["enabled"] = cfg.pull.enabled
+        pullDict["interval_sec"] = cfg.pull.intervalSec
+        pullDict["eager_blobs"] = cfg.pull.eagerBlobs
+        dict[CodingKeys.pull.rawValue] = pullDict
+
+        var captureDict = (dict[CodingKeys.capture.rawValue] as? [String: Any]) ?? [:]
+        captureDict["max_blob_mb"] = cfg.capture.maxBlobBytes / (1024 * 1024)
+        captureDict["max_text_kb"] = cfg.capture.maxTextBytes / 1024
+        captureDict["merge_window_sec"] = cfg.capture.mergeWindowSec
+        dict[CodingKeys.capture.rawValue] = captureDict
+
         Self.setOrRemove(&dict, CodingKeys.sharedSecretKeychainAccount.rawValue,
                          cfg.sharedSecretKeychainAccount)
 

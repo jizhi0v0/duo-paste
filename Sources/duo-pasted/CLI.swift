@@ -249,6 +249,9 @@ enum CLI {
 
         let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
         let blobs = BlobStore(root: paths.blobsDir)
+        // P1 review fix: 查 daemon 在不在跑。dev 场景 swift run 直接跑（不在 launchctl 管理下）
+        // 会被识别为 false，进入 promote——CLAUDE.md 已写 dev 跑前先 bootout 是用户责任
+        let daemonRunning = LaunchAgent.isRunning(label: LaunchAgent.duoPastedLabel)
         let result: Admin.PromoteResult
         do {
             result = try Admin.promoteToPrimary(
@@ -259,7 +262,9 @@ enum CLI {
                 now: now,
                 serveHost: serveHost,
                 servePort: servePort,
-                allowMissingBlobs: allowMissingBlobs
+                allowMissingBlobs: allowMissingBlobs,
+                daemonRunning: daemonRunning,
+                daemonLabel: LaunchAgent.duoPastedLabel
             )
         } catch {
             FileHandle.standardError.write(Data("promote-to-primary failed: \(error)\n".utf8))

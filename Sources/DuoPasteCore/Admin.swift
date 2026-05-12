@@ -21,6 +21,10 @@ public enum Admin {
         /// PullWorker 默认 eager_blobs=false 只镜像元数据，本机变 primary 后这些 blob 在
         /// `/blob/<sha>` 上是 404。默认拒绝；`allowMissingBlobs=true` 跳过此检查并继续。
         case missingBlobs(totalMissing: Int, samples: [String])
+        /// LaunchAgent daemon 还在跑——promote 期间 daemon 仍以 client 角色 capture 新行
+        /// （那些行 ingested_at_ns=nil，stamp 阶段已经过去，PushWorker promote 后不启动），
+        /// 这些行将永远不被 /since 暴露。要求用户先 `launchctl bootout` 停掉再重试。
+        case daemonRunning(label: String)
 
         public var description: String {
             switch self {
@@ -40,6 +44,12 @@ public enum Admin {
                     + "（示例 sha：\(head)\(samples.count > 3 ? " ..." : "")）。"
                     + "image/file 类历史在 promote 后会 404。"
                     + "若可接受丢失，加 --allow-missing-blobs 重跑。"
+            case .daemonRunning(let label):
+                return "promote 中止：daemon (\(label)) 还在跑。"
+                    + "promote 期间 daemon 仍以 client 角色 capture 出的新行将永远不被 "
+                    + "/since 暴露。先停 daemon：\n"
+                    + "  launchctl bootout gui/$UID/\(label)\n"
+                    + "再重试 promote-to-primary。"
             }
         }
     }
@@ -72,8 +82,14 @@ public enum Admin {
 
     /// 把本机从 client 提升为 primary。详 plan §c。
     ///
-    /// 流程（一个 writer tx 包住 step 3-7，原子）：
+    /// 流程（一个 writer tx 包住 step 4-8，原子）：
     /// 1. 校验当前 config 为 client 模式（`primary_url` 非空），否则 throw
+    /// 1b. **daemon-running 检查**（P1 review fix）：调用方（CLI 层）通过 `launchctl list`
+    ///     拿 daemon 在跑状态后传 `daemonRunning`；为 true 直接 throw `daemonRunning`，要求
+    ///     用户先 `launchctl bootout` 停掉再重试。**为什么必须停**：promote 跑完后到用户
+    ///     手动 kickstart 之间存在窗口，daemon 仍以 client mode capture 新行（这些行
+    ///     `ingested_at_ns=nil`，stamp 阶段已经过去）。promote 后 PushWorker 不再启动，
+    ///     这些行也不会再被 stamp——永远过滤掉在 `/since` 之外
     /// 2. **预检 blob 缺失**（writer tx 外，只读）：扫 item + item_mirror 里 blob_sha256 非空
     ///    AND deleted_at_ns IS NULL 的行，去重 sha 集合，逐个 `blobs.exists` 检查。缺失
     ///    + `allowMissingBlobs=false` → throw `missingBlobs`；`=true` → 进入下一步，
@@ -111,7 +127,9 @@ public enum Admin {
         serveHost: String? = nil,
         servePort: Int? = nil,
         allowMissingBlobs: Bool = false,
-        missingBlobSampleLimit: Int = 5
+        missingBlobSampleLimit: Int = 5,
+        daemonRunning: Bool = false,
+        daemonLabel: String = "io.duopaste.agent"
     ) throws -> PromoteResult {
         let current: Config
         do {
@@ -124,6 +142,14 @@ public enum Admin {
             throw AdminError.notInClientMode(currentSummary: current.summary)
         }
         let oldPrimaryURL = current.primaryURL
+
+        // Step 1.5: daemon-running 安全检查（P1 review fix）。daemon 在跑时拒绝 promote——
+        // promote 期间 daemon 仍以 client 角色 capture 出的新行不会被 stamp 也不会被
+        // PushWorker 推（promote 完 PushWorker 不再启动），永远卡在 ingested_at_ns=nil
+        // 不被 /since 暴露。检测下沉到 CLI 层（调 launchctl），Admin 接 Bool 保持纯函数
+        if daemonRunning {
+            throw AdminError.daemonRunning(label: daemonLabel)
+        }
 
         // Database.init 自动跑 migrator——确保 v5 primary_lineage 表已建
         let db = try Database(path: dbPath, role: .client)
