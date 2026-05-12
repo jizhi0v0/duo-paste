@@ -150,11 +150,26 @@ public final class PasteboardWatcher {
         if let rtf = pasteboard.string(forType: .rtf) {
             // RTF 降级：剪贴板历史里展示 `{\rtf1\ansi\ansicpg... \cocoartf...}` 这种 raw
             // markup 完全没意义——搜索命中不了、preview 噪声大、bundle name 也只是 host
-            // app（Codex/Claude Desktop/Notes/Mail 等）。只要 .string 有非空 plain，优先
-            // 用 plain 入 text 类。代价：失去"按原样 paste 回带样式"——但本仓库定位是
-            // 剪贴板历史检索，不是富文本中转站；况且 Copyback 已经在多数情况下双写
-            // rtf+string，对端粘贴体验由对端 app 决定。
+            // app（Codex/Claude Desktop/Notes/Mail 等）。代价：失去"按原样 paste 回带样
+            // 式"——但本仓库定位是剪贴板历史检索，不是富文本中转站；况且 Copyback 已经
+            // 在多数情况下双写 rtf+string，对端粘贴体验由对端 app 决定。
+            //
+            // 三层降级：
+            // (a) pasteboard 自己写了 .string → 直接用
+            // (b) 只写了 .rtf（Notes/Mail 部分场景）→ 本地解 RTF markup 拿 attributed.string
+            // (c) 解析失败/全空白 → 才存 raw rtf 当兜底
             if let plain = pasteboard.string(forType: .string),
+               !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                return CapturedPasteboard(
+                    kind: .text,
+                    text: plain,
+                    sourceAppBundleID: bundleID,
+                    sourceAppName: appName,
+                    capturedAtNs: capturedAtNs
+                )
+            }
+            if let plain = Self.decodeRTFToPlain(rtf),
                !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
                 return CapturedPasteboard(
@@ -229,5 +244,17 @@ public final class PasteboardWatcher {
         }
 
         return nil
+    }
+
+    /// 用 NSAttributedString 把 RTF source 解成纯文本。失败返回 nil，调用方走兜底。
+    private static func decodeRTFToPlain(_ rtf: String) -> String? {
+        guard let data = rtf.data(using: .utf8),
+              let attr = try? NSAttributedString(
+                data: data,
+                options: [.documentType: NSAttributedString.DocumentType.rtf],
+                documentAttributes: nil
+              )
+        else { return nil }
+        return attr.string
     }
 }
