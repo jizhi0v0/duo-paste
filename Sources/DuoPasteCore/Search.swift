@@ -211,6 +211,83 @@ public struct SearchAPI: Sendable {
         }
     }
 
+    /// 当前 query 条件下本机 `item` 表里的匹配总数（忽略 limit/offset）。
+    /// UI 用来显示真实 counter，不受 200 cap 截断影响。
+    public func count(_ q: SearchQuery) throws -> Int {
+        try database.pool.read { db in
+            try Self.countItem(db, query: q)
+        }
+    }
+
+    /// Mirror 模式下：`item` ∪ `item_mirror` 按 id 去重后的匹配总数。
+    /// 用 `UNION` 让 SQLite 在 id 维度自动 dedup，避免同 id 跨表存在被双算
+    /// （promote 过渡期 / pin 分歧时可能出现，跟 fetchUnion 里那段 byID dedupe 同源原因）。
+    public func countUnion(_ q: SearchQuery) throws -> Int {
+        try database.pool.read { db in
+            try Self.countUnionStatic(db, query: q)
+        }
+    }
+
+    /// 构造 count 用的 WHERE/JOIN 片段。复用 fetchHits/fetchHitsMirror 的过滤逻辑，
+    /// 只是不取列也不排序——保证 counter 跟 list 的过滤口径一致。
+    private static func buildCountClauses(
+        table: String,
+        ftsTable: String,
+        query q: SearchQuery
+    ) -> (join: String, whereClause: String, args: [DatabaseValueConvertible]) {
+        var wheres: [String] = []
+        var args: [DatabaseValueConvertible] = []
+
+        if !q.includeDeleted { wheres.append("\(table).deleted_at_ns IS NULL") }
+        if let from = q.fromNs { wheres.append("\(table).captured_at_ns >= ?"); args.append(from) }
+        if let to = q.toNs { wheres.append("\(table).captured_at_ns <= ?"); args.append(to) }
+        if !q.kinds.isEmpty {
+            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
+            wheres.append("\(table).kind IN (\(p))")
+            args.append(contentsOf: q.kinds.map { $0.rawValue })
+        }
+        if q.pinnedOnly { wheres.append("\(table).pinned = 1") }
+
+        var join = ""
+        if let text = q.text, let match = ftsQuery(from: text) {
+            join = "JOIN \(ftsTable) ON \(ftsTable).rowid = \(table).rowid"
+            wheres.append("\(ftsTable) MATCH ?")
+            args.append(match)
+        }
+        let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
+        return (join, whereClause, args)
+    }
+
+    static func countItem(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
+        let (join, whereClause, args) = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
+        let sql = "SELECT COUNT(*) FROM item \(join) \(whereClause)"
+        return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
+    }
+
+    static func countMirror(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
+        let (join, whereClause, args) = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
+        let sql = "SELECT COUNT(*) FROM item_mirror \(join) \(whereClause)"
+        return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
+    }
+
+    static func countUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
+        // UNION（不是 UNION ALL）自动按行去重，但我们只 select id 一列，所以等价于按 id dedupe。
+        // 用 sub-select 包一层让外层 COUNT(*) 数 dedup 后的行数。
+        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
+        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
+        let sql = """
+            SELECT COUNT(*) FROM (
+              SELECT item.id FROM item \(own.join) \(own.whereClause)
+              UNION
+              SELECT item_mirror.id FROM item_mirror \(mir.join) \(mir.whereClause)
+            )
+        """
+        var args: [DatabaseValueConvertible] = []
+        args.append(contentsOf: own.args)
+        args.append(contentsOf: mir.args)
+        return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
+    }
+
     /// 把用户输入的自由文本转成 FTS5 MATCH 表达式。
     /// 策略：按空白拆词，每个 token 转义双引号后作为前缀短语，AND 连接。
     /// 比如 `foo bar"baz` → `"foo"* AND "bar""baz"*`

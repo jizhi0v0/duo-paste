@@ -17,6 +17,10 @@ final class AppState {
     var lastError: String?
     /// 当前搜索源——决定顶部 banner 显示什么。
     var searchMode: SearchProvider.Mode = .local
+    /// 当前 query 条件下匹配的真实总数（不受 200 limit 截断）。UI counter 显示这个。
+    /// - 空 query → 库（或 union 后）里全部条数
+    /// - 有 query → FTS 命中总数
+    var totalCount: Int = 0
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
     var scrollPulse: Int = 0
@@ -65,6 +69,9 @@ final class AppState {
         let initial = (try? deps.searchAPI.search(SearchQuery(limit: 200))) ?? []
         self.results = initial
         self.selectedID = initial.first?.id
+        // 同步 init 阶段 mirror union 还没接入（searchProvider 没跑），用本机 item 计数作初值——
+        // panel 打开后第一次 refresh() 会替换成正确的 union/mirror 总数。
+        self.totalCount = (try? deps.searchAPI.count(SearchQuery())) ?? initial.count
     }
 
     /// 当前应该粘贴的项：优先选中项，否则取列表首项。
@@ -94,6 +101,7 @@ final class AppState {
             self.results = outcome.items
             self.snippets = outcome.snippets
             self.searchMode = outcome.mode
+            self.totalCount = outcome.totalCount
             updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
             self.lastError = nil
         } catch is CancellationError {

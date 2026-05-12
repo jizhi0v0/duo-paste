@@ -144,11 +144,17 @@ public struct SearchProvider: Sendable {
         /// `id → snippet`，仅 query.text 非空时填；query 为空时为空 map。
         /// snippet 含 STX/ETX 标记包围匹配词，UI 端切片渲染加粗。
         public let snippets: [String: String]
+        /// 当前 query 条件下匹配的真实总数（忽略 limit）。
+        /// - 空 query → 库（或 union 后）里的全部条数
+        /// - 有 query → FTS 命中总数
+        /// UI 显示这个值，**不是** `items.count`——后者被 limit 截断。
+        public let totalCount: Int
 
-        public init(items: [Item], mode: Mode, snippets: [String: String] = [:]) {
+        public init(items: [Item], mode: Mode, snippets: [String: String] = [:], totalCount: Int = 0) {
             self.items = items
             self.mode = mode
             self.snippets = snippets
+            self.totalCount = totalCount
         }
     }
 
@@ -189,12 +195,16 @@ public struct SearchProvider: Sendable {
         let result = try await remote.searchRemote(query)
         switch result.outcome {
         case .ok(let hits):
+            // 远端 transport 当前不返回 total（协议未扩字段）。本地 count 作 close 兜底——
+            // 在常见部署里 client 一旦 mirror 就绪就不走 remoteOK，此路径只是 transient 状态。
+            let total = (try? local.count(query)) ?? hits.count
             return Outcome(
                 items: hits.map(\.item),
                 mode: .remoteOK,
                 snippets: Dictionary(uniqueKeysWithValues: hits.compactMap { h in
                     h.snippet.map { (h.item.id, $0) }
-                })
+                }),
+                totalCount: total
             )
         case .unreachable(let reason), .rejected(let reason):
             // 真不可达 / 拒收时才降级到本地——保证可用性优先
@@ -208,7 +218,8 @@ public struct SearchProvider: Sendable {
         let snippets = Dictionary(uniqueKeysWithValues: hits.compactMap { (item, s) in
             s.map { (item.id, $0) }
         })
-        return Outcome(items: hits.map(\.0), mode: mode, snippets: snippets)
+        let total = (try? local.count(query)) ?? hits.count
+        return Outcome(items: hits.map(\.0), mode: mode, snippets: snippets, totalCount: total)
     }
 
     private func unionLocalOutcome(query: SearchQuery, stalenessSec: Int) -> Outcome {
@@ -216,6 +227,7 @@ public struct SearchProvider: Sendable {
         let snippets = Dictionary(uniqueKeysWithValues: hits.compactMap { (item, s) in
             s.map { (item.id, $0) }
         })
-        return Outcome(items: hits.map(\.0), mode: .localMirror(stalenessSec: stalenessSec), snippets: snippets)
+        let total = (try? local.countUnion(query)) ?? hits.count
+        return Outcome(items: hits.map(\.0), mode: .localMirror(stalenessSec: stalenessSec), snippets: snippets, totalCount: total)
     }
 }

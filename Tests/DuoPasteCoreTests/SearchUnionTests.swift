@@ -140,3 +140,66 @@ private func insertOwn(
     let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
     #expect(hits.map(\.0.id) == ["alive"])
 }
+
+// MARK: - count / countUnion
+
+@Test func countItemRespectsLimitlessTotal() throws {
+    // count 必须忽略 limit/offset，否则 UI counter 一旦库 ≥200 就永远定格在 200。
+    let db = try makeDB()
+    for i in 0..<5 {
+        try insertOwn(db, id: "i-\(i)", capturedAtNs: Int64(i) * 10, text: "n\(i)")
+    }
+    let api = SearchAPI(database: db)
+    // 即便 SearchQuery 写了 limit=2，count 也应该返回 5
+    #expect(try api.count(SearchQuery(limit: 2)) == 5)
+}
+
+@Test func countItemAppliesFTSFilter() throws {
+    let db = try makeDB()
+    try insertOwn(db, id: "a", capturedAtNs: 100, text: "needle here")
+    try insertOwn(db, id: "b", capturedAtNs: 200, text: "no match")
+    try insertOwn(db, id: "c", capturedAtNs: 300, text: "another needle")
+    #expect(try SearchAPI(database: db).count(SearchQuery(text: "needle")) == 2)
+}
+
+@Test func countItemSkipsSoftDeleted() throws {
+    let db = try makeDB()
+    try insertOwn(db, id: "alive", capturedAtNs: 100, text: "ok")
+    // 软删 own：直接 SQL stamp deleted_at_ns
+    try insertOwn(db, id: "gone", capturedAtNs: 200, text: "buried")
+    try db.pool.write { conn in
+        try conn.execute(sql: "UPDATE item SET deleted_at_ns = 999 WHERE id = 'gone'")
+    }
+    #expect(try SearchAPI(database: db).count(SearchQuery()) == 1)
+}
+
+@Test func countUnionDedupesSameIDAcrossTables() throws {
+    // 关键回归：同 id 跨表存在（promote-to-primary 过渡期常见）必须算 1 不能算 2。
+    // 用 UNION（不是 UNION ALL）在 id 维度去重。
+    let db = try makeDB()
+    try insertOwn(db, id: "dup", capturedAtNs: 500, text: "own version")
+    try insertMirror(db, id: "dup", origin: "primary", capturedAtNs: 400, text: "mirror version")
+    try insertOwn(db, id: "only-own", capturedAtNs: 100, text: "just own")
+    try insertMirror(db, id: "only-mir", origin: "primary", capturedAtNs: 200, text: "just mirror")
+    #expect(try SearchAPI(database: db).countUnion(SearchQuery()) == 3)
+}
+
+@Test func countUnionWithFTSAcrossBothTables() throws {
+    let db = try makeDB()
+    try insertOwn(db, id: "own", capturedAtNs: 100, text: "needle in own table")
+    try insertMirror(db, id: "mir", origin: "primary", capturedAtNs: 200, text: "needle in mirror table")
+    try insertOwn(db, id: "other", capturedAtNs: 300, text: "no match")
+    #expect(try SearchAPI(database: db).countUnion(SearchQuery(text: "needle")) == 2)
+}
+
+@Test func countUnionSkipsSoftDeletedOnBothSides() throws {
+    let db = try makeDB()
+    try insertOwn(db, id: "alive-own", capturedAtNs: 100, text: "ok")
+    try insertMirror(db, id: "alive-mir", origin: "primary", capturedAtNs: 200, text: "ok")
+    try insertMirror(db, id: "dead-mir", origin: "primary", capturedAtNs: 300, text: "rip", deletedAtNs: 999)
+    try insertOwn(db, id: "dead-own", capturedAtNs: 400, text: "rip")
+    try db.pool.write { conn in
+        try conn.execute(sql: "UPDATE item SET deleted_at_ns = 999 WHERE id = 'dead-own'")
+    }
+    #expect(try SearchAPI(database: db).countUnion(SearchQuery()) == 2)
+}

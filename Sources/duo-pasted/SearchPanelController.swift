@@ -48,6 +48,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// 装 NSEvent 本地监听器：箭头/Return/Esc 在 TextField 看到之前被截走，
     /// 不然搜索框会用这些键移动光标 / 换行，导航就废了。
     /// 其他按键正常透传给 SwiftUI。
+    ///
+    /// IME 例外：输入法 composing 时（marked text 非空），↑↓ 选候选页、Return 确认候选、
+    /// Esc 取消候选——这些都必须交还给 IME，不能被我们当成列表导航/粘贴/关闭吞掉。
     private func installKeyMonitor() {
         guard localKeyMonitor == nil else { return }
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -56,6 +59,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             let keyCode = Int(event.keyCode)
             let interceptCodes: Set<Int> = [126, 125, 36, 76, 53]
             guard interceptCodes.contains(keyCode) else { return event }
+            // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
+            // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
+            if let tv = event.window?.firstResponder as? NSTextView, tv.hasMarkedText() {
+                return event
+            }
             MainActor.assumeIsolated {
                 guard let self, let panel = self.panel, panel.isKeyWindow else { return }
                 switch keyCode {
@@ -83,7 +91,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     private func ensurePanel() -> NSPanel {
         if let p = panel { return p }
-        let contentRect = NSRect(x: 0, y: 0, width: 720, height: 480)
+        let contentRect = NSRect(x: 0, y: 0, width: 760, height: 520)
         let p = HUDPanel(
             contentRect: contentRect,
             styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView, .resizable],
@@ -102,6 +110,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         p.isMovableByWindowBackground = true
         p.delegate = self
+        // Spotlight-style 大圆角 + 透明 panel：让 SwiftUI .ultraThickMaterial 背景
+        // 配 RoundedRectangle clipShape 自己控制形状；panel 自身透明只用来定位 + 投影。
+        // hasShadow=true 时 AppKit 会沿 contentView layer.cornerRadius 形状画系统级 drop shadow。
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
 
         let root = SearchView(
             state: state,
@@ -117,7 +131,14 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         let hosting = NSHostingView(rootView: root)
         hosting.frame = contentRect
         hosting.autoresizingMask = [.width, .height]
+        // 让系统 drop shadow 跟着圆角走（否则 panel rect 矩形阴影会从圆角外露出来）
+        hosting.wantsLayer = true
+        hosting.layer?.cornerRadius = 22
+        hosting.layer?.cornerCurve = .continuous
+        hosting.layer?.masksToBounds = true
         p.contentView = hosting
+        // wantsLayer/cornerRadius 后 invalidate 让 shadow 重新按 mask 计算
+        p.invalidateShadow()
 
         panel = p
         return p

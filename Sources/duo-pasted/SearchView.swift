@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import DuoPasteCore
 import DuoPasteSync
 
@@ -9,6 +10,39 @@ import DuoPasteSync
     f.dateTimeStyle = .named
     return f
 }()
+
+/// 按 bundleID → app icon 的进程内 LRU-less 缓存。
+/// NSWorkspace.icon(forFile:) 每次都 IO 一次（读 Info.plist + .icns），row 渲染时不能每次重算。
+/// 没装的 bundleID（mirror 来的对端独有 app）会进 notFound 集合避免反复查 LaunchServices。
+@MainActor
+final class AppIconCache {
+    static let shared = AppIconCache()
+    private var cache: [String: NSImage] = [:]
+    private var notFound: Set<String> = []
+
+    /// 系统组件 bundleID 黑名单——LaunchServices 给得出 icon，但不代表真实"来源 app"。
+    /// 已知触发场景：mini 屏幕锁着 / 无人前台时，NSWorkspace.frontmostApplication 报
+    /// `com.apple.loginwindow`，而 loginwindow.app 自带 icon 是张白色网格占位图，UI 上很丑。
+    /// 命中直接返 nil，走 SF Symbol fallback。
+    private static let nonAppBundleIDs: Set<String> = [
+        "com.apple.loginwindow",
+        "com.apple.WindowServer",
+        "com.apple.dock",
+    ]
+
+    func icon(forBundleID bid: String) -> NSImage? {
+        if Self.nonAppBundleIDs.contains(bid) { return nil }
+        if let img = cache[bid] { return img }
+        if notFound.contains(bid) { return nil }
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) {
+            let img = NSWorkspace.shared.icon(forFile: url.path)
+            cache[bid] = img
+            return img
+        }
+        notFound.insert(bid)
+        return nil
+    }
+}
 
 struct SearchView: View {
     @Bindable var state: AppState
@@ -22,15 +56,30 @@ struct SearchView: View {
             header
             skipBanner
             modeBanner
-            Divider()
+            // Spotlight 风格不要硬 Divider，用一条细发丝线代替
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 0.5)
+                .padding(.horizontal, 14)
             if state.results.isEmpty {
                 emptyView
             } else {
                 list
             }
         }
-        .frame(minWidth: 640, idealWidth: 720, minHeight: 360, idealHeight: 480)
-        .background(.thinMaterial)
+        .frame(minWidth: 640, idealWidth: 760, minHeight: 400, idealHeight: 520)
+        // Spotlight-style 玻璃：.ultraThickMaterial 比 .thinMaterial 更不透明、更"深色玻璃"质感。
+        // clipShape 把 hosting view 内容裁成 22pt 大圆角（跟 SearchPanelController 里 layer.cornerRadius 一致）。
+        .background(.ultraThickMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+            // 0.5pt hairline 描边——dark mode 下让圆角边缘比 material 更清晰
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
+        )
+        // 让内容延伸到 NSPanel titlebar 区域（fullSizeContentView 把 contentView 占位让出来，
+        // 但 SwiftUI 默认仍把 titlebar 计入 top safe area，所以 header 上方会留 ~28pt 空白）
+        .ignoresSafeArea()
         // debounce 100ms：用户连打时上一个 task 被 .task(id:) cancel 掉，新 task
         // 先 sleep 100ms 再 refresh。停手 100ms 后才真正发远端请求——10 次按键的
         // 远端 roundtrip 合并成 1 次。CancellationError 自然吞掉。
@@ -52,29 +101,31 @@ struct SearchView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 14) {
             Image(systemName: "magnifyingglass")
+                .font(.system(size: 22, weight: .regular))
                 .foregroundStyle(.secondary)
             TextField("搜索剪贴板历史", text: $state.query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 18))
+                .font(.system(size: 22, weight: .regular))
                 .focused($searchFieldFocused)
             if !state.query.isEmpty {
                 Button {
                     state.query = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
             }
-            Text("\(state.results.count) 条")
-                .font(.caption)
+            Text("\(state.totalCount) 条")
+                .font(.system(size: 13))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 20)
     }
 
     /// 体积超限 banner：5 分钟内有 skip → 黄色提示「最近一次复制太大没存」。
@@ -117,23 +168,27 @@ struct SearchView: View {
 
     /// 顶部 banner：
     /// - `.local` / `.remoteOK` → 不显示（默认顺畅状态）
-    /// - `.localMirror` → 灰色提示，含 mirror 数据多新（"mirror @ Xm ago"）
+    /// - `.localMirror` → 稳态隐藏；staleness 超阈值（5 分钟）才以黄色显示「镜像卡顿」
+    ///   pull interval 默认 30s，稳态 staleness 应在 0-60s 之间。超过 300s 说明 pull worker
+    ///   卡死 / primary 不可达 / 时钟漂移，这时才有告知价值
     /// - `.remoteFallback` → 黄色提示 primary 离线
     @ViewBuilder
     private var modeBanner: some View {
         switch state.searchMode {
-        case .localMirror(let stalenessSec):
+        case .localMirror(let stalenessSec) where stalenessSec > 300:
             HStack(spacing: 6) {
-                Image(systemName: "internaldrive")
-                Text("本地镜像")
+                Image(systemName: "internaldrive.badge.exclamationmark")
+                Text("本地镜像更新滞后")
                 Text("·").foregroundStyle(.secondary)
-                Text("更新于 \(humanStaleness(stalenessSec)) 前").foregroundStyle(.secondary)
+                Text("已 \(humanStaleness(stalenessSec)) 未同步").foregroundStyle(.secondary)
             }
             .font(.caption)
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.gray.opacity(0.10))
+            .background(Color.yellow.opacity(0.15))
+        case .localMirror:
+            EmptyView()
         case .remoteFallback(let reason):
             HStack(spacing: 6) {
                 Image(systemName: "wifi.exclamationmark")
@@ -174,7 +229,8 @@ struct SearchView: View {
     private var list: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 0) {
+                LazyVStack(spacing: 2) {
+                    Color.clear.frame(height: 6)  // 列表顶部留点空气
                     ForEach(state.results) { item in
                         ItemRow(
                             item: item,
@@ -218,18 +274,15 @@ private struct ItemRow: View {
     let snippet: String?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: iconName)
-                .frame(width: 22, height: 22)
-                .foregroundStyle(isSelected ? Color.white : Color.accentColor)
-                .padding(.top, 1)
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: .center, spacing: 14) {
+            leadingIcon
+            VStack(alignment: .leading, spacing: 3) {
                 previewText
                     .lineLimit(2)
-                    .font(.system(size: 13))
+                    .font(.system(size: 14))
                     .foregroundStyle(isSelected ? Color.white : .primary)
                 HStack(spacing: 6) {
-                    Text(item.sourceAppName ?? item.sourceApp ?? "?")
+                    Text(kindLabel)
                     Text("·")
                     // TimelineView 周期重绘，否则 row 稳定后 Date() 不会被重算，
                     // 相对时间永远停在初次渲染的瞬间。
@@ -241,17 +294,53 @@ private struct ItemRow: View {
                         Text(humanSize(size))
                     }
                 }
-                .font(.caption)
-                .foregroundStyle(isSelected ? Color.white.opacity(0.8) : .secondary)
+                .font(.system(size: 12))
+                .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
             }
             Spacer()
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(isSelected ? Color.accentColor : Color.clear)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        // Spotlight-style 选中行：inline 圆角块，不通栏到 panel 边缘
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(isSelected ? Color.accentColor : Color.clear)
+        )
+        // 外圈 horizontal padding 让选中块两侧留出空气
+        .padding(.horizontal, 10)
     }
 
-    private var iconName: String {
+    /// 左侧图标：优先 app 图标（按 bundleID 查 LaunchServices）；找不到 fallback 到 kind SF Symbol。
+    /// fallback 触发场景：item 来自 mirror 而本机没装那个 app；或源 app 没报 bundleID。
+    @ViewBuilder
+    private var leadingIcon: some View {
+        if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
+            Image(nsImage: img)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 32, height: 32)
+        } else {
+            Image(systemName: kindSymbol)
+                .font(.system(size: 18))
+                .frame(width: 32, height: 32)
+                .foregroundStyle(isSelected ? Color.white : Color.accentColor)
+        }
+    }
+
+    /// kind 中文标签——meta 行第一列显示。比 bundle name 更立刻能读懂"这是什么"。
+    private var kindLabel: String {
+        switch item.kind {
+        case .text: "文本"
+        case .rtf: "富文本"
+        case .html: "HTML"
+        case .url: "链接"
+        case .image: "图片"
+        case .file: "文件"
+        }
+    }
+
+    /// app icon 不可用时的 fallback symbol。
+    private var kindSymbol: String {
         switch item.kind {
         case .text: "text.alignleft"
         case .rtf: "doc.richtext"

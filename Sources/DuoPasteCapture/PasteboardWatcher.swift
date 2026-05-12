@@ -72,6 +72,24 @@ public final class PasteboardWatcher {
         guard let captured = extract(capturedAtNs: capturedAtNs) else {
             return
         }
+        // 诊断：可疑 capture 把 NSPasteboard types 全打出来。两种触发：
+        // (1) ≤8 字符的短文本——「Paste.app 跳过但我们 capture」的不对称定位
+        // (2) RTF kind——常见误抓自 Telegram/Notes/Mail 这类 styled-text app 的后台写入
+        // 用途：识别漏配的 type marker（应进 skipMarkerTypes），或定位 frontmost 时序错位
+        let shouldLog: Bool
+        if let t = captured.text, t.count <= 8, captured.kind == .text {
+            shouldLog = true
+        } else if captured.kind == .rtf {
+            shouldLog = true
+        } else {
+            shouldLog = false
+        }
+        if shouldLog {
+            let types = pasteboard.types?.map(\.rawValue).joined(separator: ",") ?? "(nil)"
+            let textLen = captured.text?.count ?? 0
+            let prevSlice = (captured.text ?? "").prefix(40)
+            fputs("capture suspect kind=\(captured.kind.rawValue) bundle=\(captured.sourceAppBundleID ?? "?") name=\(captured.sourceAppName ?? "?") len=\(textLen) types=[\(types)] preview=\(String(prevSlice).debugDescription)\n", stderr)
+        }
         onCapture(captured)
     }
 
@@ -159,8 +177,11 @@ public final class PasteboardWatcher {
             )
         }
 
-        // 6) 纯文本
-        if let s = pasteboard.string(forType: .string), !s.isEmpty {
+        // 6) 纯文本——trim 后判空，过滤掉单空格 / 纯换行 / 纯 tab 之类的伪复制。
+        // 实测来源：Zed Vim mode 在空白字符上 yank、LSP 命令副作用、空选择 Cmd+C 等。
+        // 不直接 .isEmpty 判断会让这些 1-字节空白条目刷进列表（preview 完全空，无信息量）。
+        if let s = pasteboard.string(forType: .string),
+           !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return CapturedPasteboard(
                 kind: .text,
                 text: s,
