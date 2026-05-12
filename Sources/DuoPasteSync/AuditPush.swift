@@ -260,9 +260,12 @@ public enum AuditPush {
                     // 严格按 RemoteIngester.crossDeviceWindowNs 契约：dedup 只对 origin != 推送方
                     // 的本地 own-origin 行触发。所以 audit 匹配也要排除"本机自家 origin"——本机
                     // 自家两条同内容根本不会触发 RemoteIngester 的 dedup 路径，看到不算吸收
-                    // TODO(promote-lineage): once promote-to-primary records primary tenure history,
-                    // restrict this to the primary device_id active when the local row was pushed.
-                    // Today, single-primary deployments make origin != self equivalent in practice.
+                    // TODO(promote-lineage): primary_lineage 表已经在 v5 migration 建好，
+                    // promote-to-primary 子命令会在每次任期切换时写两行（self 开新任期 +
+                    // old primary 闭旧任期）。下一步把这里的 `origin != selfDeviceID` 改成
+                    // 「origin 等于本地 row 被 push 时 active 的 primary device_id」——查 lineage
+                    // 表按 row.ingestedAtNs 落在哪段 [started, ended] 区间。
+                    // 当前 single-primary deployment 下 origin != self 跟严格定义等价。
                     absorbedEntry = candidates.first(where: { entry in
                         entry.originDevice != selfDeviceID
                             && entry.capturedAtNs >= floor

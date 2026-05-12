@@ -199,6 +199,63 @@ public struct Config: Codable, Sendable, Equatable {
         )
     }
 
+    /// 把 cfg 序列化写到 `path`（atomic + 0600 权限）。
+    ///
+    /// **保留未知字段**：如果 path 已存在且能解析成 JSON dict，先用原 dict 做 base，再用 cfg
+    /// 的字段覆盖。这样：
+    /// - 用户/运维往 config.json 手动加的非 Config 字段不被吞掉（注释 key、调试开关等）
+    /// - 未来加新字段时，老版本 daemon 写回时也不会误删新字段
+    ///
+    /// 写入前调 `validate()`，非法字段组合直接 throw，不写半成品文件。
+    ///
+    /// 唯一已知调用方：`Admin.promoteToPrimary`。普通启动路径只读不写。
+    public static func write(_ cfg: Config, to path: URL) throws {
+        try cfg.validate()
+
+        var dict: [String: Any] = [:]
+        let fm = FileManager.default
+        if fm.fileExists(atPath: path.path),
+           let data = try? Data(contentsOf: path),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            dict = parsed
+        }
+
+        dict[CodingKeys.serve.rawValue] = cfg.serve
+        dict[CodingKeys.serveHost.rawValue] = cfg.serveHost
+        dict[CodingKeys.servePort.rawValue] = cfg.servePort
+        dict[CodingKeys.serveTLS.rawValue] = cfg.serveTLS
+        Self.setOrRemove(&dict, CodingKeys.tlsCertPath.rawValue, cfg.tlsCertPath)
+        Self.setOrRemove(&dict, CodingKeys.tlsKeyPath.rawValue, cfg.tlsKeyPath)
+        Self.setOrRemove(&dict, CodingKeys.primaryURL.rawValue, cfg.primaryURL?.absoluteString)
+        dict[CodingKeys.pull.rawValue] = [
+            "enabled": cfg.pull.enabled,
+            "interval_sec": cfg.pull.intervalSec,
+            "eager_blobs": cfg.pull.eagerBlobs,
+        ]
+        dict[CodingKeys.capture.rawValue] = [
+            "max_blob_mb": cfg.capture.maxBlobBytes / (1024 * 1024),
+            "max_text_kb": cfg.capture.maxTextBytes / 1024,
+            "merge_window_sec": cfg.capture.mergeWindowSec,
+        ]
+        Self.setOrRemove(&dict, CodingKeys.sharedSecretKeychainAccount.rawValue,
+                         cfg.sharedSecretKeychainAccount)
+
+        let out = try JSONSerialization.data(
+            withJSONObject: dict,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try fm.createDirectory(at: path.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+        try out.write(to: path, options: [.atomic])
+        // 跟 shared-secret 一致：config 里有 keychain_account / tls 路径等敏感字段，
+        // 默认 0600 防止他用户读
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+    }
+
+    private static func setOrRemove<T>(_ dict: inout [String: Any], _ key: String, _ value: T?) {
+        if let v = value { dict[key] = v } else { dict.removeValue(forKey: key) }
+    }
+
     /// 从 `path` 加载。文件不存在 → 返回 `.default`。其他错误（JSON 损坏、字段非法）→ throw。
     public static func load(from path: URL) throws -> Config {
         let fm = FileManager.default

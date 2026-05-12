@@ -17,6 +17,8 @@ enum CLI {
             runRetryFailed()
         case "audit-push":
             runAuditPush(args: rest)
+        case "promote-to-primary":
+            runPromoteToPrimary(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -44,6 +46,13 @@ enum CLI {
                                   N 默认 20，限制 missing/failed 样本输出条数。
                                   promote-to-primary 之前的健康检查。需要 config.json
                                   里配 primary_url + 本机有 shared-secret。
+
+          promote-to-primary [--serve-host H] [--serve-port P]
+                                  把本机从 client 升级为 primary：item_mirror → item、
+                                  清空 mirror/pull_cursor、写 primary_lineage、改 config.json
+                                  （serve=true, primary_url 移除, pull.enabled=false）。
+                                  仅在 client 模式下可用。完成后需手动 kickstart daemon
+                                  让新配置生效，并到其他 client 改 primary_url。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -189,6 +198,83 @@ enum CLI {
             }
         }
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    private static func runPromoteToPrimary(args: [String]) {
+        var serveHost: String? = nil
+        var servePort: Int? = nil
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--serve-host":
+                if i + 1 < args.count {
+                    serveHost = args[i + 1]
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("promote-to-primary: --serve-host 缺值\n".utf8))
+                    exit(1)
+                }
+            case "--serve-port":
+                if i + 1 < args.count, let p = Int(args[i + 1]), (1...65535).contains(p) {
+                    servePort = p
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("promote-to-primary: --serve-port 缺值或越界 (1-65535)\n".utf8))
+                    exit(1)
+                }
+            default:
+                FileHandle.standardError.write(Data("promote-to-primary: 未知参数 \(args[i])\n".utf8))
+                exit(1)
+            }
+        }
+
+        let paths = Paths.makeDefault()
+        let deviceID: String
+        do {
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("promote-to-primary: 读 device-id 失败: \(error)\n".utf8))
+            exit(1)
+        }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+        let result: Admin.PromoteResult
+        do {
+            result = try Admin.promoteToPrimary(
+                dbPath: paths.mainDB,
+                configPath: paths.configFile,
+                selfDeviceID: deviceID,
+                now: now,
+                serveHost: serveHost,
+                servePort: servePort
+            )
+        } catch {
+            FileHandle.standardError.write(Data("promote-to-primary failed: \(error)\n".utf8))
+            exit(1)
+        }
+
+        var lines: [String] = []
+        lines.append("promote-to-primary done")
+        lines.append("  promoted (mirror → item):       \(result.promotedRows) rows")
+        lines.append("  cleared item_mirror:            \(result.mirrorClearedRows) rows")
+        if let old = result.oldPrimaryURL {
+            lines.append("  old primary_url removed:        \(old.absoluteString)")
+        }
+        if let oldID = result.lineageOldPrimaryID {
+            lines.append("  lineage closed prior primary:   device_id=\(oldID) ended_at_ns=\(now)")
+        } else {
+            lines.append("  lineage closed prior primary:   (none — pull_cursor 之前为空)")
+        }
+        lines.append("  lineage opened self tenure:     device_id=\(deviceID) started_at_ns=\(now)")
+        lines.append("  config rewritten:               \(result.configWrittenTo.path)")
+        lines.append("")
+        lines.append("下一步：")
+        lines.append("  1. 重启 daemon 读新 config：")
+        lines.append("       launchctl kickstart -k gui/$UID/io.duopaste.agent")
+        lines.append("  2. 到其他 client 把 config.json 里的 primary_url 改成本机的可达地址，")
+        lines.append("     然后跑 `duo-pasted audit-push` 补『老 primary acked 但 mirror 未拉到』的洞。")
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+        exit(0)
     }
 
     private static func runRetryFailed() {
