@@ -220,9 +220,13 @@ RTF 抓取走三层降级：
 
 5. **lazy paste 同步阻塞 panel，不 async 关 panel 后再写 pasteboard** —— `SearchPanelController.installKeyMonitor` 的 Enter case 不再立刻 `self.hide()`；hide 责任移交 onPaste 回调实现方（AppDelegate.pasteBack）。同步路径（非 image / blob 已在）完成后 `panel.hide()`；慢路径起 `currentPasteTask` 完成后再 hide。**不要回退**——async 关 panel + 后台写 pasteboard 会让用户切到目标 app 后 paste 时已脱离原 context，体感"延迟到达"，并且 NSPasteboard 写完不代表内容到位（Cmd+V 时机错位会失败）
 
-6. **lazy 多次 Enter 自动 cancel 旧 task** —— `AppDelegate.currentPasteTask` 保存上一次 Task，`pasteBack` 调用时 `currentPasteTask?.cancel()` 再起新的。防 "拉一半再按 Enter" 重复 GET 同 sha 竞争 BlobStore.put（put 是原子 rename，重复其实安全；但避免浪费带宽 + 让 UI 状态机简单）
+6. **panel hide 必须 cancel 进行中的 lazy task**——P1 review fix。`SearchPanelController.init` 接 `onDismiss` callback，`hide()` 调它；AppDelegate 注册 `onDismiss = cancelLazyPasteIfAny`，作用是 `currentPasteTask?.cancel(); currentPasteTask = nil; state.pasteProgress = .idle`。覆盖三条触发：Esc 键 / `windowDidResignKey`（焦点切走）/ 主动 `hide()`。**不要回退**——不 cancel 会让 task 在 panel 关闭后继续把字节写进 NSPasteboard（孤儿写入：用户切到别的 app 莫名得到 paste），`.failed` banner 也会残留到下次 panel 打开
 
-7. **lazy 重试有界、总超时 5s** —— `fetchBlobLazy` 内 `backoffs: [0, 2, 4]`（第一次立即 + 两次 backoff）；每次循环先看 `Date() > deadline` 早退。理由：Tailscale 几 MB 图片正常 < 1s，3+s 大概率网络异常；让用户 5s 内得到反馈（spinner 还是 failed banner）。`.transient` 错误进入下一轮重试；`.rejected` / `.shaMismatch` / `.notFound` 立即 fail（不可恢复）
+7. **lazy 多次 Enter 自动 cancel 旧 task** —— `AppDelegate.currentPasteTask` 保存上一次 Task，`pasteBack` 调用时 `currentPasteTask?.cancel()` 再起新的。防 "拉一半再按 Enter" 重复 GET 同 sha 竞争 BlobStore.put（put 是原子 rename，重复其实安全；但避免浪费带宽 + 让 UI 状态机简单）
+
+8. **lazy 5s 总超时靠 TaskGroup race，不靠 `Date()` 检查**——P1 review fix。`fetchBlobLazy` 用 `withThrowingTaskGroup` race 两个 task：(a) `fetchBlobLazyInner` 重试循环 `backoffs=[0, 2, 4]` 处理 transient（`.transient` 进入下一轮；`.rejected`/`.shaMismatch`/`.notFound` 立即 fail），(b) `Task.sleep(5s)` 抛 timeout outcome。先完成的赢 + `group.cancelAll()`。**不要回退**——只靠 inner 循环开头 `Date() > deadline` 早退不够：URLSession 单 request 默认 60s timeout，server hang 在 connection 建立但不返回数据时，inner 根本没机会 check Date()；group cancel 让 URLSession 抛 `URLError.cancelled` 立即返回，是唯一能保证 5s 内一定有结果的姿态。`lazyBlobTimeoutSec` 必须 `nonisolated`（sleeper task capture 要求）
+
+9. **`pasteBlobFetcher` 跟 PullWorker / PushWorker 解耦**——P1 review fix。`setupPasteBlobFetcher` 在 `applicationDidFinishLaunching` 跟 `startPullWorker` 平行调用，只依赖 `primary_url + shared-secret 可加载`，**不**依赖 `pull.enabled` / `serve`。理由：用户配了 primary_url 但关掉 `pull.enabled`（不想拉全量元数据、只想 paste 时按需取单个 blob）是合法配置；fetcher 绑在 PullWorker 启动里会让这种配置下 image paste 永远失败
 
 ### PullWorker primary 换了的检测
 
