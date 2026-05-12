@@ -214,6 +214,27 @@ public struct Database: Sendable {
             """)
         }
 
+        // v5: primary 任期 lineage。每次 `duo-pasted promote-to-primary` 写两行：
+        //   1. (self_device, now, NULL)            ── 本机当前任期开始
+        //   2. (old_primary_id, 0, now)            ── 闭老 primary 任期（started=0 = "未知何时开始"）
+        // PK = (device_id, started_at_ns) 让一个 device 多次任期可记。
+        //
+        // audit-push 后续读这张表把"曾经/现在作为 primary 接收别人 origin 推送的 device"
+        // 排除出 Continuity-dedup 候选——多 primary lineage 下，"origin != self" 启发式
+        // 会把这些误判成跨设备同内容 dedup 源。详 AuditPush.swift TODO(promote-lineage)。
+        //
+        // 本 migration 只建表；写入逻辑在 Admin.promoteToPrimary。
+        m.registerMigration("v5_primary_lineage") { db in
+            try db.execute(sql: """
+                CREATE TABLE primary_lineage (
+                    device_id     TEXT NOT NULL,
+                    started_at_ns INTEGER NOT NULL,
+                    ended_at_ns   INTEGER,
+                    PRIMARY KEY (device_id, started_at_ns)
+                ) STRICT;
+            """)
+        }
+
         return m
     }
 

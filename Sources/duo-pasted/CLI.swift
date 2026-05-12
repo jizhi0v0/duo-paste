@@ -17,6 +17,8 @@ enum CLI {
             runRetryFailed()
         case "audit-push":
             runAuditPush(args: rest)
+        case "promote-to-primary":
+            runPromoteToPrimary(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -44,6 +46,19 @@ enum CLI {
                                   N 默认 20，限制 missing/failed 样本输出条数。
                                   promote-to-primary 之前的健康检查。需要 config.json
                                   里配 primary_url + 本机有 shared-secret。
+
+          promote-to-primary [--serve-host H] [--serve-port P]
+                             [--allow-missing-blobs]
+                                  把本机从 client 升级为 primary：item_mirror → item、
+                                  stamp own-origin null ingested_at_ns、清空 mirror/
+                                  pull_cursor、写 primary_lineage、改 config.json
+                                  （serve=true, primary_url 移除, pull.enabled=false）。
+                                  默认预检 blob 缺失：mirror 元数据齐但本机 BlobStore 没
+                                  字节的 sha 会让 promote 中止（DR 操作不该静默丢
+                                  image/file 历史）。--allow-missing-blobs 跳过此检查
+                                  让 promote 继续，缺失会被报告但不能自愈。
+                                  仅在 client 模式下可用。完成后需手动 kickstart daemon
+                                  让新配置生效，并到其他 client 改 primary_url。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -189,6 +204,108 @@ enum CLI {
             }
         }
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    private static func runPromoteToPrimary(args: [String]) {
+        var serveHost: String? = nil
+        var servePort: Int? = nil
+        var allowMissingBlobs = false
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--serve-host":
+                if i + 1 < args.count {
+                    serveHost = args[i + 1]
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("promote-to-primary: --serve-host 缺值\n".utf8))
+                    exit(1)
+                }
+            case "--serve-port":
+                if i + 1 < args.count, let p = Int(args[i + 1]), (1...65535).contains(p) {
+                    servePort = p
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("promote-to-primary: --serve-port 缺值或越界 (1-65535)\n".utf8))
+                    exit(1)
+                }
+            case "--allow-missing-blobs":
+                allowMissingBlobs = true
+                i += 1
+            default:
+                FileHandle.standardError.write(Data("promote-to-primary: 未知参数 \(args[i])\n".utf8))
+                exit(1)
+            }
+        }
+
+        let paths = Paths.makeDefault()
+        let deviceID: String
+        do {
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("promote-to-primary: 读 device-id 失败: \(error)\n".utf8))
+            exit(1)
+        }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+        let blobs = BlobStore(root: paths.blobsDir)
+        // P1 review fix: 查 daemon 在不在跑。dev 场景 swift run 直接跑（不在 launchctl 管理下）
+        // 会被识别为 false，进入 promote——CLAUDE.md 已写 dev 跑前先 bootout 是用户责任
+        let daemonRunning = LaunchAgent.isRunning(label: LaunchAgent.duoPastedLabel)
+        let result: Admin.PromoteResult
+        do {
+            result = try Admin.promoteToPrimary(
+                dbPath: paths.mainDB,
+                configPath: paths.configFile,
+                blobs: blobs,
+                selfDeviceID: deviceID,
+                now: now,
+                serveHost: serveHost,
+                servePort: servePort,
+                allowMissingBlobs: allowMissingBlobs,
+                daemonRunning: daemonRunning,
+                daemonLabel: LaunchAgent.duoPastedLabel
+            )
+        } catch {
+            FileHandle.standardError.write(Data("promote-to-primary failed: \(error)\n".utf8))
+            exit(1)
+        }
+
+        var lines: [String] = []
+        lines.append("promote-to-primary done")
+        lines.append("  promoted (mirror → item):       \(result.promotedRows) rows")
+        lines.append("  cleared item_mirror:            \(result.mirrorClearedRows) rows")
+        lines.append("  stamped ingested_at_ns:         \(result.stampedRows) rows (含 client 路径老 own-origin)")
+        if let old = result.oldPrimaryURL {
+            lines.append("  old primary_url removed:        \(old.absoluteString)")
+        }
+        if let oldID = result.lineageOldPrimaryID {
+            lines.append("  lineage closed prior primary:   device_id=\(oldID) ended_at_ns=\(now)")
+        } else {
+            lines.append("  lineage closed prior primary:   (none — pull_cursor 之前为空)")
+        }
+        lines.append("  lineage opened self tenure:     device_id=\(deviceID) started_at_ns=\(now)")
+        lines.append("  config rewritten:               \(result.configWrittenTo.path)")
+        if result.missingBlobsTotal > 0 {
+            lines.append("")
+            lines.append("⚠ WARNING: \(result.missingBlobsTotal) 个 blob 在本机 BlobStore 缺失")
+            lines.append("  image/file 类历史在 /blob/<sha> 上将返回 404。示例 sha：")
+            for sha in result.missingBlobsSamples {
+                lines.append("    - \(sha)")
+            }
+            lines.append("  --allow-missing-blobs 让 promote 继续，但缺失字节没法自愈。")
+        }
+        lines.append("")
+        lines.append("下一步：")
+        lines.append("  1. 装回 LaunchAgent 并以新 config 拉起 daemon（与 install-agent.sh 一致）：")
+        lines.append("       launchctl bootstrap gui/$UID ~/Library/LaunchAgents/\(LaunchAgent.duoPastedLabel).plist")
+        lines.append("       launchctl enable    gui/$UID/\(LaunchAgent.duoPastedLabel)")
+        lines.append("       launchctl kickstart -k gui/$UID/\(LaunchAgent.duoPastedLabel)")
+        lines.append("     （若 daemon 不是通过 launchctl bootout 停掉而是仍处于 loaded 状态，跳过 bootstrap/enable、直接 kickstart 即可）")
+        lines.append("  2. 到其他 client 把 config.json 里的 primary_url 改成本机的可达地址，")
+        lines.append("     然后跑 `duo-pasted audit-push` 补『老 primary acked 但 mirror 未拉到』的洞。")
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+        exit(0)
     }
 
     private static func runRetryFailed() {
