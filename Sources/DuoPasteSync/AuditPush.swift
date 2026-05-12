@@ -24,6 +24,17 @@ import DuoPasteCore
 ///    PushWorker 二次 push，但 RemoteIngester 收到同 id 直接 ACK 不更新 primary 行，
 ///    primary 永远停留在第一次 ingest 时的状态。同 id 还要对比 pinned / deletedAtNs /
 ///    capturedAtNs，diverge → 标 `staleOnPrimary`，参与 exit code。
+///
+/// **Lineage-aware 吸收源过滤**：单 primary deployment 下 "origin != self" 启发式没问题
+/// （非 self 的 candidate 必然是当前 primary）。但跨任期场景——`duo-pasted promote-to-primary`
+/// 切了 primary，老 primary 的历史 own-origin 行经 mirror→item 转移进新 primary 的 /since
+/// 流——"origin != self" 会把老 primary 的所有 own 行当成合法吸收源，造成跨任期内容碰撞
+/// 误判（air 推 "hello" 在 mbp 任期内，mini 的历史 "hello" 离 5s 窗内 → 被误算成 mini
+/// 吸收 air，实际 mbp 才有可能吸收）。修：读 `primary_lineage` 按 row.capturedAtNs 落在
+/// `[started_at_ns, ended_at_ns)` 区间确定该 push 时刻的 active primary，候选必须 origin
+/// 严格 == 这个 device_id。lineage 没覆盖到时间点（空 lineage / 时间点在所有 entry 区间外
+/// / 期望 primary == self 的 stale lineage 边界）→ 回退 "origin != self"，保单 primary 老
+/// 行为零回归。
 public enum AuditPush {
     /// audit 结果。CLI 渲染成多行文本输出；测试直接断言字段。
     public struct Report: Sendable, Equatable {
@@ -179,7 +190,22 @@ public enum AuditPush {
             cursor = page.nextCursor
         }
 
-        // 2. 读本机 own-origin 全部行。额外取 kind / content / capturedAt / pinned / deletedAt 用于
+        // 2a. 读 primary_lineage 全部行（一般空；v5 后只有 promote-to-primary 写）。
+        //    用来判定每条 own-origin 行被 push 时刻的 active primary device_id——只有
+        //    那个 device 的 own 行才可能是 Continuity dedup 吸收源。
+        let lineage = try await database.pool.read { db -> [LineageEntry] in
+            try Row.fetchAll(db, sql: """
+                SELECT device_id, started_at_ns, ended_at_ns FROM primary_lineage
+            """).map { row in
+                LineageEntry(
+                    deviceID: row["device_id"] ?? "",
+                    startedAtNs: row["started_at_ns"] ?? 0,
+                    endedAtNs: row["ended_at_ns"]
+                )
+            }
+        }
+
+        // 2b. 读本机 own-origin 全部行。额外取 kind / content / capturedAt / pinned / deletedAt 用于
         //    dedup 内容匹配 + 同 id state 对比
         let local = try await database.pool.read { db -> [LocalRow] in
             try Row.fetchAll(db, sql: """
@@ -257,17 +283,23 @@ public enum AuditPush {
                     let candidates = primaryByContent[key] ?? []
                     let floor = row.capturedAtNs &- dedupWindowNs
                     let ceiling = row.capturedAtNs &+ dedupWindowNs
-                    // 严格按 RemoteIngester.crossDeviceWindowNs 契约：dedup 只对 origin != 推送方
-                    // 的本地 own-origin 行触发。所以 audit 匹配也要排除"本机自家 origin"——本机
-                    // 自家两条同内容根本不会触发 RemoteIngester 的 dedup 路径，看到不算吸收
-                    // TODO(promote-lineage): primary_lineage 表已经在 v5 migration 建好，
-                    // promote-to-primary 子命令会在每次任期切换时写两行（self 开新任期 +
-                    // old primary 闭旧任期）。下一步把这里的 `origin != selfDeviceID` 改成
-                    // 「origin 等于本地 row 被 push 时 active 的 primary device_id」——查 lineage
-                    // 表按 row.ingestedAtNs 落在哪段 [started, ended] 区间。
-                    // 当前 single-primary deployment 下 origin != self 跟严格定义等价。
+                    // RemoteIngester.crossDeviceWindowNs 契约：dedup 只对 origin != 推送方
+                    // 的本地 own-origin 行触发。Lineage-aware 路径：用 row.capturedAtNs 当
+                    // push 时刻的 proxy 查 lineage 找该时刻 active primary，候选必须 origin
+                    // == 这个 device_id（严格匹配；跨任期碰撞被挡掉）。lineage 没覆盖（空
+                    // lineage / 早于所有任期 / 期望 primary == self 的 stale lineage 边界）
+                    // → 回退 origin != self 启发式保单 primary 老行为零回归。
+                    let expectedAbsorberOrigin = Self.activePrimaryDeviceID(
+                        at: row.capturedAtNs, lineage: lineage, selfDeviceID: selfDeviceID
+                    )
                     absorbedEntry = candidates.first(where: { entry in
-                        entry.originDevice != selfDeviceID
+                        let originOK: Bool
+                        if let expected = expectedAbsorberOrigin {
+                            originOK = entry.originDevice == expected
+                        } else {
+                            originOK = entry.originDevice != selfDeviceID
+                        }
+                        return originOK
                             && entry.capturedAtNs >= floor
                             && entry.capturedAtNs <= ceiling
                     })
@@ -330,6 +362,43 @@ public enum AuditPush {
         let originDevice: String
         let capturedAtNs: Int64
         let deletedAtNs: Int64?
+    }
+
+    /// `primary_lineage` 表的内存形态。`startedAtNs == 0` 表示"未知何时开始"
+    /// （`Admin.promoteToPrimary` 闭老 primary 任期时使用的 sentinel）。
+    /// `endedAtNs == nil` 表示任期当前仍开（self 的开新任期行）。
+    private struct LineageEntry {
+        let deviceID: String
+        let startedAtNs: Int64
+        let endedAtNs: Int64?
+    }
+
+    /// 给定一个 push 时刻 `t`，从 lineage 里挑出覆盖该时刻的 active primary。
+    /// 覆盖规则：`(startedAtNs == 0 || startedAtNs <= t) && (endedAtNs == nil || t < endedAtNs)`
+    ///
+    /// 返回 nil 的几种情况，调用方都应该回退到 "origin != selfDeviceID" 启发式：
+    /// - lineage 空（最常见，从未 promote 过）
+    /// - 时间点不落在任何 [started, ended) 区间内
+    /// - 期望 primary == selfDeviceID 的 stale lineage（self 曾 promote 过、又手动改 config
+    ///   回 client → 本地 lineage 仍记 self 任期开着）。严格匹配 self 会让所有 candidate 都
+    ///   被拒，把合法吸收源误算成 missing，因此 stale 边界落到回退路径
+    ///
+    /// 多 entry 覆盖同一时间点时（不规范的 lineage，但防御性处理）取 startedAtNs 最大的
+    /// 那条——最具体的开始时间最可能反映真实任期切换点。
+    private static func activePrimaryDeviceID(
+        at t: Int64, lineage: [LineageEntry], selfDeviceID: String
+    ) -> String? {
+        let active = lineage
+            .filter { e in
+                let startedOK = e.startedAtNs == 0 || e.startedAtNs <= t
+                let endedOK = e.endedAtNs == nil || t < e.endedAtNs!
+                return startedOK && endedOK
+            }
+            .max(by: { $0.startedAtNs < $1.startedAtNs })
+        guard let device = active?.deviceID, !device.isEmpty, device != selfDeviceID else {
+            return nil
+        }
+        return device
     }
 
     /// 同 `Database.findNearbyOwnContent` 的内容指纹规则：blob 类型按 sha256 比对，
