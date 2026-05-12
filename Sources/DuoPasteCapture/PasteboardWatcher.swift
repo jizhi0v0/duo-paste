@@ -21,14 +21,21 @@ public final class PasteboardWatcher {
     private var lastChangeCount: Int
     private var timer: Timer?
     private let onCapture: Callback
+    /// 仅 RTF 路径用于解码前 raw-size 守门，避免 50MB RTF source 被 NSAttributedString 同步
+    /// 解析后才走到 CaptureService 的 text byte cap。raw RTF 字节 > 该上限时跳过 decode，
+    /// 把 raw RTF 直接作为兜底 .rtf 文本返回 —— CaptureService 后续 byte-cap 会拦下。
+    /// 默认值匹配 Config.CaptureLimits.maxTextBytes 默认（512 * 1024）；AppDelegate 注入实际配置。
+    private let maxRawRTFBytes: Int
 
     public init(
         pasteboard: NSPasteboard = .general,
         pollInterval: TimeInterval = 0.2,
+        maxRawRTFBytes: Int = 512 * 1024,
         onCapture: @escaping Callback
     ) {
         self.pasteboard = pasteboard
         self.pollInterval = pollInterval
+        self.maxRawRTFBytes = maxRawRTFBytes
         self.lastChangeCount = pasteboard.changeCount
         self.onCapture = onCapture
     }
@@ -157,7 +164,7 @@ public final class PasteboardWatcher {
             // 三层降级：
             // (a) pasteboard 自己写了 .string → 直接用
             // (b) 只写了 .rtf（Notes/Mail 部分场景）→ 本地解 RTF markup 拿 attributed.string
-            // (c) 解析失败/全空白 → 才存 raw rtf 当兜底
+            // (c) 解析失败/全空白/raw 太大 → 才存 raw rtf 当兜底（CaptureService 字节守门后续拦下）
             if let plain = pasteboard.string(forType: .string),
                !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
@@ -169,7 +176,11 @@ public final class PasteboardWatcher {
                     capturedAtNs: capturedAtNs
                 )
             }
-            if let plain = Self.decodeRTFToPlain(rtf),
+            // raw RTF 已经超过 text cap → 跳过 NSAttributedString 解析，避免在 @MainActor
+            // 轮询路径上同步分配巨大 attributed string。decoded plain ≤ raw rtf，所以这种 case
+            // 解出来也大概率仍超 cap，让 CaptureService 拦 raw 即可
+            if rtf.utf8.count <= maxRawRTFBytes,
+               let plain = Self.decodeRTFToPlain(rtf),
                !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
                 return CapturedPasteboard(
