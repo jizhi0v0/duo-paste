@@ -65,11 +65,15 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private func installKeyMonitor() {
         guard localKeyMonitor == nil else { return }
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            // 监听回调在 main 线程触发；只取 Sendable 的 keyCode 进 MainActor 闭包，
-            // 避免 NSEvent 非 Sendable 进入隔离边界。
+            // 监听回调在 main 线程触发；只取 Sendable 的 keyCode / modifier bool 进
+            // MainActor 闭包，避免 NSEvent 非 Sendable 进入隔离边界。
             let keyCode = Int(event.keyCode)
+            let isCmd = event.modifierFlags.contains(.command)
             let interceptCodes: Set<Int> = [126, 125, 36, 76, 53]
-            guard interceptCodes.contains(keyCode) else { return event }
+            // ⌘P (keyCode=35) = 切换选中行的 pinned。仅 Cmd 修饰键命中时截走；
+            // 不带修饰键的 P 透传给 TextField 当作正常字符输入
+            let isCmdP = (keyCode == 35 && isCmd)
+            guard interceptCodes.contains(keyCode) || isCmdP else { return event }
             // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
             // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
             if let tv = event.window?.firstResponder as? NSTextView, tv.hasMarkedText() {
@@ -89,6 +93,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                         self.onPaste(item)
                     }
                 case 53: self.hide()                            // Esc
+                case 35 where isCmd:                            // ⌘P = toggle pin
+                    if let item = self.state.currentItem {
+                        self.state.togglePin(item)
+                    }
                 default: break
                 }
             }

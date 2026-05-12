@@ -55,6 +55,7 @@ struct SearchView: View {
         VStack(spacing: 0) {
             header
             filterBar
+            noticeBanner
             pasteProgressBanner
             skipBanner
             modeBanner
@@ -172,11 +173,34 @@ struct SearchView: View {
                 .buttonStyle(.plain)
                 .help("清除类型筛选")
             }
+            pinnedOnlyChip
             Spacer()
             timeRangeMenu
         }
         .padding(.horizontal, 18)
         .padding(.bottom, 10)
+    }
+
+    /// 「仅置顶」开关——风格跟 KindChip 一致，但单 chip 即开关，不带 ✕
+    private var pinnedOnlyChip: some View {
+        Button {
+            state.pinnedOnly.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 11))
+                Text("仅置顶")
+                    .font(.system(size: 12))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(state.pinnedOnly ? Color.white : .primary)
+            .background(
+                Capsule()
+                    .fill(state.pinnedOnly ? Color.accentColor : Color.primary.opacity(0.06))
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     /// chip 排列顺序：剪贴板使用频次心智（文本/图片/链接最常用 → 排前面）
@@ -225,6 +249,26 @@ struct SearchView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+    }
+
+    /// 一次性 notice（pin mirror 行被拒等）。文案 3s 自动消失（AppState 控制）。
+    /// 跟 skipBanner 区分：notice 是即时操作反馈（按 ⌘P 没生效原因），
+    /// skipBanner 是后台 capture 事件（用户没看 panel 时也会塞进来）。
+    @ViewBuilder
+    private var noticeBanner: some View {
+        if let text = state.recentNotice {
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle")
+                Text(text)
+                Spacer()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.06))
+        }
     }
 
     /// 体积超限 banner：5 分钟内有 skip → 黄色提示「最近一次复制太大没存」。
@@ -518,6 +562,14 @@ private struct ItemRow: View {
                 .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
             }
             Spacer()
+            if item.pinned {
+                // 已置顶 row 右侧 pin.fill 角标。accent 色，选中态翻白让两种状态都清晰。
+                // 不放在 meta 行里——meta 已经够拥挤，角标在 trailing 视觉更明确（跟"歌单
+                // pin 在最上"的 macOS Music app 心智一致）
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(isSelected ? Color.white : Color.accentColor)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)

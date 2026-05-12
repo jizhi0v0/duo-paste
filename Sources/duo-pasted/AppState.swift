@@ -26,6 +26,11 @@ final class AppState {
     var selectedKinds: Set<ItemKind> = []
     /// 时间窗筛选。`.all` = 不带 fromNs；其他换算成 SearchQuery.fromNs
     var timeRange: TimeRange = .all
+    /// 仅显示已置顶。SearchQuery.pinnedOnly → SQL `pinned = 1`
+    var pinnedOnly: Bool = false
+    /// 临时一次性提示（pin mirror 行被拒等场景），3s 自动清掉。
+    /// 不持久化；SearchView 顶部以 caption 形态短暂显示
+    var recentNotice: String?
 
     /// 时间窗选项。换算成 SearchQuery.fromNs（toNs 始终 nil = 不卡上界）。
     /// 注：用 wall-clock 算窗口起点，时钟偏移大时窗口范围会跟实际感受偏离——
@@ -65,7 +70,7 @@ final class AppState {
     /// 约束链（其实都已经满足，但用 String 也省去 SwiftUI Equatable 比较的实例化）
     var filterID: String {
         let kindsStr = selectedKinds.map { $0.rawValue }.sorted().joined(separator: ",")
-        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)"
+        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
     }
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
@@ -128,6 +133,48 @@ final class AppState {
         self.recentSkip = nil
     }
 
+    /// 切换 item 的 pinned 状态。仅对 own-origin 行生效；mirror 行（别的机器产生的）
+    /// 给个一次性 notice 提示，不抛错。
+    ///
+    /// 行为细节：
+    /// - own-origin + 状态变化 → Database.setPinned writer tx + refresh
+    /// - own-origin + 同状态 → no-op（不动 ingested_at_ns 避免无谓 cursor 推进）
+    /// - mirror 行（origin ≠ self）→ 显示 notice"只能置顶本机产生的项"，3s 自动消失
+    ///
+    /// 调用方：SearchPanelController 的 ⌘P key monitor。同步执行：单行 UPDATE +
+    /// 一次 MAX 查询，pool.write 在 main actor 上 < 1ms，不卡 UI
+    func togglePin(_ item: Item) {
+        guard item.originDevice == deps.deviceID else {
+            postNotice("只能置顶本机产生的项")
+            return
+        }
+        do {
+            let didUpdate = try deps.database.setPinned(
+                id: item.id,
+                pinned: !item.pinned,
+                selfDeviceID: deps.deviceID,
+                now: Clock.nowNs()
+            )
+            if didUpdate {
+                Task { await refresh() }
+            }
+        } catch {
+            self.lastError = "pin 失败: \(error)"
+        }
+    }
+
+    /// 一次性 3s notice。同一文案在窗口内重复触发不会延长——只在过期后才能换新内容
+    private func postNotice(_ text: String) {
+        self.recentNotice = text
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            // 只有还是同一条 notice 时才清——中间被新 notice 覆盖就不动
+            if self?.recentNotice == text {
+                self?.recentNotice = nil
+            }
+        }
+    }
+
     init(deps: AppDependencies) {
         self.deps = deps
         // 同步预填本地最新 200 条，避免 panel 首次打开 SwiftUI 第一帧渲染
@@ -164,6 +211,7 @@ final class AppState {
             text: trimmed.isEmpty ? nil : trimmed,
             fromNs: timeRange.fromNs(),
             kinds: Array(selectedKinds),
+            pinnedOnly: pinnedOnly,
             limit: 200
         )
         do {

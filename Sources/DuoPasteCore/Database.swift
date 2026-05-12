@@ -305,4 +305,40 @@ public struct Database: Sendable {
             try db.checkpoint(.truncate)
         }
     }
+
+    /// 切换 item.pinned。仅对 origin_device == selfDeviceID 的行生效——mirror 行
+    /// （别的机器产生的）不能 pin，由调用方在 UI 层先判断。这里在 DB 层再守一道是
+    /// 防御性：即使 UI 误传 mirror id 也不会改写跨设备行的 pinned。
+    ///
+    /// writer tx 内 bump `ingested_at_ns`，让 PullWorker 通过 /since 把变更回放到其他
+    /// 设备的 item_mirror。primary 上调 → 全局可见；client 上调 → 仅本机生效
+    /// （RemoteIngester 不更新已存在的 id，M2 契约"item 一旦 ingest 就不可变"。
+    /// 跨设备 pin 同步留到将来 /update 路由）。
+    ///
+    /// Returns: `true` 代表实际 UPDATE 了一行；`false` = item 不存在 / 非 own-origin /
+    /// 已是目标状态。**false 不是错误**，是幂等结果，调用方按需 refresh UI 即可
+    @discardableResult
+    public func setPinned(
+        id: String,
+        pinned: Bool,
+        selfDeviceID: String,
+        now: Int64
+    ) throws -> Bool {
+        try pool.write { db in
+            guard let item = try Item.filter(Column("id") == id).fetchOne(db) else {
+                return false
+            }
+            guard item.originDevice == selfDeviceID else {
+                return false
+            }
+            if item.pinned == pinned { return false }
+            let ts = try Self.nextIngestNs(db, now: now)
+            try db.execute(sql: """
+                UPDATE item
+                SET pinned = ?, ingested_at_ns = ?
+                WHERE id = ?
+            """, arguments: [pinned ? 1 : 0, ts, id])
+            return true
+        }
+    }
 }

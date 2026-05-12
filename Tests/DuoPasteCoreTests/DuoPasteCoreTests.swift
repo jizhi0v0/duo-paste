@@ -343,3 +343,71 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     }
     #expect(count == 1)
 }
+
+// MARK: - setPinned
+
+/// own-origin 行 unpinned → pinned 切换：pinned 列翻转 + ingested_at_ns bump（让 /since 回放）
+@Test func setPinnedFlipsOwnOriginRow() async throws {
+    let (_, db, _, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "x", capturedAtNs: 1_000_000_000))
+    let id = try await db.pool.read { conn in
+        try String.fetchOne(conn, sql: "SELECT id FROM item LIMIT 1") ?? ""
+    }
+    let nsBefore = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+    }
+    let did = try db.setPinned(id: id, pinned: true, selfDeviceID: "device-test", now: nsBefore &+ 100)
+    #expect(did == true)
+    let row = try await db.pool.read { conn -> (Int, Int64) in
+        let p = try Int.fetchOne(conn, sql: "SELECT pinned FROM item WHERE id = ?", arguments: [id]) ?? 0
+        let n = try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+        return (p, n)
+    }
+    #expect(row.0 == 1)
+    #expect(row.1 > nsBefore)  // ns bump 让 /since cursor 把这条回放给 mirror followers
+}
+
+/// origin != self 时 setPinned 返回 false 不动行。
+/// mirror 行（别的设备产生）不能被本机 pin —— "pinned 是 owner 端语义"
+@Test func setPinnedRefusesNonOwnOrigin() async throws {
+    let (_, db, _, _) = try makeFixture()
+    try await db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item (id, origin_device, captured_at_ns, kind, pinned, push_state)
+            VALUES ('foreign-id', 'other-device', 1_000_000, 'text', 0, 'acked')
+        """)
+    }
+    let did = try db.setPinned(id: "foreign-id", pinned: true, selfDeviceID: "device-test", now: 2_000_000)
+    #expect(did == false)
+    let p = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT pinned FROM item WHERE id = ?", arguments: ["foreign-id"]) ?? -1
+    }
+    #expect(p == 0)
+}
+
+/// 目标 pinned 跟当前一致 → no-op，不 bump ingested_at_ns。
+/// 这是为了避免无谓 cursor 推进 + 网络流量——重复按 ⌘P 切回原状态时也走这条
+@Test func setPinnedNoOpWhenSameState() async throws {
+    let (_, db, _, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "y", capturedAtNs: 1_000_000_000))
+    let id = try await db.pool.read { conn in
+        try String.fetchOne(conn, sql: "SELECT id FROM item LIMIT 1") ?? ""
+    }
+    let nsBefore = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+    }
+    // 当前 pinned=0，再设 false → no-op
+    let did = try db.setPinned(id: id, pinned: false, selfDeviceID: "device-test", now: nsBefore &+ 5_000)
+    #expect(did == false)
+    let nsAfter = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+    }
+    #expect(nsAfter == nsBefore)
+}
+
+/// 不存在的 id → 返回 false 不抛。调用方（AppState.togglePin）按幂等结果处理
+@Test func setPinnedNoOpWhenIDNotFound() throws {
+    let (_, db, _, _) = try makeFixture()
+    let did = try db.setPinned(id: "ghost", pinned: true, selfDeviceID: "device-test", now: 1)
+    #expect(did == false)
+}
