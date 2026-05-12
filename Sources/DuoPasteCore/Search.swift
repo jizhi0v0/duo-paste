@@ -99,8 +99,26 @@ public struct SearchAPI: Sendable {
             }
         }
         var deduped = Array(byID.values)
+        // 排序契约：pinned DESC → prefix DESC → captured_at_ns DESC。
+        // prefix 分数跟 SQL 端 CASE 一致（preview 起始=2, text_full 起始=1, 否则 0），
+        // 让 union 跨表合并后顺序跟单表 fetchHits 完全可预测。
+        let prefixText = q.text
+        // 跟 SQL 端口径一致：24h 窗外的项 prefix 分数清零，强制走时间倒序。
+        let nowNs = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+        let windowNs: Int64 = 86_400 * 1_000_000_000
+        func prefixScore(_ item: Item) -> Int {
+            guard let t = prefixText, !t.isEmpty else { return 0 }
+            if nowNs - item.capturedAtNs >= windowNs { return 0 }
+            let needle = t.lowercased()
+            if let pv = item.preview, pv.lowercased().hasPrefix(needle) { return 2 }
+            if let tf = item.textFull, tf.lowercased().hasPrefix(needle) { return 1 }
+            return 0
+        }
         deduped.sort { lhs, rhs in
             if lhs.0.pinned != rhs.0.pinned { return lhs.0.pinned }
+            let lp = prefixScore(lhs.0)
+            let rp = prefixScore(rhs.0)
+            if lp != rp { return lp > rp }
             return lhs.0.capturedAtNs > rhs.0.capturedAtNs
         }
         let start = min(q.offset, deduped.count)
@@ -139,6 +157,31 @@ public struct SearchAPI: Sendable {
         let snippetCol = useFTS
             ? ", snippet(item_mirror_fts, -1, char(2), char(3), '…', 8) AS _snippet"
             : ""
+        // 前缀优先：preview / text_full 以 query 文本起始的项排到同时间组的前面。
+        // case-insensitive 用 instr(LOWER(...), LOWER(?)) = 1，避开 LIKE 通配转义。
+        // text_full 兜底是因为图片/blob 类没 preview 但搜不到也无所谓——主要照顾文本项。
+        // 注意：CASE 在 SELECT 列表里，占位符出现在所有 WHERE/LIMIT 占位符之前，
+        // 所以 prefix args 必须 insert 到 args 头部，而不是 append 尾部。
+        let prefixCol: String
+        let needsPrefix = q.text != nil && ftsQuery(from: q.text!) != nil
+        if needsPrefix {
+            prefixCol = """
+                , CASE
+                    WHEN instr(LOWER(IFNULL(item_mirror.preview, '')), LOWER(?)) = 1 THEN 2
+                    WHEN instr(LOWER(IFNULL(item_mirror.text_full, '')), LOWER(?)) = 1 THEN 1
+                    ELSE 0
+                  END AS _prefix
+                """
+            args.insert(contentsOf: [q.text! as DatabaseValueConvertible, q.text! as DatabaseValueConvertible], at: 0)
+        } else {
+            prefixCol = ""
+        }
+        // 时间窗：prefix-boost 仅对 24h 内的项生效。跨天的老内容（哪怕起头匹配）也按
+        // 时间倒序排——剪贴板心智里"搜=找最近用过的"，不希望陈年老条目被翻上来。
+        // SQLite 自带 strftime('%s','now')，避免 Swift 端再往 args 里塞 now_ns。
+        let orderPrefix = needsPrefix
+            ? "(CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - item_mirror.captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END) DESC, "
+            : ""
         let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
         let sql = """
             SELECT item_mirror.id, item_mirror.origin_device, item_mirror.captured_at_ns,
@@ -146,11 +189,11 @@ public struct SearchAPI: Sendable {
                    item_mirror.source_app, item_mirror.source_app_name, item_mirror.preview,
                    item_mirror.text_full, item_mirror.blob_sha256, item_mirror.blob_size,
                    item_mirror.blob_mime, item_mirror.pinned, item_mirror.deleted_at_ns,
-                   'acked' AS push_state, 0 AS push_attempts, NULL AS last_push_error\(snippetCol)
+                   'acked' AS push_state, 0 AS push_attempts, NULL AS last_push_error\(snippetCol)\(prefixCol)
             FROM item_mirror
             \(join)
             \(whereClause)
-            ORDER BY item_mirror.pinned DESC, item_mirror.captured_at_ns DESC
+            ORDER BY item_mirror.pinned DESC, \(orderPrefix)item_mirror.captured_at_ns DESC
             LIMIT ? OFFSET ?
         """
         args.append(q.limit)
@@ -191,13 +234,33 @@ public struct SearchAPI: Sendable {
         let snippetCol = useFTS
             ? ", snippet(item_fts, -1, char(2), char(3), '…', 8) AS _snippet"
             : ""
+        let prefixCol: String
+        let needsPrefix = q.text != nil && ftsQuery(from: q.text!) != nil
+        if needsPrefix {
+            prefixCol = """
+                , CASE
+                    WHEN instr(LOWER(IFNULL(item.preview, '')), LOWER(?)) = 1 THEN 2
+                    WHEN instr(LOWER(IFNULL(item.text_full, '')), LOWER(?)) = 1 THEN 1
+                    ELSE 0
+                  END AS _prefix
+                """
+            args.insert(contentsOf: [q.text! as DatabaseValueConvertible, q.text! as DatabaseValueConvertible], at: 0)
+        } else {
+            prefixCol = ""
+        }
+        // 时间窗：prefix-boost 仅对 24h 内的项生效。跨天的老内容（哪怕起头匹配）也按
+        // 时间倒序排——剪贴板心智里"搜=找最近用过的"，不希望陈年老条目被翻上来。
+        // SQLite 自带 strftime('%s','now')，避免 Swift 端再往 args 里塞 now_ns。
+        let orderPrefix = needsPrefix
+            ? "(CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - item.captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END) DESC, "
+            : ""
         let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
         let sql = """
-            SELECT item.*\(snippetCol)
+            SELECT item.*\(snippetCol)\(prefixCol)
             FROM item
             \(join)
             \(whereClause)
-            ORDER BY item.pinned DESC, item.captured_at_ns DESC
+            ORDER BY item.pinned DESC, \(orderPrefix)item.captured_at_ns DESC
             LIMIT ? OFFSET ?
         """
         args.append(q.limit)
@@ -337,13 +400,33 @@ public struct SearchAPI: Sendable {
         }
 
         let join = useFTS ? "JOIN item_fts ON item_fts.rowid = item.rowid" : ""
+        let needsPrefix = q.text != nil && ftsQuery(from: q.text!) != nil
+        let prefixCol: String
+        if needsPrefix {
+            prefixCol = """
+                , CASE
+                    WHEN instr(LOWER(IFNULL(item.preview, '')), LOWER(?)) = 1 THEN 2
+                    WHEN instr(LOWER(IFNULL(item.text_full, '')), LOWER(?)) = 1 THEN 1
+                    ELSE 0
+                  END AS _prefix
+                """
+            args.insert(contentsOf: [q.text! as DatabaseValueConvertible, q.text! as DatabaseValueConvertible], at: 0)
+        } else {
+            prefixCol = ""
+        }
+        // 时间窗：prefix-boost 仅对 24h 内的项生效。跨天的老内容（哪怕起头匹配）也按
+        // 时间倒序排——剪贴板心智里"搜=找最近用过的"，不希望陈年老条目被翻上来。
+        // SQLite 自带 strftime('%s','now')，避免 Swift 端再往 args 里塞 now_ns。
+        let orderPrefix = needsPrefix
+            ? "(CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - item.captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END) DESC, "
+            : ""
         let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
         let sql = """
-            SELECT item.*
+            SELECT item.*\(prefixCol)
             FROM item
             \(join)
             \(whereClause)
-            ORDER BY item.pinned DESC, item.captured_at_ns DESC
+            ORDER BY item.pinned DESC, \(orderPrefix)item.captured_at_ns DESC
             LIMIT ? OFFSET ?
         """
         args.append(q.limit)
