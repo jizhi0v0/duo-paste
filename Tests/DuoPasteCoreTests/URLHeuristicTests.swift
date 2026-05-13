@@ -86,3 +86,27 @@ import Foundation
     #expect(!looksLikeURL("http://.com"))          // 起首 '.'
     #expect(!looksLikeURL("http://example..com"))  // 连续 '..'
 }
+
+@Test func acceptsIPv6Literal() {
+    // codex review round 2：IPv6 literal 是合法 URL host，开发者本机服务剪贴板里偶有出现
+    #expect(looksLikeURL("http://[::1]:3000"))
+    #expect(looksLikeURL("https://[2001:db8::1]/path"))
+    #expect(looksLikeURL("http://[::ffff:1.2.3.4]/"))  // IPv4-mapped
+}
+
+@Test func acceptsTrailingDotFQDN() {
+    // codex review round 2：trailing dot 是 DNS absolute form 合法形态，不该拒
+    #expect(looksLikeURL("http://example.com."))
+    #expect(looksLikeURL("https://github.com./foo"))
+}
+
+@Test func acceptsIPv4Literal() {
+    // 边界：纯 IPv4 host 在 dotted-name 路径里走 [0-9.-] 字符集，应通过
+    #expect(looksLikeURL("http://127.0.0.1:8080"))
+    #expect(looksLikeURL("http://192.168.1.1/"))
+}
+
+@Test func acceptsLocalhost() {
+    // localhost 没有 '.' 不走 IPv6 路径，dotted-name 路径里 [a-z] 字符集通过
+    #expect(looksLikeURL("http://localhost:8443"))
+}

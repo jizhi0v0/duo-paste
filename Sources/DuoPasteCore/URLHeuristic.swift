@@ -10,9 +10,12 @@ import Foundation
 ///     "URL + 后接文字"——SQL backfill 端 `text_full NOT LIKE '% %'` 只挡 space，Swift 端
 ///     必须连 \t 一起挡，否则 "https://x.com<TAB>note" 在 Swift 路径会被错升 .url
 ///   - URL(string:) 解析成功
-///   - host 校验：非空、无连续 `..`、不以 `.` 起止、字符限于 `[a-zA-Z0-9.-]`
-///     （IDN 已 punycode 成 `xn--...`；IPv6 形如 `::1` 含 `:` 会被排除——剪贴板里裸 IPv6
-///     URL 极罕见，保守换误判面收紧）
+///   - host 校验分两支：
+///     - IPv6 literal（`URL.host` 含 `:`）：只校验字符限于 `[0-9a-fA-F:.\[\]]`，
+///       IPv4-mapped 形如 `::ffff:1.2.3.4` 含 `.` 也支持；不挡 `..` 因为 IPv6 `::` 是合法 elision
+///     - 普通 dotted name / IPv4：非空、不以 `.` 起首、无连续 `..`、字符限于 `[a-zA-Z0-9.-]`。
+///       trailing dot（FQDN absolute form `example.com.`）合法，**不**拒；IDN 已 punycode 成
+///       `xn--...` 命中字符集
 ///
 /// 不接受 `www.` / 裸 host / file://：
 ///   - 裸 host 误判风险高（"config.json" 也匹配大多数 TLD 启发）
@@ -29,7 +32,15 @@ public func looksLikeURL(_ s: String) -> Bool {
           scheme == "http" || scheme == "https"
     else { return false }
     guard let host = url.host, !host.isEmpty else { return false }
-    if host.hasPrefix(".") || host.hasSuffix(".") { return false }
+
+    if host.contains(":") {
+        // IPv6 literal。Apple URL.host 对 `http://[::1]/` 通常返回 `::1`（无 brackets），但
+        // 历史/未来版本不保证，allow 字符集兼容两种形态 + IPv4-mapped (含 '.')
+        let allowedIPv6 = CharacterSet(charactersIn: "0123456789abcdefABCDEF:.[]")
+        if host.unicodeScalars.contains(where: { !allowedIPv6.contains($0) }) { return false }
+        return true
+    }
+    if host.hasPrefix(".") { return false }
     if host.contains("..") { return false }
     let allowedHostChars = CharacterSet.lowercaseLetters
         .union(.uppercaseLetters)
