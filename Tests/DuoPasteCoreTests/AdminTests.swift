@@ -102,7 +102,8 @@ private func seedOCRItem(
     kind: ItemKind = .image,
     ocrState: OCRState?,
     deletedAtNs: Int64? = nil,
-    lastError: String? = "old error"
+    lastError: String? = "old error",
+    pushState: PushState = .acked
 ) throws {
     let it = Item(
         id: id, originDevice: originDevice,
@@ -110,7 +111,7 @@ private func seedOCRItem(
         preview: "p-\(id)",
         blobSha256: kind == .image ? String(repeating: "a", count: 64) : nil,
         deletedAtNs: deletedAtNs,
-        pushState: .acked,
+        pushState: pushState,
         lastPushError: lastError,
         ocrState: ocrState
     )
@@ -170,6 +171,29 @@ private func seedOCRItem(
     let byID = Dictionary(uniqueKeysWithValues: after.map { ($0.id, $0) })
     #expect(byID["mine"]?.ocrState == .pending)
     #expect(byID["theirs"]?.ocrState == .failed)
+}
+
+@Test func retryFailedOCRPreservesLastErrorWhenPushFailed() throws {
+    // 不变量：last_push_error 列被 OCR 跟 push 共享，retry-failed-ocr 在 push 真的失败
+    // 着的时候不该抹掉 push 的真实错误（"rejected: bad blob"）
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(
+        db: db, id: "double-trouble", originDevice: "me",
+        ocrState: .failed,
+        lastError: "rejected: bad blob",
+        pushState: .failed
+    )
+    let n = try Admin.retryFailedOCR(dbPath: paths.mainDB, selfDeviceID: "me", scope: .all)
+    #expect(n == 1)
+    let after = try db.pool.read { conn in
+        try Item.filter(Column("id") == "double-trouble").fetchOne(conn)
+    }
+    #expect(after?.ocrState == .pending)
+    // push 失败的真实原因不被 OCR 重置抹掉
+    #expect(after?.lastPushError == "rejected: bad blob")
 }
 
 @Test func retryFailedOCRSkipsSoftDeleted() throws {

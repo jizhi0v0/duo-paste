@@ -244,9 +244,8 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     let env = try makeEnv()
     let sha = try seedBlob(env)
     try seedItem(env, id: "perm-err", originDevice: env.deviceID, blobSha: sha)
-    struct E: Error {}
     let recognizer = StubOCRRecognizer(
-        table: [sha: .failure(.visionPermanent(E()))]
+        table: [sha: .failure(.visionPermanent(reason: "stub permanent"))]
     )
     let w = OCRWorker(
         database: env.db, blobs: env.blobs,
@@ -340,8 +339,9 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     // 插入新 image 并 wake
     try seedItem(env, id: "fresh", originDevice: env.deviceID, blobSha: sha)
     w.wake()
-    // 给 worker 一点时间处理
-    for _ in 0..<20 {
+    // 给 worker 一点时间处理。CI 上 50ms × 20 = 1s 偶发抢不到 CPU，放宽到 3s 总
+    // budget（60 × 50ms）让 wake → tick → DB write 链路在慢机器上也稳
+    for _ in 0..<60 {
         if await recorder.count() > 0 { break }
         try await Task.sleep(nanoseconds: 50_000_000)
     }
@@ -350,6 +350,40 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     let after = try fetchItem(env, id: "fresh")
     #expect(after?.ocrState == .done)
     #expect(after?.textFull == "woke")
+}
+
+@Test func ocrWorkerMarkSkippedDoesNotClobberPushFailedLastError() async throws {
+    // 不变量：last_push_error 列被 push / OCR 共享，OCR mark skipped/failed 时不该
+    // 盖掉 push 真实失败的 last_push_error
+    let env = try makeEnv()
+    let sha = try seedBlob(env)
+    // 故意造一个 push_state=failed 行，last_push_error 是 push 的真实错误
+    let it = Item(
+        id: "push-and-ocr-fail",
+        originDevice: env.deviceID,
+        capturedAtNs: 1_700_000_000_000_000_000,
+        kind: .image,
+        preview: "p",
+        blobSha256: sha,
+        pushState: .failed,
+        lastPushError: "rejected: server returned 400",
+        ocrState: .pending
+    )
+    try await env.db.pool.write { try it.insert($0) }
+    // OCR recognizer 抛 imageLoadFailed → markSkipped 会想把 reason 写 last_push_error
+    let recognizer = StubOCRRecognizer(
+        table: [sha: .failure(.imageLoadFailed)]
+    )
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig()
+    )
+    _ = await w.tick()
+    let after = try fetchItem(env, id: "push-and-ocr-fail")
+    #expect(after?.ocrState == .skipped)
+    // 但 last_push_error 保留 push 失败的真实原因
+    #expect(after?.lastPushError == "rejected: server returned 400")
 }
 
 @Test func ocrWorkerBumpsIngestedAtNsOnMarkDone() async throws {

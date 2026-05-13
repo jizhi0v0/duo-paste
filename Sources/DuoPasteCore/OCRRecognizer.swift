@@ -29,16 +29,23 @@ public struct OCRResult: Sendable, Equatable {
 ///   → 标 `skipped`，不再重试（图本身有问题）
 /// - `visionTransient`
 ///   → bump 内存 attempts 计数，达到上限再标 `failed`（Vision 模型一过性抽风）
+///
+/// **存 String reason 而不是 `any Error`**：原版本是 `case visionTransient(Error)`，
+/// 让枚举存 `any Error` 存在 Swift 6 strict-concurrency 顾虑——`any Error` 不静态
+/// Sendable，underlying 的 NSError userInfo 里可能含 NSMutableArray 等非 Sendable 内容。
+/// recognize 把 error 从 DispatchQueue.global 跨回 actor 边界时若未来开启 strict 模式
+/// 会报。降级为 reason 字符串：消费者（OCRWorker）只用它走日志 + `last_push_error`
+/// 列，不需要原 typed Error 对象
 public enum OCRRecognizeError: Error, Sendable {
     /// NSImage init 失败（文件损坏 / 非图片格式 / 读不到字节）。
     case imageLoadFailed
     /// 拿 CGImage 失败（某些 PDF stub / SVG / 容器类格式）。
     case unsupportedFormat
     /// Vision 抛错可能临时（GPU 占用 / 模型加载竞争 / 系统休眠唤醒过渡期）。
-    case visionTransient(Error)
+    case visionTransient(reason: String)
     /// Vision 抛错并明确是永久性（罕见，预留语义；当前 VisionOCRRecognizer 不主动
     /// 产生，但 stub 测试用得到 + 未来可加 NSError code 判别）。
-    case visionPermanent(Error)
+    case visionPermanent(reason: String)
 }
 
 extension OCRRecognizeError: CustomStringConvertible {
@@ -46,8 +53,8 @@ extension OCRRecognizeError: CustomStringConvertible {
         switch self {
         case .imageLoadFailed:      return "OCRRecognizeError.imageLoadFailed"
         case .unsupportedFormat:    return "OCRRecognizeError.unsupportedFormat"
-        case .visionTransient(let e): return "OCRRecognizeError.visionTransient(\(e))"
-        case .visionPermanent(let e): return "OCRRecognizeError.visionPermanent(\(e))"
+        case .visionTransient(let r): return "OCRRecognizeError.visionTransient(\(r))"
+        case .visionPermanent(let r): return "OCRRecognizeError.visionPermanent(\(r))"
         }
     }
 }

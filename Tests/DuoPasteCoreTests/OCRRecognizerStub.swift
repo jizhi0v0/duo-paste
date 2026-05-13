@@ -56,7 +56,6 @@ struct AlwaysTransientRecognizer: OCRRecognizer {
     let recorder: OCRCallRecorder
     func recognize(imageURL: URL, languages: [String]) async throws -> OCRResult {
         await recorder.record(imageURL.lastPathComponent)
-        struct E: Error {}
-        throw OCRRecognizeError.visionTransient(E())
+        throw OCRRecognizeError.visionTransient(reason: "stub transient")
     }
 }

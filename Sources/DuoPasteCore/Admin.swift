@@ -523,7 +523,11 @@ public enum Admin {
     /// - `scope=.id(_)`：只看 id + kind=image。无视 origin / state——用户敲了 id 就是
     ///   手动 override，包括把 done 翻成 pending 重 OCR 的场景
     ///
-    /// 同步把 `last_push_error` 清空（OCR 失败原因复用此列，重 OCR 前清掉避免污染）。
+    /// **清 `last_push_error` 的边界**（review fix）：OCRWorker 跟 PushWorker 共享这一列，
+    /// 仅在 `push_state != 'failed'` 时清——如果 push 真的失败着、错误信息是 push 的
+    /// （比如"rejected: bad blob"），不该被 OCR 重试无意中抹掉。`CASE` 让 push 失败行
+    /// 保留原 last_push_error，其余行清空（删 OCR 留下的 "blob too large" 之类）。
+    ///
     /// **不** bump ingested_at_ns——重置本身不改 item 内容；worker 真跑 OCR 写
     /// text_full 时再 bump。
     ///
@@ -540,7 +544,10 @@ public enum Admin {
                 try conn.execute(sql: """
                     UPDATE item
                     SET ocr_state = 'pending',
-                        last_push_error = NULL
+                        last_push_error = CASE
+                            WHEN push_state = 'failed' THEN last_push_error
+                            ELSE NULL
+                        END
                     WHERE origin_device = ?
                       AND kind = 'image'
                       AND ocr_state IN ('failed', 'skipped')
@@ -550,7 +557,10 @@ public enum Admin {
                 try conn.execute(sql: """
                     UPDATE item
                     SET ocr_state = 'pending',
-                        last_push_error = NULL
+                        last_push_error = CASE
+                            WHEN push_state = 'failed' THEN last_push_error
+                            ELSE NULL
+                        END
                     WHERE id = ?
                       AND kind = 'image'
                 """, arguments: [id])
