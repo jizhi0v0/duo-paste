@@ -40,18 +40,23 @@ public final class PasteboardWatcher {
     /// 把 raw RTF 直接作为兜底 .rtf 文本返回 —— CaptureService 后续 byte-cap 会拦下。
     /// 默认值匹配 Config.CaptureLimits.maxTextBytes 默认（512 * 1024）；AppDelegate 注入实际配置。
     private let maxRawRTFBytes: Int
+    /// file URL 分支：图片类型文件的字节上限。超限只记路径字符串，不读字节。
+    /// 默认值匹配 Config.CaptureLimits.maxBlobBytes 默认（32 MB）；AppDelegate 注入实际配置。
+    private let maxBlobBytes: Int
 
     public init(
         pasteboard: NSPasteboard = .general,
         pollInterval: TimeInterval = 0.2,
         debounceMs: Int = 500,
         maxRawRTFBytes: Int = 512 * 1024,
+        maxBlobBytes: Int = 32 * 1024 * 1024,
         onCapture: @escaping Callback
     ) {
         self.pasteboard = pasteboard
         self.pollInterval = pollInterval
         self.debounceNs = Int64(max(0, debounceMs)) * 1_000_000
         self.maxRawRTFBytes = maxRawRTFBytes
+        self.maxBlobBytes = maxBlobBytes
         self.lastChangeCount = pasteboard.changeCount
         self.onCapture = onCapture
     }
@@ -198,9 +203,34 @@ public final class PasteboardWatcher {
             .urlReadingFileURLsOnly: true
         ]) as? [URL], !urls.isEmpty {
             let paths = urls.map { $0.path }.joined(separator: "\n")
+
+            // 单文件且后缀是图片：尝试读字节存 blob，让 mirror client 能通过 /blob/<sha> 同步
+            var imageBlob: Data? = nil
+            var imageBlobExt: String? = nil
+            var imageBlobMime: String? = nil
+            if urls.count == 1 {
+                let url = urls[0]
+                if fileLooksLikeImage(path: url.path) {
+                    // 先检查文件大小，避免在 @MainActor 路径上同步读超大文件
+                    let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                    if fileSize > 0 && fileSize <= maxBlobBytes {
+                        // 读失败（权限/文件已删）→ imageBlob=nil，静默降级为纯路径 capture
+                        imageBlob = try? Data(contentsOf: url)
+                        if imageBlob != nil {
+                            let ext = url.pathExtension.lowercased()
+                            imageBlobExt = ext
+                            imageBlobMime = Self.imageExtToMime(ext)
+                        }
+                    }
+                }
+            }
+
             return CapturedPasteboard(
                 kind: .file,
                 text: paths,
+                blob: imageBlob,
+                blobExt: imageBlobExt,
+                blobMime: imageBlobMime,
                 fileName: urls.count == 1 ? urls[0].lastPathComponent : nil,
                 sourceAppBundleID: bundleID,
                 sourceAppName: appName,
@@ -377,5 +407,20 @@ public final class PasteboardWatcher {
               )
         else { return nil }
         return attr.string
+    }
+
+    /// 图片文件后缀 → MIME type。未知格式返回通用二进制流类型。
+    private static func imageExtToMime(_ ext: String) -> String {
+        switch ext {
+        case "png":        return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "heic":       return "image/heic"
+        case "heif":       return "image/heif"
+        case "gif":        return "image/gif"
+        case "webp":       return "image/webp"
+        case "tiff", "tif": return "image/tiff"
+        case "bmp":        return "image/bmp"
+        default:           return "application/octet-stream"
+        }
     }
 }

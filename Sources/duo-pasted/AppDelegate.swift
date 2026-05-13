@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel = SearchPanelController(
             state: state,
             onPaste: { [weak self] item in self?.pasteBack(item) },
+            onReveal: { [weak self] item in self?.revealInFinder(item) },
             onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() }
         )
         statusBar = StatusBarController { [weak self] in
@@ -55,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         watcher = PasteboardWatcher(
             maxRawRTFBytes: deps.config.capture.maxTextBytes,
+            maxBlobBytes: deps.config.capture.maxBlobBytes,
             onCapture: { [weak self] captured in
                 self?.handleCapture(captured)
             }
@@ -299,6 +301,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 fputs("ingest error: \(error)\n", stderr)
             }
+        }
+    }
+
+    private func revealInFinder(_ item: Item) {
+        switch item.kind {
+        case .file:
+            guard let raw = item.textFull ?? item.preview, !raw.isEmpty else { return }
+            let urls = raw.split(separator: "\n", omittingEmptySubsequences: true)
+                .map { URL(fileURLWithPath: String($0)) }
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+
+        case .image:
+            currentPasteTask?.cancel()
+            currentPasteTask = nil
+            state.pasteProgress = .idle
+
+            guard let sha = item.blobSha256 else { return }
+
+            // 本地已有 blob → 直接打开
+            if let url = deps.blobs.locate(sha256: sha) {
+                NSWorkspace.shared.open(url)
+                return
+            }
+
+            // 远端 blob 未缓存 → 复用 lazy fetch 路径，拉完后打开
+            guard let fetcher = pasteBlobFetcher else {
+                state.pasteProgress = .failed(reason: "图片在本机未缓存，且未配置 primary 拉取通道")
+                return
+            }
+
+            state.pasteProgress = .fetching(itemID: item.id, sizeHint: item.blobSize)
+            currentPasteTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let outcome = await self.fetchBlobLazy(sha: sha, fetcher: fetcher)
+                if Task.isCancelled { return }
+                switch outcome {
+                case .success:
+                    self.state.pasteProgress = .idle
+                    if let url = self.deps.blobs.locate(sha256: sha) {
+                        NSWorkspace.shared.open(url)
+                    }
+                    self.panel.hide()
+                case .failure(let reason):
+                    self.state.pasteProgress = .failed(reason: reason)
+                }
+            }
+
+        default:
+            break
         }
     }
 

@@ -190,7 +190,8 @@ public actor CaptureService {
                 sourceApp: c.sourceAppBundleID,
                 sourceAppName: c.sourceAppName,
                 preview: preview,
-                textFull: c.fileName,
+                // file kind 保留完整路径供 Finder reveal + FTS 搜索；image/其他 kind 用 fileName
+                textFull: c.kind == .file ? (c.text ?? c.fileName) : c.fileName,
                 blobSha256: info.sha256,
                 blobSize: info.size,
                 blobMime: c.blobMime,
