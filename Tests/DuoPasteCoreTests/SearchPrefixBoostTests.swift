@@ -37,6 +37,8 @@ private func insertOwn(
     try db.pool.write { conn in try it.insert(conn) }
 }
 
+/// v7 合表后 peer 行直接落 item 表（origin != self，PullWorker 写时强制 push_state='acked'）。
+/// 名字保留 `insertMirror` 让测试语义可读，实际写 item 表。
 private func insertMirror(
     _ db: DuoDB,
     id: String,
@@ -44,15 +46,19 @@ private func insertMirror(
     text: String,
     pinned: Bool = false
 ) throws {
-    try db.pool.write { conn in
-        try conn.execute(sql: """
-            INSERT INTO item_mirror (
-                id, origin_device, captured_at_ns, ingested_at_ns, kind,
-                source_app, source_app_name, preview, text_full,
-                blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, mirrored_at_ns
-            ) VALUES (?, 'primary', ?, ?, 'text', NULL, 'T', ?, ?, NULL, NULL, NULL, ?, NULL, ?)
-        """, arguments: [id, capturedAtNs, capturedAtNs, text, text, pinned ? 1 : 0, capturedAtNs])
-    }
+    let it = Item(
+        id: id,
+        originDevice: "primary",
+        capturedAtNs: capturedAtNs,
+        ingestedAtNs: capturedAtNs,
+        kind: .text,
+        sourceAppName: "T",
+        preview: text,
+        textFull: text,
+        pinned: pinned,
+        pushState: .acked
+    )
+    try db.pool.write { conn in try it.insert(conn) }
 }
 
 private func nowNs() -> Int64 {

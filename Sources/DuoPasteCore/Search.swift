@@ -59,12 +59,15 @@ public struct SearchAPI: Sendable {
         }
     }
 
-    /// Mirror 模式：本机 `item`（origin=self）UNION 远端 `item_mirror`（origin≠self）。
-    /// PullWorker 写 item_mirror 时跳过自家 origin，所以两表 id 不重叠，但保留 `seen` 去重
-    /// 兜底（promote-to-primary 流程会瞬间产生重叠状态）。
+    /// Mesh 模式：v7 合表后 peer 行直接落 `item` 表，本机 own 行也在 `item` 表。原来的
+    /// "本机 item ∪ 远端 item_mirror" 跨表 union 退化为单表 fetchHits + Swift 端 text-fold。
     ///
-    /// 排序契约：pinned DESC, captured_at_ns DESC。两表各超量取 limit+offset，
-    /// 合并后再裁剪——这是必须的，否则某一侧 limit 截断会丢掉真正应该排前面的远端项。
+    /// **保留 fetchUnion 接口**：SearchProvider.localMirror 路径仍调它（PR 6 才清 Mode 枚举）。
+    /// 内部逻辑：fetchHits oversample（无 kinds/pinnedOnly 过滤）→ text-fold（pinned OR 聚合）
+    /// → 后置 kinds/pinnedOnly 过滤 → 排序契约（pinned/prefix24h/captured DESC）→ LIMIT/OFFSET。
+    ///
+    /// text-fold 必须保留：合表后同文本可能跨 origin 重复（本机 own 行 + peer mirror 行），capture
+    /// 层 dedup 只过滤同 origin，跨 origin 兜底靠这一层（详 CLAUDE.md "文本永久 dedup"）。
     public func searchUnion(_ q: SearchQuery) throws -> [(Item, String?)] {
         try database.pool.read { db in
             try Self.fetchUnion(db, query: q)
@@ -72,28 +75,14 @@ public struct SearchAPI: Sendable {
     }
 
     static func fetchUnion(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
-        // pinnedOnly / kinds 必须在跨表 dedup **之后**按 winner 行的字段过滤。否则：
-        // - pinned 分歧：own 上 id=X 新行 pinned=false + mirror 上 id=X 旧行 pinned=true，子查询
-        //   各自带 `pinned=1` 过滤后只剩 mirror 旧行，dedup 没东西可合并，UI 看到陈旧文本
-        // - kind 分歧：own=text 新 / mirror=image 旧，子查询带 `kind IN (image)` 过滤后只剩
-        //   mirror 旧行，UI list 出来一条 image——但 countByKindUnion 算出来 winner=text → 算
-        //   到 text 桶，chip 显示 "image 0" 跟 list 矛盾（即 codex review P1 #1 指出的口径分裂）
+        // pinnedOnly / kinds 必须在 text-fold **之后**按 winner 行的字段过滤——fold 会做 pinned
+        // OR 聚合，过滤依据必须是聚合后 winner。否则：跨 origin 同文本一边 pinned=true 一边
+        // false，子查询带 `pinned=1` 过滤后只剩 pinned 那条参与 fold，winner 不变；但 list /
+        // countByKindUnion 走同源 oversample 流程要保证三者口径一致。
         //
-        // 正确顺序：拉**不**带 pinnedOnly/kinds 的候选集 → 按 (captured_at_ns DESC, own>mirror)
-        // 取 winner → 再用 winner 行的 pinned / kind 字段过滤。SQL 端 `countByKindUnionStatic` /
-        // `countUnionStatic` 走同源逻辑（ROW_NUMBER + WHERE filter on winner）保证三者口径一致。
-        //
-        // pinnedOnly=true 或 q.kinds 非空时 oversample 必须无界——否则子查询按时间倒序取
-        // limit+offset 行可能全是不该出现在结果里的类型/未 pin 状态，dedup+filter 后凑不齐
-        // q.limit。剪贴板量级（item+mirror 通常万级；FTS 命中后通常千级以下），Int.max 拉全
-        // 集 Swift 端 dedup 几毫秒，跟 pinnedOnly 同源决策。
-        //
-        // **已知 tradeoff**（codex review round 2 P2 #1）：空搜索 + kind chip 场景这里会从
-        // item / item_mirror 拉全量行到 Swift，按 captured_at_ns DESC 取 q.limit+offset 后
-        // dedup + filter + sort。万级规模实测无感。若未来发现痛点，可改成 SQL CTE +
-        // ROW_NUMBER() 选 winner → WHERE kind/pinned 过滤 → LIMIT/OFFSET 一刀流（fetchHits /
-        // fetchHitsMirror 的 ORDER + LIMIT 都要重写，且 FTS join 路径要单独处理 snippet 列），
-        // 工作量较大不在本 PR 范围。
+        // pinnedOnly=true 或 q.kinds 非空时 oversample 必须无界——否则按时间倒序取 limit+offset
+        // 行可能全是不该出现在结果里的类型/未 pin 状态，filter 后凑不齐 q.limit。剪贴板量级
+        // 万级，Swift 端 fold 几毫秒，可接受。
         let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty
         let oversampleLimit = needsPostFilter ? Int.max : (q.limit + q.offset)
         let oversample = SearchQuery(
@@ -104,37 +93,19 @@ public struct SearchAPI: Sendable {
             limit: oversampleLimit,
             offset: 0
         )
-        let own = try fetchHits(db, query: oversample)
-        let mirror = try fetchHitsMirror(db, query: oversample)
+        let raw = try fetchHits(db, query: oversample)
 
-        // 同 id 跨表 dedup：promote 过渡期 / pin 状态分歧时，可能同 id 在 item 和 item_mirror 各一份。
-        // **必须**在排序前按 captured_at_ns 取最新——否则若 mirror 那份 pinned=true 而 own 那份
-        // pinned=false（用户在 primary 上 pin 了但还没同步回 own），(pinned DESC) 会让旧 mirror 行
-        // 赢过新 own 行，UI 显示陈旧文本。
-        var byID: [String: (Item, String?)] = [:]
-        byID.reserveCapacity(own.count + mirror.count)
-        for hit in own + mirror {
-            if let existing = byID[hit.0.id] {
-                if hit.0.capturedAtNs > existing.0.capturedAtNs {
-                    byID[hit.0.id] = hit
-                }
-            } else {
-                byID[hit.0.id] = hit
-            }
-        }
-        var deduped = Array(byID.values)
-
-        // 文本永久 dedup：id-dedup 之后按 text_full 二次 fold。仅 blob_sha256 IS NULL 行参与
+        // 文本永久 dedup：单表 item 内按 text_full 二次 fold。仅 blob_sha256 IS NULL 行参与
         // （即 text/url/file，"字节相等即同"），blob kind 不动——同 sha 图片多次复制可能是
         // 用户故意保留时间线。winner = max(capturedAtNs)，pinned 通过 OR 聚合（任一条 pinned
         // → fold 结果 pinned=true），符合"pin 是对内容的属性而非具体 row"心智。
         //
         // 必须在下面的 kind/pinned 后置 filter **之前**——pinned 聚合后 winner.pinned 才是
-        // 正确的过滤依据，跟"按 winner 行字段过滤"不变量同源。
+        // 正确的过滤依据。
         var byText: [String: (Item, String?)] = [:]
         var nonTextFolded: [(Item, String?)] = []
-        nonTextFolded.reserveCapacity(deduped.count)
-        for hit in deduped {
+        nonTextFolded.reserveCapacity(raw.count)
+        for hit in raw {
             let it = hit.0
             if it.blobSha256 == nil, let tf = it.textFull, !tf.isEmpty {
                 if let existing = byText[tf] {
@@ -149,10 +120,10 @@ public struct SearchAPI: Sendable {
                 nonTextFolded.append(hit)
             }
         }
-        deduped = Array(byText.values) + nonTextFolded
+        var deduped = Array(byText.values) + nonTextFolded
 
         // 按 winner 行的字段过滤——不可前置到子查询。countByKindUnion / countUnion 走同源
-        // 不变量（SQL 端 ROW_NUMBER → WHERE 过滤），保证 chip 数字、count、list 三者口径一致。
+        // 不变量保证 chip 数字、count、list 三者口径一致。
         if !q.kinds.isEmpty {
             let allowed = Set(q.kinds)
             deduped = deduped.filter { allowed.contains($0.0.kind) }
@@ -161,8 +132,7 @@ public struct SearchAPI: Sendable {
             deduped = deduped.filter { $0.0.pinned }
         }
         // 排序契约：pinned DESC → prefix DESC → captured_at_ns DESC。
-        // prefix 分数跟 SQL 端 CASE 一致（preview 起始=2, text_full 起始=1, 否则 0），
-        // 让 union 跨表合并后顺序跟单表 fetchHits 完全可预测。
+        // prefix 分数跟 SQL 端 CASE 一致（preview 起始=2, text_full 起始=1, 否则 0）。
         let prefixText = q.text
         // 跟 SQL 端口径一致：24h 窗外的项 prefix 分数清零，强制走时间倒序。
         let nowNs = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
@@ -186,87 +156,6 @@ public struct SearchAPI: Sendable {
         let end = min(q.offset + q.limit, deduped.count)
         guard start < end else { return [] }
         return Array(deduped[start..<end])
-    }
-
-    /// `item_mirror` 版的 fetchHits。schema 差异（无 push_state/push_attempts/last_push_error，
-    /// 多 mirrored_at_ns）在 SELECT 列表里补：合成 `'acked' AS push_state, 0 AS push_attempts,
-    /// NULL AS last_push_error` 让 Row → Item 解码不报缺字段。
-    static func fetchHitsMirror(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
-        var wheres: [String] = []
-        var args: [DatabaseValueConvertible] = []
-
-        if !q.includeDeleted { wheres.append("item_mirror.deleted_at_ns IS NULL") }
-        if let from = q.fromNs { wheres.append("item_mirror.captured_at_ns >= ?"); args.append(from) }
-        if let to = q.toNs { wheres.append("item_mirror.captured_at_ns <= ?"); args.append(to) }
-        if !q.kinds.isEmpty {
-            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
-            wheres.append("item_mirror.kind IN (\(p))")
-            args.append(contentsOf: q.kinds.map { $0.rawValue })
-        }
-        if q.pinnedOnly { wheres.append("item_mirror.pinned = 1") }
-
-        let useFTS: Bool
-        if let text = q.text, let match = ftsQuery(from: text) {
-            useFTS = true
-            wheres.append("item_mirror_fts MATCH ?")
-            args.append(match)
-        } else {
-            useFTS = false
-        }
-
-        let join = useFTS ? "JOIN item_mirror_fts ON item_mirror_fts.rowid = item_mirror.rowid" : ""
-        let snippetCol = useFTS
-            ? ", snippet(item_mirror_fts, -1, char(2), char(3), '…', 8) AS _snippet"
-            : ""
-        // 前缀优先：preview / text_full 以 query 文本起始的项排到同时间组的前面。
-        // case-insensitive 用 instr(LOWER(...), LOWER(?)) = 1，避开 LIKE 通配转义。
-        // text_full 兜底是因为图片/blob 类没 preview 但搜不到也无所谓——主要照顾文本项。
-        // 注意：CASE 在 SELECT 列表里，占位符出现在所有 WHERE/LIMIT 占位符之前，
-        // 所以 prefix args 必须 insert 到 args 头部，而不是 append 尾部。
-        let prefixCol: String
-        let needsPrefix = q.text != nil && ftsQuery(from: q.text!) != nil
-        if needsPrefix {
-            prefixCol = """
-                , CASE
-                    WHEN instr(LOWER(IFNULL(item_mirror.preview, '')), LOWER(?)) = 1 THEN 2
-                    WHEN instr(LOWER(IFNULL(item_mirror.text_full, '')), LOWER(?)) = 1 THEN 1
-                    ELSE 0
-                  END AS _prefix
-                """
-            args.insert(contentsOf: [q.text! as DatabaseValueConvertible, q.text! as DatabaseValueConvertible], at: 0)
-        } else {
-            prefixCol = ""
-        }
-        // 时间窗：prefix-boost 仅对 24h 内的项生效。跨天的老内容（哪怕起头匹配）也按
-        // 时间倒序排——剪贴板心智里"搜=找最近用过的"，不希望陈年老条目被翻上来。
-        // SQLite 自带 strftime('%s','now')，避免 Swift 端再往 args 里塞 now_ns。
-        let orderPrefix = needsPrefix
-            ? "(CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - item_mirror.captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END) DESC, "
-            : ""
-        let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
-        let sql = """
-            SELECT item_mirror.id, item_mirror.origin_device, item_mirror.captured_at_ns,
-                   item_mirror.ingested_at_ns, item_mirror.kind,
-                   item_mirror.source_app, item_mirror.source_app_name, item_mirror.preview,
-                   item_mirror.text_full, item_mirror.blob_sha256, item_mirror.blob_size,
-                   item_mirror.blob_mime, item_mirror.pinned, item_mirror.deleted_at_ns,
-                   'acked' AS push_state, 0 AS push_attempts, NULL AS last_push_error,
-                   item_mirror.ocr_state\(snippetCol)\(prefixCol)
-            FROM item_mirror
-            \(join)
-            \(whereClause)
-            ORDER BY item_mirror.pinned DESC, \(orderPrefix)item_mirror.captured_at_ns DESC
-            LIMIT ? OFFSET ?
-        """
-        args.append(q.limit)
-        args.append(q.offset)
-
-        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
-        return try rows.map { row -> (Item, String?) in
-            let item = try Item(row: row)
-            let snippet: String? = useFTS ? row["_snippet"] : nil
-            return (item, snippet)
-        }
     }
 
     static func fetchHits(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
@@ -344,16 +233,16 @@ public struct SearchAPI: Sendable {
         }
     }
 
-    /// Mirror 模式下：`item` ∪ `item_mirror` 按 id 去重后的匹配总数。
-    /// 用 `UNION` 让 SQLite 在 id 维度自动 dedup，避免同 id 跨表存在被双算
-    /// （promote 过渡期 / pin 分歧时可能出现，跟 fetchUnion 里那段 byID dedupe 同源原因）。
+    /// Mesh 模式下：合表后 `item` 单表，countUnion 跟 fetchUnion 同源走 text-fold 路径
+    /// （`countUnionStatic` 内部调 `fetchUnion(limit=.max)`），保证 list / total / chip 三者口径
+    /// 一致。原跨表 union 语义在 v7 合表后退化为单表 fold，但 API 保留给 SearchProvider 用。
     public func countUnion(_ q: SearchQuery) throws -> Int {
         try database.pool.read { db in
             try Self.countUnionStatic(db, query: q)
         }
     }
 
-    /// 构造 count 用的 WHERE/JOIN 片段。复用 fetchHits/fetchHitsMirror 的过滤逻辑，
+    /// 构造 count 用的 WHERE/JOIN 片段。复用 fetchHits 的过滤逻辑，
     /// 只是不取列也不排序——保证 counter 跟 list 的过滤口径一致。
     private static func buildCountClauses(
         table: String,
@@ -389,12 +278,6 @@ public struct SearchAPI: Sendable {
         return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
     }
 
-    static func countMirror(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
-        let (join, whereClause, args) = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
-        let sql = "SELECT COUNT(*) FROM item_mirror \(join) \(whereClause)"
-        return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
-    }
-
     static func countUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
         // 走 fetchUnion 同源路径——id-dedup + 文本 fold + 按 winner 字段过滤——保证
         // list / total-count / kind-count 三者口径一致。规模上剪贴板 item+mirror 万级，
@@ -422,10 +305,8 @@ public struct SearchAPI: Sendable {
         }
     }
 
-    /// Union 版本：`item ∪ item_mirror` 按 id 去重后再 GROUP BY kind。
-    /// 同 id 跨表 (kind, pinned) 可能在 promote 过渡期 / 异常状态分歧——必须按
-    /// `captured_at_ns DESC` 选 winner 行，跟 fetchUnion 的 dedup 不变量对齐，否则
-    /// chip "图片 1" 但点 image 后看不到那行（数字跟列表口径分裂）。
+    /// Mesh 模式下：合表后单表 `item` 按 text-fold 后 GROUP BY kind。`countByKindUnionStatic`
+    /// 走 fetchUnion 同源路径——text-fold + pinned 后置过滤——保证 chip / count / list 口径一致。
     public func countByKindUnion(_ q: SearchQuery) throws -> [ItemKind: Int] {
         let stripped = Self.stripKinds(q)
         return try database.pool.read { db in

@@ -289,16 +289,25 @@ public actor PullWorker {
         return result
     }
 
-    /// 比对 persisted primary_id 跟新探测到的 currentPrimaryID。不一致 → 清空 mirror + cursor。
+    /// 比对 persisted peer_device_id 跟新探测到的 currentPrimaryID。不一致 → 清非 self origin
+    /// 行 + cursor 重拉。
+    ///
+    /// 合表（v7）后 item_mirror 没了，peer 行直接落 item 表；切 peer 时不能整表清，要保留本机
+    /// own-origin 行（origin=self），只删 origin != self 的 peer 行。PR 1 单 peer 部署下"非 self
+    /// origin"就等于"当前 peer 的行"；PR 2 多 peer 后这条 SQL 会演化（按具体被换的 peer_id 过滤）。
     private func reconcilePrimary(currentPrimaryID: String) async throws {
         let persisted = try await database.pool.read { db -> String? in
-            try String.fetchOne(db, sql: "SELECT primary_id FROM pull_cursor LIMIT 1")
+            try String.fetchOne(db, sql: "SELECT peer_device_id FROM pull_cursor LIMIT 1")
         }
         guard let persisted else { return }   // 首次启动 / 已被清空 → 啥也不做
         if persisted == currentPrimaryID { return }
-        log("primary device changed (\(persisted) → \(currentPrimaryID))，重置 mirror + cursor")
+        log("peer device changed (\(persisted) → \(currentPrimaryID))，重置 peer 行 + cursor")
+        let selfID = selfDeviceID
         try await database.pool.write { db in
-            try db.execute(sql: "DELETE FROM item_mirror")
+            try db.execute(
+                sql: "DELETE FROM item WHERE origin_device != ?",
+                arguments: [selfID]
+            )
             try db.execute(sql: "DELETE FROM pull_cursor")
         }
     }
@@ -306,7 +315,7 @@ public actor PullWorker {
     private func loadCursor(primaryID: String) async throws -> SinceCursor {
         try await database.pool.read { db -> SinceCursor in
             let row = try Row.fetchOne(db, sql: """
-                SELECT cursor_ns, cursor_id FROM pull_cursor WHERE primary_id = ?
+                SELECT cursor_ns, cursor_id FROM pull_cursor WHERE peer_device_id = ?
             """, arguments: [primaryID])
             guard let row else { return .zero }
             let ns: Int64 = row["cursor_ns"] ?? 0
@@ -326,7 +335,11 @@ public actor PullWorker {
         var mirroredShas: Set<String>
     }
 
-    /// 写 item_mirror + 更新 pull_cursor，单事务。返回实际入表行数（扣除 origin=self + 跨设备 dedup skip + paste-echo skip）。
+    /// 写 item（合表后从 item_mirror 改成 item）+ 更新 pull_cursor，单事务。
+    /// 返回实际入表行数（扣除 origin=self + 跨设备 dedup skip + paste-echo skip）。
+    ///
+    /// v7 合表后 peer 行直接落 item 表。强制写 push_state='acked'：mirror 来源行已经在 peer 上
+    /// ingest 完成，PR 1 期间 push_state 列仍存在，必须给它有效终态值避免被 PushWorker 误推。
     private func applyPage(_ page: SincePageWire, primaryID: String) async throws -> ApplyOutcome {
         let device = selfDeviceID
         let now = nowNs()
@@ -338,18 +351,19 @@ public actor PullWorker {
             var pasteEchoSkipped = 0
             var mirroredShas: Set<String> = []
             for item in page.items {
-                // 跳过自家 origin —— 已经在 item 表里，搜索 UNION 时不重叠
+                // 跳过自家 origin —— 本机 own 行已在 item 表，回推会被 INSERT OR IGNORE 兜底但
+                // 防御性 early continue 节省一次查询
                 if item.originDevice == device { continue }
                 // Paste-echo 抑制（PasteSuppressionSet）：本机刚 pasteBack 写过的内容，被对端通过
                 // Universal Clipboard 同步走 + 对端 watcher capture，再通过 /since 推回来。
-                // 这条理应不进 mirror（避免历史里出现一条"我刚 paste 的副本"）。
+                // 这条理应不入表（避免历史里出现一条"我刚 paste 的副本"）。
                 // 跟下面的 crossDeviceDedup 路径正交：dedup 需要本机有 own item 当锚点；
                 // paste 路径不写 own item，所以只能靠这个内存 set。
                 //
-                // 跟 dedup 一样：只对**首次入 mirror** 生效。已 mirrored 的 id 是 state update
+                // 跟 dedup 一样：只对**首次入表** 生效。已存在的 peer-origin id 是 state update
                 // （软删 / pin 变更回放），必须放过。
                 let alreadyMirrored: Bool = try {
-                    try Int.fetchOne(db, sql: "SELECT 1 FROM item_mirror WHERE id = ?", arguments: [item.id]) != nil
+                    try Int.fetchOne(db, sql: "SELECT 1 FROM item WHERE id = ?", arguments: [item.id]) != nil
                 }()
                 // 候选 capturedAtNs 必须传给 suppression：shouldSuppress 还要求 capturedAt
                 // 在 record 时刻之后（容 5s skew），否则 catch-up 时同内容的历史行会被
@@ -365,7 +379,7 @@ public actor PullWorker {
                     continue
                 }
                 // 跨设备 Continuity dedup：本机 origin=self 同内容在 ±window 内已存 →
-                // 这次拉来的是 Universal Clipboard 副本，skip 不写 mirror，UI 只显单条 own。
+                // 这次拉来的是 Universal Clipboard 副本，skip 不入表，UI 只显单条 own。
                 // windowNs=0 关闭这层；本设备没装 Continuity 或没开 Universal Clipboard 时
                 // findNearbyOwnContent 永远命中不了，开销几乎为零（走 captured_at_ns 索引）。
                 if windowNs > 0, !alreadyMirrored,
@@ -382,13 +396,15 @@ public actor PullWorker {
                     dedupSkipped += 1
                     continue
                 }
+                // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump）回放；
+                // peer 行强制 push_state='acked' 防误推。PR 1 期间 push_* 列仍存在，PR 4 才清。
                 try db.execute(sql: """
-                    INSERT OR REPLACE INTO item_mirror
+                    INSERT OR REPLACE INTO item
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                        source_app, source_app_name, preview, text_full,
                        blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-                       mirrored_at_ns, ocr_state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       push_state, push_attempts, last_push_error, ocr_state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'acked', 0, NULL, ?)
                 """, arguments: [
                     item.id,
                     item.originDevice,
@@ -404,12 +420,11 @@ public actor PullWorker {
                     item.blobMime,
                     item.pinned ? 1 : 0,
                     item.deletedAtNs,
-                    now,
                     item.ocrState?.rawValue,
                 ])
                 written += 1
                 // 收集本页 blob 需求集合（eager 阶段后处理）。kind=image/file 才有意义；
-                // 软删行（tombstone）跳过——它代表"primary 上已删"，没字节也合理
+                // 软删行（tombstone）跳过——它代表"peer 上已删"，没字节也合理
                 if let sha = item.blobSha256, item.deletedAtNs == nil,
                    item.kind == .image || item.kind == .file {
                     mirroredShas.insert(sha)
@@ -417,9 +432,9 @@ public actor PullWorker {
             }
             // UPSERT cursor。SQLite 3.24+ ON CONFLICT 语法，macOS 14 自带 SQLite > 3.24 OK。
             try db.execute(sql: """
-                INSERT INTO pull_cursor (primary_id, cursor_ns, cursor_id, updated_at_ns)
+                INSERT INTO pull_cursor (peer_device_id, cursor_ns, cursor_id, updated_at_ns)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(primary_id) DO UPDATE SET
+                ON CONFLICT(peer_device_id) DO UPDATE SET
                     cursor_ns = excluded.cursor_ns,
                     cursor_id = excluded.cursor_id,
                     updated_at_ns = excluded.updated_at_ns

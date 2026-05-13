@@ -305,6 +305,97 @@ public struct Database: Sendable {
             }
         }
 
+        // v7: mesh 拓扑合表。primary/client 模型废弃，每台 Mac 都是 peer。
+        //
+        // 1) 合表 item_mirror → item，mirror 行强制 push_state='acked'（这些行已经在 primary
+        //    上 ingest 完成；mesh 拓扑下 push_state 列 PR 4 才删，PR 1 期间仍存在，必须给它
+        //    一个有效终态值，否则升级期间 push_state 路径误把 mirror 行当 pending 重推）
+        // 2) 兜底 stamp ingested_at_ns IS NULL 行（合表后混入 + 旧 client own-origin 行残留）。
+        //    必须 Swift 端逐行调 nextIngestNs 保严格单增——纯 SQL 一次性 UPDATE 不行
+        //    （详 Database.nextIngestNs 不变量）
+        // 3) DROP item_mirror 全套：triggers / FTS 虚表 / partial indexes / 主表
+        // 4) pull_cursor PK primary_id → peer_device_id（rename + 迁数据；mesh 拓扑下每个 peer
+        //    一行 cursor，原 primary_id 字段名语义不再对）
+        // 5) DROP primary_lineage（mesh 拓扑下无任期概念，audit-push PR 4 才删，期间该表读 SQL
+        //    运行时挂 + 对应测试可挂——plan PR 1 字面接受）
+        //
+        // push_state / push_attempts / last_push_error 列 + idx_item_push 在 PR 1 期间**保留**，
+        // PR 4 v8 migration 再 DROP。
+        m.registerMigration("v7_mesh_consolidation") { db in
+            // step 1: 合 item_mirror → item。INSERT OR IGNORE 让 id 冲突时 own 行赢
+            // （own 是源头数据更可信，mirror 是镜像可能漏更新）。强制 push_state='acked'
+            // 避免后续 PushWorker 误把 mirror 行重推
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO item (
+                    id, origin_device, captured_at_ns, ingested_at_ns, kind,
+                    source_app, source_app_name, preview, text_full,
+                    blob_sha256, blob_size, blob_mime,
+                    pinned, deleted_at_ns,
+                    push_state, push_attempts, last_push_error,
+                    ocr_state
+                )
+                SELECT
+                    id, origin_device, captured_at_ns, ingested_at_ns, kind,
+                    source_app, source_app_name, preview, text_full,
+                    blob_sha256, blob_size, blob_mime,
+                    pinned, deleted_at_ns,
+                    'acked', 0, NULL,
+                    ocr_state
+                FROM item_mirror;
+            """)
+
+            // step 2: 兜底 stamp ingested_at_ns IS NULL。逐行 nextIngestNs 单增，
+            // 按 captured_at_ns ASC 顺序保 stamp 顺序 = 用户感知顺序（之后 /since
+            // cursor 推进时 peer 拉到的也是这个顺序）
+            let nullRows = try Row.fetchAll(db, sql: """
+                SELECT id FROM item
+                WHERE ingested_at_ns IS NULL
+                ORDER BY captured_at_ns ASC, id ASC
+            """)
+            for row in nullRows {
+                guard let id: String = row["id"] else { continue }
+                let now = Clock.nowNs()
+                let ns = try Self.nextIngestNs(db, now: now)
+                try db.execute(sql: """
+                    UPDATE item
+                    SET ingested_at_ns = ?,
+                        push_state = 'acked',
+                        push_attempts = 0,
+                        last_push_error = NULL
+                    WHERE id = ?
+                """, arguments: [ns, id])
+            }
+
+            // step 3: drop mirror 相关
+            try db.execute(sql: "DROP TRIGGER IF EXISTS item_mirror_au;")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS item_mirror_ad;")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS item_mirror_ai;")
+            try db.execute(sql: "DROP TABLE IF EXISTS item_mirror_fts;")
+            try db.execute(sql: "DROP INDEX IF EXISTS idx_mirror_blob_sha;")
+            try db.execute(sql: "DROP INDEX IF EXISTS idx_mirror_kind_captured;")
+            try db.execute(sql: "DROP INDEX IF EXISTS idx_mirror_captured;")
+            try db.execute(sql: "DROP TABLE IF EXISTS item_mirror;")
+
+            // step 4: pull_cursor PK 重建（primary_id → peer_device_id）
+            try db.execute(sql: """
+                CREATE TABLE pull_cursor_v7 (
+                    peer_device_id  TEXT PRIMARY KEY,
+                    cursor_ns       INTEGER NOT NULL,
+                    cursor_id       TEXT NOT NULL DEFAULT '',
+                    updated_at_ns   INTEGER NOT NULL
+                ) STRICT;
+            """)
+            try db.execute(sql: """
+                INSERT INTO pull_cursor_v7 (peer_device_id, cursor_ns, cursor_id, updated_at_ns)
+                SELECT primary_id, cursor_ns, cursor_id, updated_at_ns FROM pull_cursor;
+            """)
+            try db.execute(sql: "DROP TABLE pull_cursor;")
+            try db.execute(sql: "ALTER TABLE pull_cursor_v7 RENAME TO pull_cursor;")
+
+            // step 5: drop primary_lineage（mesh 拓扑下无任期；audit-push 代码 PR 4 才清）
+            try db.execute(sql: "DROP TABLE IF EXISTS primary_lineage;")
+        }
+
         return m
     }
 
