@@ -116,6 +116,47 @@ private func openAtV5() throws -> DatabasePool {
     }
 }
 
+/// codex review round 1 P1 #1：v6 backfill 必须拒收 URL.host=nil 的畸形文本，
+/// 跟 capture 路径同源调 looksLikeURL，避免单 SQL GLOB 通得过但启发拒收的 text 行
+/// 被永久错升为 url
+@Test func v6DoesNotPromoteMalformedURLs() async throws {
+    let pool = try openAtV5()
+    try await pool.write { db in
+        try db.execute(sql: """
+            INSERT INTO item (id, origin_device, captured_at_ns, kind, text_full)
+            VALUES
+                ('empty-host',   'dev', 1, 'text', 'https:///path'),
+                ('tab-inside',   'dev', 2, 'text', 'https://x.com' || char(9) || 'note'),
+                ('bad-host-dot', 'dev', 3, 'text', 'http://example..com/'),
+                ('lead-dot',     'dev', 4, 'text', 'http://.com/'),
+                ('underscore',   'dev', 5, 'text', 'http://_.com/')
+        """)
+    }
+    try Database.migrator.migrate(pool)
+    try await pool.read { db in
+        let stillText = try String.fetchSet(db, sql: "SELECT id FROM item WHERE kind='text'")
+        #expect(stillText == ["empty-host", "tab-inside", "bad-host-dot", "lead-dot", "underscore"])
+    }
+}
+
+/// 历史路径 GLOB 不接受前导/尾随空白和大写 scheme；切到 Swift backfill 后应当能修正
+@Test func v6PromotesURLsWithLeadingWhitespaceOrUppercaseScheme() async throws {
+    let pool = try openAtV5()
+    try await pool.write { db in
+        try db.execute(sql: """
+            INSERT INTO item (id, origin_device, captured_at_ns, kind, text_full)
+            VALUES
+                ('leading-space', 'dev', 1, 'text', '  https://example.com  '),
+                ('upper-scheme',  'dev', 2, 'text', 'HTTPS://example.com')
+        """)
+    }
+    try Database.migrator.migrate(pool)
+    try await pool.read { db in
+        let promoted = try String.fetchSet(db, sql: "SELECT id FROM item WHERE kind='url'")
+        #expect(promoted == ["leading-space", "upper-scheme"])
+    }
+}
+
 @Test func v6DoesNotBumpIngestedAtNsOnBackfill() async throws {
     let pool = try openAtV5()
     try await pool.write { db in

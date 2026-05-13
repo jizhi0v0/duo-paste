@@ -276,26 +276,33 @@ public struct Database: Sendable {
                 WHERE kind = 'image' AND ocr_state IS NULL;
             """)
 
-            try db.execute(sql: """
-                UPDATE item
-                SET kind = 'url'
-                WHERE kind = 'text'
-                  AND text_full IS NOT NULL
-                  AND (text_full GLOB 'http://?*' OR text_full GLOB 'https://?*')
-                  AND text_full NOT LIKE '%' || char(10) || '%'
-                  AND text_full NOT LIKE '%' || char(13) || '%'
-                  AND text_full NOT LIKE '% %';
-            """)
-            try db.execute(sql: """
-                UPDATE item_mirror
-                SET kind = 'url'
-                WHERE kind = 'text'
-                  AND text_full IS NOT NULL
-                  AND (text_full GLOB 'http://?*' OR text_full GLOB 'https://?*')
-                  AND text_full NOT LIKE '%' || char(10) || '%'
-                  AND text_full NOT LIKE '%' || char(13) || '%'
-                  AND text_full NOT LIKE '% %';
-            """)
+            // Swift 端 backfill 调 looksLikeURL —— 跟 capture 路径同源判断，避免 SQL GLOB
+            // 表达不出的 host 严格性漏判（codex review round 1 P1 #1）：
+            //   - 'https:///path'        ── GLOB 'https://?*' 接受（`?` = 任意单字符，`/` 也算）
+            //                                但 URL.host=nil → looksLikeURL 拒收
+            //   - 'https://x.com<TAB>y'  ── GLOB 不挡 \t；looksLikeURL 严格 contains(\t) 拒收
+            //   - '  https://x.com  '    ── GLOB 不接受（前导空白），looksLikeURL trim 后接受
+            //   - 'HTTPS://x.com'        ── GLOB 大小写敏感漏掉，looksLikeURL .lowercased() 接受
+            //
+            // 一次单机 backfill，行数级别 1k-10k，逐行 UPDATE 在事务内 commit 也够；
+            // 真撞到 100k 量级再换批量 IN clause
+            for table in ["item", "item_mirror"] {
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT id, text_full FROM \(table)
+                    WHERE kind = 'text' AND text_full IS NOT NULL
+                """)
+                for row in rows {
+                    guard let id: String = row["id"],
+                          let txt: String = row["text_full"]
+                    else { continue }
+                    if looksLikeURL(txt) {
+                        try db.execute(
+                            sql: "UPDATE \(table) SET kind = 'url' WHERE id = ?",
+                            arguments: [id]
+                        )
+                    }
+                }
+            }
         }
 
         return m

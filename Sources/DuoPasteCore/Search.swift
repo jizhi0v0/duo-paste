@@ -222,7 +222,8 @@ public struct SearchAPI: Sendable {
                    item_mirror.source_app, item_mirror.source_app_name, item_mirror.preview,
                    item_mirror.text_full, item_mirror.blob_sha256, item_mirror.blob_size,
                    item_mirror.blob_mime, item_mirror.pinned, item_mirror.deleted_at_ns,
-                   'acked' AS push_state, 0 AS push_attempts, NULL AS last_push_error\(snippetCol)\(prefixCol)
+                   'acked' AS push_state, 0 AS push_attempts, NULL AS last_push_error,
+                   item_mirror.ocr_state\(snippetCol)\(prefixCol)
             FROM item_mirror
             \(join)
             \(whereClause)

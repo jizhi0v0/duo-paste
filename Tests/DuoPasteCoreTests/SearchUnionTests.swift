@@ -427,6 +427,32 @@ private func insertOwn(
     #expect(counts[.image] == 1)
 }
 
+// MARK: - codex review round 1 P1 #2: fetchHitsMirror 必须把 ocr_state 透传
+
+@Test func unionMirrorPropagatesOcrStateToItem() throws {
+    // mirror 行 ocr_state='done' 经过 fetchHitsMirror → searchUnion 后 Item.ocrState 必须保留，
+    // 否则 OCR worker 没法分流"已扫过"的 mirror 行 + UI 展示状态信息丢失
+    let db = try makeDB()
+    try db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item_mirror (
+                id, origin_device, captured_at_ns, ingested_at_ns, kind,
+                source_app, source_app_name, preview, text_full,
+                blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+                mirrored_at_ns, ocr_state
+            ) VALUES (
+                'mir-img', 'primary', 200, 200, 'image',
+                NULL, 'Mirror App', 'pic', 'pic',
+                NULL, NULL, NULL, 0, NULL,
+                200, 'done'
+            )
+        """)
+    }
+    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    let mirror = hits.first { $0.0.id == "mir-img" }
+    #expect(mirror?.0.ocrState == .done)
+}
+
 @Test func countUnionTieBreaksOwnOverMirrorOnSameTimestamp() throws {
     // captured_at_ns 相等时跟 fetchUnion 同源（own=0/_src ASC 赢），不会出现非确定 winner。
     // own.text 跟 mirror.image 同时间戳 → winner=own.text → image 桶 0 / text 桶 1。
