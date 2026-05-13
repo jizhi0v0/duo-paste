@@ -253,9 +253,12 @@ public actor OCRWorker {
     }
 
     /// SQL：`origin_device = self AND kind = 'image' AND ocr_state = 'pending'
-    /// AND blob_sha256 IS NOT NULL AND deleted_at_ns IS NULL` 按 captured_at_ns ASC
-    /// 取 batchSize 条。ASC 让 backfill 老历史按时间顺序清，新捕获走 wake 进 batch
-    /// 顺序无所谓
+    /// AND deleted_at_ns IS NULL` 按 captured_at_ns ASC 取 batchSize 条。
+    /// ASC 让 backfill 老历史按时间顺序清，新捕获走 wake 进 batch 顺序无所谓。
+    ///
+    /// **不过滤 blob_sha256 IS NOT NULL**：legacy/corrupt/backfill 出来的 image 行
+    /// 可能 sha 缺失。让它们进 batch，processOne 第一行 `guard let sha` 把它们
+    /// 标 skipped 收敛——否则永远卡 pending，"no blob sha" 这条 markSkipped 分支也不可达
     private func fetchPending() throws -> [Item] {
         let limit = config.batchSize
         let device = originDevice
@@ -264,7 +267,6 @@ public actor OCRWorker {
                 .filter(Column("origin_device") == device)
                 .filter(Column("kind") == ItemKind.image.rawValue)
                 .filter(Column("ocr_state") == OCRState.pending.rawValue)
-                .filter(Column("blob_sha256") != nil)
                 .filter(Column("deleted_at_ns") == nil)
                 .order(Column("captured_at_ns").asc)
                 .limit(limit)
@@ -317,6 +319,7 @@ public actor OCRWorker {
                             ELSE ?
                         END
                     WHERE id = ?
+                      AND deleted_at_ns IS NULL
                 """, arguments: [reason, id])
             }
         } catch {
@@ -339,6 +342,7 @@ public actor OCRWorker {
                             ELSE ?
                         END
                     WHERE id = ?
+                      AND deleted_at_ns IS NULL
                 """, arguments: [reason, id])
             }
         } catch {

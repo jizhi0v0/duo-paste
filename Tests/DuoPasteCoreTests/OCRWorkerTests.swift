@@ -222,6 +222,26 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(await recorder.count() == 0)
 }
 
+@Test func ocrWorkerSkipsImageWithNullBlobSha() async throws {
+    // legacy/corrupt image 行 sha 缺失。fetchPending **不**应过滤掉它们——
+    // processOne 第一行 `guard let sha` 走 markSkipped 收敛掉，否则永卡 pending
+    let env = try makeEnv()
+    try seedItem(env, id: "no-sha-img", originDevice: env.deviceID, blobSha: nil)
+    let recorder = OCRCallRecorder()
+    let recognizer = StubOCRRecognizer(recorder: recorder)
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig()
+    )
+    let r = await w.tick()
+    #expect(r.skipped == 1)
+    let after = try fetchItem(env, id: "no-sha-img")
+    #expect(after?.ocrState == .skipped)
+    #expect(after?.lastPushError?.contains("no blob sha") == true)
+    #expect(await recorder.count() == 0)
+}
+
 @Test func ocrWorkerSkipsOnImageLoadFailure() async throws {
     let env = try makeEnv()
     let sha = try seedBlob(env)

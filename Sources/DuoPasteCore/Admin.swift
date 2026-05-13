@@ -567,6 +567,9 @@ public enum Admin {
                       AND deleted_at_ns IS NULL
                 """, arguments: [selfDeviceID])
             case .id(let id):
+                // origin_device + deleted_at_ns guard 与 .all 路径对齐：单条重置也只
+                // 翻本机 own-origin 且未软删的行，避免把 remote-origin / tombstone 翻回
+                // pending 但 OCRWorker.fetchPending 不扫导致永卡
                 try conn.execute(sql: """
                     UPDATE item
                     SET ocr_state = 'pending',
@@ -575,8 +578,10 @@ public enum Admin {
                             ELSE NULL
                         END
                     WHERE id = ?
+                      AND origin_device = ?
                       AND kind = 'image'
-                """, arguments: [id])
+                      AND deleted_at_ns IS NULL
+                """, arguments: [id, selfDeviceID])
             }
             return conn.changesCount
         }

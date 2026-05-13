@@ -210,6 +210,42 @@ private func seedOCRItem(
     #expect(after?.ocrState == .failed)
 }
 
+@Test func retryFailedOCRByIDSkipsOtherOrigin() throws {
+    // .id 路径必须跟 .all 一样守 origin_device——否则会把 remote-origin image 翻回
+    // pending 但 OCRWorker.fetchPending 只扫 own-origin，结果永卡
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(db: db, id: "theirs", originDevice: "other", ocrState: .failed)
+    let n = try Admin.retryFailedOCR(
+        dbPath: paths.mainDB, selfDeviceID: "me", scope: .id("theirs")
+    )
+    #expect(n == 0)
+    let after = try db.pool.read { conn in
+        try Item.filter(Column("id") == "theirs").fetchOne(conn)
+    }
+    #expect(after?.ocrState == .failed)
+}
+
+@Test func retryFailedOCRByIDSkipsSoftDeleted() throws {
+    // .id 路径必须守 deleted_at_ns IS NULL——否则会在 tombstone 上翻 ocr_state，
+    // 但 worker 不扫，永卡
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(db: db, id: "del", originDevice: "me", ocrState: .failed, deletedAtNs: 999)
+    let n = try Admin.retryFailedOCR(
+        dbPath: paths.mainDB, selfDeviceID: "me", scope: .id("del")
+    )
+    #expect(n == 0)
+    let after = try db.pool.read { conn in
+        try Item.filter(Column("id") == "del").fetchOne(conn)
+    }
+    #expect(after?.ocrState == .failed)
+}
+
 private extension Character {
     var isHexDigit: Bool {
         isASCII && (isNumber || ("a"..."f").contains(self) || ("A"..."F").contains(self))
