@@ -462,6 +462,68 @@ private func insertMirrorRow(
     #expect(row?.pushState == .acked)
 }
 
+@Test func promoteBackfillsNullOcrStateOnImageRows() throws {
+    // 不变量（round 2 review fix）：v6 之后从老 primary（无 ocr_state 字段）拉到的 mirror
+    // 行 ocr_state=NULL，promote 时该被回填成 pending，让 phase 2 跨 origin OCR 上线后
+    // 直接看到 pending 而不需要再加 migration
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    try writeClientConfig(to: paths.configFile)
+
+    let db = try Database(path: paths.mainDB, role: .client)
+    try db.pool.write { conn in
+        // mirror 行 image kind / ocr_state NULL（手工注入模拟老 primary 不发该字段）
+        try conn.execute(sql: """
+            INSERT INTO item_mirror
+              (id, origin_device, captured_at_ns, ingested_at_ns, kind,
+               source_app, source_app_name, preview, text_full,
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+               mirrored_at_ns, ocr_state)
+            VALUES ('img-null', 'device-A', 7_000, 7_000, 'image',
+                    NULL, NULL, 'p', NULL, NULL, NULL, 'image/png', 0, NULL,
+                    7_000, NULL)
+        """)
+        // 加一条 text mirror 行确保只回填 image kind
+        try conn.execute(sql: """
+            INSERT INTO item_mirror
+              (id, origin_device, captured_at_ns, ingested_at_ns, kind,
+               source_app, source_app_name, preview, text_full,
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+               mirrored_at_ns, ocr_state)
+            VALUES ('txt-null', 'device-A', 8_000, 8_000, 'text',
+                    NULL, NULL, 'q', 'hello', NULL, NULL, NULL, 0, NULL,
+                    8_000, NULL)
+        """)
+        // 加一条软删 image 行确保不回填 tombstone
+        try conn.execute(sql: """
+            INSERT INTO item_mirror
+              (id, origin_device, captured_at_ns, ingested_at_ns, kind,
+               source_app, source_app_name, preview, text_full,
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+               mirrored_at_ns, ocr_state)
+            VALUES ('img-tomb', 'device-A', 9_000, 9_000, 'image',
+                    NULL, NULL, 'p', NULL, NULL, NULL, 'image/png', 0, 9_500,
+                    9_000, NULL)
+        """)
+    }
+    _ = try Admin.promoteToPrimary(
+        dbPath: paths.mainDB,
+        configPath: paths.configFile,
+        blobs: BlobStore(root: paths.blobsDir),
+        selfDeviceID: "self-dev",
+        now: 100_000
+    )
+    let after = try Database(path: paths.mainDB, role: .primary)
+    let rows = try after.pool.read { conn -> [Item] in
+        try Item.order(Column("id")).fetchAll(conn)
+    }
+    let byID = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+    #expect(byID["img-null"]?.ocrState == .pending, "image NULL 回填 pending")
+    #expect(byID["txt-null"]?.ocrState == nil, "text kind 保持 NULL")
+    #expect(byID["img-tomb"]?.ocrState == nil, "软删 image 不回填")
+}
+
 // MARK: - P2: blob 缺失预检
 
 @Test func promoteRefusesWhenBlobsMissingByDefault() throws {

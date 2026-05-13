@@ -250,6 +250,19 @@ public enum Admin {
             }
             let stampedRows = nullIDs.count
 
+            // c2. 【round 2 review fix】image 行 ocr_state 防御回填。v6 migration 一次性把
+            //     当时 item / item_mirror 表里所有 NULL→pending；但 v6 之后 PullWorker 从老
+            //     primary（v6 之前 binary，不发 ocr_state）拉新行时仍 NULL，promote 把它们搬
+            //     进 item 表。即便 phase 1 OCRWorker 只扫 origin=self 跳过这些跨 origin 行，
+            //     phase 2 加跨 origin OCR 时应该看到 pending；现在标好状态成本极低
+            try conn.execute(sql: """
+                UPDATE item
+                SET ocr_state = 'pending'
+                WHERE kind = 'image'
+                  AND ocr_state IS NULL
+                  AND deleted_at_ns IS NULL
+            """)
+
             // d. 清空 mirror + cursor。FTS 触发器同步清 item_mirror_fts，免费。
             try conn.execute(sql: "DELETE FROM item_mirror")
             let clearedRows = conn.changesCount
