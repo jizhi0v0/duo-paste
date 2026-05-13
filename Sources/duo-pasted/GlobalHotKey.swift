@@ -73,11 +73,21 @@ final class GlobalHotKey {
     }
 
     /// 注册 ⌥⌘V（默认）。失败抛错，便于调用方降级。
+    /// 幂等：重复调用先 unregister 旧 hotkey + remove 旧 handler，再注册新组合——
+    /// 让"自定义失败回退默认"或将来 config reload 都能干净接管，不泄漏 Carbon 句柄
     func register(
         keyCode: UInt32 = UInt32(kVK_ANSI_V),
         carbonModifiers: UInt32 = UInt32(cmdKey | optionKey),
         onFire: @escaping () -> Void
     ) throws {
+        if let h = handlerRef {
+            RemoveEventHandler(h)
+            handlerRef = nil
+        }
+        if let r = hotKeyRef {
+            UnregisterEventHotKey(r)
+            hotKeyRef = nil
+        }
         self.handler = onFire
         Self.shared = self
 

@@ -399,6 +399,19 @@ public struct Config: Codable, Sendable, Equatable {
                 )
             }
         }
+        // shift-only 等于全局拦截大写字母（Shift+V = V），让用户没法在任何 app 输入大写。
+        // 必须至少有一个 cmd/option/control 把组合从"普通输入"里拉出来
+        let nonShift = hotkey.modifiers.contains { m in
+            let lower = m.lowercased()
+            return lower == "cmd" || lower == "command"
+                || lower == "option" || lower == "alt"
+                || lower == "control" || lower == "ctrl"
+        }
+        if !nonShift {
+            throw ConfigError.invalidCombination(
+                "hotkey.modifiers 不能只有 shift——会拦截所有大写字母输入。请加 cmd / option / control"
+            )
+        }
     }
 
     /// 是否要给本机捕获标 pending（= 有 primary 要推）。

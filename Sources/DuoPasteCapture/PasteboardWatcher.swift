@@ -60,10 +60,39 @@ public final class PasteboardWatcher {
     /// 让接下来一次或多次 tick 不会把自己的写入误当作用户复制。
     ///
     /// 同时清空 `pendingDeadlineNs`：write back 路径完成后任何 pending debounce 都失效，
-    /// 否则会在 deadline 到期时把自己刚 suppress 的写回当成 capture 重新触发 callback
+    /// 否则会在 deadline 到期时把自己刚 suppress 的写回当成 capture 重新触发 callback。
+    ///
+    /// **注意**：若 paste-back 发生时刚好处在某次真实复制的 debounce 窗口内，那条真实
+    /// 复制会被本方法连同 pending 一起丢弃 —— 调用方应当在写回 pasteboard **之前**先调
+    /// `flushPendingIfAny()` 把真实复制提交掉，再调本方法做 self-write 抑制。
     public func suppressUpToCurrent() {
         lastChangeCount = pasteboard.changeCount
         pendingDeadlineNs = 0
+    }
+
+    /// 在 paste-back 写回 pasteboard **之前**调：若 debounce 窗口里有 pending 的真实
+    /// 复制，立刻 capture 一次（此刻 pasteboard 还是用户复制的原始内容），让那条真实
+    /// 复制不会被随后的 suppressUpToCurrent 静默丢弃。
+    ///
+    /// 覆盖两条路径：
+    /// 1. `pendingDeadlineNs > 0`：tick 已经观察到 changeCount 变化、正在 debounce
+    /// 2. `pasteboard.changeCount != lastChangeCount`：用户在两次 tick 间隔（≤200ms）
+    ///    刚复制完就立刻按 Enter，tick 还没轮到、`pendingDeadlineNs` 还是 0。此时
+    ///    必须也 flush，否则随后的 Copyback.write 会覆盖未观察到的真实复制
+    ///
+    /// 没有任何变化 → no-op。
+    public func flushPendingIfAny() {
+        let cc = pasteboard.changeCount
+        if cc != lastChangeCount {
+            // 未观察到的真实复制 —— 先 stamp lastChangeCount 让 capture 不再被 tick 重复抓
+            lastChangeCount = cc
+            pendingDeadlineNs = 0
+            capture()
+            return
+        }
+        guard pendingDeadlineNs > 0 else { return }
+        pendingDeadlineNs = 0
+        capture()
     }
 
     public func start() {

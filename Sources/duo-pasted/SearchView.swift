@@ -428,11 +428,17 @@ struct SearchView: View {
     }
 
     private var emptyView: some View {
-        VStack(spacing: 8) {
+        // 区分两个语义：库里真空（首次安装）vs 当前筛选导致空。后者只要 query / kinds /
+        // timeRange / pinnedOnly 任一非默认就成立——文案不同避免用户误以为 daemon 挂了
+        let hasActiveFilter = !state.query.isEmpty
+            || !state.selectedKinds.isEmpty
+            || state.timeRange != .all
+            || state.pinnedOnly
+        return VStack(spacing: 8) {
             Image(systemName: "tray")
                 .font(.system(size: 36))
                 .foregroundStyle(.secondary)
-            Text(state.query.isEmpty ? "还没有任何剪贴板历史" : "无匹配结果")
+            Text(hasActiveFilter ? "当前筛选无结果" : "还没有任何剪贴板历史")
                 .foregroundStyle(.secondary)
             if let err = state.lastError {
                 Text(err).font(.caption).foregroundStyle(.red)
