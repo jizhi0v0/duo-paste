@@ -533,8 +533,11 @@ public enum Admin {
     /// - `scope=.all`：仅本机 own-origin 的 image kind 且 ocr_state 落 failed/skipped。
     ///   排除：tombstone（deleted_at_ns != nil）/ 非 image / 非 own-origin（别人家的行
     ///   由对端 worker 负责）/ 已 pending（无需翻）/ done（用户没显式指定别动它）。
-    /// - `scope=.id(_)`：只看 id + kind=image。无视 origin / state——用户敲了 id 就是
-    ///   手动 override，包括把 done 翻成 pending 重 OCR 的场景
+    /// - `scope=.id(_)`：只看 id + kind=image + `origin_device = selfDeviceID`
+    ///   + `deleted_at_ns IS NULL`。无视 state——用户敲了 id 就是手动 override，
+    ///   包括把 done 翻成 pending 重 OCR 的场景。但仍守 origin / tombstone：
+    ///   OCRWorker.fetchPending 也只扫 own-origin + 非软删，翻 remote-origin /
+    ///   tombstone 的 ocr_state 没人处理会永卡 pending
     ///
     /// **清 `last_push_error` 的边界**（review fix）：OCRWorker 跟 PushWorker 共享这一列，
     /// 仅在 `push_state != 'failed'` 时清——如果 push 真的失败着、错误信息是 push 的

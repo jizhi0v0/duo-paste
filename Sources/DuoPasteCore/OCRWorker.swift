@@ -307,7 +307,8 @@ public actor OCRWorker {
     ///
     /// **不盖 push_state='failed' 行的 last_push_error**：那是真实的 push 失败原因，
     /// 操作员要看。OCR skipped 的 reason 比真实 push 失败次要——只在 push 没失败时
-    /// 写。如果 push 失败，OCR 不抢这一列，但 `ocr_state='skipped'` 仍然落地
+    /// 写。如果 push 失败，OCR 不抢这一列，但 `ocr_state='skipped'` 在**未软删时**仍然落地
+    /// （`deleted_at_ns IS NULL` guard 会让 fetchPending→processOne 之间被软删的行直接 0 行影响）
     private func markSkipped(id: String, reason: String) async {
         do {
             try await database.pool.write { db in
