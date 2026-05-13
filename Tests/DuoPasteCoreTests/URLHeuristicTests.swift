@@ -110,3 +110,20 @@ import Foundation
     // localhost 没有 '.' 不走 IPv6 路径，dotted-name 路径里 [a-z] 字符集通过
     #expect(looksLikeURL("http://localhost:8443"))
 }
+
+@Test func rejectsBareDotHost() {
+    // 极端：'http://./' 经 URL parse 后 host='.'，必须被 hasPrefix('.') 挡掉
+    #expect(!looksLikeURL("http://./"))
+}
+
+@Test func rejectsMalformedIPv6Literal() {
+    // IPv6 字符集只允许 [0-9a-fA-F:.\[\]]，含其他字符直接拒——挡 typo / 钓鱼
+    #expect(!looksLikeURL("http://[::zz::1]/"))
+    #expect(!looksLikeURL("http://[::g]/"))
+}
+
+@Test func rejectsIPv6ZoneID() {
+    // 钉死当前行为：IPv6 zone-id（'%' + interface name 通常含 a-f 之外字符）当前明确拒。
+    // 剪贴板 URL 里极罕见；将来真有需求再扩字符集
+    #expect(!looksLikeURL("http://[fe80::1%25en0]/"))
+}
