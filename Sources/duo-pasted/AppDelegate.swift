@@ -59,14 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         watcher.start()
 
         hotkey = GlobalHotKey()
-        do {
-            try hotkey.register { [weak self] in
-                self?.panel.toggle()
-            }
-        } catch {
-            fputs("hotkey register failed: \(error)\n", stderr)
-            // 没有快捷键也能用菜单栏入口，不致命
-        }
+        registerHotkeyWithFallback()
 
         snapshotScheduler = SnapshotScheduler(deps: deps)
         snapshotScheduler.start()
@@ -87,6 +80,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPasteBlobFetcher()
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · db=\(deps.paths.mainDB.path)\n", stderr)
+    }
+
+    /// 用 config.hotkey 注册 Carbon 全局快捷键；失败时回退到默认 ⌥⌘V 再试一次。
+    /// 失败原因常见两种：(1) 别的 app 已经占用了同样的组合（如 Alfred 抢 ⌘Space），
+    /// 此时回退默认能让 daemon 至少有一条入口；(2) translate 失败属程序员错误（Config
+    /// 应已 validate），但 fallback 路径用默认参数直接走 register 默认值，绕过 translate
+    private func registerHotkeyWithFallback() {
+        let cfg = deps.config.hotkey
+        do {
+            let translated = try HotkeyTranslation.translate(cfg)
+            try hotkey.register(
+                keyCode: translated.keyCode,
+                carbonModifiers: translated.modifiers
+            ) { [weak self] in
+                self?.panel.toggle()
+            }
+            fputs("hotkey registered: \(cfg.modifiers.joined(separator: "+"))+\(cfg.key)\n", stderr)
+            return
+        } catch {
+            fputs("hotkey register failed (\(cfg.modifiers.joined(separator: "+"))+\(cfg.key)): \(error). falling back to default ⌥⌘V\n", stderr)
+        }
+        // 已经是默认组合还是挂了，那真的没救了——光留菜单栏入口
+        if cfg == Config.HotkeyConfig.default {
+            fputs("hotkey fallback skipped: already on default ⌥⌘V\n", stderr)
+            return
+        }
+        do {
+            try hotkey.register(onFire: { [weak self] in
+                self?.panel.toggle()
+            })
+            fputs("hotkey registered (fallback): option+cmd+V\n", stderr)
+        } catch {
+            fputs("hotkey fallback also failed: \(error). only menu bar entry available\n", stderr)
+        }
     }
 
     /// Push worker：把本机 origin pending → primary。
@@ -285,6 +312,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 真正写 NSPasteboard 那一步——blob 字节已到位（或非 image kind）
     private func performLocalPaste(_ item: Item) {
+        // 先 flush 任何 pending 的真实复制：若 debounce 窗口里正有一条用户的 Cmd+C 在
+        // 等 500ms 稳定，我们的写回会污染 pasteboard 内容并被 suppressUpToCurrent 丢掉。
+        // flush 在写回之前调，capture 读到的还是用户原始内容
+        watcher.flushPendingIfAny()
         let wrote = Copyback.write(item: item, blobs: deps.blobs)
         watcher.suppressUpToCurrent()
         if wrote, let fp = PasteSuppressionSet.fingerprint(forItem: item) {

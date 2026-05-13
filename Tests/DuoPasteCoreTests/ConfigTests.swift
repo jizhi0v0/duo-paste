@@ -146,3 +146,79 @@ private func tmpConfig(_ json: String) throws -> URL {
     #expect(cfg.primaryURL == nil)
     #expect(cfg.derivedDatabaseRole == .primary)
 }
+
+// MARK: - hotkey
+
+@Test func hotkeyDefaultsToOptCmdV() throws {
+    let url = try tmpConfig("{}")
+    let cfg = try Config.load(from: url)
+    #expect(cfg.hotkey.key == "V")
+    #expect(Set(cfg.hotkey.modifiers) == Set(["cmd", "option"]))
+}
+
+@Test func hotkeyCustomReadsFromConfig() throws {
+    let url = try tmpConfig("""
+    { "hotkey": { "key": "L", "modifiers": ["cmd", "shift"] } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.hotkey.key == "L")
+    #expect(Set(cfg.hotkey.modifiers) == Set(["cmd", "shift"]))
+}
+
+@Test func hotkeyRejectsUnsupportedKey() throws {
+    let url = try tmpConfig("""
+    { "hotkey": { "key": "F1", "modifiers": ["cmd"] } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
+@Test func hotkeyRejectsEmptyModifiers() throws {
+    let url = try tmpConfig("""
+    { "hotkey": { "key": "V", "modifiers": [] } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
+@Test func hotkeyRejectsUnknownModifier() throws {
+    let url = try tmpConfig("""
+    { "hotkey": { "key": "V", "modifiers": ["fn"] } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
+@Test func hotkeyAcceptsModifierAliases() throws {
+    let url = try tmpConfig("""
+    { "hotkey": { "key": "v", "modifiers": ["command", "alt"] } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.hotkey.key == "v")  // 不归一化原始字段，由 translate 层 uppercase
+    #expect(cfg.hotkey.modifiers == ["command", "alt"])
+}
+
+@Test func hotkeyWritePreservesUnknownNestedFields() throws {
+    // hotkey 子 dict 也走 nested merge，未来加 "label" 之类字段不丢
+    let url = try tmpConfig("""
+    {
+        "hotkey": {
+            "key": "V",
+            "modifiers": ["cmd", "option"],
+            "description": "用户起的别名"
+        }
+    }
+    """)
+    var cfg = try Config.load(from: url)
+    cfg.hotkey = .init(key: "K", modifiers: ["cmd", "shift"])
+    try Config.write(cfg, to: url)
+    // 重读，未知字段 description 还在
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    let hk = dict["hotkey"] as! [String: Any]
+    #expect((hk["description"] as? String) == "用户起的别名")
+    #expect((hk["key"] as? String) == "K")
+}

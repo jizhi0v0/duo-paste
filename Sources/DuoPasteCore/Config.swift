@@ -36,6 +36,9 @@ public struct Config: Codable, Sendable, Equatable {
     /// 默认值见 CaptureLimits.default。
     public var capture: CaptureLimits
 
+    /// 全局快捷键。默认 ⌥⌘V（跟硬编码历史值一致）。改了 config.json 后要重启 daemon
+    public var hotkey: HotkeyConfig
+
     /// Keychain 里 shared secret 的 account 名。HMAC 签名用。primary_url 为空时不需要。
     public var sharedSecretKeychainAccount: String?
 
@@ -98,6 +101,46 @@ public struct Config: Codable, Sendable, Equatable {
         }
     }
 
+    public struct HotkeyConfig: Codable, Sendable, Equatable {
+        /// 键位字符串：A-Z / 0-9 子集。大小写无关——内部按 uppercase 比对。
+        /// 不支持 F1/Esc/Tab 这类特殊键——M4 简化版（剪贴板调出大多用字母组合，
+        /// 用户拿 F-key 当主键的场景少；将来扩 keyToCode 表即可）
+        public var key: String
+        /// 修饰键子集，元素来自 {"cmd","option","control","shift"}。
+        /// "command" / "alt" / "ctrl" 等别名在 carbon 转换层接受
+        public var modifiers: [String]
+
+        /// 默认 ⌥⌘V，跟历史硬编码一致——零回归
+        public static let `default` = HotkeyConfig(key: "V", modifiers: ["cmd", "option"])
+
+        public init(key: String, modifiers: [String]) {
+            self.key = key
+            self.modifiers = modifiers
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case key
+            case modifiers
+        }
+
+        /// `key` 必须落在受支持字符集里。Carbon keyCode 转换不在这里——保持 Config
+        /// 模块不依赖 Carbon。GlobalHotKey 调用方负责字符串 → keyCode 映射 + 报错
+        public static let supportedKeys: Set<String> = {
+            var set: Set<String> = []
+            for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" { set.insert(String(c)) }
+            for c in "0123456789" { set.insert(String(c)) }
+            return set
+        }()
+
+        /// 修饰键别名归一化。失败抛 ConfigError（validate() 用）
+        public static let supportedModifiers: Set<String> = [
+            "cmd", "command",
+            "option", "alt",
+            "control", "ctrl",
+            "shift",
+        ]
+    }
+
     public struct PullConfig: Codable, Sendable, Equatable {
         /// true → 启动 pull worker，周期拉 primary 全量到 item_mirror。
         public var enabled: Bool
@@ -130,6 +173,7 @@ public struct Config: Codable, Sendable, Equatable {
         primaryURL: nil,
         pull: .default,
         capture: .default,
+        hotkey: .default,
         sharedSecretKeychainAccount: nil
     )
 
@@ -143,6 +187,7 @@ public struct Config: Codable, Sendable, Equatable {
         primaryURL: URL?,
         pull: PullConfig,
         capture: CaptureLimits = .default,
+        hotkey: HotkeyConfig = .default,
         sharedSecretKeychainAccount: String?
     ) {
         self.serve = serve
@@ -154,6 +199,7 @@ public struct Config: Codable, Sendable, Equatable {
         self.primaryURL = primaryURL
         self.pull = pull
         self.capture = capture
+        self.hotkey = hotkey
         self.sharedSecretKeychainAccount = sharedSecretKeychainAccount
     }
 
@@ -167,6 +213,7 @@ public struct Config: Codable, Sendable, Equatable {
         case primaryURL = "primary_url"
         case pull
         case capture
+        case hotkey
         case sharedSecretKeychainAccount = "shared_secret_keychain_account"
     }
 
@@ -194,6 +241,7 @@ public struct Config: Codable, Sendable, Equatable {
         }
         self.pull = try c.decodeIfPresent(PullConfig.self, forKey: .pull) ?? .default
         self.capture = try c.decodeIfPresent(CaptureLimits.self, forKey: .capture) ?? .default
+        self.hotkey = try c.decodeIfPresent(HotkeyConfig.self, forKey: .hotkey) ?? .default
         self.sharedSecretKeychainAccount = try c.decodeIfPresent(
             String.self, forKey: .sharedSecretKeychainAccount
         )
@@ -243,6 +291,12 @@ public struct Config: Codable, Sendable, Equatable {
         captureDict["max_text_kb"] = cfg.capture.maxTextBytes / 1024
         captureDict["merge_window_sec"] = cfg.capture.mergeWindowSec
         dict[CodingKeys.capture.rawValue] = captureDict
+
+        // hotkey 同款 nested merge——用户/未来可能加 description / disabled 之类字段
+        var hotkeyDict = (dict[CodingKeys.hotkey.rawValue] as? [String: Any]) ?? [:]
+        hotkeyDict["key"] = cfg.hotkey.key
+        hotkeyDict["modifiers"] = cfg.hotkey.modifiers
+        dict[CodingKeys.hotkey.rawValue] = hotkeyDict
 
         Self.setOrRemove(&dict, CodingKeys.sharedSecretKeychainAccount.rawValue,
                          cfg.sharedSecretKeychainAccount)
@@ -324,6 +378,39 @@ public struct Config: Codable, Sendable, Equatable {
             }
             // 路径存在性检查放到 server 启动时——避免单元测试要求文件存在
             _ = cert; _ = key
+        }
+        // hotkey 字段校验——拼写错的 modifier / 不支持的 key 在启动时就 throw，
+        // 不会让 daemon 起来后 GlobalHotKey.register 报神秘 Carbon 错误码
+        let keyNorm = hotkey.key.uppercased()
+        if !HotkeyConfig.supportedKeys.contains(keyNorm) {
+            throw ConfigError.invalidCombination(
+                "hotkey.key 不支持：\(hotkey.key)。当前只支持 A-Z 和 0-9"
+            )
+        }
+        if hotkey.modifiers.isEmpty {
+            throw ConfigError.invalidCombination(
+                "hotkey.modifiers 不能为空——纯字母键会跟普通输入冲突"
+            )
+        }
+        for m in hotkey.modifiers {
+            if !HotkeyConfig.supportedModifiers.contains(m.lowercased()) {
+                throw ConfigError.invalidCombination(
+                    "hotkey.modifiers 不支持：\(m)。可选：cmd / option / control / shift"
+                )
+            }
+        }
+        // shift-only 等于全局拦截大写字母（Shift+V = V），让用户没法在任何 app 输入大写。
+        // 必须至少有一个 cmd/option/control 把组合从"普通输入"里拉出来
+        let nonShift = hotkey.modifiers.contains { m in
+            let lower = m.lowercased()
+            return lower == "cmd" || lower == "command"
+                || lower == "option" || lower == "alt"
+                || lower == "control" || lower == "ctrl"
+        }
+        if !nonShift {
+            throw ConfigError.invalidCombination(
+                "hotkey.modifiers 不能只有 shift——会拦截所有大写字母输入。请加 cmd / option / control"
+            )
         }
     }
 

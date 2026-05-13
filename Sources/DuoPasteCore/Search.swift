@@ -72,12 +72,23 @@ public struct SearchAPI: Sendable {
     }
 
     static func fetchUnion(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
+        // pinnedOnly 必须在跨表 dedup **之后**应用。否则：own 上 id=X 是新行 pinned=false、
+        // mirror 上 id=X 是旧行 pinned=true（primary 改了 pin 但还没回流到 own），子查询
+        // 各自带 `pinned=1` 过滤后只剩 mirror 旧行——dedup 没东西可合并，UI 看到陈旧文本
+        // 且仍然 pinned。正确顺序：拉**不**带 pinnedOnly 的候选集 → 按 captured_at_ns 取最新
+        // → 再用最新行的 pinned 字段做最后过滤。
+        //
+        // pinnedOnly=true 时 oversample 必须无界——否则若 mirror 顶部充满"在 mirror 里
+        // pinned=true 但在 own 里 pinned=false 的过期副本"，oversample 上界会先吃满这些
+        // 副本，让真正应进结果的 pinned 行（编号更后）落在 limit+offset 之外。
+        // pinned 项总数实际很小（用户手动 pin 的，几十量级），无上限不会有性能问题
+        let oversampleLimit = q.pinnedOnly ? Int.max : (q.limit + q.offset)
         let oversample = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
-            kinds: q.kinds, pinnedOnly: q.pinnedOnly,
+            kinds: q.kinds, pinnedOnly: false,
             includeDeleted: q.includeDeleted,
-            limit: q.limit + q.offset,
+            limit: oversampleLimit,
             offset: 0
         )
         let own = try fetchHits(db, query: oversample)
@@ -99,6 +110,9 @@ public struct SearchAPI: Sendable {
             }
         }
         var deduped = Array(byID.values)
+        if q.pinnedOnly {
+            deduped = deduped.filter { $0.0.pinned }
+        }
         // 排序契约：pinned DESC → prefix DESC → captured_at_ns DESC。
         // prefix 分数跟 SQL 端 CASE 一致（preview 起始=2, text_full 起始=1, 否则 0），
         // 让 union 跨表合并后顺序跟单表 fetchHits 完全可预测。
@@ -336,6 +350,18 @@ public struct SearchAPI: Sendable {
     static func countUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
         // UNION（不是 UNION ALL）自动按行去重，但我们只 select id 一列，所以等价于按 id dedupe。
         // 用 sub-select 包一层让外层 COUNT(*) 数 dedup 后的行数。
+        //
+        // pinnedOnly 走 fetchUnion 路径——子查询不带 pinned 过滤，dedup 后取胜者的 pinned
+        // 字段做过滤（跟 fetchUnion 的 dedupe-then-pinnedOnly 不变量对齐）。
+        if q.pinnedOnly {
+            return try fetchUnion(db, query: SearchQuery(
+                text: q.text,
+                fromNs: q.fromNs, toNs: q.toNs,
+                kinds: q.kinds, pinnedOnly: true,
+                includeDeleted: q.includeDeleted,
+                limit: Int.max, offset: 0
+            )).count
+        }
         let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
         let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
         let sql = """
