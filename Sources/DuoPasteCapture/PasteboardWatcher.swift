@@ -18,7 +18,21 @@ public final class PasteboardWatcher {
 
     private let pasteboard: NSPasteboard
     private let pollInterval: TimeInterval
+    /// debounce 窗口（纳秒）。changeCount 跳变后等这么久没新跳变才真正 capture。
+    ///
+    /// 用途：合并 app 自己的连续多次剪贴板写入。已知场景：
+    /// - **CleanShot**：截图保存时先写本地缓存路径，iCloud Drive 同步完成后改写
+    ///   iCloud 路径——一次截图两次 changeCount 跳变，原本会变成两条 file item
+    /// - 富文本 app（Notes / Mail）在写 .rtf + .html + .string 时可能分多次 setString
+    ///
+    /// 0 = 关闭 debounce 立即 capture（测试 / 调试注入）。默认 500ms：
+    /// - 远低于人眼反应（200-300ms）+ panel 打开动画时间，用户完全察觉不到
+    /// - 比 CleanShot 观察到的 iCloud 同步延迟（~200ms）留充足 buffer
+    private let debounceNs: Int64
     private var lastChangeCount: Int
+    /// 进入 debounce 等待时记录的触发时刻。0 = 当前没 pending capture。
+    /// 每次 changeCount 跳变都重置为 `now + debounceNs`，直到稳定一整个窗口才触发
+    private var pendingDeadlineNs: Int64 = 0
     private var timer: Timer?
     private let onCapture: Callback
     /// 仅 RTF 路径用于解码前 raw-size 守门，避免 50MB RTF source 被 NSAttributedString 同步
@@ -30,11 +44,13 @@ public final class PasteboardWatcher {
     public init(
         pasteboard: NSPasteboard = .general,
         pollInterval: TimeInterval = 0.2,
+        debounceMs: Int = 500,
         maxRawRTFBytes: Int = 512 * 1024,
         onCapture: @escaping Callback
     ) {
         self.pasteboard = pasteboard
         self.pollInterval = pollInterval
+        self.debounceNs = Int64(max(0, debounceMs)) * 1_000_000
         self.maxRawRTFBytes = maxRawRTFBytes
         self.lastChangeCount = pasteboard.changeCount
         self.onCapture = onCapture
@@ -42,8 +58,12 @@ public final class PasteboardWatcher {
 
     /// 由"自己写回剪贴板"的代码在写完后调用，把内部 lastChangeCount 推到当前值，
     /// 让接下来一次或多次 tick 不会把自己的写入误当作用户复制。
+    ///
+    /// 同时清空 `pendingDeadlineNs`：write back 路径完成后任何 pending debounce 都失效，
+    /// 否则会在 deadline 到期时把自己刚 suppress 的写回当成 capture 重新触发 callback
     public func suppressUpToCurrent() {
         lastChangeCount = pasteboard.changeCount
+        pendingDeadlineNs = 0
     }
 
     public func start() {
@@ -64,9 +84,32 @@ public final class PasteboardWatcher {
 
     private func tick() {
         let cc = pasteboard.changeCount
-        guard cc != lastChangeCount else { return }
-        lastChangeCount = cc
+        if cc != lastChangeCount {
+            lastChangeCount = cc
+            if debounceNs > 0 {
+                // 进入或重置 debounce 等待窗口。这一 tick 不 capture——等下次 tick
+                // 看 cc 是否还稳定（用户没继续写）才触发。app 在窗口内再次写剪贴板
+                // （如 CleanShot 100ms 后改写 iCloud 路径）→ 重新走到这里 → deadline 刷新
+                pendingDeadlineNs = Clock.nowNs() + debounceNs
+                return
+            }
+            // 显式关 debounce → 立即 capture（测试 / 调试可用，零回归）
+            capture()
+            return
+        }
+        // cc 稳定（这一 tick 没人写）。看 pending 窗口是否已过期 → 触发 capture
+        guard pendingDeadlineNs > 0,
+              Clock.nowNs() >= pendingDeadlineNs
+        else { return }
+        pendingDeadlineNs = 0
+        capture()
+    }
 
+    /// 真正读 pasteboard 提取内容并回调。从 tick() 拆出来——debounce 路径在 deadline
+    /// 到期时调；零 debounce 路径在 changeCount 跳变时立刻调。
+    /// 注意：skipMarkerTypes 检测放在这里（不是 changeCount 跳变时刻），因为
+    /// debounce 窗口内 app 可能还没写完所有 type marker
+    private func capture() {
         let capturedAtNs = Clock.nowNs()
 
         // 跳过特殊标记类型
