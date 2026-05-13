@@ -25,11 +25,12 @@ public func looksLikeWebViewHTML(_ html: String) -> Bool {
         return true
     }
     // <head><meta charset='utf-8'></head> 包裹变体（DingTalk 等 Electron 文档编辑器）。
-    // 限定 head 段内出现 utf-8 charset meta，且 head 块在合理位置（≤ 256 字节）关闭，
-    // 避免误伤把 head 当结构性元素的完整 HTML 文档。
+    // 限定 head 段内出现 utf-8 charset meta，且 head 块在合理位置（≤ 256 个 UTF-8 字节）
+    // 关闭，避免误伤把 head 当结构性元素塞了一堆 meta/link 的完整 HTML 文档。
+    // 用 utf8.count 而不是字符距离——前者跟字节预算对齐，head 里塞 CJK 时不会被低估。
     if lower.hasPrefix("<head>"),
        let headEnd = lower.range(of: "</head>"),
-       lower.distance(from: lower.startIndex, to: headEnd.lowerBound) <= 256
+       lower[lower.startIndex..<headEnd.lowerBound].utf8.count <= 256
     {
         let headStart = lower.index(lower.startIndex, offsetBy: "<head>".count)
         let headBody = lower[headStart..<headEnd.lowerBound]

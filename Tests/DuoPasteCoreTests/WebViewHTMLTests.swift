@@ -80,3 +80,12 @@ import Foundation
     #expect(!looksLikeWebViewHTML("<head><title>x</title></head><div>y</div>"))
     #expect(!looksLikeWebViewHTML("<head><meta charset='gbk'></head><div>y</div>"))
 }
+
+@Test func ignoresHeadSegmentBeyondByteLimit() {
+    // head 段塞够多 meta 让 </head> 超过 256 字节预算时不命中——锁住阈值，
+    // 防止 head 当结构性元素的完整 HTML 文档巧合含 charset=utf-8 被误判。
+    let filler = String(repeating: "<meta name=\"x\" content=\"y\">", count: 20)
+    let html = "<head><meta charset=\"utf-8\">\(filler)</head><div>x</div>"
+    #expect(html.utf8.count > 256)
+    #expect(!looksLikeWebViewHTML(html))
+}

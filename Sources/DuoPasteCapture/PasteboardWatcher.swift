@@ -275,7 +275,8 @@ public final class PasteboardWatcher {
         // 4) HTML
         if let html = pasteboard.string(forType: .html) {
             // web view selection 降级：WebKit / Chromium 系（浏览器 + Electron + Codex /
-            // ChatGPT / Claude Desktop 等）写 HTML 时前面会塞 <meta charset='utf-8'>，
+            // ChatGPT / Claude Desktop / DingTalk 等）写 HTML 时前面会塞
+            // <meta charset='utf-8'>（裸前缀或 <head> 包裹两种变体，DingTalk 走后者），
             // 内容是带 inline style + data-* 属性的一坨 markup——对剪贴板管理器毫无用处。
             // 此时如果 .string 也有非空 plain text，优先用 plain，丢 markup。
             if looksLikeWebViewHTML(html),
