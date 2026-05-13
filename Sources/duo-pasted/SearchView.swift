@@ -153,32 +153,40 @@ struct SearchView: View {
     /// chip 顺序按 ItemKind 出现频次手排（text 最常用 → 排最左），不按 enum 声明序。
     /// 改 chip 时不要按 ItemKind.allCases 遍历——枚举序 (text/rtf/html/url/image/file)
     /// 把 rtf/html 推到前面会让用户每次都要扫过去找"图片"
+    ///
+    /// 布局：左侧 chip 区横向滚动（panel 收窄时不会让 "文本" 垂直堆叠成 "文 / 本"，
+    /// trackpad 双指水平滑动可见全部 chip），右侧 timeRangeMenu 固定贴边——时间窗高频，
+    /// 不能因为滚动隐藏到屏外。chip 内部全部 `.fixedSize()` 保自然宽度。
     private var filterBar: some View {
         HStack(spacing: 6) {
-            ForEach(filterChipKinds, id: \.self) { kind in
-                // 契约：空 dict（remoteOK / 出错）→ nil 隐藏数字；非空 dict（local /
-                // unionLocal 路径）→ 缺 key 默认 0 显示 "图片 0"。这样 KindChip 头注释
-                // 的 "0 也显示" 才真生效，否则缺 key 时跟 "远端未知" 撞同一种 nil 渲染。
-                KindChip(
-                    kind: kind,
-                    isSelected: state.selectedKinds.contains(kind),
-                    count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
-                    onTap: { toggleKind(kind) }
-                )
-            }
-            if !state.selectedKinds.isEmpty {
-                Button {
-                    state.selectedKinds.removeAll()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(filterChipKinds, id: \.self) { kind in
+                        // 契约：空 dict（remoteOK / 出错）→ nil 隐藏数字；非空 dict（local /
+                        // unionLocal 路径）→ 缺 key 默认 0 显示 "图片 0"。这样 KindChip 头注释
+                        // 的 "0 也显示" 才真生效，否则缺 key 时跟 "远端未知" 撞同一种 nil 渲染。
+                        KindChip(
+                            kind: kind,
+                            isSelected: state.selectedKinds.contains(kind),
+                            count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
+                            onTap: { toggleKind(kind) }
+                        )
+                    }
+                    if !state.selectedKinds.isEmpty {
+                        Button {
+                            state.selectedKinds.removeAll()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("清除类型筛选")
+                    }
+                    pinnedOnlyChip
                 }
-                .buttonStyle(.plain)
-                .help("清除类型筛选")
+                .padding(.vertical, 1)
             }
-            pinnedOnlyChip
-            Spacer()
             timeRangeMenu
         }
         .padding(.horizontal, 18)
@@ -205,6 +213,7 @@ struct SearchView: View {
             )
         }
         .buttonStyle(.plain)
+        .fixedSize()
     }
 
     /// chip 排列顺序：剪贴板使用频次心智（文本/图片/链接最常用 → 排前面）
@@ -528,6 +537,9 @@ private struct KindChip: View {
             )
         }
         .buttonStyle(.plain)
+        // 不加这个，父 HStack 收窄时会把 "文本" 压成 "文 / 本" 垂直堆叠（Text 默认允许多行换行）。
+        // 配合 filterBar 外层 ScrollView 横滚——panel 即使窄到 minWidth=640 chip 也保自然宽度
+        .fixedSize()
     }
 
     private var label: String {
