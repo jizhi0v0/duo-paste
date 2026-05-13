@@ -16,7 +16,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let root = tempDir()
     let paths = Paths(root: root)
     paths.ensureExists()
-    let db = try Database(path: paths.mainDB, role: .primary)
+    let db = try Database(path: paths.mainDB)
     let blobs = BlobStore(root: paths.blobsDir)
     let service = CaptureService(database: db, blobs: blobs, deviceID: "device-test")
     return (paths, db, blobs, service)
@@ -36,49 +36,17 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     }
 }
 
-@Test func v2MigrationCreatesMirrorTables() throws {
-    let (_, db, _, _) = try makeFixture()
-    try db.pool.read { conn in
-        for name in ["item_mirror", "item_mirror_fts", "pull_cursor"] {
-            let exists = try Bool.fetchOne(conn, sql: """
-                SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)
-            """, arguments: [name]) ?? false
-            #expect(exists, "expected \(name) to exist after migration")
-        }
-    }
-}
+// PR 1 v7 migration 已 DROP item_mirror / item_mirror_fts。原 v2MigrationCreatesMirrorTables /
+// mirrorFTSRoundTrip 测试不再适用——peer 行直接落 item 表，FTS 走 item_fts 触发器。
 
-@Test func v2MigrationIsIdempotentOnReopen() throws {
+@Test func migrationIsIdempotentOnReopen() throws {
     // 用一个固定 DB 文件，先 open 一次跑 migration，再 open 一次应零变更。
     let root = tempDir()
     let paths = Paths(root: root)
     paths.ensureExists()
-    _ = try Database(path: paths.mainDB, role: .primary)
-    // 第二次打开：GRDB 应跳过已应用的 migration。如果 v2 不幂等会因 CREATE TABLE 重复报错。
-    _ = try Database(path: paths.mainDB, role: .primary)
-}
-
-@Test func mirrorFTSRoundTrip() throws {
-    // 验证 item_mirror 的 FTS trigger 真的会被触发——这是 M3 pull worker 上线前
-    // 唯一能验证 mirror 表 + FTS 是否串通的入口。
-    let (_, db, _, _) = try makeFixture()
-    try db.pool.write { conn in
-        try conn.execute(sql: """
-            INSERT INTO item_mirror (id, origin_device, captured_at_ns, kind,
-                                     preview, text_full, source_app_name,
-                                     pinned, mirrored_at_ns)
-            VALUES ('m1', 'remote-device', 1000, 'text',
-                    'hello mirror', 'hello mirror world', 'WeChat',
-                    0, 2000);
-        """)
-    }
-    try db.pool.read { conn in
-        let hit = try String.fetchOne(conn, sql: """
-            SELECT id FROM item_mirror
-            WHERE rowid IN (SELECT rowid FROM item_mirror_fts WHERE item_mirror_fts MATCH ?)
-        """, arguments: ["mirror"])
-        #expect(hit == "m1")
-    }
+    _ = try Database(path: paths.mainDB)
+    // 第二次打开：GRDB 应跳过已应用的 migration。如果不幂等会因 CREATE TABLE 重复报错。
+    _ = try Database(path: paths.mainDB)
 }
 
 @Test func uuidv7IsMonotonicByMs() {
@@ -122,7 +90,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(items.count == 1)
     #expect(items[0].kind == .text)
     #expect(items[0].textFull == "hello capture world")
-    #expect(items[0].pushState == .acked) // primary mode
+    #expect(items[0].ingestedAtNs != nil)  // mesh 拓扑下 capture 后立即 stamp
 }
 
 @Test func captureMergesIdenticalWithinWindow() async throws {
@@ -156,7 +124,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let root = tempDir()
     let paths = Paths(root: root)
     paths.ensureExists()
-    let db = try Database(path: paths.mainDB, role: .primary)
+    let db = try Database(path: paths.mainDB)
     let blobs = BlobStore(root: paths.blobsDir)
     let service = CaptureService(
         database: db, blobs: blobs, deviceID: "device-test",
@@ -375,8 +343,8 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let (_, db, _, _) = try makeFixture()
     try await db.pool.write { conn in
         try conn.execute(sql: """
-            INSERT INTO item (id, origin_device, captured_at_ns, kind, pinned, push_state)
-            VALUES ('foreign-id', 'other-device', 1_000_000, 'text', 0, 'acked')
+            INSERT INTO item (id, origin_device, captured_at_ns, kind, pinned)
+            VALUES ('foreign-id', 'other-device', 1_000_000, 'text', 0)
         """)
     }
     let did = try db.setPinned(id: "foreign-id", pinned: true, selfDeviceID: "device-test", now: 2_000_000)

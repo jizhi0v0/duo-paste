@@ -22,7 +22,7 @@ private func makeClientDB() throws -> DuoDB {
         .appendingPathComponent("duo-multi-peer-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    return try DuoDB(path: paths.mainDB, role: .client)
+    return try DuoDB(path: paths.mainDB)
 }
 
 private func mkItem(
@@ -39,8 +39,7 @@ private func mkItem(
         kind: .text,
         sourceAppName: "Test",
         preview: text,
-        textFull: text,
-        pushState: .acked
+        textFull: text
     )
 }
 
@@ -185,11 +184,10 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
             INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-               push_state, push_attempts, last_push_error, ocr_state)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, ocr_state)
             VALUES
-              ('a-row', ?, 100, 100, 'text', NULL, 'A', 'A', 'A', NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL),
-              ('b-row', ?, 200, 200, 'text', NULL, 'B', 'B', 'B', NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
+              ('a-row', ?, 100, 100, 'text', NULL, 'A', 'A', 'A', NULL, NULL, NULL, 0, NULL, NULL),
+              ('b-row', ?, 200, 200, 'text', NULL, 'B', 'B', 'B', NULL, NULL, NULL, 0, NULL, NULL)
         """, arguments: [peerAID, peerBOldID])
         try conn.execute(sql: """
             INSERT INTO pull_cursor (peer_device_id, cursor_ns, cursor_id, updated_at_ns)
@@ -249,11 +247,10 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
             INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-               push_state, push_attempts, last_push_error, ocr_state)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, ocr_state)
             VALUES
-              ('old-row', ?, 100, 100, 'text', NULL, 'O', 'O', 'O', NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL),
-              ('other-row', ?, 110, 110, 'text', NULL, 'X', 'X', 'X', NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
+              ('old-row', ?, 100, 100, 'text', NULL, 'O', 'O', 'O', NULL, NULL, NULL, 0, NULL, NULL),
+              ('other-row', ?, 110, 110, 'text', NULL, 'X', 'X', 'X', NULL, NULL, NULL, 0, NULL, NULL)
         """, arguments: [peerOldID, otherPeerID])
         // 学习模式只查到 pull_cursor LIMIT 1：单 peer 部署只有这一行
         try conn.execute(sql: """

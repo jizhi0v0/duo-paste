@@ -33,7 +33,7 @@ final class AppDependencies {
         let paths = Paths.makeDefault()
         let deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
         let config = try Config.load(from: paths.configFile)
-        let database = try Database(path: paths.mainDB, role: config.derivedDatabaseRole)
+        let database = try Database(path: paths.mainDB)
         let blobs = BlobStore(root: paths.blobsDir)
         self.paths = paths
         self.config = config
@@ -69,7 +69,7 @@ final class AppDependencies {
         var remote: SearchTransport? = nil
         if let primaryURL = config.primaryURL {
             if let secret = try? SharedSecret.load(from: paths.sharedSecretFile) {
-                remote = HTTPIngestClient(
+                remote = HTTPPeerClient(
                     baseURL: primaryURL,
                     auth: HMACAuth(secret: secret),
                     session: Self.syncURLSession

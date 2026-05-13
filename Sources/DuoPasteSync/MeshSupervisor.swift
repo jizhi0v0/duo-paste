@@ -8,7 +8,7 @@ import DuoPasteCore
 /// 单个 worker 的 pull 行为继续在 PullWorkerTests / MultiPeerPullWorkerTests 验证。
 ///
 /// 注入 `[PullWorker]` 而不是 `[PeerSpec] + transportFactory`：
-/// - 生产 AppDelegate 自己组装好每个 worker（HTTPIngestClient transport + 注入依赖），传进 supervisor
+/// - 生产 AppDelegate 自己组装好每个 worker（HTTPPeerClient transport + 注入依赖），传进 supervisor
 /// - 测试可直接构造 mock-transport 的 worker 列表传进来
 /// - supervisor 不依赖 transport / config 细节，可独立单测
 ///

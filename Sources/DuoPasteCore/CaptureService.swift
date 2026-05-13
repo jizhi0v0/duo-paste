@@ -106,7 +106,6 @@ public actor CaptureService {
 
     private func ingestText(_ c: CapturedPasteboard, text: String) throws -> CaptureResult {
         let preview = makePreview(text)
-        let role = database.role
         let now = c.capturedAtNs
 
         let result: CaptureResult = try database.pool.write { db -> CaptureResult in
@@ -115,6 +114,10 @@ public actor CaptureService {
             //   重复文本不像重复图片需要时间线，bump 一条最旧的让它浮顶即可）。
             // textMergeWindowNs == 0 → 完全禁用合并（每次都插新行）。
             // textMergeWindowNs > 0 → N 纳秒内合并，跟旧 mergeWindowNs 行为兼容。
+            //
+            // **mesh 拓扑下 dedup 必须限定 origin=self**：合表后 item 表含 peer 行，
+            // 不加 origin 过滤会命中并 bump peer 行的 captured_at_ns，等于本机改了
+            // 别人的数据（peer 视角看是漂移）。详 plan §"CaptureService 改动" 第 3 条
             let mergeCandidate: Item?
             if textMergeWindowNs == 0 {
                 mergeCandidate = nil
@@ -122,6 +125,7 @@ public actor CaptureService {
                 var query = Item
                     .filter(Column("kind") == c.kind.rawValue)
                     .filter(Column("text_full") == text)
+                    .filter(Column("origin_device") == deviceID)
                     .filter(Column("deleted_at_ns") == nil)
                 if let windowNs = textMergeWindowNs {
                     let mergeFloor = now - windowNs
@@ -136,27 +140,15 @@ public actor CaptureService {
                 updated.capturedAtNs = now
                 if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }
                 if updated.sourceAppName == nil { updated.sourceAppName = c.sourceAppName }
-                if role == .client {
-                    // 客户端模式下重置推送状态，让 push worker 把"刷新时间"也同步过去
-                    updated.pushState = .pending
-                    updated.pushAttempts = 0
-                    updated.lastPushError = nil
-                } else {
-                    // primary 上 merge 也要 bump ingested_at_ns，否则 mirror clients
-                    // 已经把这行 cursor 推进过去后再也看不到这次 capturedAt 刷新——
-                    // 见 plan moonlit-wave.md "primary 在 /since 里也回放"
-                    updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
-                }
+                // mesh 路径永远 stamp ingested_at_ns，让 peers 通过 /since 看到这次刷新
+                updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 try updated.update(db)
                 return CaptureResult(outcome: .mergedWithPrevious, item: updated)
             }
 
-            // primary 路径走 nextIngestNs 保证 commit 顺序 = ingested_at_ns 顺序，
-            // /since cursor 才不会漏行（详见 Database.nextIngestNs 注释）。
-            // client 路径 ingested_at_ns 永远 nil——primary 收到 push 时再打。
-            let ingestNs: Int64? = role == .primary
-                ? try DuoPasteCore.Database.nextIngestNs(db, now: now)
-                : nil
+            // 走 nextIngestNs 保证 commit 顺序 = ingested_at_ns 顺序，/since cursor
+            // 才不会漏行（详见 Database.nextIngestNs 注释）
+            let ingestNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
             let item = Item(
                 id: UUIDv7.generateString(),
                 originDevice: deviceID,
@@ -166,13 +158,12 @@ public actor CaptureService {
                 sourceApp: c.sourceAppBundleID,
                 sourceAppName: c.sourceAppName,
                 preview: preview,
-                textFull: text,
-                pushState: role == .primary ? .acked : .pending
+                textFull: text
             )
             try item.insert(db)
             return CaptureResult(outcome: .inserted, item: item)
         }
-        broadcastIfAdvanced(role: role, item: result.item, outcome: result.outcome)
+        broadcastIfAdvanced(item: result.item, outcome: result.outcome)
         return result
     }
 
@@ -180,14 +171,15 @@ public actor CaptureService {
         // 先内容寻址写盘，得到 sha256
         let info = try blobs.put(blob, ext: c.blobExt)
         let preview = c.fileName ?? "[\(c.kind.rawValue) \(humanSize(info.size))]"
-        let role = database.role
         let now = c.capturedAtNs
         let mergeFloor = now - mergeWindowNs
 
         let result: CaptureResult = try database.pool.write { db -> CaptureResult in
+            // 同 ingestText：blob 合并候选必须限定 origin=self，避免 bump peer 行
             if let last = try Item
                 .filter(Column("kind") == c.kind.rawValue)
                 .filter(Column("blob_sha256") == info.sha256)
+                .filter(Column("origin_device") == deviceID)
                 .filter(Column("captured_at_ns") >= mergeFloor)
                 .filter(Column("deleted_at_ns") == nil)
                 .order(Column("captured_at_ns").desc)
@@ -197,26 +189,14 @@ public actor CaptureService {
                 updated.capturedAtNs = now
                 if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }
                 if updated.sourceAppName == nil { updated.sourceAppName = c.sourceAppName }
-                if role == .client {
-                    updated.pushState = .pending
-                    updated.pushAttempts = 0
-                    updated.lastPushError = nil
-                } else {
-                    // 同 ingestText 注释：primary merge 要 bump ingested_at_ns 让 mirror 看见
-                    updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
-                }
+                updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 try updated.update(db)
                 return CaptureResult(outcome: .mergedWithPrevious, item: updated)
             }
 
-            let ingestNs: Int64? = role == .primary
-                ? try DuoPasteCore.Database.nextIngestNs(db, now: now)
-                : nil
-            // image kind 入库即标 ocr_state=pending，让未来 OCR worker 扫到。
+            let ingestNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
+            // image kind 入库即标 ocr_state=pending，让 OCR worker 扫到。
             // file kind 也是 blob 但不走 OCR（文件路径是字符串，BlobStore 里没字节）。
-            // client 模式下也写 pending —— push 给 primary 时 ocr_state 不上 wire，
-            // primary 收到后 IngestRequest.toItem 会重新按 kind 设 pending。本机这一列
-            // 在 promote-to-primary 时会被本地 OCR worker 接管
             let ocrState: OCRState? = c.kind == .image ? .pending : nil
             let item = Item(
                 id: UUIDv7.generateString(),
@@ -232,21 +212,20 @@ public actor CaptureService {
                 blobSha256: info.sha256,
                 blobSize: info.size,
                 blobMime: c.blobMime,
-                pushState: role == .primary ? .acked : .pending,
                 ocrState: ocrState
             )
             try item.insert(db)
             return CaptureResult(outcome: .inserted, item: item)
         }
-        broadcastIfAdvanced(role: role, item: result.item, outcome: result.outcome)
+        broadcastIfAdvanced(item: result.item, outcome: result.outcome)
         return result
     }
 
     /// commit 后回调钩子：item.ingested_at_ns 非 nil → 这次 capture/merge 推进了 cursor，
     /// 触发 onCursorAdvanced 让 server 端 broadcaster fan-out cursor_advanced 帧给 peers。
-    /// client role / skipped 路径不触发——client 行 ingested_at_ns 永远 nil；skipped 没 item。
-    private func broadcastIfAdvanced(role: DatabaseRole, item: Item?, outcome: CaptureResult.Outcome) {
-        guard role == .primary, let item, let ns = item.ingestedAtNs else { return }
+    /// skipped 路径不触发（没有 item）。mesh 拓扑下每台机都是 peer，不再有 client 跳过条件
+    private func broadcastIfAdvanced(item: Item?, outcome: CaptureResult.Outcome) {
+        guard let item, let ns = item.ingestedAtNs else { return }
         switch outcome {
         case .inserted, .mergedWithPrevious:
             onCursorAdvanced(ns)

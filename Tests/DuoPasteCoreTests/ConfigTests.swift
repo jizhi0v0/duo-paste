@@ -16,7 +16,6 @@ private func tmpConfig(_ json: String) throws -> URL {
         .appendingPathComponent("duo-no-config-\(UUID().uuidString).json")
     let cfg = try Config.load(from: nonexistent)
     #expect(cfg == Config.default)
-    #expect(cfg.derivedDatabaseRole == .primary)  // standalone == primary 语义
     #expect(cfg.summary == "standalone")
 }
 
@@ -35,8 +34,6 @@ private func tmpConfig(_ json: String) throws -> URL {
     """)
     let cfg = try Config.load(from: url)
     #expect(cfg.primaryURL?.absoluteString == "https://primary.tail.ts.net:8443")
-    #expect(cfg.derivedDatabaseRole == .client)
-    #expect(cfg.capturesNeedPush == true)
     #expect(cfg.summary.hasPrefix("client→"))
 }
 
@@ -61,7 +58,6 @@ private func tmpConfig(_ json: String) throws -> URL {
     let cfg = try Config.load(from: url)
     #expect(cfg.serve == true)
     #expect(cfg.primaryURL == nil)
-    #expect(cfg.derivedDatabaseRole == .primary)
     #expect(cfg.summary.hasPrefix("primary @"))
 }
 
@@ -144,7 +140,6 @@ private func tmpConfig(_ json: String) throws -> URL {
     """)
     let cfg = try Config.load(from: url)
     #expect(cfg.primaryURL == nil)
-    #expect(cfg.derivedDatabaseRole == .primary)
 }
 
 // MARK: - hotkey

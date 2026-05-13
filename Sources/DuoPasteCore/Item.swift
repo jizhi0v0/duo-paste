@@ -10,15 +10,9 @@ public enum ItemKind: String, Codable, Sendable, CaseIterable {
     case file
 }
 
-public enum PushState: String, Codable, Sendable {
-    case pending
-    case acked
-    case failed
-}
-
 /// 图片 OCR 状态机。NULL = 非 image kind / 无需 OCR。
 /// 区分 "没扫过 vs 扫过但无文字" / "失败 vs 成功无文本"——OCR worker 调度依据。
-/// 用 String raw + Codable 让 wire 上是 plain string；老 primary 不发该字段时
+/// 用 String raw + Codable 让 wire 上是 plain string；老 peer 不发该字段时
 /// `Item.ocrState` decode 成 nil 兼容
 public enum OCRState: String, Codable, Sendable {
     case pending
@@ -44,9 +38,6 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
     public var blobMime: String?
     public var pinned: Bool
     public var deletedAtNs: Int64?
-    public var pushState: PushState
-    public var pushAttempts: Int
-    public var lastPushError: String?
     public var ocrState: OCRState?
 
     public init(
@@ -64,9 +55,6 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         blobMime: String? = nil,
         pinned: Bool = false,
         deletedAtNs: Int64? = nil,
-        pushState: PushState = .pending,
-        pushAttempts: Int = 0,
-        lastPushError: String? = nil,
         ocrState: OCRState? = nil
     ) {
         self.id = id
@@ -83,9 +71,6 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         self.blobMime = blobMime
         self.pinned = pinned
         self.deletedAtNs = deletedAtNs
-        self.pushState = pushState
-        self.pushAttempts = pushAttempts
-        self.lastPushError = lastPushError
         self.ocrState = ocrState
     }
 
@@ -112,9 +97,6 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         case blobMime = "blob_mime"
         case pinned
         case deletedAtNs = "deleted_at_ns"
-        case pushState = "push_state"
-        case pushAttempts = "push_attempts"
-        case lastPushError = "last_push_error"
         case ocrState = "ocr_state"
     }
 }

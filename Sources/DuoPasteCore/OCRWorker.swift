@@ -302,50 +302,40 @@ public actor OCRWorker {
     }
 
     /// 标 skipped。**不** bump ingested_at_ns —— skipped 是终态，没必要让下游再拉一遍
-    /// 把"图里没字"这件事广播出去（item 行实质内容未变）。复用 `last_push_error` 列
-    /// 放原因字符串（plan §决策：当前不为 OCR 单独加列，列名稍微 misleading 但够用）。
+    /// 把"图里没字"这件事广播出去（item 行实质内容未变）。
     ///
-    /// **不盖 push_state='failed' 行的 last_push_error**：那是真实的 push 失败原因，
-    /// 操作员要看。OCR skipped 的 reason 比真实 push 失败次要——只在 push 没失败时
-    /// 写。如果 push 失败，OCR 不抢这一列，但 `ocr_state='skipped'` 在**未软删时**仍然落地
-    /// （`deleted_at_ns IS NULL` guard 会让 fetchPending→processOne 之间被软删的行直接 0 行影响）
+    /// **PR 4 之前**这里还往 `last_push_error` 列写 reason；该列随 push 链路一起被 v8
+    /// migration 删了，操作员排错只能看 stderr `ocr:` 日志（reason 仍 log 出去）。
+    /// `deleted_at_ns IS NULL` guard 让 fetchPending→processOne 之间被软删的行 0 行影响
     private func markSkipped(id: String, reason: String) async {
         do {
             try await database.pool.write { db in
                 try db.execute(sql: """
                     UPDATE item
-                    SET ocr_state = 'skipped',
-                        last_push_error = CASE
-                            WHEN push_state = 'failed' THEN last_push_error
-                            ELSE ?
-                        END
+                    SET ocr_state = 'skipped'
                     WHERE id = ?
                       AND deleted_at_ns IS NULL
-                """, arguments: [reason, id])
+                """, arguments: [id])
             }
+            log("skipped \(id): \(reason)")
         } catch {
             log("markSkipped failed for \(id): \(error)")
         }
     }
 
     /// 标 failed。同 skipped 不 bump ingested_at_ns；用户 retry-failed-ocr 翻回
-    /// pending 时再让 worker 处理。
-    ///
-    /// 同 markSkipped：不盖 push_state='failed' 行的 last_push_error
+    /// pending 时再让 worker 处理。reason 仅 log，不落 DB（同 markSkipped 注释）
     private func markFailed(id: String, reason: String) async {
         do {
             try await database.pool.write { db in
                 try db.execute(sql: """
                     UPDATE item
-                    SET ocr_state = 'failed',
-                        last_push_error = CASE
-                            WHEN push_state = 'failed' THEN last_push_error
-                            ELSE ?
-                        END
+                    SET ocr_state = 'failed'
                     WHERE id = ?
                       AND deleted_at_ns IS NULL
-                """, arguments: [reason, id])
+                """, arguments: [id])
             }
+            log("failed \(id): \(reason)")
         } catch {
             log("markFailed failed for \(id): \(error)")
         }

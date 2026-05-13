@@ -30,11 +30,6 @@ public struct SyncServer: Sendable {
     /// CaptureService 完成 writer tx 调 `broadcaster.broadcastCursorAdvanced(...)` fan-out。
     /// nil → server 不支持 WS（standalone primary / 测试），仍能正常 serve HTTP。
     public let broadcaster: WSBroadcaster?
-    /// `POST /ingest` body 上限。单条 item 含 text_full + 元数据，
-    /// 1 MB 已经远超任何剪贴文本场景；blob 走单独路由。
-    public static let ingestBodyLimit = 1 * 1024 * 1024
-    /// `PUT /blob/{sha256}` body 上限。64 MB 给图片留充裕余地，挡住 OOM 攻击面。
-    public static let blobBodyLimit = 64 * 1024 * 1024
 
     public struct TLSPaths: Sendable {
         public let certPath: String
@@ -71,7 +66,6 @@ public struct SyncServer: Sendable {
         Self.registerRoutes(
             on: router,
             deviceID: deviceID,
-            ingester: RemoteIngester(database: database, selfDeviceID: deviceID),
             blobs: blobs,
             searchAPI: SearchAPI(database: database),
             sinceAPI: SinceAPI(database: database)
@@ -84,7 +78,7 @@ public struct SyncServer: Sendable {
 
         // PR 3：broadcaster 非 nil → 启用 WebSocket upgrade 路径。WS 路由独立 Router
         // (BasicWebSocketRequestContext)，通过 `http1WebSocketUpgrade(webSocketRouter:)`
-        // 让 server 同时接 HTTP /ingest /since /blob /search /health + WS /sync/ws
+        // 让 server 同时接 HTTP /since /blob /search /health + WS /sync/ws
         if let broadcaster {
             let wsRouter = Self.makeWebSocketRouter(
                 auth: auth,
@@ -198,10 +192,11 @@ public struct SyncServer: Sendable {
     }
 
     /// 内部抽出来便于将来加路由 + 单测。
+    /// PR 4 之后只剩 mesh peer 间的 GET 路由：health / blob / since / search。
+    /// `/ingest` + PUT/HEAD `/blob` 已删——mesh 拓扑下不再有"client → primary push"语义。
     static func registerRoutes<Ctx: RequestContext>(
         on router: Router<Ctx>,
         deviceID: String,
-        ingester: RemoteIngester,
         blobs: BlobStore,
         searchAPI: SearchAPI,
         sinceAPI: SinceAPI
@@ -218,52 +213,6 @@ public struct SyncServer: Sendable {
             return resp
         }
 
-        router.post("/ingest") { request, _ -> Response in
-            // Middleware 只验了 header 上的 hash。Handler 读完真 body 必须再算一次，
-            // 否则攻击者能配一个合法签名但发任意 body（攻击模型见 Auth.swift 注释）。
-            let bodyBuffer = try await request.body.collect(upTo: ingestBodyLimit)
-            let bodyData = Data(buffer: bodyBuffer)
-            let actualHash = HMACAuth.sha256Hex(bodyData)
-            let headerHashName = HTTPField.Name(HMACAuth.bodyHashHeader)!
-            let claimedHash = request.headers[headerHashName]?.lowercased() ?? ""
-            guard actualHash == claimedHash else {
-                return errorJSON(.badRequest, "body sha256 不匹配 X-DP-Body-SHA256")
-            }
-
-            let req: IngestRequest
-            do {
-                req = try JSONDecoder().decode(IngestRequest.self, from: bodyData)
-            } catch {
-                return errorJSON(.badRequest, "JSON 解码失败: \(error)")
-            }
-            let result: RemoteIngester.Result
-            do {
-                result = try await ingester.ingest(req)
-            } catch let e as IngestError {
-                return errorJSON(.badRequest, e.description)
-            } catch {
-                return errorJSON(.internalServerError, "ingest 内部错误: \(error)")
-            }
-            let payload: [String: Any] = [
-                "ok": true,
-                "id": result.id,
-                "ingested_at_ns": result.ingestedAtNs,
-                "was_new": result.wasNew,
-            ]
-            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-            var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
-            resp.headers[.contentType] = "application/json"
-            return resp
-        }
-
-        // HEAD /blob/{sha256}：探测是否已存在。client 在上传前先 HEAD，避免重传大文件。
-        router.head("/blob/:sha256") { _, context -> Response in
-            guard let sha = context.parameters.get("sha256"), Self.isValidSha256(sha) else {
-                return Response(status: .badRequest)
-            }
-            return Response(status: blobs.exists(sha256: sha) ? .ok : .notFound)
-        }
-
         // GET /blob/{sha256}：取 blob bytes。
         router.get("/blob/:sha256") { _, context -> Response in
             guard let sha = context.parameters.get("sha256"), Self.isValidSha256(sha) else {
@@ -278,50 +227,6 @@ public struct SyncServer: Sendable {
                 return resp
             } catch {
                 return errorJSON(.internalServerError, "blob read failed: \(error)")
-            }
-        }
-
-        // PUT /blob/{sha256}：上传 blob。
-        // 关键校验：path 的 sha256 == body sha256 == X-DP-Body-SHA256 三方一致
-        // path 是公开寻址，header 是签名锚定，actual 是真 body——攻防上是不同维度。
-        router.put("/blob/:sha256") { request, context -> Response in
-            guard let pathSha = context.parameters.get("sha256"), Self.isValidSha256(pathSha) else {
-                return errorJSON(.badRequest, "sha256 格式非法")
-            }
-            // 已存在 → 短路，省读 body
-            if blobs.exists(sha256: pathSha) {
-                let payload: [String: Any] = ["ok": true, "sha256": pathSha, "was_existing": true]
-                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
-                resp.headers[.contentType] = "application/json"
-                return resp
-            }
-            let bodyBuffer = try await request.body.collect(upTo: blobBodyLimit)
-            let bodyData = Data(buffer: bodyBuffer)
-            let actualHash = HMACAuth.sha256Hex(bodyData)
-            let headerHashName = HTTPField.Name(HMACAuth.bodyHashHeader)!
-            let claimedHash = request.headers[headerHashName]?.lowercased() ?? ""
-            guard actualHash == pathSha else {
-                return errorJSON(.badRequest, "body sha256 与 URL path 不匹配")
-            }
-            guard actualHash == claimedHash else {
-                return errorJSON(.badRequest, "body sha256 与 X-DP-Body-SHA256 不匹配")
-            }
-            do {
-                let info = try blobs.put(bodyData)
-                let payload: [String: Any] = [
-                    "ok": true,
-                    "sha256": info.sha256,
-                    "size": info.size,
-                    "was_existing": info.wasExisting,
-                ]
-                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-                var resp = Response(status: info.wasExisting ? .ok : .created,
-                                    body: .init(byteBuffer: .init(bytes: data)))
-                resp.headers[.contentType] = "application/json"
-                return resp
-            } catch {
-                return errorJSON(.internalServerError, "blob put failed: \(error)")
             }
         }
 
@@ -422,10 +327,6 @@ public struct SyncServer: Sendable {
             "kind": item.kind.rawValue,
             // Item.Codable 期望 Bool；不能给 0/1 否则客户端解码报 typeMismatch
             "pinned": item.pinned,
-            // push_state / push_attempts 是客户端内部字段，但 Item.Codable 把它们标为必填——
-            // 把 primary 自己的 acked 状态原样下发，client 端忽略即可
-            "push_state": item.pushState.rawValue,
-            "push_attempts": item.pushAttempts,
         ]
         if let v = item.ingestedAtNs   { d["ingested_at_ns"] = v }
         if let v = item.sourceApp      { d["source_app"] = v }

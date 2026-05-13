@@ -23,7 +23,7 @@ private func makeDB() throws -> DuoDB {
         .appendingPathComponent("duo-foldv7-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    return try DuoDB(path: paths.mainDB, role: .client)
+    return try DuoDB(path: paths.mainDB)
 }
 
 /// 直接 INSERT 到 item 表，模拟 own 行（origin=self）或 peer 行（origin!=self，PullWorker 路径
@@ -50,8 +50,7 @@ private func insertItem(
         textFull: text,
         blobSha256: blobSha256,
         pinned: pinned,
-        deletedAtNs: deletedAtNs,
-        pushState: .acked
+        deletedAtNs: deletedAtNs
     )
     try db.pool.write { conn in try it.insert(conn) }
 }

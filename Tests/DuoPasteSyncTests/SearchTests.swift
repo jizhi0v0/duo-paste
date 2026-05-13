@@ -11,7 +11,7 @@ private func makeDBWithItems(_ items: [Item]) throws -> DuoDB {
         .appendingPathComponent("duo-search-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB, role: .primary)
+    let db = try DuoDB(path: paths.mainDB)
     try db.pool.write { conn in
         for it in items { try it.insert(conn) }
     }
@@ -34,8 +34,7 @@ private func sampleItem(
         sourceAppName: "Example",
         preview: text,
         textFull: text,
-        pinned: pinned,
-        pushState: .acked
+        pinned: pinned
     )
 }
 
@@ -252,7 +251,7 @@ private actor CountingSearchTransport: SearchTransport {
     )
     let serverTask = Task { try? await server.run() }
     let baseURL = URL(string: "http://127.0.0.1:\(port)")!
-    let client = HTTPIngestClient(baseURL: baseURL, auth: auth)
+    let client = HTTPPeerClient(baseURL: baseURL, auth: auth)
 
     // 等 server 启动
     var ready = false

@@ -12,7 +12,7 @@ private func makeClientDB() throws -> DuoDB {
         .appendingPathComponent("duo-blob-lazy-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    return try DuoDB(path: paths.mainDB, role: .client)
+    return try DuoDB(path: paths.mainDB)
 }
 
 private func makeBlobs() -> BlobStore {
@@ -37,8 +37,7 @@ private func mkImageItem(
         sourceAppName: "Test",
         preview: "[image]",
         blobSha256: blobSha, blobSize: 1024, blobMime: "image/png",
-        deletedAtNs: deletedAtNs,
-        pushState: .acked
+        deletedAtNs: deletedAtNs
     )
 }
 
@@ -47,8 +46,7 @@ private func mkTextItem(id: String, origin: String, ingestedAtNs: Int64) -> Item
         id: id, originDevice: origin,
         capturedAtNs: ingestedAtNs, ingestedAtNs: ingestedAtNs,
         kind: .text,
-        preview: "txt", textFull: "txt",
-        pushState: .acked
+        preview: "txt", textFull: "txt"
     )
 }
 
@@ -318,14 +316,14 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
     #expect(!blobs.exists(sha256: sha))
 }
 
-// MARK: - HTTPIngestClient.getBlob 端到端（真起 server）
+// MARK: - HTTPPeerClient.getBlob 端到端（真起 server）
 
 private func makeServerFixture() throws -> (DuoDB, BlobStore, HMACAuth, Int) {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("duo-blob-http-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB, role: .primary)
+    let db = try DuoDB(path: paths.mainDB)
     let blobs = BlobStore(root: paths.blobsDir)
     try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
     let auth = HMACAuth(secret: Data(repeating: 0xAB, count: 32))
@@ -364,7 +362,7 @@ private func waitReady(baseURL: URL, auth: HMACAuth) async -> Bool {
     let base = URL(string: "http://127.0.0.1:\(port)")!
     #expect(await waitReady(baseURL: base, auth: auth))
 
-    let client = HTTPIngestClient(baseURL: base, auth: auth)
+    let client = HTTPPeerClient(baseURL: base, auth: auth)
     let outcome = try await client.getBlob(sha256: sha)
     switch outcome {
     case .found(let bytes):
@@ -384,7 +382,7 @@ private func waitReady(baseURL: URL, auth: HMACAuth) async -> Bool {
     let base = URL(string: "http://127.0.0.1:\(port)")!
     #expect(await waitReady(baseURL: base, auth: auth))
 
-    let client = HTTPIngestClient(baseURL: base, auth: auth)
+    let client = HTTPPeerClient(baseURL: base, auth: auth)
     let fakeSha = String(repeating: "ab", count: 32)
     let outcome = try await client.getBlob(sha256: fakeSha)
     switch outcome {
@@ -404,7 +402,7 @@ private func waitReady(baseURL: URL, auth: HMACAuth) async -> Bool {
 
     // 错的 secret → server 401
     let badAuth = HMACAuth(secret: Data(repeating: 0xFF, count: 32))
-    let client = HTTPIngestClient(baseURL: base, auth: badAuth)
+    let client = HTTPPeerClient(baseURL: base, auth: badAuth)
     let fakeSha = String(repeating: "cd", count: 32)
     do {
         _ = try await client.getBlob(sha256: fakeSha)

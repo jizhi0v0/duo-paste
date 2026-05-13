@@ -13,16 +13,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkey: GlobalHotKey!
     private var snapshotScheduler: SnapshotScheduler!
     private var serverTask: Task<Void, Never>?
-    private var pushWorker: PushWorker?
     /// Mesh peer 拉取入口。PR 2 单 peer 部署下 supervisor 内只有一个 PullWorker，行为跟原
     /// `pullWorker: PullWorker?` 等价；PR 5 mesh-init 后多 peer 列表自然 fan-out 进 N 个 worker
     private var meshSupervisor: MeshSupervisor?
-    /// 本机 OCR worker。`config.ocr.enabled=true` 才启动；启动条件跟 push/pull 解耦，
-    /// 任何 role（standalone / primary / client）都跑 own-origin image OCR
+    /// 本机 OCR worker。`config.ocr.enabled=true` 才启动；启动条件跟 mesh 解耦，
+    /// 任何拓扑（standalone / mesh peer）都跑 own-origin image OCR
     private var ocrWorker: OCRWorker?
     /// lazy blob 拉取：image kind + 本机 BlobStore 缺字节时按需 GET /blob/<sha> 到本地。
-    /// 跟 PullWorker / PushWorker 共享 HTTPIngestClient 配置（同一 baseURL + auth），
-    /// nil → standalone 模式或 startPullWorker 失败，pasteBack 缺字节时显示错误而非干跑
+    /// 跟 PullWorker 共享 HTTPPeerClient 配置（同一 baseURL + auth），
+    /// nil → standalone 模式或加载 shared-secret 失败，pasteBack 缺字节时显示错误而非干跑
     private var pasteBlobFetcher: BlobFetcher?
     /// 当前在跑的 lazy paste task。多次按 Enter 时先 cancel 旧 task 再起新的，
     /// 避免重复拉同一 sha 的字节竞争 BlobStore.put
@@ -73,9 +72,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if deps.config.serve {
             startSyncServer()
-        }
-        if deps.config.primaryURL != nil {
-            startPushWorker()
         }
         if deps.config.pull.enabled {
             startMeshSupervisor()
@@ -131,31 +127,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Push worker：把本机 origin pending → primary。
-    /// Shared secret 加载失败 / config 没有 primary_url 不会到这里——AppDelegate 启动时已 guard。
-    private func startPushWorker() {
-        guard let primaryURL = deps.config.primaryURL else { return }
-        do {
-            let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
-            let auth = HMACAuth(secret: secret)
-            let client = HTTPIngestClient(
-                baseURL: primaryURL,
-                auth: auth,
-                session: AppDependencies.syncURLSession
-            )
-            let worker = PushWorker(
-                database: deps.database,
-                blobs: deps.blobs,
-                transport: client,
-                originDevice: deps.deviceID
-            )
-            self.pushWorker = worker
-            Task { await worker.start() }
-            fputs("push worker → \(primaryURL.absoluteString)\n", stderr)
-        } catch {
-            fputs("push worker NOT started: \(error)\n", stderr)
-        }
-    }
 
     /// Mesh supervisor：周期把每个 peer 全量同步到本地 item 表。PR 2 单 peer 适配——把
     /// 现有 `Config.primaryURL` + `Config.pull` 字段当成 single-peer mesh。PR 5 mesh-init
@@ -172,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
-            let client = HTTPIngestClient(
+            let client = HTTPPeerClient(
                 baseURL: primaryURL,
                 auth: auth,
                 session: AppDependencies.syncURLSession
@@ -217,7 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// lazy paste-back blob fetcher 初始化——跟 PullWorker / PushWorker 独立。
-    /// 只要 config 配了 primary_url + shared-secret 可加载就建一个 HTTPIngestClient
+    /// 只要 config 配了 primary_url + shared-secret 可加载就建一个 HTTPPeerClient
     /// 给 pasteBack 用，**不依赖** pull.enabled / serve 配置。**这是 paste-back
     /// 不可降级的最低要求**：用户已经选中图片按 Enter 了，没 fetcher 等于挂掉
     private func setupPasteBlobFetcher() {
@@ -225,7 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
-            self.pasteBlobFetcher = HTTPIngestClient(
+            self.pasteBlobFetcher = HTTPPeerClient(
                 baseURL: primaryURL,
                 auth: auth,
                 session: AppDependencies.syncURLSession
@@ -319,7 +290,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     fputs("capture skipped (too large): \(kind) \(bytes)B > \(limit)B\n", stderr)
                 }
                 await self.state.refresh()
-                self.pushWorker?.wake()    // 有 worker 才唤醒；没配 primary 即 nil
                 // image kind 入库后 wake OCR worker 缩短延迟（避免等 5min idle）
                 if case .inserted = result.outcome,
                    result.item?.kind == .image {

@@ -1,16 +1,10 @@
 import Foundation
 import GRDB
 
-public enum DatabaseRole: Sendable {
-    case primary
-    case client
-}
-
 public struct Database: Sendable {
     public let pool: DatabasePool
-    public let role: DatabaseRole
 
-    public init(path: URL, role: DatabaseRole = .client) throws {
+    public init(path: URL) throws {
         var config = Configuration()
         config.prepareDatabase { db in
             // WAL + foreign keys + busy timeout
@@ -18,7 +12,6 @@ public struct Database: Sendable {
             try db.execute(sql: "PRAGMA busy_timeout = 3000")
         }
         self.pool = try DatabasePool(path: path.path, configuration: config)
-        self.role = role
         try Self.migrator.migrate(pool)
     }
 
@@ -394,6 +387,18 @@ public struct Database: Sendable {
 
             // step 5: drop primary_lineage（mesh 拓扑下无任期；audit-push 代码 PR 4 才清）
             try db.execute(sql: "DROP TABLE IF EXISTS primary_lineage;")
+        }
+
+        // v8: 删 push_* 列。PR 3 落地后所有 cursor 更新走 mesh /since + WS 通知，
+        // 不再有 push 链路；保留 push_state 列等于占盘 + 让 Item.Codable 还得维护字段。
+        //
+        // 用 ALTER DROP COLUMN（SQLite 3.35+，macOS 14 自带 3.43+ 满足）。FTS5 trigger
+        // 不引用这三列，无需重建。
+        m.registerMigration("v8_drop_push_columns") { db in
+            try db.execute(sql: "DROP INDEX IF EXISTS idx_item_push;")
+            try db.execute(sql: "ALTER TABLE item DROP COLUMN push_state;")
+            try db.execute(sql: "ALTER TABLE item DROP COLUMN push_attempts;")
+            try db.execute(sql: "ALTER TABLE item DROP COLUMN last_push_error;")
         }
 
         return m

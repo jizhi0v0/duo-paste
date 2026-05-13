@@ -11,7 +11,7 @@ private func makeClientDB() throws -> DuoDB {
         .appendingPathComponent("duo-pull-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    return try DuoDB(path: paths.mainDB, role: .client)
+    return try DuoDB(path: paths.mainDB)
 }
 
 private func mkItem(
@@ -32,8 +32,7 @@ private func mkItem(
         preview: text,
         textFull: text,
         pinned: pinned,
-        deletedAtNs: deletedAtNs,
-        pushState: .acked
+        deletedAtNs: deletedAtNs
     )
 }
 
@@ -206,9 +205,8 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
             INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-               push_state, push_attempts, last_push_error, ocr_state)
-            VALUES ('stale-1', 'old-primary', 100, 100, 'text', NULL, 'old', 'old', 'old', NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, ocr_state)
+            VALUES ('stale-1', 'old-primary', 100, 100, 'text', NULL, 'old', 'old', 'old', NULL, NULL, NULL, 0, NULL, NULL)
         """)
         try conn.execute(sql: """
             INSERT INTO pull_cursor (peer_device_id, cursor_ns, cursor_id, updated_at_ns)
@@ -258,8 +256,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         let own = Item(
             id: "own-1", originDevice: selfID,
             capturedAtNs: baseline, ingestedAtNs: nil,  // client 自家 capture，ingested_at_ns 还没打
-            kind: .text, preview: "shared text", textFull: "shared text",
-            pushState: .pending
+            kind: .text, preview: "shared text", textFull: "shared text"
         )
         try own.insert(conn)
     }
@@ -354,8 +351,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         id: "old-row", originDevice: "mini-primary",
         capturedAtNs: historicalCapturedNs,
         ingestedAtNs: historicalCapturedNs + 1_000_000,
-        kind: .text, preview: "ok", textFull: "ok",
-        pushState: .acked
+        kind: .text, preview: "ok", textFull: "ok"
     )
     let transport = FakeSinceTransport(
         pages: [page(
@@ -402,10 +398,9 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
             INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-               push_state, push_attempts, last_push_error, ocr_state)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, ocr_state)
             VALUES (?, 'mini-primary', ?, ?, 'text', NULL, NULL, 'shared text', 'shared text',
-                    NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
+                    NULL, NULL, NULL, 0, NULL, NULL)
         """, arguments: ["mini-echo", baseline, baseline])
     }
     // primary 推过来一次软删（同 id，新 ingested_at_ns）
@@ -413,7 +408,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         id: "mini-echo", originDevice: "mini-primary",
         capturedAtNs: baseline, ingestedAtNs: baseline + 1_000_000_000,
         kind: .text, preview: "shared text", textFull: "shared text",
-        deletedAtNs: baseline + 1_000_000_000, pushState: .acked
+        deletedAtNs: baseline + 1_000_000_000
     )
     let transport = FakeSinceTransport(
         pages: [page(items: [softDelete], nextNs: baseline + 1_000_000_000, nextID: "mini-echo", hasMore: false)],
@@ -484,8 +479,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         let own = Item(
             id: "own-x", originDevice: selfID,
             capturedAtNs: baseline, ingestedAtNs: nil,
-            kind: .text, preview: "stale text", textFull: "stale text",
-            pushState: .pending
+            kind: .text, preview: "stale text", textFull: "stale text"
         )
         try own.insert(conn)
         // item 表里也有这条 peer 行（已经入过，靠 fixture SQL 写入，避免被 dedup）
@@ -493,9 +487,8 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
             INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-               push_state, push_attempts, last_push_error, ocr_state)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, ocr_state)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL)
         """, arguments: [
             "mini-x", "mini-primary", baseline + 100_000_000, baseline + 100_000_000, "text",
             "Test", "stale text", "stale text"
@@ -509,8 +502,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         ingestedAtNs: baseline + 200_000_000,
         kind: .text, sourceAppName: "Test",
         preview: "stale text", textFull: "stale text",
-        deletedAtNs: 999_999_999,    // primary 标了软删
-        pushState: .acked
+        deletedAtNs: 999_999_999    // primary 标了软删
     )
     let transport = FakeSinceTransport(
         pages: [page(items: [softDeleted], nextNs: baseline + 200_000_000, nextID: "mini-x", hasMore: false)],
@@ -542,8 +534,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         let own = Item(
             id: "own-old", originDevice: selfID,
             capturedAtNs: baseline, ingestedAtNs: nil,
-            kind: .text, preview: "same text", textFull: "same text",
-            pushState: .pending
+            kind: .text, preview: "same text", textFull: "same text"
         )
         try own.insert(conn)
     }
@@ -645,9 +636,9 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     let primaryDeviceID = "primary-e2e"
     try await primaryDB.pool.write { conn in
         let it1 = Item(id: "a", originDevice: "other-mac", capturedAtNs: 100, ingestedAtNs: 100,
-                       kind: .text, preview: "alpha", textFull: "alpha", pushState: .acked)
+                       kind: .text, preview: "alpha", textFull: "alpha")
         let it2 = Item(id: "b", originDevice: "another-mac", capturedAtNs: 200, ingestedAtNs: 200,
-                       kind: .text, preview: "bravo", textFull: "bravo", pushState: .acked)
+                       kind: .text, preview: "bravo", textFull: "bravo")
         try it1.insert(conn)
         try it2.insert(conn)
     }
@@ -661,8 +652,8 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
                             host: "127.0.0.1", port: port, auth: auth)
     let serverTask = Task { try? await server.run() }
     defer { serverTask.cancel() }
-    // 等 server 起：用 HTTPIngestClient.fetchPrimaryHealth() 轮询
-    let probe = HTTPIngestClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!, auth: auth)
+    // 等 server 起：用 HTTPPeerClient.fetchPrimaryHealth() 轮询
+    let probe = HTTPPeerClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!, auth: auth)
     var ready = false
     for _ in 0..<50 {
         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -672,7 +663,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     #expect(ready)
     let clientDB = try makeClientDB()
     let baseURL = URL(string: "http://127.0.0.1:\(port)")!
-    let httpClient = HTTPIngestClient(baseURL: baseURL, auth: auth)
+    let httpClient = HTTPPeerClient(baseURL: baseURL, auth: auth)
     let status = MeshStatus()
     let worker = PullWorker(
         database: clientDB,

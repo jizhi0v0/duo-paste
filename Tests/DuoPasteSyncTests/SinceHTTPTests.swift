@@ -11,7 +11,7 @@ private func makeServerFixture(items: [Item]) throws -> (DuoDB, BlobStore, HMACA
         .appendingPathComponent("duo-since-http-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB, role: .primary)
+    let db = try DuoDB(path: paths.mainDB)
     try db.pool.write { conn in
         for it in items { try it.insert(conn) }
     }
@@ -37,8 +37,7 @@ private func item(
         kind: .text,
         preview: text,
         textFull: text,
-        deletedAtNs: deletedAtNs,
-        pushState: .acked
+        deletedAtNs: deletedAtNs
     )
 }
 

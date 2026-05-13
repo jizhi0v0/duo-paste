@@ -534,14 +534,6 @@ public struct Config: Codable, Sendable, Equatable {
         }
     }
 
-    /// 是否要给本机捕获标 pending（= 有 primary 要推）。
-    /// CaptureService 当前用 DatabaseRole 表达同一件事；这里给一个语义清晰的别名。
-    public var capturesNeedPush: Bool { primaryURL != nil }
-
-    public var derivedDatabaseRole: DatabaseRole {
-        capturesNeedPush ? .client : .primary
-    }
-
     /// 用户可读的单行摘要，启动日志用。
     public var summary: String {
         let scheme = serveTLS ? "https" : "http"

@@ -13,7 +13,7 @@ private func makeDB() throws -> DuoDB {
         .appendingPathComponent("duo-prefix-\(UUID().uuidString)", isDirectory: true)
     let paths = Paths(root: root)
     paths.ensureExists()
-    return try DuoDB(path: paths.mainDB, role: .client)
+    return try DuoDB(path: paths.mainDB)
 }
 
 private func insertOwn(
@@ -31,8 +31,7 @@ private func insertOwn(
         sourceAppName: "T",
         preview: text,
         textFull: text,
-        pinned: pinned,
-        pushState: .acked
+        pinned: pinned
     )
     try db.pool.write { conn in try it.insert(conn) }
 }
@@ -55,8 +54,7 @@ private func insertMirror(
         sourceAppName: "T",
         preview: text,
         textFull: text,
-        pinned: pinned,
-        pushState: .acked
+        pinned: pinned
     )
     try db.pool.write { conn in try it.insert(conn) }
 }

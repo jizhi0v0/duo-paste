@@ -90,7 +90,7 @@ public struct BlobStore: Sendable {
 
     /// `put` 的防御版本：在算 sha 之前先比对 `expectedSha`，不匹配直接 throw。
     /// 用于 lazy GET /blob 拉来的字节落盘——content-addressed 不变量要求接收端再
-    /// 校验一次（HTTPIngestClient.getBlob 内部已校验，但调用方主动 verify 是补强）。
+    /// 校验一次（HTTPPeerClient.getBlob 内部已校验，但调用方主动 verify 是补强）。
     @discardableResult
     public func putVerified(_ data: Data, expectedSha256: String, ext: String? = nil) throws -> BlobInfo {
         precondition(expectedSha256.count == 64, "sha256 must be 64 hex chars")

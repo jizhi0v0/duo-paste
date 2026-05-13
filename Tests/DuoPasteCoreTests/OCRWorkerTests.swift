@@ -20,7 +20,7 @@ private struct TestEnv {
 private func makeEnv(deviceID: String = "self-device") throws -> TestEnv {
     let paths = Paths(root: tempDir())
     paths.ensureExists()
-    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .primary)
+    let db = try DuoPasteCore.Database(path: paths.mainDB)
     let blobs = BlobStore(root: paths.blobsDir)
     return TestEnv(paths: paths, db: db, blobs: blobs, deviceID: deviceID)
 }
@@ -51,7 +51,6 @@ private func seedItem(
         preview: "preview-\(id)",
         blobSha256: blobSha,
         deletedAtNs: deletedAtNs,
-        pushState: .acked,
         ocrState: ocrState
     )
     try env.db.pool.write { try it.insert($0) }
@@ -192,7 +191,6 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(r.skipped == 1)
     let after = try fetchItem(env, id: "no-blob")
     #expect(after?.ocrState == .skipped)
-    #expect(after?.lastPushError?.contains("blob missing") == true)
     #expect(await recorder.count() == 0)
 }
 
@@ -218,7 +216,6 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(r.skipped == 1)
     let after = try fetchItem(env, id: "huge-img")
     #expect(after?.ocrState == .skipped)
-    #expect(after?.lastPushError?.contains("blob too large") == true)
     #expect(await recorder.count() == 0)
 }
 
@@ -238,7 +235,6 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(r.skipped == 1)
     let after = try fetchItem(env, id: "no-sha-img")
     #expect(after?.ocrState == .skipped)
-    #expect(after?.lastPushError?.contains("no blob sha") == true)
     #expect(await recorder.count() == 0)
 }
 
@@ -296,7 +292,6 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     }
     let after = try fetchItem(env, id: "flaky")
     #expect(after?.ocrState == .failed)
-    #expect(after?.lastPushError?.contains("max attempts") == true)
     #expect(lastResult.failed == 1)
     #expect(await recorder.count() == 3)
 }
@@ -413,39 +408,8 @@ private struct SoftDeleteOnRecognize: OCRRecognizer {
     #expect(after?.textFull == nil)
 }
 
-@Test func ocrWorkerMarkSkippedDoesNotClobberPushFailedLastError() async throws {
-    // 不变量：last_push_error 列被 push / OCR 共享，OCR mark skipped/failed 时不该
-    // 盖掉 push 真实失败的 last_push_error
-    let env = try makeEnv()
-    let sha = try seedBlob(env)
-    // 故意造一个 push_state=failed 行，last_push_error 是 push 的真实错误
-    let it = Item(
-        id: "push-and-ocr-fail",
-        originDevice: env.deviceID,
-        capturedAtNs: 1_700_000_000_000_000_000,
-        kind: .image,
-        preview: "p",
-        blobSha256: sha,
-        pushState: .failed,
-        lastPushError: "rejected: server returned 400",
-        ocrState: .pending
-    )
-    try await env.db.pool.write { try it.insert($0) }
-    // OCR recognizer 抛 imageLoadFailed → markSkipped 会想把 reason 写 last_push_error
-    let recognizer = StubOCRRecognizer(
-        table: [sha: .failure(.imageLoadFailed)]
-    )
-    let w = OCRWorker(
-        database: env.db, blobs: env.blobs,
-        recognizer: recognizer, originDevice: env.deviceID,
-        config: fastConfig()
-    )
-    _ = await w.tick()
-    let after = try fetchItem(env, id: "push-and-ocr-fail")
-    #expect(after?.ocrState == .skipped)
-    // 但 last_push_error 保留 push 失败的真实原因
-    #expect(after?.lastPushError == "rejected: server returned 400")
-}
+// PR 4 删了 push_state / last_push_error 列，原 ocrWorkerMarkSkippedDoesNotClobberPushFailedLastError
+// 测试不再适用——OCR worker 现在只动 ocr_state 列，reason 走 stderr log。
 
 @Test func ocrWorkerBumpsIngestedAtNsOnMarkDone() async throws {
     let env = try makeEnv()
@@ -459,7 +423,6 @@ private struct SoftDeleteOnRecognize: OCRRecognizer {
         kind: .image,
         preview: "p",
         blobSha256: sha,
-        pushState: .acked,
         ocrState: .pending
     )
     try await env.db.pool.write { try it.insert($0) }

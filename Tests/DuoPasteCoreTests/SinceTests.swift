@@ -15,7 +15,7 @@ private func tempDir() -> URL {
 private func makeDB() throws -> DuoDB {
     let paths = Paths(root: tempDir())
     paths.ensureExists()
-    return try DuoDB(path: paths.mainDB, role: .primary)
+    return try DuoDB(path: paths.mainDB)
 }
 
 private func mkItem(
@@ -33,8 +33,7 @@ private func mkItem(
         kind: .text,
         preview: text,
         textFull: text,
-        deletedAtNs: deletedAtNs,
-        pushState: .acked
+        deletedAtNs: deletedAtNs
     )
 }
 

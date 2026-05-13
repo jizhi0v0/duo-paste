@@ -2,7 +2,7 @@ import Foundation
 import DuoPasteCore
 
 /// 远端搜索的传输抽象——与 IngestTransport 独立，方便 UI 端只依赖搜索能力，
-/// 不绑定 push 实现。生产由 HTTPIngestClient 同时实现两个协议。
+/// 不绑定 push 实现。生产由 HTTPPeerClient 同时实现两个协议。
 public protocol SearchTransport: Sendable {
     func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult
 }
@@ -27,7 +27,7 @@ public struct SearchHit: Sendable {
     }
 }
 
-extension HTTPIngestClient: SearchTransport {
+extension HTTPPeerClient: SearchTransport {
     public func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
         var components = URLComponents()
         components.path = "/search"

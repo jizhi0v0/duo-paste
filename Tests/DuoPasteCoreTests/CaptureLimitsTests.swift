@@ -13,7 +13,7 @@ private func tempDir() -> URL {
 private func makeService(limits: Config.CaptureLimits) throws -> (CaptureService, DuoPasteCore.Database) {
     let paths = Paths(root: tempDir())
     paths.ensureExists()
-    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .primary)
+    let db = try DuoPasteCore.Database(path: paths.mainDB)
     let blobs = BlobStore(root: paths.blobsDir)
     let service = CaptureService(database: db, blobs: blobs, deviceID: "test", limits: limits)
     return (service, db)

@@ -75,7 +75,7 @@ public actor PullWorker {
     /// nil = 抑制功能未启用（standalone / 测试不传）。
     private let pasteSuppressions: PasteSuppressionSet?
     /// eager_blobs=true 时用于拉 blob 字节。nil → 即使 config.eagerBlobs=true 也 no-op
-    /// （让测试可以独立控制；生产 AppDelegate 始终注入 HTTPIngestClient）
+    /// （让测试可以独立控制；生产 AppDelegate 始终注入 HTTPPeerClient）
     private let blobFetcher: BlobFetcher?
     /// eager_blobs=true 时把拉回的字节写入这里。nil → 同 blobFetcher
     private let blobs: BlobStore?
@@ -453,15 +453,15 @@ public actor PullWorker {
                     dedupSkipped += 1
                     continue
                 }
-                // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump）回放；
-                // peer 行强制 push_state='acked' 防误推。PR 1 期间 push_* 列仍存在，PR 4 才清。
+                // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump）回放。
+                // PR 4 已删 push_state / push_attempts / last_push_error 列。
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO item
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                        source_app, source_app_name, preview, text_full,
                        blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-                       push_state, push_attempts, last_push_error, ocr_state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'acked', 0, NULL, ?)
+                       ocr_state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, arguments: [
                     item.id,
                     item.originDevice,
