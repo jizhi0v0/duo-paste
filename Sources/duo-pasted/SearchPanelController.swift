@@ -10,6 +10,8 @@ import DuoPasteCore
 final class SearchPanelController: NSObject, NSWindowDelegate {
     private let state: AppState
     private let onPaste: (Item) -> Void
+    /// Command-Return opens file/image items outside the paste flow.
+    private let onReveal: ((Item) -> Void)?
     /// panel hide / dismiss 路径调用——AppDelegate 用它 cancel 进行中的 lazy paste
     /// task + 重置 state.pasteProgress。覆盖三条触发点：Esc 键 / windowDidResignKey
     /// （焦点切走）/ 主动调 hide() 的其它入口
@@ -18,9 +20,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private var localKeyMonitor: Any?
 
     init(state: AppState, onPaste: @escaping (Item) -> Void,
+         onReveal: ((Item) -> Void)? = nil,
          onDismiss: @escaping () -> Void = {}) {
         self.state = state
         self.onPaste = onPaste
+        self.onReveal = onReveal
         self.onDismiss = onDismiss
     }
 
@@ -86,11 +90,17 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 case 125: self.state.navigate(by: 1)            // ↓
                 case 36, 76:                                    // Return / Enter
                     if let item = self.state.currentItem {
-                        // 不在这里 hide——把"何时 hide"交给 onPaste 回调实现方。
-                        // image kind + blob 缺字节走 lazy 拉路径时 panel 要保持可见显示
-                        // spinner overlay；同步路径由 AppDelegate.pasteBack 拿 panel 引用
-                        // 自己关
-                        self.onPaste(item)
+                        if isCmd && (item.kind == .file || item.kind == .image) {
+                            // 不在这里 hide。远端 blob 可能要异步拉取，立即 hide 会触发
+                            // onDismiss 取消任务；同步成功/异步成功由 AppDelegate 关 panel。
+                            self.onReveal?(item)
+                        } else {
+                            // 不在这里 hide——把"何时 hide"交给 onPaste 回调实现方。
+                            // image kind + blob 缺字节走 lazy 拉路径时 panel 要保持可见显示
+                            // spinner overlay；同步路径由 AppDelegate.pasteBack 拿 panel 引用
+                            // 自己关
+                            self.onPaste(item)
+                        }
                     }
                 case 53: self.hide()                            // Esc
                 case 35 where isCmd:                            // ⌘P = toggle pin
