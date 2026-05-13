@@ -25,9 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 当前在跑的 lazy paste task。多次按 Enter 时先 cancel 旧 task 再起新的，
     /// 避免重复拉同一 sha 的字节竞争 BlobStore.put
     private var currentPasteTask: Task<Void, Never>?
-    /// lazy 拉超时（5s）。Tailscale 几 MB 图片正常 < 1s；3+s 大概率网络异常。
+    /// lazy 拉超时。走 Tailscale DERP 中继时 TLS 握手本身就需 3s+；30s 给足余量。
     /// nonisolated 让 TaskGroup 的 sleeper task 能 capture（详 fetchBlobLazy）
-    nonisolated static let lazyBlobTimeoutSec: TimeInterval = 5
+    nonisolated static let lazyBlobTimeoutSec: TimeInterval = 30
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
@@ -307,18 +307,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func revealInFinder(_ item: Item) {
         switch item.kind {
         case .file:
-            // Image file URLs are captured as `.file` so Finder paste-back still
-            // writes file URLs, but Command-Return should be able to open their
-            // bytes on mirror clients where the original source path does not exist.
-            if let sha = item.blobSha256 {
-                openBlobBackedItem(item, sha: sha)
-                return
-            }
-
             let urls = fileURLs(from: item)
-            guard !urls.isEmpty else { return }
-            NSWorkspace.shared.activateFileViewerSelecting(urls)
-            panel.hide()
+            let existingURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+            if !existingURLs.isEmpty {
+                // 本地路径存在 → Finder reveal
+                NSWorkspace.shared.activateFileViewerSelecting(existingURLs)
+                panel.hide()
+            } else if let sha = item.blobSha256 {
+                // 路径不在本机（远端 file item）且有 blob → Preview 打开
+                openBlobBackedItem(item, sha: sha)
+            }
 
         case .image:
             guard let sha = item.blobSha256 else { return }

@@ -10,7 +10,7 @@ import DuoPasteCore
 final class SearchPanelController: NSObject, NSWindowDelegate {
     private let state: AppState
     private let onPaste: (Item) -> Void
-    /// Command-Return opens file/image items outside the paste flow.
+    /// ⌘Return 时触发——file/image kind。AppDelegate 用它调 NSWorkspace reveal/open。
     private let onReveal: ((Item) -> Void)?
     /// panel hide / dismiss 路径调用——AppDelegate 用它 cancel 进行中的 lazy paste
     /// task + 重置 state.pasteProgress。覆盖三条触发点：Esc 键 / windowDidResignKey
