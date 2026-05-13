@@ -472,6 +472,7 @@ struct SearchView: View {
                         ItemRow(
                             item: item,
                             isSelected: item.id == state.selectedID,
+                            selfDeviceID: state.deps.deviceID,
                             snippet: state.snippets[item.id]
                         )
                         .contentShape(Rectangle())
@@ -571,8 +572,18 @@ private struct KindChip: View {
 private struct ItemRow: View {
     let item: Item
     let isSelected: Bool
+    /// 本机 device-id。`item.originDevice != selfDeviceID` 表示这条是 PullWorker 从对端
+    /// 镜像过来的远端 item —— meta 行多一个 "远端" 标，让用户能跟"我自己在这台机器上
+    /// 复制的"区分开。已知场景：对端开了 ToDesk/向日葵 等远程桌面工具的"剪贴板同步"，
+    /// 本机内容被回环抓住后 origin=对端，搜索结果里出现"看起来跟本机复制一模一样但
+    /// source app 是 ToDesk"的条目；远端标识让冗余可解释、不再误以为是本地 capture bug
+    let selfDeviceID: String
     /// 含 STX/ETX 高亮标记的 FTS snippet。仅 query 非空 + 命中时非 nil。
     let snippet: String?
+
+    private var isRemoteMirror: Bool {
+        item.originDevice != selfDeviceID
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
@@ -603,6 +614,10 @@ private struct ItemRow: View {
                         Text("·")
                         Text(humanSize(size))
                     }
+                    if isRemoteMirror {
+                        Text("·")
+                        Text("远端")
+                    }
                 }
                 .font(.system(size: 12))
                 .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
@@ -631,12 +646,23 @@ private struct ItemRow: View {
     /// 左侧图标：优先 app 图标（按 bundleID 查 LaunchServices）；self capture 走专属
     /// badge；其余 fallback 到 kind SF Symbol。
     /// fallback 触发场景：item 来自 mirror 而本机没装那个 app；或源 app 没报 bundleID。
-    @ViewBuilder
+    /// remote mirror（origin != self）在右下角叠 `arrow.down.left` 角标，跟 meta 行的
+    /// "· 远端" 文字双重强化——单纯文字过弱，纯角标新用户不知含义，两个一起最稳。
     private var leadingIcon: some View {
+        ZStack(alignment: .bottomTrailing) {
+            leadingIconCore
+            if isRemoteMirror {
+                remoteOriginBadge
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var leadingIconCore: some View {
         if item.isSelfCapture {
             // duo-paste 自家复制：圆形 badge + 剪贴板 symbol，让"自家来源"在长列表里一眼
             // 识别，而不是跟其他 fallback 共用 kind symbol。选中态翻成"白底 accent icon"
-            // 跟未选中态的"accent 底白 icon"反白对称——选中行整体已经是 accent 蓝高亮，
+            // 跟未选中态的"accent 底白 icon"反白对称——选中行整体已经是 accent 蓝高亮,
             // 同色圆底会跟行融化，白底实色让 icon 跟选中行分离
             ZStack {
                 Circle()
@@ -657,6 +683,24 @@ private struct ItemRow: View {
                 .frame(width: 32, height: 32)
                 .foregroundStyle(isSelected ? Color.white : Color.accentColor)
         }
+    }
+
+    /// 远端镜像角标：橙色填充小圆 + 白色 SF Symbol "arrow.down.left"（"从外面进来的"心智）。
+    /// 颜色选橙：避开 self badge 的 accent 蓝（撞色让两种来源辨识不开）；橙在 macOS 系统
+    /// 角标里常见（mail unread / dock badge）能被用户的视觉系统直觉认作"次级状态标记"。
+    /// 外圈白 stroke 让 badge 边界在深色 app icon（Chrome / Zed）跟浅色玻璃 panel 上都清晰。
+    private var remoteOriginBadge: some View {
+        ZStack {
+            Circle()
+                .fill(Color.orange)
+            Circle()
+                .strokeBorder(Color.white, lineWidth: 1)
+            Image(systemName: "arrow.down.left")
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: 14, height: 14)
+        .offset(x: 3, y: 3)
     }
 
     /// kind 中文标签——meta 行第一列显示。比 bundle name 更立刻能读懂"这是什么"。
