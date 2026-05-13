@@ -203,3 +203,74 @@ private func insertOwn(
     }
     #expect(try SearchAPI(database: db).countUnion(SearchQuery()) == 2)
 }
+
+// MARK: - countByKind / countByKindUnion
+
+@Test func countByKindUnionGroupsAcrossBothTables() throws {
+    // 模拟典型场景：本机 own 主要是 text，mirror 镜了 image 过来
+    let db = try makeDB()
+    try insertOwn(db, id: "t1", capturedAtNs: 100, kind: .text, text: "alpha")
+    try insertOwn(db, id: "t2", capturedAtNs: 200, kind: .text, text: "bravo")
+    try insertOwn(db, id: "i1", capturedAtNs: 300, kind: .image)
+    try insertMirror(db, id: "mi1", origin: "primary", capturedAtNs: 400, kind: .image, text: "img1")
+    try insertMirror(db, id: "mi2", origin: "primary", capturedAtNs: 500, kind: .image, text: "img2")
+    try insertMirror(db, id: "mu1", origin: "primary", capturedAtNs: 600, kind: .url, text: "https://x")
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery())
+    #expect(counts[.text] == 2)
+    #expect(counts[.image] == 3)
+    #expect(counts[.url] == 1)
+    #expect(counts[.html] == nil)  // 没出现的 kind 不要塞 0，让 UI 自行决定显示策略
+}
+
+@Test func countByKindUnionIgnoresQueryKindsFilter() throws {
+    // 关键不变量：chip 上的数字表示"如果只选这个 kind 会有多少"，所以传进来的 query.kinds
+    // 必须被忽略——否则用户多选 chip 时 count 来回跳，无法判断稀疏类型
+    let db = try makeDB()
+    try insertOwn(db, id: "t1", capturedAtNs: 100, kind: .text, text: "x")
+    try insertOwn(db, id: "i1", capturedAtNs: 200, kind: .image)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery(kinds: [.text]))
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == 1)  // ← 不被 kinds=[.text] 过滤掉
+}
+
+@Test func countByKindUnionAppliesFTSAndTimeWindow() throws {
+    // chip count 必须跟 query / timeRange / pinnedOnly 联动——只有 kinds 维度被剥离。
+    // 这样用户输入 "foo" 后 chip 数字立刻反映"包含 foo 的 X 类有几条"。
+    let db = try makeDB()
+    try insertOwn(db, id: "t1", capturedAtNs: 100, kind: .text, text: "needle text")
+    try insertOwn(db, id: "t2", capturedAtNs: 200, kind: .text, text: "irrelevant")
+    try insertMirror(db, id: "i1", origin: "primary", capturedAtNs: 300, kind: .image, text: "needle img")
+    try insertMirror(db, id: "i2", origin: "primary", capturedAtNs: 400, kind: .image, text: "other")
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery(text: "needle"))
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == 1)
+}
+
+@Test func countByKindUnionDedupesCrossTableSameID() throws {
+    // 同 id 跨表（promote 过渡期）算一份。kind 一致 → UNION 去重生效。
+    let db = try makeDB()
+    try insertOwn(db, id: "dup", capturedAtNs: 200, kind: .image)
+    try insertMirror(db, id: "dup", origin: "primary", capturedAtNs: 100, kind: .image)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery())
+    #expect(counts[.image] == 1)
+}
+
+@Test func countByKindFallsBackToItemOnlyForStandalone() throws {
+    // standalone / pure-primary 走 countByKind（只 own 表），不掺 mirror
+    let db = try makeDB()
+    try insertOwn(db, id: "t1", capturedAtNs: 100, kind: .text, text: "x")
+    try insertOwn(db, id: "i1", capturedAtNs: 200, kind: .image)
+    try insertMirror(db, id: "m1", origin: "primary", capturedAtNs: 300, kind: .image, text: "should-not-count")
+    let counts = try SearchAPI(database: db).countByKind(SearchQuery())
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == 1)  // mirror 那行不算进去
+}
+
+@Test func countByKindUnionSkipsSoftDeletedByDefault() throws {
+    let db = try makeDB()
+    try insertOwn(db, id: "alive", capturedAtNs: 100, kind: .text, text: "ok")
+    try insertMirror(db, id: "dead", origin: "primary", capturedAtNs: 200, kind: .image, text: "rip", deletedAtNs: 999)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery())
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == nil)  // 唯一一行 image 是软删的，桶里不该出现
+}

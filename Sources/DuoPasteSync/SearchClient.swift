@@ -149,12 +149,23 @@ public struct SearchProvider: Sendable {
         /// - 有 query → FTS 命中总数
         /// UI 显示这个值，**不是** `items.count`——后者被 limit 截断。
         public let totalCount: Int
+        /// 按 kind 分桶的命中数。**忽略** `query.kinds`——chip 上挂 "图片 (19)" 时
+        /// 显示的是"如果只选这个 kind 会有多少"，跟当前已选 chip 集合无关。
+        /// 远端路径暂不返回（协议未扩字段），UI 端拿不到时不显示 count。
+        public let kindCounts: [ItemKind: Int]
 
-        public init(items: [Item], mode: Mode, snippets: [String: String] = [:], totalCount: Int = 0) {
+        public init(
+            items: [Item],
+            mode: Mode,
+            snippets: [String: String] = [:],
+            totalCount: Int = 0,
+            kindCounts: [ItemKind: Int] = [:]
+        ) {
             self.items = items
             self.mode = mode
             self.snippets = snippets
             self.totalCount = totalCount
+            self.kindCounts = kindCounts
         }
     }
 
@@ -195,16 +206,20 @@ public struct SearchProvider: Sendable {
         let result = try await remote.searchRemote(query)
         switch result.outcome {
         case .ok(let hits):
-            // 远端 transport 当前不返回 total（协议未扩字段）。本地 count 作 close 兜底——
-            // 在常见部署里 client 一旦 mirror 就绪就不走 remoteOK，此路径只是 transient 状态。
+            // 远端 transport 当前不返回 total / kindCounts（协议未扩字段）。本地 count 作 close
+            // 兜底——常见部署里 client 一旦 mirror 就绪就不走 remoteOK，此路径只是 transient 状态。
+            // kindCounts 也从本地（own + mirror 都算上）取——比 hits-only 算更准，能反映"如果
+            // 我只点这个 kind 会有多少"的真实候选。
             let total = (try? local.count(query)) ?? hits.count
+            let kindCounts = (try? local.countByKindUnion(query)) ?? [:]
             return Outcome(
                 items: hits.map(\.item),
                 mode: .remoteOK,
                 snippets: Dictionary(uniqueKeysWithValues: hits.compactMap { h in
                     h.snippet.map { (h.item.id, $0) }
                 }),
-                totalCount: total
+                totalCount: total,
+                kindCounts: kindCounts
             )
         case .unreachable(let reason), .rejected(let reason):
             // 真不可达 / 拒收时才降级到本地——保证可用性优先
@@ -219,7 +234,14 @@ public struct SearchProvider: Sendable {
             s.map { (item.id, $0) }
         })
         let total = (try? local.count(query)) ?? hits.count
-        return Outcome(items: hits.map(\.0), mode: mode, snippets: snippets, totalCount: total)
+        let kindCounts = (try? local.countByKind(query)) ?? [:]
+        return Outcome(
+            items: hits.map(\.0),
+            mode: mode,
+            snippets: snippets,
+            totalCount: total,
+            kindCounts: kindCounts
+        )
     }
 
     private func unionLocalOutcome(query: SearchQuery, stalenessSec: Int) -> Outcome {
@@ -228,6 +250,13 @@ public struct SearchProvider: Sendable {
             s.map { (item.id, $0) }
         })
         let total = (try? local.countUnion(query)) ?? hits.count
-        return Outcome(items: hits.map(\.0), mode: .localMirror(stalenessSec: stalenessSec), snippets: snippets, totalCount: total)
+        let kindCounts = (try? local.countByKindUnion(query)) ?? [:]
+        return Outcome(
+            items: hits.map(\.0),
+            mode: .localMirror(stalenessSec: stalenessSec),
+            snippets: snippets,
+            totalCount: total,
+            kindCounts: kindCounts
+        )
     }
 }

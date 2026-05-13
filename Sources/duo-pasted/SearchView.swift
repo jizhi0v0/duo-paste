@@ -159,6 +159,7 @@ struct SearchView: View {
                 KindChip(
                     kind: kind,
                     isSelected: state.selectedKinds.contains(kind),
+                    count: state.kindCounts[kind],
                     onTap: { toggleKind(kind) }
                 )
             }
@@ -490,9 +491,13 @@ struct SearchView: View {
 
 /// 类型 chip 单元。pill capsule，选中状态 accent 填充 + 白字。
 /// 单击 toggle 选中状态。视觉跟 timeRangeMenu 的 capsule 保持一致——padding / radius 同步
+///
+/// `count` 非 nil 时尾巴挂活计数 "图片 19"——让用户立刻看出哪个类稀疏。
+/// 0 也显示（"图片 0"），避免用户误以为 filter 失效；nil = 远端模式拿不到时隐藏
 private struct KindChip: View {
     let kind: ItemKind
     let isSelected: Bool
+    let count: Int?
     let onTap: () -> Void
 
     var body: some View {
@@ -502,6 +507,12 @@ private struct KindChip: View {
                     .font(.system(size: 11))
                 Text(label)
                     .font(.system(size: 12))
+                if let count {
+                    Text("\(count)")
+                        .font(.system(size: 11))
+                        .monospacedDigit()
+                        .foregroundStyle(isSelected ? Color.white.opacity(0.75) : .secondary)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)

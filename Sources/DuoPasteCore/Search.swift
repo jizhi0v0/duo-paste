@@ -377,6 +377,87 @@ public struct SearchAPI: Sendable {
         return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
     }
 
+    /// 当前 (query / timeRange / pinnedOnly) 维度下，按 kind 分桶的命中数。
+    /// **忽略**输入 `q.kinds`——chip count 显示的是"如果我只点这个 kind 会得到多少"，
+    /// 跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法判断稀疏类型。
+    public func countByKind(_ q: SearchQuery) throws -> [ItemKind: Int] {
+        let stripped = Self.stripKinds(q)
+        return try database.pool.read { db in
+            try Self.countByKindItem(db, query: stripped)
+        }
+    }
+
+    /// Union 版本：`item ∪ item_mirror` 按 id 去重后再 GROUP BY kind。
+    /// 同 id 跨表 kind 一致（id 跟 capture 事件 1:1），UNION (id, kind) 不会双算。
+    public func countByKindUnion(_ q: SearchQuery) throws -> [ItemKind: Int] {
+        let stripped = Self.stripKinds(q)
+        return try database.pool.read { db in
+            try Self.countByKindUnionStatic(db, query: stripped)
+        }
+    }
+
+    private static func stripKinds(_ q: SearchQuery) -> SearchQuery {
+        SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs, toNs: q.toNs,
+            kinds: [],
+            pinnedOnly: q.pinnedOnly,
+            includeDeleted: q.includeDeleted,
+            limit: 0, offset: 0
+        )
+    }
+
+    static func countByKindItem(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
+        let (join, whereClause, args) = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
+        let sql = "SELECT item.kind AS kind, COUNT(*) AS cnt FROM item \(join) \(whereClause) GROUP BY item.kind"
+        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+        return decodeKindCountRows(rows)
+    }
+
+    static func countByKindUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
+        // pinnedOnly 走 fetchUnion 路径——跟 countUnionStatic 同源不变量
+        // （pinned 状态可能在 own 跟 mirror 行上分歧，必须 dedup 后取最新行的 pinned 再过滤）。
+        if q.pinnedOnly {
+            let items = try fetchUnion(db, query: SearchQuery(
+                text: q.text,
+                fromNs: q.fromNs, toNs: q.toNs,
+                kinds: [], pinnedOnly: true,
+                includeDeleted: q.includeDeleted,
+                limit: Int.max, offset: 0
+            ))
+            var out: [ItemKind: Int] = [:]
+            for (it, _) in items {
+                out[it.kind, default: 0] += 1
+            }
+            return out
+        }
+        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
+        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
+        let sql = """
+            SELECT kind, COUNT(*) AS cnt FROM (
+              SELECT item.id AS id, item.kind AS kind FROM item \(own.join) \(own.whereClause)
+              UNION
+              SELECT item_mirror.id AS id, item_mirror.kind AS kind FROM item_mirror \(mir.join) \(mir.whereClause)
+            ) GROUP BY kind
+        """
+        var args: [DatabaseValueConvertible] = []
+        args.append(contentsOf: own.args)
+        args.append(contentsOf: mir.args)
+        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+        return decodeKindCountRows(rows)
+    }
+
+    private static func decodeKindCountRows(_ rows: [Row]) -> [ItemKind: Int] {
+        var out: [ItemKind: Int] = [:]
+        for r in rows {
+            let raw: String? = r["kind"]
+            guard let raw, let k = ItemKind(rawValue: raw) else { continue }
+            let cnt: Int = r["cnt"] ?? 0
+            out[k] = cnt
+        }
+        return out
+    }
+
     /// 把用户输入的自由文本转成 FTS5 MATCH 表达式。
     /// 策略：按空白拆词，每个 token 转义双引号后作为前缀短语，AND 连接。
     /// 比如 `foo bar"baz` → `"foo"* AND "bar""baz"*`
