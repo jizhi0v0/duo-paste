@@ -137,18 +137,19 @@ public actor OCRWorker {
         log("worker stopped")
     }
 
-    public struct TickResult: Sendable, Equatable {
-        public var processed: Int = 0
-        public var done: Int = 0
-        public var skipped: Int = 0
-        public var failed: Int = 0
-        public var transient: Int = 0
+    struct TickResult: Sendable, Equatable {
+        var processed: Int = 0
+        var done: Int = 0
+        var skipped: Int = 0
+        var failed: Int = 0
+        var transient: Int = 0
     }
 
     /// 单 tick：捞一批 pending → 顺序逐张处理 → 返回统计。
-    /// 暴露 internal 让单测可直接驱动一次循环，不依赖 wake/sleep 时序
+    /// `internal` 而非 `public`——测试用 `@testable import` 拿到访问权，
+    /// 外部生产代码（AppDelegate）不应直接调 tick 跟内部 runLoop 抢资源
     @discardableResult
-    public func tick() async -> TickResult {
+    func tick() async -> TickResult {
         var result = TickResult()
         let pending: [Item]
         do {
@@ -212,6 +213,10 @@ public actor OCRWorker {
 
         do {
             let r = try await recognizer.recognize(imageURL: url, languages: config.languages)
+            // recognize 是耗时 async 调用（Vision 0.5-3s）。等回来后 stop() 可能已经
+            // 把 runTask cancel 过——此时不应再写 DB，让 ocr_state 保留 pending 等下次
+            // 重启后重扫。匹配 `catch is CancellationError` 分支的"不动 DB 状态"语义
+            if Task.isCancelled { return .transient }
             await markDone(id: item.id, text: r.text)
             attemptCounts.removeValue(forKey: item.id)
             return .done
@@ -292,14 +297,21 @@ public actor OCRWorker {
 
     /// 标 skipped。**不** bump ingested_at_ns —— skipped 是终态，没必要让下游再拉一遍
     /// 把"图里没字"这件事广播出去（item 行实质内容未变）。复用 `last_push_error` 列
-    /// 放原因字符串（plan §决策：当前不为 OCR 单独加列，列名稍微 misleading 但够用）
+    /// 放原因字符串（plan §决策：当前不为 OCR 单独加列，列名稍微 misleading 但够用）。
+    ///
+    /// **不盖 push_state='failed' 行的 last_push_error**：那是真实的 push 失败原因，
+    /// 操作员要看。OCR skipped 的 reason 比真实 push 失败次要——只在 push 没失败时
+    /// 写。如果 push 失败，OCR 不抢这一列，但 `ocr_state='skipped'` 仍然落地
     private func markSkipped(id: String, reason: String) async {
         do {
             try await database.pool.write { db in
                 try db.execute(sql: """
                     UPDATE item
                     SET ocr_state = 'skipped',
-                        last_push_error = ?
+                        last_push_error = CASE
+                            WHEN push_state = 'failed' THEN last_push_error
+                            ELSE ?
+                        END
                     WHERE id = ?
                 """, arguments: [reason, id])
             }
@@ -309,14 +321,19 @@ public actor OCRWorker {
     }
 
     /// 标 failed。同 skipped 不 bump ingested_at_ns；用户 retry-failed-ocr 翻回
-    /// pending 时再让 worker 处理
+    /// pending 时再让 worker 处理。
+    ///
+    /// 同 markSkipped：不盖 push_state='failed' 行的 last_push_error
     private func markFailed(id: String, reason: String) async {
         do {
             try await database.pool.write { db in
                 try db.execute(sql: """
                     UPDATE item
                     SET ocr_state = 'failed',
-                        last_push_error = ?
+                        last_push_error = CASE
+                            WHEN push_state = 'failed' THEN last_push_error
+                            ELSE ?
+                        END
                     WHERE id = ?
                 """, arguments: [reason, id])
             }

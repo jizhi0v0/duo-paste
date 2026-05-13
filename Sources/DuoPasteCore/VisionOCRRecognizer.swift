@@ -12,8 +12,8 @@ import AppKit
 ///   accurate 在中文上漏字明显少于 .fast。单图 0.5-3s 在 utility QoS 后台可接受。
 /// - `usesLanguageCorrection=true` 默认，搭配 `recognitionLanguages` hint 让
 ///   Vision 优先返回符合语言模型的候选；中英文混合截图大多受益
-/// - macOS 13+ 开 `automaticallyDetectsLanguage` —— Vision 自动猜语言，
-///   不影响 hint 优先级（Apple 文档明确两者并行）
+/// - `automaticallyDetectsLanguage=true` 让 Vision 自动猜语言，不影响 hint 优先级
+///   （Apple 文档明确两者并行）。macOS 13+ 可用，项目最低 macOS 14，直接打开
 public struct VisionOCRRecognizer: OCRRecognizer {
     /// `.accurate`（默认）/ `.fast`。Config 字符串映射在 Bridge 层做。
     public let recognitionLevel: VNRequestTextRecognitionLevel
@@ -54,17 +54,18 @@ public struct VisionOCRRecognizer: OCRRecognizer {
                 req.recognitionLevel = level
                 req.usesLanguageCorrection = useLang
                 req.recognitionLanguages = langs
-                if #available(macOS 13.0, *) {
-                    req.automaticallyDetectsLanguage = true
-                }
+                // 项目最低支持 macOS 14，automaticallyDetectsLanguage 永远可用
+                req.automaticallyDetectsLanguage = true
                 let handler = VNImageRequestHandler(cgImage: cg, options: [:])
                 do {
                     try handler.perform([req])
                 } catch {
-                    cont.resume(throwing: OCRRecognizeError.visionTransient(error))
+                    cont.resume(throwing: OCRRecognizeError.visionTransient(
+                        reason: String(describing: error)
+                    ))
                     return
                 }
-                let observations = (req.results as? [VNRecognizedTextObservation]) ?? []
+                let observations = req.results ?? []
                 let lines = observations.compactMap { obs in
                     obs.topCandidates(1).first?.string
                 }
