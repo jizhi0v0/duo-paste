@@ -93,6 +93,99 @@ private func tempDir() -> URL {
     #expect(count == 0)
 }
 
+// MARK: - retry-failed-ocr
+
+private func seedOCRItem(
+    db: DuoPasteCore.Database,
+    id: String,
+    originDevice: String,
+    kind: ItemKind = .image,
+    ocrState: OCRState?,
+    deletedAtNs: Int64? = nil,
+    lastError: String? = "old error"
+) throws {
+    let it = Item(
+        id: id, originDevice: originDevice,
+        capturedAtNs: 1000, kind: kind,
+        preview: "p-\(id)",
+        blobSha256: kind == .image ? String(repeating: "a", count: 64) : nil,
+        deletedAtNs: deletedAtNs,
+        pushState: .acked,
+        lastPushError: lastError,
+        ocrState: ocrState
+    )
+    try db.pool.write { try it.insert($0) }
+}
+
+@Test func retryFailedOCRResetsFailedAndSkipped() throws {
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(db: db, id: "f1", originDevice: "me", ocrState: .failed)
+    try seedOCRItem(db: db, id: "s1", originDevice: "me", ocrState: .skipped)
+    try seedOCRItem(db: db, id: "d1", originDevice: "me", ocrState: .done)
+    try seedOCRItem(db: db, id: "p1", originDevice: "me", ocrState: .pending)
+    let n = try Admin.retryFailedOCR(dbPath: paths.mainDB, selfDeviceID: "me", scope: .all)
+    #expect(n == 2)
+    let after: [Item] = try db.pool.read { try Item.order(Column("id")).fetchAll($0) }
+    let byID = Dictionary(uniqueKeysWithValues: after.map { ($0.id, $0) })
+    #expect(byID["f1"]?.ocrState == .pending)
+    #expect(byID["f1"]?.lastPushError == nil)
+    #expect(byID["s1"]?.ocrState == .pending)
+    #expect(byID["s1"]?.lastPushError == nil)
+    #expect(byID["d1"]?.ocrState == .done)
+    #expect(byID["d1"]?.lastPushError == "old error")  // 不动
+    #expect(byID["p1"]?.ocrState == .pending)
+}
+
+@Test func retryFailedOCRByIDForcesEvenDone() throws {
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(db: db, id: "done-row", originDevice: "me", ocrState: .done)
+    let n = try Admin.retryFailedOCR(
+        dbPath: paths.mainDB, selfDeviceID: "me", scope: .id("done-row")
+    )
+    #expect(n == 1)
+    let after = try db.pool.read { conn in
+        try Item.filter(Column("id") == "done-row").fetchOne(conn)
+    }
+    #expect(after?.ocrState == .pending)
+}
+
+@Test func retryFailedOCRSkipsOtherOriginByDefault() throws {
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(db: db, id: "mine", originDevice: "me", ocrState: .failed)
+    try seedOCRItem(db: db, id: "theirs", originDevice: "other", ocrState: .failed)
+    let n = try Admin.retryFailedOCR(dbPath: paths.mainDB, selfDeviceID: "me", scope: .all)
+    #expect(n == 1)
+    let after = try db.pool.read { conn -> [Item] in
+        try Item.order(Column("id")).fetchAll(conn)
+    }
+    let byID = Dictionary(uniqueKeysWithValues: after.map { ($0.id, $0) })
+    #expect(byID["mine"]?.ocrState == .pending)
+    #expect(byID["theirs"]?.ocrState == .failed)
+}
+
+@Test func retryFailedOCRSkipsSoftDeleted() throws {
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB, role: .client)
+    try seedOCRItem(db: db, id: "del", originDevice: "me", ocrState: .failed, deletedAtNs: 999)
+    let n = try Admin.retryFailedOCR(dbPath: paths.mainDB, selfDeviceID: "me", scope: .all)
+    #expect(n == 0)
+    let after = try db.pool.read { conn in
+        try Item.filter(Column("id") == "del").fetchOne(conn)
+    }
+    #expect(after?.ocrState == .failed)
+}
+
 private extension Character {
     var isHexDigit: Bool {
         isASCII && (isNumber || ("a"..."f").contains(self) || ("A"..."F").contains(self))

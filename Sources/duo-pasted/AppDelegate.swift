@@ -15,6 +15,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serverTask: Task<Void, Never>?
     private var pushWorker: PushWorker?
     private var pullWorker: PullWorker?
+    /// 本机 OCR worker。`config.ocr.enabled=true` 才启动；启动条件跟 push/pull 解耦，
+    /// 任何 role（standalone / primary / client）都跑 own-origin image OCR
+    private var ocrWorker: OCRWorker?
     /// lazy blob 拉取：image kind + 本机 BlobStore 缺字节时按需 GET /blob/<sha> 到本地。
     /// 跟 PullWorker / PushWorker 共享 HTTPIngestClient 配置（同一 baseURL + auth），
     /// nil → standalone 模式或 startPullWorker 失败，pasteBack 缺字节时显示错误而非干跑
@@ -78,6 +81,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 在 paste 时按需拉单个 blob。P1 review fix：原实现把 fetcher 绑在
         // startPullWorker 里，pull.enabled=false 时 image paste 永远失败
         setupPasteBlobFetcher()
+
+        // OCR worker：本机 own-origin image 跑 Vision OCR 把图里文字写 text_full 进 FTS5。
+        // 启动条件 = config.ocr.enabled，跟 push/pull/serve 解耦——任何 role 都跑自家
+        // OCR（分布式 MVP，每台 Mac 自跑自家 origin=self，结果不跨设备同步；详 plan
+        // vivid-scanning-vellum.md §1 设计原则）
+        if deps.config.ocr.enabled {
+            startOCRWorker()
+        }
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · db=\(deps.paths.mainDB.path)\n", stderr)
     }
@@ -197,6 +208,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// OCR worker：扫本机 own-origin image kind + ocr_state=pending 的行，调 Vision
+    /// 把图里文字写 item.text_full 进 FTS5。失败 / 不识别格式 → 标 skipped / failed，
+    /// 用户跑 `duo-pasted retry-failed-ocr` 重置回 pending 重扫。
+    private func startOCRWorker() {
+        let cfg = deps.config.ocr
+        let level = VisionOCRRecognizer.level(fromConfig: cfg.recognitionLevel)
+        let recognizer = VisionOCRRecognizer(
+            recognitionLevel: level,
+            usesLanguageCorrection: true,
+            log: { msg in
+                FileHandle.standardError.write(Data("ocr-vision: \(msg)\n".utf8))
+            }
+        )
+        let workerConfig = OCRWorker.Config(
+            perItemPauseMs: max(0, cfg.perItemPauseMs),
+            maxBlobBytes: max(1, cfg.maxBlobMB) * 1024 * 1024,
+            languages: cfg.languages
+        )
+        let worker = OCRWorker(
+            database: deps.database,
+            blobs: deps.blobs,
+            recognizer: recognizer,
+            originDevice: deps.deviceID,
+            config: workerConfig
+        )
+        self.ocrWorker = worker
+        Task { await worker.start() }
+        fputs("ocr worker · level=\(cfg.recognitionLevel) · langs=\(cfg.languages.joined(separator: ","))\n", stderr)
+    }
+
     /// 启动 Hummingbird server。loadShared secret 失败 / 端口占用 等都不致命——
     /// 让 daemon 继续起 UI / 捕获，server 单独失败只在日志里出现，用户能看到。
     private func startSyncServer() {
@@ -250,6 +291,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 await self.state.refresh()
                 self.pushWorker?.wake()    // 有 worker 才唤醒；没配 primary 即 nil
+                // image kind 入库后 wake OCR worker 缩短延迟（避免等 5min idle）
+                if case .inserted = result.outcome,
+                   result.item?.kind == .image {
+                    self.ocrWorker?.wake()
+                }
             } catch {
                 fputs("ingest error: \(error)\n", stderr)
             }

@@ -1,0 +1,327 @@
+import Foundation
+import GRDB
+
+/// 本地 OCR 调度器。仿 PushWorker 单 actor 串行 tick + `wake()` 缩短延迟。
+///
+/// **职责**：扫本机 `origin = self` + `kind = 'image'` + `ocr_state = 'pending'` 的行，
+/// 调 OCRRecognizer 拿文本写回 `text_full` + `ocr_state = 'done'`，FTS5 trigger 自动
+/// 刷新索引让图里中英文进搜索。
+///
+/// **不变量**（详 plan vivid-scanning-vellum.md §关键不变量）：
+/// 1. 只扫 origin=self，不跨 origin（破"PullWorker 跳过 own-origin"前提；Phase 2 加
+///    /update endpoint 再放）
+/// 2. 写回 own-origin 行时 bump `ingested_at_ns`（Database.nextIngestNs），让
+///    audit-push / 未来跨设备同步看到更新
+/// 3. text_full 空字符串归一化为 nil（FTS5 zero-length match 有 corner case）
+/// 4. 不动 preview（preview = capture 时定的视觉摘要；OCR 文本是搜索维度）
+/// 5. markDone 即便 text 为空（避免每 tick 重扫这条永不收敛）
+/// 6. `failed` 不自动重试（actor 内存 attempts 计数 → 达上限 → DB 标 failed，需要
+///    用户跑 retry-failed-ocr 重置）
+///
+/// **调度**：
+/// - 单 actor 串行处理一个 batch（默认 20 张）
+/// - 每张之间 sleep `perItemPauseMs`（默认 100ms）让前台不卡
+/// - 空 batch → sleep `idleIntervalSec`（默认 300s）
+/// - `wake()` 由 AppDelegate.captureCallback 在 image 入库后调，取消当前 sleep 提前 tick
+public actor OCRWorker {
+    public struct Config: Sendable {
+        /// 空 batch 后 sleep 时长。默认 300s（5min 兜底）；wake() 让新 image 不必等满
+        public var idleIntervalSec: TimeInterval
+        /// 同一 batch 内每张 OCR 后 sleep 的间隔。让前台 UI 不卡（Vision .accurate 单
+        /// 图峰值 50-100% 单核 1-3s，间歇 100ms 给前台 task 机会）
+        public var perItemPauseMs: Int
+        /// transient 错误连续达到此值 → 标 failed 不再扫
+        public var maxAttempts: Int
+        /// 一个 tick 处理多少行
+        public var batchSize: Int
+        /// blob 字节超过此值 → 标 skipped 不喂 Vision。理由：Vision 解大图内存峰值高，
+        /// 而且 4K+ 长截图 OCR 性价比低（用户大概率是误捕获，已被 capture 阶段
+        /// max_blob_mb=32 挡过一次，本 cap 是 OCR 自己的更紧上限）
+        public var maxBlobBytes: Int
+        /// Vision recognitionLanguages hint。按优先级排序，accurate 模式下作语言模型
+        /// 选择依据；macOS 13+ automaticallyDetectsLanguage 再补一道
+        public var languages: [String]
+
+        public init(
+            idleIntervalSec: TimeInterval = 300,
+            perItemPauseMs: Int = 100,
+            maxAttempts: Int = 5,
+            batchSize: Int = 20,
+            maxBlobBytes: Int = 16 * 1024 * 1024,
+            languages: [String] = ["zh-Hans", "en-US"]
+        ) {
+            self.idleIntervalSec = idleIntervalSec
+            self.perItemPauseMs = perItemPauseMs
+            self.maxAttempts = maxAttempts
+            self.batchSize = batchSize
+            self.maxBlobBytes = maxBlobBytes
+            self.languages = languages
+        }
+
+        public static let `default` = Config()
+    }
+
+    private let database: DuoPasteCore.Database
+    private let blobs: BlobStore
+    private let recognizer: OCRRecognizer
+    private let originDevice: String
+    private let config: Config
+    private let log: @Sendable (String) -> Void
+
+    private var runTask: Task<Void, Never>?
+    private var currentSleep: Task<Void, Error>?
+    /// 内存 attempts 计数：id → attempts。`failed` 不持久化原因详 plan §决策——
+    /// daemon 重启 = 全部 pending 重新扫一遍（OCR 失败大多是图本身坏 / Vision 系统 bug，
+    /// 跨重启重试不算大代价）。`failed` 终态需用户 retry-failed-ocr 重置
+    private var attemptCounts: [String: Int] = [:]
+
+    public init(
+        database: DuoPasteCore.Database,
+        blobs: BlobStore,
+        recognizer: OCRRecognizer,
+        originDevice: String,
+        config: Config = .default,
+        log: @escaping @Sendable (String) -> Void = { msg in
+            FileHandle.standardError.write(Data("ocr: \(msg)\n".utf8))
+        }
+    ) {
+        self.database = database
+        self.blobs = blobs
+        self.recognizer = recognizer
+        self.originDevice = originDevice
+        self.config = config
+        self.log = log
+    }
+
+    public func start() {
+        guard runTask == nil else { return }
+        self.runTask = Task { [weak self] in
+            await self?.runLoop()
+        }
+    }
+
+    public func stop() {
+        currentSleep?.cancel()
+        currentSleep = nil
+        runTask?.cancel()
+        runTask = nil
+    }
+
+    /// 外部（AppDelegate.captureCallback 在 image 入库后）通知：可能有新 pending。
+    /// 实现仿 PushWorker.wake：取消当前 sleep 让 runLoop 提前进入下一 tick。
+    public nonisolated func wake() {
+        Task { await self.cancelCurrentSleep() }
+    }
+
+    private func cancelCurrentSleep() {
+        currentSleep?.cancel()
+    }
+
+    /// 主循环：tick → 算 sleep → 进入可中断 sleep → 再 tick。
+    /// drained.processed == 0（空 batch）→ idleIntervalSec；非空 → 0（立即下一 tick
+    /// 把 backlog 清空，wake() 路径不必等满 idle 周期）
+    private func runLoop() async {
+        log("worker started · originDevice=\(originDevice) · langs=\(config.languages.joined(separator: ","))")
+        while !Task.isCancelled {
+            let drained = await tick()
+            let sleepSec: TimeInterval = drained.processed == 0 ? config.idleIntervalSec : 0
+            if sleepSec > 0 {
+                let task = Task {
+                    try await Task.sleep(nanoseconds: UInt64(sleepSec * 1_000_000_000))
+                }
+                self.currentSleep = task
+                _ = try? await task.value    // wake() 取消 → 抛 CancellationError，忽略
+                self.currentSleep = nil
+            }
+        }
+        log("worker stopped")
+    }
+
+    public struct TickResult: Sendable, Equatable {
+        public var processed: Int = 0
+        public var done: Int = 0
+        public var skipped: Int = 0
+        public var failed: Int = 0
+        public var transient: Int = 0
+    }
+
+    /// 单 tick：捞一批 pending → 顺序逐张处理 → 返回统计。
+    /// 暴露 internal 让单测可直接驱动一次循环，不依赖 wake/sleep 时序
+    @discardableResult
+    public func tick() async -> TickResult {
+        var result = TickResult()
+        let pending: [Item]
+        do {
+            pending = try fetchPending()
+        } catch {
+            log("fetch pending failed: \(error)")
+            return result
+        }
+        if pending.isEmpty { return result }
+
+        for item in pending {
+            if Task.isCancelled { break }
+            let outcome = await processOne(item)
+            result.processed += 1
+            switch outcome {
+            case .done:       result.done += 1
+            case .skipped:    result.skipped += 1
+            case .failedTerm: result.failed += 1
+            case .transient:  result.transient += 1
+            }
+            // perItemPauseMs > 0 才 sleep，避免测试场景多余开销
+            if config.perItemPauseMs > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(config.perItemPauseMs) * 1_000_000)
+            }
+        }
+        if result.processed > 0 {
+            log("tick processed=\(result.processed) done=\(result.done) skipped=\(result.skipped) failed=\(result.failed) transient=\(result.transient)")
+        }
+        return result
+    }
+
+    private enum ProcessOutcome: Sendable {
+        case done
+        case skipped
+        case failedTerm
+        case transient
+    }
+
+    private func processOne(_ item: Item) async -> ProcessOutcome {
+        guard let sha = item.blobSha256, !sha.isEmpty else {
+            await markSkipped(id: item.id, reason: "no blob sha")
+            return .skipped
+        }
+        guard let url = blobs.locate(sha256: sha) else {
+            await markSkipped(id: item.id, reason: "blob missing")
+            return .skipped
+        }
+        // 守门：blob 字节超 cap → 跳过。读 attribute 失败不阻塞——按存量大小 0 处理
+        let bytes: Int
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            bytes = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        } catch {
+            await markSkipped(id: item.id, reason: "stat failed: \(error)")
+            return .skipped
+        }
+        if bytes > config.maxBlobBytes {
+            await markSkipped(id: item.id, reason: "blob too large: \(bytes) > \(config.maxBlobBytes)")
+            return .skipped
+        }
+
+        do {
+            let r = try await recognizer.recognize(imageURL: url, languages: config.languages)
+            await markDone(id: item.id, text: r.text)
+            attemptCounts.removeValue(forKey: item.id)
+            return .done
+        } catch let e as OCRRecognizeError {
+            switch e {
+            case .imageLoadFailed, .unsupportedFormat, .visionPermanent:
+                await markSkipped(id: item.id, reason: "\(e)")
+                attemptCounts.removeValue(forKey: item.id)
+                return .skipped
+            case .visionTransient:
+                let next = (attemptCounts[item.id] ?? 0) + 1
+                attemptCounts[item.id] = next
+                if next >= config.maxAttempts {
+                    await markFailed(id: item.id, reason: "max attempts (\(next)): \(e)")
+                    attemptCounts.removeValue(forKey: item.id)
+                    return .failedTerm
+                }
+                return .transient
+            }
+        } catch is CancellationError {
+            // 关 worker 时 task cancel；不动 DB 状态，下次重启再扫
+            return .transient
+        } catch {
+            // 非 typed error 当 transient：bump 内存 attempts 走同样路径
+            let next = (attemptCounts[item.id] ?? 0) + 1
+            attemptCounts[item.id] = next
+            if next >= config.maxAttempts {
+                await markFailed(id: item.id, reason: "max attempts (\(next)): \(error)")
+                attemptCounts.removeValue(forKey: item.id)
+                return .failedTerm
+            }
+            return .transient
+        }
+    }
+
+    /// SQL：`origin_device = self AND kind = 'image' AND ocr_state = 'pending'
+    /// AND blob_sha256 IS NOT NULL AND deleted_at_ns IS NULL` 按 captured_at_ns ASC
+    /// 取 batchSize 条。ASC 让 backfill 老历史按时间顺序清，新捕获走 wake 进 batch
+    /// 顺序无所谓
+    private func fetchPending() throws -> [Item] {
+        let limit = config.batchSize
+        let device = originDevice
+        return try database.pool.read { db in
+            try Item
+                .filter(Column("origin_device") == device)
+                .filter(Column("kind") == ItemKind.image.rawValue)
+                .filter(Column("ocr_state") == OCRState.pending.rawValue)
+                .filter(Column("blob_sha256") != nil)
+                .filter(Column("deleted_at_ns") == nil)
+                .order(Column("captured_at_ns").asc)
+                .limit(limit)
+                .fetchAll(db)
+        }
+    }
+
+    /// 写回成功 OCR 结果。**关键**：
+    /// - bump `ingested_at_ns` 让 audit-push / 未来同步看到更新（plan §不变量 #2）
+    /// - text 空字符串 → nil（plan §不变量 #3）
+    /// - 不动 preview / captured_at_ns / push_state（OCR 不是新 capture，也不影响推送）
+    private func markDone(id: String, text: String) async {
+        let normalized: String? = text.isEmpty ? nil : text
+        let now = Clock.nowNs()
+        do {
+            try await database.pool.write { db in
+                let stamp = try DuoPasteCore.Database.nextIngestNs(db, now: now)
+                try db.execute(sql: """
+                    UPDATE item
+                    SET text_full = ?,
+                        ocr_state = 'done',
+                        ingested_at_ns = ?
+                    WHERE id = ?
+                """, arguments: [normalized, stamp, id])
+            }
+        } catch {
+            log("markDone failed for \(id): \(error)")
+        }
+    }
+
+    /// 标 skipped。**不** bump ingested_at_ns —— skipped 是终态，没必要让下游再拉一遍
+    /// 把"图里没字"这件事广播出去（item 行实质内容未变）。复用 `last_push_error` 列
+    /// 放原因字符串（plan §决策：当前不为 OCR 单独加列，列名稍微 misleading 但够用）
+    private func markSkipped(id: String, reason: String) async {
+        do {
+            try await database.pool.write { db in
+                try db.execute(sql: """
+                    UPDATE item
+                    SET ocr_state = 'skipped',
+                        last_push_error = ?
+                    WHERE id = ?
+                """, arguments: [reason, id])
+            }
+        } catch {
+            log("markSkipped failed for \(id): \(error)")
+        }
+    }
+
+    /// 标 failed。同 skipped 不 bump ingested_at_ns；用户 retry-failed-ocr 翻回
+    /// pending 时再让 worker 处理
+    private func markFailed(id: String, reason: String) async {
+        do {
+            try await database.pool.write { db in
+                try db.execute(sql: """
+                    UPDATE item
+                    SET ocr_state = 'failed',
+                        last_push_error = ?
+                    WHERE id = ?
+                """, arguments: [reason, id])
+            }
+        } catch {
+            log("markFailed failed for \(id): \(error)")
+        }
+    }
+}

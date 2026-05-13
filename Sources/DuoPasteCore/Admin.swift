@@ -506,4 +506,56 @@ public enum Admin {
             return conn.changesCount
         }
     }
+
+    /// OCR 重试范围。`all` 把所有 own-origin 的 image 行里 `ocr_state IN ('failed', 'skipped')`
+    /// 全部翻回 pending；`id(_)` 是单条手动 override（无视当前 state 黑名单——用户显式指定就
+    /// 信任）
+    public enum OCRRetryScope: Sendable, Equatable {
+        case all
+        case id(String)
+    }
+
+    /// 把 OCR `failed` / `skipped` 行重置回 pending 让 OCRWorker 重新扫。
+    ///
+    /// - `scope=.all`：仅本机 own-origin 的 image kind 且 ocr_state 落 failed/skipped。
+    ///   排除：tombstone（deleted_at_ns != nil）/ 非 image / 非 own-origin（别人家的行
+    ///   由对端 worker 负责）/ 已 pending（无需翻）/ done（用户没显式指定别动它）。
+    /// - `scope=.id(_)`：只看 id + kind=image。无视 origin / state——用户敲了 id 就是
+    ///   手动 override，包括把 done 翻成 pending 重 OCR 的场景
+    ///
+    /// 同步把 `last_push_error` 清空（OCR 失败原因复用此列，重 OCR 前清掉避免污染）。
+    /// **不** bump ingested_at_ns——重置本身不改 item 内容；worker 真跑 OCR 写
+    /// text_full 时再 bump。
+    ///
+    /// - Returns: 受影响的行数
+    public static func retryFailedOCR(
+        dbPath: URL,
+        selfDeviceID: String,
+        scope: OCRRetryScope
+    ) throws -> Int {
+        let db = try Database(path: dbPath, role: .client)
+        return try db.pool.write { conn -> Int in
+            switch scope {
+            case .all:
+                try conn.execute(sql: """
+                    UPDATE item
+                    SET ocr_state = 'pending',
+                        last_push_error = NULL
+                    WHERE origin_device = ?
+                      AND kind = 'image'
+                      AND ocr_state IN ('failed', 'skipped')
+                      AND deleted_at_ns IS NULL
+                """, arguments: [selfDeviceID])
+            case .id(let id):
+                try conn.execute(sql: """
+                    UPDATE item
+                    SET ocr_state = 'pending',
+                        last_push_error = NULL
+                    WHERE id = ?
+                      AND kind = 'image'
+                """, arguments: [id])
+            }
+            return conn.changesCount
+        }
+    }
 }
