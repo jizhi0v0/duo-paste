@@ -736,10 +736,46 @@ private struct ItemRow: View {
     /// 注意返回类型 `Text`（不能用 @ViewBuilder 的 _ConditionalContent，要支持
     /// `.lineLimit(2)` 这类只对 Text 生效的修饰）
     private var previewText: Text {
+        // file 行 text_full 存完整路径；FTS snippet 也是路径片段——
+        // 同目录下多条结果路径段相同，用户无法区分。
+        // 始终显示完整文件名，并尝试把 snippet 里的高亮词匹配到文件名内加粗。
+        if item.kind == .file {
+            let raw = item.textFull ?? item.preview ?? ""
+            let names = raw.split(separator: "\n", omittingEmptySubsequences: true)
+                .map { URL(fileURLWithPath: String($0)).lastPathComponent }
+                .filter { !$0.isEmpty }
+            if let first = names.first {
+                let head = highlightedFileName(first, from: snippet)
+                if names.count == 1 { return head }
+                return head + Text(" +\(names.count - 1)").foregroundStyle(.secondary)
+            }
+        }
         if let s = snippet, !s.isEmpty {
             return highlightedText(from: s)
         }
         return Text(item.preview ?? "")
+    }
+
+    /// 完整文件名显示，若搜索词恰好命中文件名则加粗，否则返回纯文本。
+    /// 高亮词从 snippet 的 STX/ETX 标记里提取，取最长的那个避免短子串抢先。
+    private func highlightedFileName(_ name: String, from snippet: String?) -> Text {
+        var terms: [String] = []
+        var rest = (snippet ?? "")[...]
+        while let s = rest.range(of: "\u{02}") {
+            let after = rest[s.upperBound...]
+            if let e = after.range(of: "\u{03}") {
+                terms.append(String(after[..<e.lowerBound]))
+                rest = after[e.upperBound...]
+            } else { break }
+        }
+        guard let term = terms.max(by: { $0.count < $1.count }),
+              !term.isEmpty,
+              let range = name.range(of: term, options: .caseInsensitive) else {
+            return Text(name)
+        }
+        return Text(String(name[..<range.lowerBound]))
+            + Text(String(name[range])).bold()
+            + Text(String(name[range.upperBound...]))
     }
 
     private func highlightedText(from snippet: String) -> Text {
