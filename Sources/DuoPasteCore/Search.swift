@@ -388,7 +388,9 @@ public struct SearchAPI: Sendable {
     }
 
     /// Union 版本：`item ∪ item_mirror` 按 id 去重后再 GROUP BY kind。
-    /// 同 id 跨表 kind 一致（id 跟 capture 事件 1:1），UNION (id, kind) 不会双算。
+    /// 同 id 跨表 (kind, pinned) 可能在 promote 过渡期 / 异常状态分歧——必须按
+    /// `captured_at_ns DESC` 选 winner 行，跟 fetchUnion 的 dedup 不变量对齐，否则
+    /// chip "图片 1" 但点 image 后看不到那行（数字跟列表口径分裂）。
     public func countByKindUnion(_ q: SearchQuery) throws -> [ItemKind: Int] {
         let stripped = Self.stripKinds(q)
         return try database.pool.read { db in
@@ -415,30 +417,47 @@ public struct SearchAPI: Sendable {
     }
 
     static func countByKindUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
-        // pinnedOnly 走 fetchUnion 路径——跟 countUnionStatic 同源不变量
-        // （pinned 状态可能在 own 跟 mirror 行上分歧，必须 dedup 后取最新行的 pinned 再过滤）。
-        if q.pinnedOnly {
-            let items = try fetchUnion(db, query: SearchQuery(
-                text: q.text,
-                fromNs: q.fromNs, toNs: q.toNs,
-                kinds: [], pinnedOnly: true,
-                includeDeleted: q.includeDeleted,
-                limit: Int.max, offset: 0
-            ))
-            var out: [ItemKind: Int] = [:]
-            for (it, _) in items {
-                out[it.kind, default: 0] += 1
-            }
-            return out
-        }
-        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
-        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
+        // pinnedOnly 必须在跨表 dedup **之后**应用（跟 fetchUnion 顶头注释同源不变量）：
+        // own 上 pinned=false 新行 + mirror 上 pinned=true 旧行，子查询带 pinned=1 过滤会
+        // 让 mirror 旧行胜出，count 把已 unpin 的内容算进 pinned 桶。正确做法：子查询
+        // **不**带 pinned 过滤拿全候选，按 captured_at_ns DESC 选 winner，再用 winner 的
+        // pinned 字段过滤。
+        let stripped = SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs, toNs: q.toNs,
+            kinds: [],
+            pinnedOnly: false,   // 子查询不带 pinned 过滤；winner 选完后再 filter
+            includeDeleted: q.includeDeleted,
+            limit: 0, offset: 0
+        )
+        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: stripped)
+        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: stripped)
+        // ROW_NUMBER() OVER (PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC) = 1 选 winner。
+        // SQLite ≥ 3.25 (2018) 起支持 window function；macOS 14 系统 SQLite 已是 3.43+。
+        // UNION ALL 而非 UNION——窗口函数在外层做 dedup，内层不需要去重也跳过排序。
+        //
+        // tiebreak `_src`：own=0 / mirror=1，captured_at_ns 相等时 own 先赢。跟 fetchUnion
+        // Swift 端 `for hit in own + mirror` + 严格大于 (`>`) 才覆盖的不变量对齐——避免 SQL
+        // / Swift 两条路径在边界 case 上口径分裂。
+        let pinnedFilter = q.pinnedOnly ? " AND pinned = 1" : ""
         let sql = """
             SELECT kind, COUNT(*) AS cnt FROM (
-              SELECT item.id AS id, item.kind AS kind FROM item \(own.join) \(own.whereClause)
-              UNION
-              SELECT item_mirror.id AS id, item_mirror.kind AS kind FROM item_mirror \(mir.join) \(mir.whereClause)
-            ) GROUP BY kind
+              SELECT id, kind, pinned, ROW_NUMBER() OVER (
+                  PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC
+              ) AS _rn
+              FROM (
+                SELECT item.id AS id, item.kind AS kind, item.pinned AS pinned,
+                       item.captured_at_ns AS captured_at_ns, 0 AS _src
+                FROM item \(own.join) \(own.whereClause)
+                UNION ALL
+                SELECT item_mirror.id AS id, item_mirror.kind AS kind,
+                       item_mirror.pinned AS pinned,
+                       item_mirror.captured_at_ns AS captured_at_ns, 1 AS _src
+                FROM item_mirror \(mir.join) \(mir.whereClause)
+              )
+            )
+            WHERE _rn = 1\(pinnedFilter)
+            GROUP BY kind
         """
         var args: [DatabaseValueConvertible] = []
         args.append(contentsOf: own.args)

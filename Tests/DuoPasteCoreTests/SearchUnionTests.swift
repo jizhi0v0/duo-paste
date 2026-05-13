@@ -247,12 +247,62 @@ private func insertOwn(
 }
 
 @Test func countByKindUnionDedupesCrossTableSameID() throws {
-    // 同 id 跨表（promote 过渡期）算一份。kind 一致 → UNION 去重生效。
+    // 同 id 跨表（promote 过渡期）算一份。dedupe 走 ROW_NUMBER OVER captured_at_ns DESC，
+    // 取 winner 行的 kind——kind 一致时这条 case 跟 winner kind 不同 case 收敛到同一结果。
     let db = try makeDB()
     try insertOwn(db, id: "dup", capturedAtNs: 200, kind: .image)
     try insertMirror(db, id: "dup", origin: "primary", capturedAtNs: 100, kind: .image)
     let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery())
     #expect(counts[.image] == 1)
+}
+
+@Test func countByKindUnionDedupesCrossTableKindDivergence() throws {
+    // 边界：同 id 跨表 kind 不一致（极少见但可能——schema 演进 / 异常状态）。
+    // 必须按 captured_at_ns DESC 选 winner 行的 kind，跟 fetchUnion 的 dedup 不变量对齐——
+    // 否则 chip 显示 "image 1" 但用户点 image 后看不到该行（winner 那份其实是 text）。
+    let db = try makeDB()
+    try insertOwn(db, id: "dup", capturedAtNs: 200, kind: .text, text: "winner")
+    try insertMirror(db, id: "dup", origin: "primary", capturedAtNs: 100, kind: .image)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery())
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == nil)  // 落选的 mirror 行不进桶
+}
+
+@Test func countByKindUnionTieBreaksOwnOverMirror() throws {
+    // 边界：同 id 跨表 captured_at_ns 完全相等（极少见但理论上可能：手动 replay INSERT
+    // 或时钟跳变）。ROW_NUMBER 单看 captured_at_ns 不确定 winner——加 _src tiebreak
+    // own=0 / mirror=1 让 own 赢，跟 fetchUnion Swift 端"先 own 后 mirror + 严格大于
+    // 才覆盖"的不变量一致，避免 SQL / Swift 路径在边界 case 上分裂。
+    let db = try makeDB()
+    try insertOwn(db, id: "tie", capturedAtNs: 500, kind: .text, text: "own wins")
+    try insertMirror(db, id: "tie", origin: "primary", capturedAtNs: 500, kind: .image)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery())
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == nil)
+}
+
+@Test func countByKindUnionPinnedOnlyResolvesByWinnerNotByStaleMirrorRow() throws {
+    // 关键不变量：pinnedOnly 必须在跨表 dedupe **之后**按 winner 行的 pinned 字段过滤。
+    // 模拟：own 上 pin 取消（pinned=false 新行），mirror 上仍 pinned=true（旧行还没同步）。
+    // winner = own 那份 pinned=false → pinnedOnly=true 时该 id 不进 pinned 桶。
+    // 同时再来一行 own pinned=true 当对照，确保 pinned 桶不空。
+    let db = try makeDB()
+    try insertOwn(db, id: "x", capturedAtNs: 1000, kind: .text, text: "unpinned now", pinned: false)
+    try insertMirror(db, id: "x", origin: "primary", capturedAtNs: 100, kind: .text, text: "stale pin", pinned: true)
+    try insertOwn(db, id: "really-pinned", capturedAtNs: 500, kind: .image, pinned: true)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery(pinnedOnly: true))
+    #expect(counts[.text] == nil)  // x 的 winner 是 unpinned，不算
+    #expect(counts[.image] == 1)
+}
+
+@Test func countByKindUnionPinnedOnlyCountsWinnerPinned() throws {
+    // 对称 case：own pinned=false 旧行 + mirror pinned=true 新行 → winner 是 mirror（capturedAtNs 大）
+    // → pinned 桶应该算上这一份
+    let db = try makeDB()
+    try insertOwn(db, id: "y", capturedAtNs: 100, kind: .url, text: "old unpinned", pinned: false)
+    try insertMirror(db, id: "y", origin: "primary", capturedAtNs: 1000, kind: .url, text: "new pinned", pinned: true)
+    let counts = try SearchAPI(database: db).countByKindUnion(SearchQuery(pinnedOnly: true))
+    #expect(counts[.url] == 1)
 }
 
 @Test func countByKindFallsBackToItemOnlyForStandalone() throws {
