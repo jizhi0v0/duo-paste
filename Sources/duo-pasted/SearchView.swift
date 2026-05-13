@@ -156,10 +156,13 @@ struct SearchView: View {
     private var filterBar: some View {
         HStack(spacing: 6) {
             ForEach(filterChipKinds, id: \.self) { kind in
+                // 契约：空 dict（remoteOK / 出错）→ nil 隐藏数字；非空 dict（local /
+                // unionLocal 路径）→ 缺 key 默认 0 显示 "图片 0"。这样 KindChip 头注释
+                // 的 "0 也显示" 才真生效，否则缺 key 时跟 "远端未知" 撞同一种 nil 渲染。
                 KindChip(
                     kind: kind,
                     isSelected: state.selectedKinds.contains(kind),
-                    count: state.kindCounts[kind],
+                    count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
                     onTap: { toggleKind(kind) }
                 )
             }
@@ -493,7 +496,9 @@ struct SearchView: View {
 /// 单击 toggle 选中状态。视觉跟 timeRangeMenu 的 capsule 保持一致——padding / radius 同步
 ///
 /// `count` 非 nil 时尾巴挂活计数 "图片 19"——让用户立刻看出哪个类稀疏。
-/// 0 也显示（"图片 0"），避免用户误以为 filter 失效；nil = 远端模式拿不到时隐藏
+/// 0 也显示（"图片 0"），避免用户误以为 filter 失效；nil = 远端模式拿不到时隐藏。
+/// nil/0 的区分发生在 caller：空 kindCounts dict（remoteOK / 出错）→ nil；非空 dict
+/// （本地有命中）→ 缺 key 默认 0。
 private struct KindChip: View {
     let kind: ItemKind
     let isSelected: Bool
