@@ -34,12 +34,12 @@
     - **Eager (`pull.eager_blobs=true`)**：PullWorker `applyPage` 同事务收集本页 image/file + deleted_at_ns IS NULL 的 sha 集合；tick 完 cursor 已 commit 后 best-effort 循环 GET missing blobs → `putVerified`。失败 only log，**不阻塞 cursor 推进**——下次 tick 同 sha 自然重试。已存在的 sha 直接 short-circuit 走 BlobStore.exists 不发请求
     - **新协议 `BlobFetcher`**：`HTTPIngestClient.getBlob` 实现 GET /blob + HMAC + 200 时本地重算 sha 校验防字节篡改。返回 `.found(Data)` / `.notFound`；4xx 非 404 / 5xx / sha mismatch 走 `GetBlobError`（rejected / transient / shaMismatch）。新增 `BlobStore.putVerified` 防御接口先校验 expected sha 再落盘
     - **UI 入口契约改动**：`SearchPanelController.installKeyMonitor` 的 Enter case 不再立刻 `self.hide()`——把 "何时 hide" 交给 onPaste 回调实现。AppDelegate.pasteBack 在同步路径完成后 `panel.hide()`、慢路径（image + missing）由 currentPasteTask 完成时再 hide。不变量：panel 持有引用 = 控制权
-- M3 全部完成；下一站 M4
+- M3 全部完成；URL 文本启发分类 + image OCR state schema 预埋已落地（PR#17，hazy-hatching-bentley.md）；下一站 OCR worker
 - **RTF 三层降级 完成**（PR#3 + PR#5 合作）：watcher 抓 RTF 时优先 (a) pasteboard 自带非空 .string → 直接用；(b) raw RTF 字节 ≤ `maxTextBytes` cap → `decodeRTFToPlain` 用 NSAttributedString 解出 plain；(c) 失败/全空白/raw 太大 → 兜底存 raw rtf 让 CaptureService 字节守门拦下。`PasteboardWatcher.maxRawRTFBytes` 由 AppDelegate 注入 `deps.config.capture.maxTextBytes`，避免 50MB RTF 在 @MainActor 轮询路径上同步分配巨型 NSAttributedString
 - **搜索 prefix boost 完成**（PR#6）：搜索排序契约 `(pinned DESC, prefix DESC, captured_at_ns DESC)`。`preview` 起始命中 = 2 分 / `text_full` 起始命中 = 1 分 / 否则 0。**24h 时间窗**：只对 24h 内的项生效，跨天老内容哪怕起头匹配也按时间倒序排——剪贴板心智是"搜=找最近用过的"。SQL 端三条路径（`fetchHits` / `fetchHitsMirror` / `fetch`）+ Swift 端 `fetchUnion.prefixScore` 全部对称实现，回归测试见 `SearchPrefixBoostTests.swift`
 - **测试**：236 个测试（含 BlobStoreTests 4 + BlobLazyPullTests 10）。BlobLazyPullTests 覆盖 `eager_blobs` 拉 missing + off skip / 已有字节短路 / tombstone 跳过 / own-origin 跳过 / fetcher 失败不回滚 mirror / notFound 不致命 + HTTPIngestClient.getBlob 端到端（200/404/401）。BlobStoreTests 覆盖 putVerified 接受/拒绝/已存在短路/byteOrder。PullWorker HTTP 端到端 + 部分 in-memory eager 测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），跟 `swift test --filter PullWorker` / `--filter BlobLazyPull` 单独验证
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
-- **下一站**：M4 导出（Markdown/JSON/原始 SQLite）+ UX 打磨（类型/时间筛选 / pinned UI / 快捷键自定义）。详细拆解见 plans/...moonlit-wave.md
+- **下一站**：**OCR worker (Phase 1)** —— image kind 跑 Vision OCR 把图里文字写 `text_full` 进 FTS5，让中文/英文截图能被搜到。Schema 已就位（PR#17），需要落 OCRWorker actor + Vision 集成 + Config OCR 段 + retry-failed-ocr CLI。MVP 走分布式（每台 Mac 自跑自家 `origin=self`），跨设备 OCR 结果同步留 Phase 2。详细拆解见 `plans/vivid-scanning-vellum.md`。M4 导出 / pinned UI / 快捷键自定义 / 自定义时间 picker 排在 OCR worker 之后
 
 ## 架构与 Non-Goals
 
