@@ -16,6 +16,17 @@ public enum PushState: String, Codable, Sendable {
     case failed
 }
 
+/// 图片 OCR 状态机。NULL = 非 image kind / 无需 OCR。
+/// 区分 "没扫过 vs 扫过但无文字" / "失败 vs 成功无文本"——OCR worker 调度依据。
+/// 用 String raw + Codable 让 wire 上是 plain string；老 primary 不发该字段时
+/// `Item.ocrState` decode 成 nil 兼容
+public enum OCRState: String, Codable, Sendable {
+    case pending
+    case done
+    case failed
+    case skipped
+}
+
 public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "item"
 
@@ -36,6 +47,7 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
     public var pushState: PushState
     public var pushAttempts: Int
     public var lastPushError: String?
+    public var ocrState: OCRState?
 
     public init(
         id: String,
@@ -54,7 +66,8 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         deletedAtNs: Int64? = nil,
         pushState: PushState = .pending,
         pushAttempts: Int = 0,
-        lastPushError: String? = nil
+        lastPushError: String? = nil,
+        ocrState: OCRState? = nil
     ) {
         self.id = id
         self.originDevice = originDevice
@@ -73,6 +86,7 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         self.pushState = pushState
         self.pushAttempts = pushAttempts
         self.lastPushError = lastPushError
+        self.ocrState = ocrState
     }
 
     enum CodingKeys: String, CodingKey {
@@ -93,5 +107,6 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         case pushState = "push_state"
         case pushAttempts = "push_attempts"
         case lastPushError = "last_push_error"
+        case ocrState = "ocr_state"
     }
 }

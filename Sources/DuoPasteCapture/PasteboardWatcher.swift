@@ -237,12 +237,14 @@ public final class PasteboardWatcher {
             // (a) pasteboard 自己写了 .string → 直接用
             // (b) 只写了 .rtf（Notes/Mail 部分场景）→ 本地解 RTF markup 拿 attributed.string
             // (c) 解析失败/全空白/raw 太大 → 才存 raw rtf 当兜底（CaptureService 字节守门后续拦下）
+            //
+            // (a)/(b) 拿到 plain 后走 plainTextOrURL —— 浏览器把 URL 选中文本同时塞 .rtf + .string
+            // 时不能落到 .text 兜底（chip "链接" 会漏计），跟 step 6 用同一份 looksLikeURL 判断
             if let plain = pasteboard.string(forType: .string),
                !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
-                return CapturedPasteboard(
-                    kind: .text,
-                    text: plain,
+                return Self.plainTextOrURL(
+                    plain,
                     sourceAppBundleID: bundleID,
                     sourceAppName: appName,
                     capturedAtNs: capturedAtNs
@@ -255,9 +257,8 @@ public final class PasteboardWatcher {
                let plain = Self.decodeRTFToPlain(rtf),
                !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
-                return CapturedPasteboard(
-                    kind: .text,
-                    text: plain,
+                return Self.plainTextOrURL(
+                    plain,
                     sourceAppBundleID: bundleID,
                     sourceAppName: appName,
                     capturedAtNs: capturedAtNs
@@ -283,9 +284,10 @@ public final class PasteboardWatcher {
                let plain = pasteboard.string(forType: .string),
                !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
-                return CapturedPasteboard(
-                    kind: .text,
-                    text: plain,
+                // 同 RTF 降级：浏览器/Electron 选中 URL 文本会同时写 HTML + .string，
+                // plain 落 .text 会让 chip "链接" 漏计；走同一份 looksLikeURL 判断
+                return Self.plainTextOrURL(
+                    plain,
                     sourceAppBundleID: bundleID,
                     sourceAppName: appName,
                     capturedAtNs: capturedAtNs
@@ -318,9 +320,8 @@ public final class PasteboardWatcher {
         // 不直接 .isEmpty 判断会让这些 1-字节空白条目刷进列表（preview 完全空，无信息量）。
         if let s = pasteboard.string(forType: .string),
            !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return CapturedPasteboard(
-                kind: .text,
-                text: s,
+            return Self.plainTextOrURL(
+                s,
                 sourceAppBundleID: bundleID,
                 sourceAppName: appName,
                 capturedAtNs: capturedAtNs
@@ -328,6 +329,35 @@ public final class PasteboardWatcher {
         }
 
         return nil
+    }
+
+    /// 把一段已确认非空的 plain text 包成 CapturedPasteboard。trim 后符合 `looksLikeURL`
+    /// 升 `.url`，否则保留原 `.text`。RTF/HTML 降级 + step 6 都共用，让"plain text + 看
+    /// 起来是 URL → 升 .url" 这条契约只在一处实现，避免 step 6 走过升级、降级路径漏判
+    /// 导致 chip "链接" 计数三条路径口径分裂
+    private static func plainTextOrURL(
+        _ s: String,
+        sourceAppBundleID: String?,
+        sourceAppName: String?,
+        capturedAtNs: Int64
+    ) -> CapturedPasteboard {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if looksLikeURL(trimmed) {
+            return CapturedPasteboard(
+                kind: .url,
+                text: trimmed,
+                sourceAppBundleID: sourceAppBundleID,
+                sourceAppName: sourceAppName,
+                capturedAtNs: capturedAtNs
+            )
+        }
+        return CapturedPasteboard(
+            kind: .text,
+            text: s,
+            sourceAppBundleID: sourceAppBundleID,
+            sourceAppName: sourceAppName,
+            capturedAtNs: capturedAtNs
+        )
     }
 
     /// 用 NSAttributedString 把 RTF source 解成纯文本。失败返回 nil，调用方走兜底。

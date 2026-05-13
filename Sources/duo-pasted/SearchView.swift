@@ -569,6 +569,15 @@ private struct ItemRow: View {
                     .foregroundStyle(isSelected ? Color.white : .primary)
                 HStack(spacing: 6) {
                     Text(kindLabel)
+                    // file kind 路径后缀像图片 → 显示"文件 · 图片" hint。
+                    // 弱信号 badge，不参与 chip 计数也不改 kind —— ".jpg" 文本路径不一定真是图片
+                    if item.kind == .file,
+                       let path = item.textFull,
+                       fileLooksLikeImage(path: path)
+                    {
+                        Text("·")
+                        Text("图片")
+                    }
                     Text("·")
                     // TimelineView 周期重绘，否则 row 稳定后 Date() 不会被重算，
                     // 相对时间永远停在初次渲染的瞬间。

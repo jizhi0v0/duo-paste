@@ -198,8 +198,13 @@ public enum Admin {
                 sql: "SELECT primary_id FROM pull_cursor LIMIT 1"
             )
 
-            // b. item_mirror → item。SELECT 显式列出 14 mirror 字段 + 3 个 push 字段常量值，
-            //    顺序对齐 item 表 schema。push_state 'acked' 见 doc。
+            // b. item_mirror → item。SELECT 显式列出 mirror 字段 + 3 个 push 字段常量值
+            //    + ocr_state，顺序对齐 item 表 schema。push_state 'acked' 见 doc。
+            //    ocr_state 直接搬过来——mirror 行里若 primary 已 OCR done，搬到 item 后
+            //    不需要重 OCR；若 mirror 行 ocr_state IS NULL（v6 之前老 primary 不发该字段），
+            //    搬过来仍是 NULL，新 primary 上的 OCR worker 该认 NULL = "没扫过"。
+            //    （未来 worker 启动时可一次性把所有 kind=image AND ocr_state IS NULL 的
+            //    own-origin 行回填为 pending；schema 不需要再变）
             try conn.execute(sql: """
                 INSERT OR IGNORE INTO item (
                     id, origin_device, captured_at_ns, ingested_at_ns,
@@ -207,7 +212,8 @@ public enum Admin {
                     preview, text_full,
                     blob_sha256, blob_size, blob_mime,
                     pinned, deleted_at_ns,
-                    push_state, push_attempts, last_push_error
+                    push_state, push_attempts, last_push_error,
+                    ocr_state
                 )
                 SELECT
                     id, origin_device, captured_at_ns, ingested_at_ns,
@@ -215,7 +221,8 @@ public enum Admin {
                     preview, text_full,
                     blob_sha256, blob_size, blob_mime,
                     pinned, deleted_at_ns,
-                    'acked', 0, NULL
+                    'acked', 0, NULL,
+                    ocr_state
                 FROM item_mirror
             """)
             let promotedRows = conn.changesCount

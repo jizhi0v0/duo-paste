@@ -38,7 +38,8 @@ public struct IngestRequest: Codable, Sendable {
     }
 
     /// 提升为 Item，由 primary 补齐 `ingested_at_ns` 和把 `push_state` 钉成 acked
-    /// （primary 是源头，不再往外推）。
+    /// （primary 是源头，不再往外推）。image kind 默认 ocr_state=pending —— OCR worker
+    /// 只跑 primary 一次，结果通过 mirror 同步给所有 client，避免每台机重复算
     public func toItem(ingestedAtNs: Int64) -> Item {
         Item(
             id: id,
@@ -57,7 +58,8 @@ public struct IngestRequest: Codable, Sendable {
             deletedAtNs: deletedAtNs,
             pushState: .acked,
             pushAttempts: 0,
-            lastPushError: nil
+            lastPushError: nil,
+            ocrState: kind == .image ? .pending : nil
         )
     }
 

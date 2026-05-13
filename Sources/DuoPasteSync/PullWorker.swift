@@ -387,8 +387,8 @@ public actor PullWorker {
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                        source_app, source_app_name, preview, text_full,
                        blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-                       mirrored_at_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       mirrored_at_ns, ocr_state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, arguments: [
                     item.id,
                     item.originDevice,
@@ -405,6 +405,7 @@ public actor PullWorker {
                     item.pinned ? 1 : 0,
                     item.deletedAtNs,
                     now,
+                    item.ocrState?.rawValue,
                 ])
                 written += 1
                 // 收集本页 blob 需求集合（eager 阶段后处理）。kind=image/file 才有意义；
