@@ -276,6 +276,9 @@ public actor OCRWorker {
     /// - bump `ingested_at_ns` 让 audit-push / 未来同步看到更新（plan §不变量 #2）
     /// - text 空字符串 → nil（plan §不变量 #3）
     /// - 不动 preview / captured_at_ns / push_state（OCR 不是新 capture，也不影响推送）
+    /// - `AND deleted_at_ns IS NULL` 守护：fetchPending → processOne 之间用户可能软删
+    ///   该 item。把 OCR 结果写进 tombstone 不破坏 search（已 exclude），但会通过 /since
+    ///   把"软删 image 又被 OCR 了"无谓下发给 mirror clients
     private func markDone(id: String, text: String) async {
         let normalized: String? = text.isEmpty ? nil : text
         let now = Clock.nowNs()
@@ -288,6 +291,7 @@ public actor OCRWorker {
                         ocr_state = 'done',
                         ingested_at_ns = ?
                     WHERE id = ?
+                      AND deleted_at_ns IS NULL
                 """, arguments: [normalized, stamp, id])
             }
         } catch {

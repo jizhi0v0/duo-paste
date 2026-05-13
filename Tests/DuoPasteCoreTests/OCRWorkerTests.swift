@@ -352,6 +352,47 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(after?.textFull == "woke")
 }
 
+/// 在 recognize() 内部触发软删的 recognizer，用来精准模拟 markDone 时 row 已是 tombstone。
+/// fetchPending 已经排除了 deleted_at_ns IS NOT NULL 的行，所以普通 race 无法触发；
+/// 这里跨 fetchPending 后、markDone 前的窗口
+private struct SoftDeleteOnRecognize: OCRRecognizer {
+    let id: String
+    let db: DuoPasteCore.Database
+    let result: OCRResult
+
+    func recognize(imageURL: URL, languages: [String]) async throws -> OCRResult {
+        let rowID = id
+        try await db.pool.write { conn in
+            try conn.execute(sql: "UPDATE item SET deleted_at_ns = ? WHERE id = ?",
+                             arguments: [999, rowID])
+        }
+        return result
+    }
+}
+
+@Test func ocrWorkerMarkDoneGuardsAgainstTombstoneRace() async throws {
+    // 不变量：fetchPending → processOne 之间用户软删该行，markDone 的
+    // `AND deleted_at_ns IS NULL` 守护必须过滤掉它，不把 OCR 结果写进 tombstone
+    let env = try makeEnv()
+    let sha = try seedBlob(env)
+    try seedItem(env, id: "tombstone-race", originDevice: env.deviceID, blobSha: sha)
+    let recognizer = SoftDeleteOnRecognize(
+        id: "tombstone-race", db: env.db,
+        result: OCRResult(text: "should not land")
+    )
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig()
+    )
+    _ = await w.tick()
+    let after = try fetchItem(env, id: "tombstone-race")
+    // 已被软删
+    #expect(after?.deletedAtNs == 999)
+    // markDone 的 guard 让 UPDATE 命中 0 行 —— text_full 没被写入
+    #expect(after?.textFull == nil)
+}
+
 @Test func ocrWorkerMarkSkippedDoesNotClobberPushFailedLastError() async throws {
     // 不变量：last_push_error 列被 push / OCR 共享，OCR mark skipped/failed 时不该
     // 盖掉 push 真实失败的 last_push_error

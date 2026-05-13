@@ -452,16 +452,24 @@ enum CLI {
     }
 
     private static func runRetryFailedOCR(args: [String]) {
-        var scope: Admin.OCRRetryScope = .all
+        // --all / --id 互斥：用户拼错或 shell history 拼接时极易踩。track 两者出现的次数，
+        // 解析完一起判断比"last wins"明确得多
+        var sawAll = false
+        var explicitID: String? = nil
         var i = 0
         while i < args.count {
             switch args[i] {
             case "--all":
-                scope = .all
+                sawAll = true
                 i += 1
             case "--id":
                 if i + 1 < args.count {
-                    scope = .id(args[i + 1])
+                    let v = args[i + 1]
+                    if v.isEmpty {
+                        FileHandle.standardError.write(Data("retry-failed-ocr: --id 值不能为空\n".utf8))
+                        exit(1)
+                    }
+                    explicitID = v
                     i += 2
                 } else {
                     FileHandle.standardError.write(Data("retry-failed-ocr: --id 缺值\n".utf8))
@@ -471,6 +479,15 @@ enum CLI {
                 FileHandle.standardError.write(Data("retry-failed-ocr: 未知参数 \(args[i])\n".utf8))
                 exit(1)
             }
+        }
+        let scope: Admin.OCRRetryScope
+        if sawAll && explicitID != nil {
+            FileHandle.standardError.write(Data("retry-failed-ocr: --all 和 --id 互斥\n".utf8))
+            exit(1)
+        } else if let id = explicitID {
+            scope = .id(id)
+        } else {
+            scope = .all   // 无参 = --all
         }
         let paths = Paths.makeDefault()
         paths.ensureExists()
