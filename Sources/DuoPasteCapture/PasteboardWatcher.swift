@@ -318,6 +318,20 @@ public final class PasteboardWatcher {
         // 不直接 .isEmpty 判断会让这些 1-字节空白条目刷进列表（preview 完全空，无信息量）。
         if let s = pasteboard.string(forType: .string),
            !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // URL 文本升级：浏览器选中地址栏 URL Cmd+C 时只写 .string 不写 NSURL，
+            // 上面第 5 步 readObjects([NSURL.self]) 抓不到。trim 后符合
+            // looksLikeURL（严格 http(s):// + 单行 + 无空格）则视为 .url 入库——
+            // 让 "链接" chip 计数准确，搜索体验里 URL 跟其他文本能分开
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if looksLikeURL(trimmed) {
+                return CapturedPasteboard(
+                    kind: .url,
+                    text: trimmed,
+                    sourceAppBundleID: bundleID,
+                    sourceAppName: appName,
+                    capturedAtNs: capturedAtNs
+                )
+            }
             return CapturedPasteboard(
                 kind: .text,
                 text: s,

@@ -339,6 +339,7 @@ public struct SyncServer: Sendable {
         if let v = item.blobSize       { d["blob_size"] = v }
         if let v = item.blobMime       { d["blob_mime"] = v }
         if let v = item.deletedAtNs    { d["deleted_at_ns"] = v }
+        if let v = item.ocrState       { d["ocr_state"] = v.rawValue }
         return d
     }
 

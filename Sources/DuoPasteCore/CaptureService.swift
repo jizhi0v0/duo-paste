@@ -175,6 +175,12 @@ public actor CaptureService {
             let ingestNs: Int64? = role == .primary
                 ? try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 : nil
+            // image kind 入库即标 ocr_state=pending，让未来 OCR worker 扫到。
+            // file kind 也是 blob 但不走 OCR（文件路径是字符串，BlobStore 里没字节）。
+            // client 模式下也写 pending —— push 给 primary 时 ocr_state 不上 wire，
+            // primary 收到后 IngestRequest.toItem 会重新按 kind 设 pending。本机这一列
+            // 在 promote-to-primary 时会被本地 OCR worker 接管
+            let ocrState: OCRState? = c.kind == .image ? .pending : nil
             let item = Item(
                 id: UUIDv7.generateString(),
                 originDevice: deviceID,
@@ -188,7 +194,8 @@ public actor CaptureService {
                 blobSha256: info.sha256,
                 blobSize: info.size,
                 blobMime: c.blobMime,
-                pushState: role == .primary ? .acked : .pending
+                pushState: role == .primary ? .acked : .pending,
+                ocrState: ocrState
             )
             try item.insert(db)
             return CaptureResult(outcome: .inserted, item: item)

@@ -236,6 +236,68 @@ public struct Database: Sendable {
             """)
         }
 
+        // v6: 两件事一起做——
+        //
+        // 1. 加 `ocr_state TEXT NULL` 到 item / item_mirror。是给后续 OCR worker 留的状态位。
+        //    取值：'pending' | 'done' | 'failed' | 'skipped'，NULL = 非 image kind / 无需 OCR。
+        //    必须有这一列，否则 worker 区分不出"没扫过"vs"扫过但图里没字"——前者要扫，后者
+        //    跳过；区分不出"失败"vs"成功无文本"——前者要重试，后者终态。
+        //
+        //    OCR 文本本身复用现有 `text_full`（FTS5 已索引 + UPDATE trigger 已挂），
+        //    不需要新列也不需要新 FTS 表。worker 在未来某个 PR 加，本 migration 只埋 schema。
+        //
+        //    backfill：已有 image 行全部标 'pending'，让 worker 上线后慢慢扫历史。
+        //
+        // 2. URL 文本误分类回填。浏览器 Cmd+C URL 文本只写 .string 不写 NSURL 对象，
+        //    PasteboardWatcher 第 5 步抓不到 → 落第 6 步 → kind=text。本期同时修了 capture
+        //    路径让新数据直接 kind=url；这里把历史 text 行里"trimmed 是 http(s):// 起头
+        //    单行"的也改成 url。GLOB 比 LIKE 高效（无 ESCAPE），换行检测排除 raw RTF /
+        //    multi-line markdown 误判。
+        //
+        //    **不 bump `ingested_at_ns`**：本机改 own-origin 行的分类是"修正"不是"新数据"，
+        //    其它 client 拉到自己的新数据时 capture 已经正确分类；老数据分类差异只在本机
+        //    chip 计数上有体感，不需要全网同步。
+        //
+        //    **不需要重 rebuild FTS**：FTS5 trigger 挂在所有列上，但 `kind` 不在 FTS 索引列里，
+        //    所以 trigger 触发会重新 index 一次（无害）；search 走 `kind IN (?)` 直接读 item
+        //    表的 kind 列，立即生效。
+        m.registerMigration("v6_url_and_ocr_state") { db in
+            try db.execute(sql: "ALTER TABLE item ADD COLUMN ocr_state TEXT;")
+            try db.execute(sql: "ALTER TABLE item_mirror ADD COLUMN ocr_state TEXT;")
+
+            try db.execute(sql: """
+                UPDATE item
+                SET ocr_state = 'pending'
+                WHERE kind = 'image' AND ocr_state IS NULL;
+            """)
+            try db.execute(sql: """
+                UPDATE item_mirror
+                SET ocr_state = 'pending'
+                WHERE kind = 'image' AND ocr_state IS NULL;
+            """)
+
+            try db.execute(sql: """
+                UPDATE item
+                SET kind = 'url'
+                WHERE kind = 'text'
+                  AND text_full IS NOT NULL
+                  AND (text_full GLOB 'http://?*' OR text_full GLOB 'https://?*')
+                  AND text_full NOT LIKE '%' || char(10) || '%'
+                  AND text_full NOT LIKE '%' || char(13) || '%'
+                  AND text_full NOT LIKE '% %';
+            """)
+            try db.execute(sql: """
+                UPDATE item_mirror
+                SET kind = 'url'
+                WHERE kind = 'text'
+                  AND text_full IS NOT NULL
+                  AND (text_full GLOB 'http://?*' OR text_full GLOB 'https://?*')
+                  AND text_full NOT LIKE '%' || char(10) || '%'
+                  AND text_full NOT LIKE '%' || char(13) || '%'
+                  AND text_full NOT LIKE '% %';
+            """)
+        }
+
         return m
     }
 
