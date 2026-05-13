@@ -377,6 +377,106 @@ public struct SearchAPI: Sendable {
         return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
     }
 
+    /// 当前 (query / timeRange / pinnedOnly) 维度下，按 kind 分桶的命中数。
+    /// **忽略**输入 `q.kinds`——chip count 显示的是"如果我只点这个 kind 会得到多少"，
+    /// 跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法判断稀疏类型。
+    public func countByKind(_ q: SearchQuery) throws -> [ItemKind: Int] {
+        let stripped = Self.stripKinds(q)
+        return try database.pool.read { db in
+            try Self.countByKindItem(db, query: stripped)
+        }
+    }
+
+    /// Union 版本：`item ∪ item_mirror` 按 id 去重后再 GROUP BY kind。
+    /// 同 id 跨表 (kind, pinned) 可能在 promote 过渡期 / 异常状态分歧——必须按
+    /// `captured_at_ns DESC` 选 winner 行，跟 fetchUnion 的 dedup 不变量对齐，否则
+    /// chip "图片 1" 但点 image 后看不到那行（数字跟列表口径分裂）。
+    public func countByKindUnion(_ q: SearchQuery) throws -> [ItemKind: Int] {
+        let stripped = Self.stripKinds(q)
+        return try database.pool.read { db in
+            try Self.countByKindUnionStatic(db, query: stripped)
+        }
+    }
+
+    private static func stripKinds(_ q: SearchQuery) -> SearchQuery {
+        SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs, toNs: q.toNs,
+            kinds: [],
+            pinnedOnly: q.pinnedOnly,
+            includeDeleted: q.includeDeleted,
+            limit: 0, offset: 0
+        )
+    }
+
+    static func countByKindItem(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
+        let (join, whereClause, args) = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
+        let sql = "SELECT item.kind AS kind, COUNT(*) AS cnt FROM item \(join) \(whereClause) GROUP BY item.kind"
+        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+        return decodeKindCountRows(rows)
+    }
+
+    static func countByKindUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
+        // pinnedOnly 必须在跨表 dedup **之后**应用（跟 fetchUnion 顶头注释同源不变量）：
+        // own 上 pinned=false 新行 + mirror 上 pinned=true 旧行，子查询带 pinned=1 过滤会
+        // 让 mirror 旧行胜出，count 把已 unpin 的内容算进 pinned 桶。正确做法：子查询
+        // **不**带 pinned 过滤拿全候选，按 captured_at_ns DESC 选 winner，再用 winner 的
+        // pinned 字段过滤。
+        let stripped = SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs, toNs: q.toNs,
+            kinds: [],
+            pinnedOnly: false,   // 子查询不带 pinned 过滤；winner 选完后再 filter
+            includeDeleted: q.includeDeleted,
+            limit: 0, offset: 0
+        )
+        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: stripped)
+        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: stripped)
+        // ROW_NUMBER() OVER (PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC) = 1 选 winner。
+        // SQLite ≥ 3.25 (2018) 起支持 window function；macOS 14 系统 SQLite 已是 3.43+。
+        // UNION ALL 而非 UNION——窗口函数在外层做 dedup，内层不需要去重也跳过排序。
+        //
+        // tiebreak `_src`：own=0 / mirror=1，captured_at_ns 相等时 own 先赢。跟 fetchUnion
+        // Swift 端 `for hit in own + mirror` + 严格大于 (`>`) 才覆盖的不变量对齐——避免 SQL
+        // / Swift 两条路径在边界 case 上口径分裂。
+        let pinnedFilter = q.pinnedOnly ? " AND pinned = 1" : ""
+        let sql = """
+            SELECT kind, COUNT(*) AS cnt FROM (
+              SELECT id, kind, pinned, ROW_NUMBER() OVER (
+                  PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC
+              ) AS _rn
+              FROM (
+                SELECT item.id AS id, item.kind AS kind, item.pinned AS pinned,
+                       item.captured_at_ns AS captured_at_ns, 0 AS _src
+                FROM item \(own.join) \(own.whereClause)
+                UNION ALL
+                SELECT item_mirror.id AS id, item_mirror.kind AS kind,
+                       item_mirror.pinned AS pinned,
+                       item_mirror.captured_at_ns AS captured_at_ns, 1 AS _src
+                FROM item_mirror \(mir.join) \(mir.whereClause)
+              )
+            )
+            WHERE _rn = 1\(pinnedFilter)
+            GROUP BY kind
+        """
+        var args: [DatabaseValueConvertible] = []
+        args.append(contentsOf: own.args)
+        args.append(contentsOf: mir.args)
+        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+        return decodeKindCountRows(rows)
+    }
+
+    private static func decodeKindCountRows(_ rows: [Row]) -> [ItemKind: Int] {
+        var out: [ItemKind: Int] = [:]
+        for r in rows {
+            let raw: String? = r["kind"]
+            guard let raw, let k = ItemKind(rawValue: raw) else { continue }
+            let cnt: Int = r["cnt"] ?? 0
+            out[k] = cnt
+        }
+        return out
+    }
+
     /// 把用户输入的自由文本转成 FTS5 MATCH 表达式。
     /// 策略：按空白拆词，每个 token 转义双引号后作为前缀短语，AND 连接。
     /// 比如 `foo bar"baz` → `"foo"* AND "bar""baz"*`

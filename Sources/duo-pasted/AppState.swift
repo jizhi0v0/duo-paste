@@ -17,10 +17,13 @@ final class AppState {
     var lastError: String?
     /// 当前搜索源——决定顶部 banner 显示什么。
     var searchMode: SearchProvider.Mode = .local
-    /// 当前 query 条件下匹配的真实总数（不受 200 limit 截断）。UI counter 显示这个。
+    /// 当前 query 条件下匹配的真实总数（不受 list limit 截断）。UI counter 显示这个。
     /// - 空 query → 库（或 union 后）里全部条数
     /// - 有 query → FTS 命中总数
     var totalCount: Int = 0
+    /// 按 kind 分桶的命中数（忽略 selectedKinds 自身——chip 上的数字含义是"如果只选这个
+    /// kind 会有多少"，跟当前已勾选 chip 集合无关）。UI 端 KindChip 用来挂 "图片 (19)"。
+    var kindCounts: [ItemKind: Int] = [:]
     /// 类型筛选。空集 = 全部（不带 WHERE 过滤）；非空 = SearchQuery.kinds IN (...)
     /// chip 行 UI 多选 toggle，状态变化触发 refresh
     var selectedKinds: Set<ItemKind> = []
@@ -177,17 +180,23 @@ final class AppState {
 
     init(deps: AppDependencies) {
         self.deps = deps
-        // 同步预填本地最新 200 条，避免 panel 首次打开 SwiftUI 第一帧渲染
+        // 同步预填本地最新 listLimit 条，避免 panel 首次打开 SwiftUI 第一帧渲染
         // 时 results=[] → 看到 "0 条" 闪一下。Panel 触发 .task 后会异步 refresh
         // 一次（可能从 remote 拿更新），把这里的结果替换/扩展。
         // 用本地不走 searchProvider，绕开 remote 慢路径——0 ms 同步可拿到结果。
-        let initial = (try? deps.searchAPI.search(SearchQuery(limit: 200))) ?? []
+        let initial = (try? deps.searchAPI.search(SearchQuery(limit: Self.listLimit))) ?? []
         self.results = initial
         self.selectedID = initial.first?.id
         // 同步 init 阶段 mirror union 还没接入（searchProvider 没跑），用本机 item 计数作初值——
         // panel 打开后第一次 refresh() 会替换成正确的 union/mirror 总数。
         self.totalCount = (try? deps.searchAPI.count(SearchQuery())) ?? initial.count
+        self.kindCounts = (try? deps.searchAPI.countByKind(SearchQuery())) ?? [:]
     }
+
+    /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断，无业务语义——稀疏类型
+    /// （比如图片只有 19 条，文本却几百条）必须 limit 够大才能滚到底找到。LazyVStack 渲
+    /// 染千行不卡，SQLite 拉千行 row ~10ms 内
+    static let listLimit = 1000
 
     /// 当前应该粘贴的项：优先选中项，否则取列表首项。
     var currentItem: Item? {
@@ -212,7 +221,7 @@ final class AppState {
             fromNs: timeRange.fromNs(),
             kinds: Array(selectedKinds),
             pinnedOnly: pinnedOnly,
-            limit: 200
+            limit: Self.listLimit
         )
         do {
             let outcome = try await deps.searchProvider.search(q)
@@ -220,6 +229,7 @@ final class AppState {
             self.snippets = outcome.snippets
             self.searchMode = outcome.mode
             self.totalCount = outcome.totalCount
+            self.kindCounts = outcome.kindCounts
             // 每次 refresh 顺便快照 mirror 时钟偏移——PullWorker 在后台 30s 一次刷新，
             // SearchView banner 用这个值
             self.clockSkewMs = deps.mirrorStatus.clockSkewMs()

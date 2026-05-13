@@ -172,6 +172,46 @@ private actor CountingSearchTransport: SearchTransport {
     #expect(await transport.callsCount() == 1)
 }
 
+@Test func searchProviderRemoteOKHasEmptyKindCounts() async throws {
+    // .remoteOK 路径 hits 来自远端，本地 own/mirror 是局部子集——用本地算 kindCounts
+    // 会跟远端 hits 的 kind 分布矛盾（chip "图片 200" 但点击后 remote 重打返回 0）。
+    // 这条用例钉死契约：transient remote-OK 状态下 kindCounts 必须为空（UI 端 nil → 隐藏）。
+    let localDB = try makeDBWithItems([
+        sampleItem(text: "local text", kind: .text),
+        sampleItem(text: "local img", kind: .image),
+    ])
+    struct OKTransport: SearchTransport {
+        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
+            RemoteSearchResult(outcome: .ok([]))
+        }
+    }
+    let provider = SearchProvider(local: SearchAPI(database: localDB), remote: OKTransport())
+    let outcome = try await provider.search(SearchQuery())
+    #expect(outcome.mode == .remoteOK)
+    #expect(outcome.kindCounts.isEmpty)
+}
+
+@Test func searchProviderLocalMirrorHasUnionKindCounts() async throws {
+    // 对照：localMirror 路径必须填 kindCounts（union 算的），让 UI chip 显示数字。
+    let db = try makeDBWithItems([
+        sampleItem(id: "own-t", text: "own text", kind: .text),
+        sampleItem(id: "own-i", text: "own img", kind: .image),
+    ])
+    let provider = SearchProvider(
+        local: SearchAPI(database: db),
+        remote: nil,
+        mirrorLastPullNs: { 1_000_000_000 },
+        nowNs: { 1_000_000_000 }
+    )
+    let outcome = try await provider.search(SearchQuery())
+    if case .localMirror = outcome.mode {
+        #expect(outcome.kindCounts[.text] == 1)
+        #expect(outcome.kindCounts[.image] == 1)
+    } else {
+        Issue.record("expected .localMirror, got \(outcome.mode)")
+    }
+}
+
 @Test func searchProviderRejectedFallsBackToo() async throws {
     // 401/4xx 也应该回退本地（保活），但 banner 显示具体原因
     let db = try makeDBWithItems([sampleItem(text: "local only")])
