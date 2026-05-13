@@ -10,3 +10,7 @@ DerivedData/
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+
+# AI 助手本地状态/约定文件
+.claude/
+AGENTS.md
