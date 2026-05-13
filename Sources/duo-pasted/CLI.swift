@@ -15,6 +15,8 @@ enum CLI {
             runInitSecret(force: force)
         case "retry-failed":
             runRetryFailed()
+        case "retry-failed-ocr":
+            runRetryFailedOCR(args: rest)
         case "audit-push":
             runAuditPush(args: rest)
         case "promote-to-primary":
@@ -41,6 +43,14 @@ enum CLI {
 
           retry-failed            把所有 push_state=failed 的 item 重置回 pending，
                                   下次 push worker 会重试。push_attempts 清零、
+                                  last_push_error 清空。
+
+          retry-failed-ocr [--all | --id <ITEM_ID>]
+                                  把本机 own-origin image 行的 ocr_state 翻回 pending，
+                                  让 OCRWorker 重 OCR。无参数等价 --all：只动
+                                  ocr_state IN ('failed', 'skipped') 的行（done 不动）。
+                                  --id 模式忽略 state 黑名单——给指定 image 行强制重
+                                  OCR（如 Vision 模型升级后想刷某条 done 行）。
                                   last_push_error 清空。
 
           audit-push [--sample N] 拿本机 own-origin item 跟 primary /since 全量对账，
@@ -437,6 +447,55 @@ enum CLI {
             exit(0)
         } catch {
             FileHandle.standardError.write(Data("retry-failed failed: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func runRetryFailedOCR(args: [String]) {
+        var scope: Admin.OCRRetryScope = .all
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--all":
+                scope = .all
+                i += 1
+            case "--id":
+                if i + 1 < args.count {
+                    scope = .id(args[i + 1])
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("retry-failed-ocr: --id 缺值\n".utf8))
+                    exit(1)
+                }
+            default:
+                FileHandle.standardError.write(Data("retry-failed-ocr: 未知参数 \(args[i])\n".utf8))
+                exit(1)
+            }
+        }
+        let paths = Paths.makeDefault()
+        paths.ensureExists()
+        let deviceID: String
+        do {
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("retry-failed-ocr: 读 device-id 失败: \(error)\n".utf8))
+            exit(1)
+        }
+        do {
+            let n = try Admin.retryFailedOCR(
+                dbPath: paths.mainDB,
+                selfDeviceID: deviceID,
+                scope: scope
+            )
+            switch scope {
+            case .all:
+                print("reset \(n) image item(s) to ocr_state=pending")
+            case .id(let id):
+                print("reset \(n) row(s) for id=\(id) to ocr_state=pending")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("retry-failed-ocr failed: \(error)\n".utf8))
             exit(1)
         }
     }

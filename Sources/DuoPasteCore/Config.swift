@@ -31,6 +31,11 @@ public struct Config: Codable, Sendable, Equatable {
 
     public var pull: PullConfig
 
+    /// OCR 段：是否启用 + 语言 + blob 上限 + Vision 识别精度。详 plan vivid-scanning-vellum.md
+    /// 第 3 刀。enabled=false → AppDelegate 不启 OCRWorker；CaptureService 仍标 pending
+    /// （不动数据形态），用户翻回 true 后历史 pending 自然被处理
+    public var ocr: OCRSettings
+
     /// 捕获守门：blob / text 字节上限。超过 → 跳过捕获（不写 DB 不写 blob），
     /// macOS pasteboard 自身仍可正常 Cmd+V 粘贴——只是不进 duo-paste 历史。
     /// 默认值见 CaptureLimits.default。
@@ -141,6 +146,64 @@ public struct Config: Codable, Sendable, Equatable {
         ]
     }
 
+    /// OCR worker 配置段。AppDelegate 启动时把 `enabled=true` 翻译成 OCRWorker.Config
+    /// 启 worker；`enabled=false` 不启。详 plan vivid-scanning-vellum.md 第 3 刀。
+    public struct OCRSettings: Codable, Sendable, Equatable {
+        /// false → 不启动 OCRWorker。CaptureService 仍写 ocr_state=pending；翻回 true
+        /// 后这些历史会被处理（不在 capture 路径区分"开/关"避免增加状态空间）
+        public var enabled: Bool
+        /// Vision recognitionLanguages hint。按优先级排序；macOS 13+ 上
+        /// automaticallyDetectsLanguage 还会自动猜，hint 仍作为模型偏好
+        public var languages: [String]
+        /// blob 字节超过此值 → 标 skipped 不喂 Vision。capture 端的 max_blob_mb 默认 32MB
+        /// 是"防意外巨物入库"，本 cap 是"OCR 本身慢/内存峰值高"的另一类守门
+        public var maxBlobMB: Int
+        /// "accurate" / "fast"。默认 accurate——中文截图 fast 漏字明显
+        public var recognitionLevel: String
+        /// 同 batch 内每张 OCR 之间 sleep 毫秒。100ms 让前台 UI 不卡
+        public var perItemPauseMs: Int
+
+        public static let `default` = OCRSettings(
+            enabled: true,
+            languages: ["zh-Hans", "en-US"],
+            maxBlobMB: 16,
+            recognitionLevel: "accurate",
+            perItemPauseMs: 100
+        )
+
+        public init(
+            enabled: Bool,
+            languages: [String],
+            maxBlobMB: Int,
+            recognitionLevel: String,
+            perItemPauseMs: Int
+        ) {
+            self.enabled = enabled
+            self.languages = languages
+            self.maxBlobMB = maxBlobMB
+            self.recognitionLevel = recognitionLevel
+            self.perItemPauseMs = perItemPauseMs
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case enabled
+            case languages
+            case maxBlobMB = "max_blob_mb"
+            case recognitionLevel = "recognition_level"
+            case perItemPauseMs = "per_item_pause_ms"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let defaults = OCRSettings.default
+            self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? defaults.enabled
+            self.languages = try c.decodeIfPresent([String].self, forKey: .languages) ?? defaults.languages
+            self.maxBlobMB = try c.decodeIfPresent(Int.self, forKey: .maxBlobMB) ?? defaults.maxBlobMB
+            self.recognitionLevel = try c.decodeIfPresent(String.self, forKey: .recognitionLevel) ?? defaults.recognitionLevel
+            self.perItemPauseMs = try c.decodeIfPresent(Int.self, forKey: .perItemPauseMs) ?? defaults.perItemPauseMs
+        }
+    }
+
     public struct PullConfig: Codable, Sendable, Equatable {
         /// true → 启动 pull worker，周期拉 primary 全量到 item_mirror。
         public var enabled: Bool
@@ -172,6 +235,7 @@ public struct Config: Codable, Sendable, Equatable {
         tlsKeyPath: nil,
         primaryURL: nil,
         pull: .default,
+        ocr: .default,
         capture: .default,
         hotkey: .default,
         sharedSecretKeychainAccount: nil
@@ -186,6 +250,7 @@ public struct Config: Codable, Sendable, Equatable {
         tlsKeyPath: String?,
         primaryURL: URL?,
         pull: PullConfig,
+        ocr: OCRSettings = .default,
         capture: CaptureLimits = .default,
         hotkey: HotkeyConfig = .default,
         sharedSecretKeychainAccount: String?
@@ -198,6 +263,7 @@ public struct Config: Codable, Sendable, Equatable {
         self.tlsKeyPath = tlsKeyPath
         self.primaryURL = primaryURL
         self.pull = pull
+        self.ocr = ocr
         self.capture = capture
         self.hotkey = hotkey
         self.sharedSecretKeychainAccount = sharedSecretKeychainAccount
@@ -212,6 +278,7 @@ public struct Config: Codable, Sendable, Equatable {
         case tlsKeyPath = "tls_key_path"
         case primaryURL = "primary_url"
         case pull
+        case ocr
         case capture
         case hotkey
         case sharedSecretKeychainAccount = "shared_secret_keychain_account"
@@ -240,6 +307,7 @@ public struct Config: Codable, Sendable, Equatable {
             self.primaryURL = nil
         }
         self.pull = try c.decodeIfPresent(PullConfig.self, forKey: .pull) ?? .default
+        self.ocr = try c.decodeIfPresent(OCRSettings.self, forKey: .ocr) ?? .default
         self.capture = try c.decodeIfPresent(CaptureLimits.self, forKey: .capture) ?? .default
         self.hotkey = try c.decodeIfPresent(HotkeyConfig.self, forKey: .hotkey) ?? .default
         self.sharedSecretKeychainAccount = try c.decodeIfPresent(
@@ -297,6 +365,15 @@ public struct Config: Codable, Sendable, Equatable {
         hotkeyDict["key"] = cfg.hotkey.key
         hotkeyDict["modifiers"] = cfg.hotkey.modifiers
         dict[CodingKeys.hotkey.rawValue] = hotkeyDict
+
+        // ocr 同款 nested merge——未来可能加 custom_words / debug_dump 等字段
+        var ocrDict = (dict[CodingKeys.ocr.rawValue] as? [String: Any]) ?? [:]
+        ocrDict["enabled"] = cfg.ocr.enabled
+        ocrDict["languages"] = cfg.ocr.languages
+        ocrDict["max_blob_mb"] = cfg.ocr.maxBlobMB
+        ocrDict["recognition_level"] = cfg.ocr.recognitionLevel
+        ocrDict["per_item_pause_ms"] = cfg.ocr.perItemPauseMs
+        dict[CodingKeys.ocr.rawValue] = ocrDict
 
         Self.setOrRemove(&dict, CodingKeys.sharedSecretKeychainAccount.rawValue,
                          cfg.sharedSecretKeychainAccount)
@@ -411,6 +488,21 @@ public struct Config: Codable, Sendable, Equatable {
             throw ConfigError.invalidCombination(
                 "hotkey.modifiers 不能只有 shift——会拦截所有大写字母输入。请加 cmd / option / control"
             )
+        }
+        // ocr 字段校验
+        if !["accurate", "fast"].contains(ocr.recognitionLevel.lowercased()) {
+            throw ConfigError.invalidCombination(
+                "ocr.recognition_level 必须是 'accurate' 或 'fast'：\(ocr.recognitionLevel)"
+            )
+        }
+        if ocr.languages.isEmpty {
+            throw ConfigError.invalidCombination("ocr.languages 不能为空")
+        }
+        if ocr.maxBlobMB < 1 {
+            throw ConfigError.invalidCombination("ocr.max_blob_mb 必须 >= 1")
+        }
+        if ocr.perItemPauseMs < 0 {
+            throw ConfigError.invalidCombination("ocr.per_item_pause_ms 必须 >= 0")
         }
     }
 
