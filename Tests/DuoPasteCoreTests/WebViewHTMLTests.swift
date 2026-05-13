@@ -48,3 +48,35 @@ import Foundation
     let html = "  \n  <meta charset='utf-8'><div>x</div>"
     #expect(looksLikeWebViewHTML(html))
 }
+
+@Test func detectsDingTalkHeadWrappedMeta() {
+    // DingTalk 文档复制实际样本：<head> 包住 meta charset，后面接 table markup
+    let html = """
+    <head><meta charset="UTF-8"></head><table id="zongheng-ccp-host" \
+    data-ctx="{&quot;cid&quot;:&quot;3b70c775&quot;}" cellspacing="0">\
+    <tbody><tr><td>ip地址</td></tr></tbody></table>
+    """
+    #expect(looksLikeWebViewHTML(html))
+}
+
+@Test func detectsHeadWrappedMetaSingleQuote() {
+    let html = "<head><meta charset='utf-8'></head><div>x</div>"
+    #expect(looksLikeWebViewHTML(html))
+}
+
+@Test func detectsHeadWrappedMetaWithLeadingWhitespace() {
+    let html = "  \n<head><meta charset=\"UTF-8\"></head><table><tr><td>x</td></tr></table>"
+    #expect(looksLikeWebViewHTML(html))
+}
+
+@Test func ignoresFullHTMLDocumentWithUTF8Meta() {
+    // 完整 HTML 文档（含 <html><head>...）不算 web view selection——
+    // 比如本地 .html 文件被读出来塞剪贴板时这种结构很常见，markup 本身就是用户要的内容。
+    let html = "<html><head><meta charset=\"utf-8\"></head><body><p>x</p></body></html>"
+    #expect(!looksLikeWebViewHTML(html))
+}
+
+@Test func ignoresHeadWithoutUTF8Meta() {
+    #expect(!looksLikeWebViewHTML("<head><title>x</title></head><div>y</div>"))
+    #expect(!looksLikeWebViewHTML("<head><meta charset='gbk'></head><div>y</div>"))
+}
