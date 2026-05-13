@@ -89,6 +89,14 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         self.ocrState = ocrState
     }
 
+    /// sourceApp 用的 sentinel：表示"本机 duo-paste 内 Cmd+C"。watcher 在 self
+    /// frontmost 时注入；UI 据此显示自定义 icon 而非 LaunchServices 查不到时的通用
+    /// kind fallback。duo-paste 是 LSUIElement SwiftPM 二进制，frontApp.bundleIdentifier
+    /// 多半返回 nil，靠 sentinel 把"self capture"语义显式落到 DB 里
+    public static let selfSourceAppSentinel = "io.duopaste.self"
+
+    public var isSelfCapture: Bool { sourceApp == Self.selfSourceAppSentinel }
+
     enum CodingKeys: String, CodingKey {
         case id
         case originDevice = "origin_device"

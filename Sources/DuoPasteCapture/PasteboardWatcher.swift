@@ -183,8 +183,15 @@ public final class PasteboardWatcher {
         // （剪贴板管理器本质就是"复制就该被记录"）。self-pid 跳过的副作用：那次
         // changeCount 被吃掉再也不补，搜索结果永远 0 条。已取消跳过；pasteBack 路径
         // 自己用 suppressUpToCurrent 保护，不依赖 self-pid 过滤。
-        let bundleID = frontApp?.bundleIdentifier
-        let appName = frontApp?.localizedName
+        //
+        // self-capture sentinel：duo-paste 是 LSUIElement SwiftPM 二进制没 Info.plist，
+        // frontApp.bundleIdentifier 多半 nil，LaunchServices 查不到任何 icon，UI 永远走
+        // kind fallback symbol（一条三横线 text.alignleft）跟"frontmost app 没报 bundleID"
+        // 那类条目视觉上没法区分。这里 self 命中时强制写 sentinel + 友好名，UI 据此走
+        // 专门的 self badge。
+        let isSelfCapture = frontApp?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+        let bundleID = isSelfCapture ? Item.selfSourceAppSentinel : frontApp?.bundleIdentifier
+        let appName = isSelfCapture ? "duo-paste" : frontApp?.localizedName
 
         // 1) 文件 URL
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [

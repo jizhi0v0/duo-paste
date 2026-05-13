@@ -28,6 +28,9 @@ final class AppIconCache {
         "com.apple.loginwindow",
         "com.apple.WindowServer",
         "com.apple.dock",
+        // self-capture sentinel：详见 Item.selfSourceAppSentinel。即便有别处误调
+        // AppIconCache，也直接命中黑名单返 nil，让 leadingIcon 走 self badge 分支
+        Item.selfSourceAppSentinel,
     ]
 
     func icon(forBundleID bid: String) -> NSImage? {
@@ -625,11 +628,25 @@ private struct ItemRow: View {
         .padding(.horizontal, 10)
     }
 
-    /// 左侧图标：优先 app 图标（按 bundleID 查 LaunchServices）；找不到 fallback 到 kind SF Symbol。
+    /// 左侧图标：优先 app 图标（按 bundleID 查 LaunchServices）；self capture 走专属
+    /// badge；其余 fallback 到 kind SF Symbol。
     /// fallback 触发场景：item 来自 mirror 而本机没装那个 app；或源 app 没报 bundleID。
     @ViewBuilder
     private var leadingIcon: some View {
-        if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
+        if item.isSelfCapture {
+            // duo-paste 自家复制：圆形 badge + 剪贴板 symbol，让"自家来源"在长列表里一眼
+            // 识别，而不是跟其他 fallback 共用 kind symbol。选中态翻成"白底 accent icon"
+            // 跟未选中态的"accent 底白 icon"反白对称——选中行整体已经是 accent 蓝高亮，
+            // 同色圆底会跟行融化，白底实色让 icon 跟选中行分离
+            ZStack {
+                Circle()
+                    .fill(isSelected ? Color.white : Color.accentColor)
+                Image(systemName: "doc.on.clipboard.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.white)
+            }
+            .frame(width: 32, height: 32)
+        } else if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
             Image(nsImage: img)
                 .resizable()
                 .interpolation(.high)
