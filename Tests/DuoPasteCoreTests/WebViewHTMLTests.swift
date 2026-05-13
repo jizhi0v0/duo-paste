@@ -81,11 +81,30 @@ import Foundation
     #expect(!looksLikeWebViewHTML("<head><meta charset='gbk'></head><div>y</div>"))
 }
 
-@Test func ignoresHeadSegmentBeyondByteLimit() {
-    // head 段塞够多 meta 让 </head> 超过 256 字节预算时不命中——锁住阈值，
-    // 防止 head 当结构性元素的完整 HTML 文档巧合含 charset=utf-8 被误判。
-    let filler = String(repeating: "<meta name=\"x\" content=\"y\">", count: 20)
-    let html = "<head><meta charset=\"utf-8\">\(filler)</head><div>x</div>"
-    #expect(html.utf8.count > 256)
+@Test func acceptsHeadSegmentAtByteLimit() {
+    // head 段恰好 256 字节边界正面：<head>(6) + <meta charset="utf-8">(22) + 228 个 a = 256
+    let html = "<head><meta charset=\"utf-8\">\(String(repeating: "a", count: 228))</head><div>x</div>"
+    let headRange = html.range(of: "</head>")!
+    #expect(html[html.startIndex..<headRange.lowerBound].utf8.count == 256)
+    #expect(looksLikeWebViewHTML(html))
+}
+
+@Test func ignoresHeadSegmentJustBeyondByteLimit() {
+    // head 段 257 字节：刚跨过阈值就应当拒绝——锁住精确边界，
+    // 阈值若被悄悄改大（哪怕只到 257）就让这条变红。
+    let html = "<head><meta charset=\"utf-8\">\(String(repeating: "a", count: 229))</head><div>x</div>"
+    let headRange = html.range(of: "</head>")!
+    #expect(html[html.startIndex..<headRange.lowerBound].utf8.count == 257)
+    #expect(!looksLikeWebViewHTML(html))
+}
+
+@Test func ignoresCJKHeadBeyondByteBudgetWhileWithinCharBudget() {
+    // 76 个"中"(228 字节) + 1 个 ASCII = 229 字节 head 内容，head 段总 257 字节超阈值。
+    // 字符数 6+22+76+1 = 105 远低于 256——这条会在阈值被改回 String.distance（字符数）
+    // 时假命中，专门锁住 utf8.count 语义。
+    let html = "<head><meta charset=\"utf-8\">\(String(repeating: "中", count: 76))a</head><div>x</div>"
+    let headRange = html.range(of: "</head>")!
+    #expect(html[html.startIndex..<headRange.lowerBound].utf8.count == 257)
+    #expect(html[html.startIndex..<headRange.lowerBound].count == 105)
     #expect(!looksLikeWebViewHTML(html))
 }
