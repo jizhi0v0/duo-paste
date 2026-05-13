@@ -16,9 +16,10 @@ final class AppDependencies {
     /// `pull.enabled=true` 时 mirrorStatus 通过 PullWorker 更新 → SearchProvider 看到非 nil
     /// 自动切 union 本地路径，不再过远端。
     let searchProvider: SearchProvider
-    /// Pull worker 跟 SearchProvider 间的非阻塞状态通道。`pull.enabled=false` 时这个对象
-    /// 永远不被 set → SearchProvider 走原 .local / .remoteOK 逻辑。
-    let mirrorStatus: MirrorStatus
+    /// Mesh peer PullWorker 跟 SearchProvider / UI 间的非阻塞状态通道。`pull.enabled=false`
+    /// 时这个对象永远不被 set → SearchProvider 走原 .local / .remoteOK 逻辑。多 peer 部署下
+    /// SearchProvider 看 `oldestLastPullNs()`（最悲观）—— 任一 peer 还没追平就不走 localMirror。
+    let meshStatus: MeshStatus
     /// 跨设备 paste-echo 抑制集合。AppDelegate.pasteBack 写入；PullWorker 应用 mirror 时查。
     let pasteSuppressions: PasteSuppressionSet
 
@@ -41,8 +42,8 @@ final class AppDependencies {
         )
         let searchAPI = SearchAPI(database: database)
         self.searchAPI = searchAPI
-        let mirrorStatus = MirrorStatus()
-        self.mirrorStatus = mirrorStatus
+        let meshStatus = MeshStatus()
+        self.meshStatus = meshStatus
         self.pasteSuppressions = PasteSuppressionSet()
 
         // primary_url 配置好且能加载到 shared secret → 准备远端搜索；否则 nil 走本地
@@ -61,7 +62,7 @@ final class AppDependencies {
         self.searchProvider = SearchProvider(
             local: searchAPI,
             remote: remote,
-            mirrorLastPullNs: { [mirrorStatus] in mirrorStatus.lastPullNs() }
+            mirrorLastPullNs: { [meshStatus] in meshStatus.oldestLastPullNs() }
         )
     }
 

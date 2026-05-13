@@ -14,7 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var snapshotScheduler: SnapshotScheduler!
     private var serverTask: Task<Void, Never>?
     private var pushWorker: PushWorker?
-    private var pullWorker: PullWorker?
+    /// Mesh peer 拉取入口。PR 2 单 peer 部署下 supervisor 内只有一个 PullWorker，行为跟原
+    /// `pullWorker: PullWorker?` 等价；PR 5 mesh-init 后多 peer 列表自然 fan-out 进 N 个 worker
+    private var meshSupervisor: MeshSupervisor?
     /// 本机 OCR worker。`config.ocr.enabled=true` 才启动；启动条件跟 push/pull 解耦，
     /// 任何 role（standalone / primary / client）都跑 own-origin image OCR
     private var ocrWorker: OCRWorker?
@@ -76,7 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startPushWorker()
         }
         if deps.config.pull.enabled {
-            startPullWorker()
+            startMeshSupervisor()
         }
         // lazy paste-back blob fetcher 跟 PullWorker 独立——只要配了 primary_url
         // + shared-secret，即使 pull.enabled=false（用户不想拉全量元数据）也能
@@ -155,10 +157,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Pull worker：周期把 primary 全量同步进本地 item_mirror。
+    /// Mesh supervisor：周期把每个 peer 全量同步到本地 item 表。PR 2 单 peer 适配——把
+    /// 现有 `Config.primaryURL` + `Config.pull` 字段当成 single-peer mesh。PR 5 mesh-init
+    /// 后 Config 改成 `peers: [PeerConfig]` 列表，这里 fan-out 多个 PullWorker。
+    ///
     /// 启用条件：`config.pull.enabled=true` 且 primary_url 非空（Config.validate 已保证）。
     /// 启动失败（shared-secret / URL 解析）非致命，daemon 仍然能用本机捕获 + 本地搜索。
-    private func startPullWorker() {
+    private func startMeshSupervisor() {
         guard let primaryURL = deps.config.primaryURL else { return }
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
@@ -169,11 +174,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 session: AppDependencies.syncURLSession
             )
             let intervalSec = max(1, deps.config.pull.intervalSec)
+            // PR 2 单 peer 适配：现有 Config 没有 peer.deviceID 字段（PR 5 才加），所以走
+            // **学习模式**（expectedPeerDeviceID=nil）—— 首次 /health 拿到 device_id 后
+            // stamp 进 pull_cursor.peer_device_id，reconcile 比对靠这条 cursor。
+            // 行为跟 PR 1 reconcilePrimary 等价。
             let worker = PullWorker(
                 database: deps.database,
                 transport: client,
                 selfDeviceID: deps.deviceID,
-                mirrorStatus: deps.mirrorStatus,
+                expectedPeerDeviceID: nil,
+                meshStatus: deps.meshStatus,
                 pasteSuppressions: deps.pasteSuppressions,
                 blobFetcher: client,
                 blobs: deps.blobs,
@@ -182,11 +192,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     eagerBlobs: deps.config.pull.eagerBlobs
                 )
             )
-            self.pullWorker = worker
-            Task { await worker.start() }
-            fputs("pull worker → \(primaryURL.absoluteString) @ \(intervalSec)s\n", stderr)
+            let supervisor = MeshSupervisor(workers: [worker])
+            self.meshSupervisor = supervisor
+            Task { await supervisor.start() }
+            fputs("mesh supervisor → 1 peer @ \(primaryURL.absoluteString) (interval=\(intervalSec)s)\n", stderr)
         } catch {
-            fputs("pull worker NOT started: \(error)\n", stderr)
+            fputs("mesh supervisor NOT started: \(error)\n", stderr)
         }
     }
 

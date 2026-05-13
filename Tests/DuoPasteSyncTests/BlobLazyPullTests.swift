@@ -128,7 +128,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
     )
@@ -136,7 +136,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     // mirror 行写好
     let mirroredIDs = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item_mirror ORDER BY id").map { $0["id"] as String }
+        try Row.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id").map { $0["id"] as String }
     }
     #expect(mirroredIDs == ["img-1", "txt-1"])
     // blob 字节写好
@@ -162,7 +162,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: false)
     )
@@ -170,7 +170,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     // mirror 行写了
     let count = try await db.pool.read { conn -> Int in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? 0
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? 0
     }
     #expect(count == 1)
     // 但 blob 没拉，fetcher 零调用
@@ -196,7 +196,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
     )
@@ -221,7 +221,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
     )
@@ -243,7 +243,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
     )
@@ -266,7 +266,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
     )
@@ -274,7 +274,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     // mirror 行仍在
     let count = try await db.pool.read { conn -> Int in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? 0
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? 0
     }
     #expect(count == 1)
     // cursor 也已推进
@@ -305,14 +305,14 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
 
     let worker = PullWorker(
         database: db, transport: transport,
-        selfDeviceID: "client", mirrorStatus: MirrorStatus(),
+        selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
     )
     await runBriefly(worker)
 
     let count = try await db.pool.read { conn -> Int in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? 0
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? 0
     }
     #expect(count == 1)
     #expect(!blobs.exists(sha256: sha))

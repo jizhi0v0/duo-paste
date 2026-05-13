@@ -64,7 +64,12 @@ public actor PullWorker {
     private let database: DuoPasteCore.Database
     private let transport: SinceTransport
     private let selfDeviceID: String
-    private let mirrorStatus: MirrorStatus
+    /// 期望的 peer device_id。nil → 首次启动学习模式（用 /health 返回的 device_id 当 cursor PK）；
+    /// 非 nil → 严格模式（/health 返回的 device_id 跟它对不上立刻 transient skip，
+    ///   防止 peer URL 配错指到另一台机器而污染本机数据）。
+    /// PR 2 阶段 MeshSupervisor 从 PeerSpec.deviceID 透传过来：手填 ID 走严格，nil 走学习。
+    private let expectedPeerDeviceID: String?
+    private let meshStatus: MeshStatus
     /// 跨设备 paste-echo 抑制：本机 pasteBack 写 NSPasteboard 后通过 Continuity 反弹到对端
     /// 又被对端 watcher capture 推回来时，PullWorker 在 applyPage 里查这个 set，命中 skip。
     /// nil = 抑制功能未启用（standalone / 测试不传）。
@@ -81,12 +86,16 @@ public actor PullWorker {
     private var runTask: Task<Void, Never>?
     private var currentSleep: Task<Void, Error>?
     private var consecutiveTransientFailures = 0
+    /// 当前 tick 锚定的 peer device_id。reconcilePeer 学到 / 严格模式从 init 注入。
+    /// 用于 setLastPullNs / setClockSkewMs 等 MeshStatus per-peer 调用。
+    private var currentPeerDeviceID: String?
 
     public init(
         database: DuoPasteCore.Database,
         transport: SinceTransport,
         selfDeviceID: String,
-        mirrorStatus: MirrorStatus,
+        expectedPeerDeviceID: String? = nil,
+        meshStatus: MeshStatus,
         pasteSuppressions: PasteSuppressionSet? = nil,
         blobFetcher: BlobFetcher? = nil,
         blobs: BlobStore? = nil,
@@ -99,7 +108,8 @@ public actor PullWorker {
         self.database = database
         self.transport = transport
         self.selfDeviceID = selfDeviceID
-        self.mirrorStatus = mirrorStatus
+        self.expectedPeerDeviceID = expectedPeerDeviceID
+        self.meshStatus = meshStatus
         self.pasteSuppressions = pasteSuppressions
         self.blobFetcher = blobFetcher
         self.blobs = blobs
@@ -133,20 +143,26 @@ public actor PullWorker {
     }
 
     private func runLoop() async {
-        log("worker started · self=\(selfDeviceID) · interval=\(Int(config.intervalSec))s")
+        let peerSuffix = expectedPeerDeviceID.map { " · peer=\($0)" } ?? ""
+        log("worker started · self=\(selfDeviceID)\(peerSuffix) · interval=\(Int(config.intervalSec))s")
         while !Task.isCancelled {
             let r = await tick()
 
-            // 标 lastPullNs 的语义：「mirror 已严格追平 primary」——only when has_more=false 且无 transient
-            // 若 has_more=true（中途）或有 transient，保持原值，SearchProvider 可能仍能看到旧 lastPullNs
-            if !r.hadTransient && !r.hasMore {
-                mirrorStatus.setLastPullNs(nowNs())
+            // 标 lastPullNs 的语义：「mirror 已严格追平该 peer」——only when has_more=false 且无 transient
+            // 若 has_more=true（中途）或有 transient，保持原值，SearchProvider 仍可看到旧 lastPullNs。
+            // currentPeerDeviceID 由 tick 内 reconcilePeer 设置（首次或换号时），nil 时跳过——
+            // 等同 transient（没拿到 peer id 不能标"已追平"）。
+            if !r.hadTransient && !r.hasMore, let pid = currentPeerDeviceID {
+                meshStatus.setLastPullNs(peerDeviceID: pid, nowNs())
             }
 
             if r.hadTransient {
                 consecutiveTransientFailures += 1
             } else {
                 consecutiveTransientFailures = 0
+            }
+            if let pid = currentPeerDeviceID {
+                meshStatus.setConsecutiveFailures(peerDeviceID: pid, consecutiveTransientFailures)
             }
 
             let sleepSec: TimeInterval
@@ -188,7 +204,7 @@ public actor PullWorker {
     private func tick() async -> TickResult {
         var result = TickResult()
 
-        // 1. /health：拿当前 primary device_id
+        // 1. /health：拿当前 peer device_id
         let healthRes: PrimaryHealthResult
         do {
             healthRes = try await transport.fetchPrimaryHealth()
@@ -199,20 +215,27 @@ public actor PullWorker {
             result.hadTransient = true
             return result
         }
-        let currentPrimaryID: String
-        let primaryNowMs: Int64
+        let currentPeerID: String
+        let peerNowMs: Int64
         switch healthRes.outcome {
         case .ok(let id, let nowMs):
-            // 拒绝空 device_id：会污染 pull_cursor.primary_id 主键 + 在 reconcile 里假阳性触发
-            // mirror 清空。理论上 server 永远不会返回空（DeviceID.loadOrCreate 保证），
-            // 但万一旧版 / 篡改 / 网络中间件改包，guard 在这里。
+            // 拒绝空 device_id：会污染 pull_cursor.peer_device_id 主键 + 在 reconcile 里假阳性
+            // 触发清行。理论上 server 永远不会返回空（DeviceID.loadOrCreate 保证），但万一旧版
+            // / 篡改 / 网络中间件改包，guard 在这里。
             guard !id.isEmpty else {
                 log("health 返回空 device_id，当 transient 跳过")
                 result.hadTransient = true
                 return result
             }
-            currentPrimaryID = id
-            primaryNowMs = nowMs
+            // 严格模式：expectedPeerDeviceID 非 nil 时校验。对不上 = 配置错（peer URL 指错机器
+            // / DNS 漂移指到别人 mesh），不该写本机 DB——transient skip 让 backoff 上去
+            if let expected = expectedPeerDeviceID, expected != id {
+                log("expected peer=\(expected) but /health returned \(id)，transient skip")
+                result.hadTransient = true
+                return result
+            }
+            currentPeerID = id
+            peerNowMs = nowMs
         case .unreachable(let r):
             log("health unreachable: \(r)")
             result.hadTransient = true
@@ -222,23 +245,24 @@ public actor PullWorker {
             result.hadTransient = true
             return result
         }
-        mirrorStatus.setPrimaryDeviceID(currentPrimaryID)
+        // 锚定本 tick 的 peer ID（用于 runLoop 末尾的 setLastPullNs / setConsecutiveFailures）
+        self.currentPeerDeviceID = currentPeerID
 
-        // 1b. 时钟偏移 sanity check。primary now_ms vs local wall-clock，单位毫秒（signed）。
-        // 用本地 wall-clock（nowNs / 1e6）跟 primary now_ms 比；rountrip 半程当 0，对 30s 阈值
+        // 1b. 时钟偏移 sanity check。peer now_ms vs local wall-clock，单位毫秒（signed）。
+        // 用本地 wall-clock（nowNs / 1e6）跟 peer now_ms 比；rountrip 半程当 0，对 30s 阈值
         // 影响 < 100ms 量级可忽略。
         let localNowMs = nowNs() / 1_000_000
-        let skew = primaryNowMs - localNowMs
-        mirrorStatus.setClockSkewMs(skew)
+        let skew = peerNowMs - localNowMs
+        meshStatus.setClockSkewMs(peerDeviceID: currentPeerID, skew)
         if abs(skew) >= config.clockSkewWarnMs {
-            log("clock skew warn: primary=\(primaryNowMs)ms local=\(localNowMs)ms diff=\(skew)ms (threshold=\(config.clockSkewWarnMs)ms)")
+            log("clock skew warn: peer=\(peerNowMs)ms local=\(localNowMs)ms diff=\(skew)ms (threshold=\(config.clockSkewWarnMs)ms)")
         }
 
-        // 2. 检测 primary 换了 → 清空 mirror + cursor
+        // 2. 检测 peer 换了 device_id → 精确清该 peer 的旧行 + cursor 重拉
         do {
-            try await reconcilePrimary(currentPrimaryID: currentPrimaryID)
+            try await reconcilePeer(currentPeerID: currentPeerID)
         } catch {
-            log("reconcile primary failed: \(error)")
+            log("reconcile peer failed: \(error)")
             result.hadTransient = true
             return result
         }
@@ -246,7 +270,7 @@ public actor PullWorker {
         // 3. 读 cursor
         let cursor: SinceCursor
         do {
-            cursor = try await loadCursor(primaryID: currentPrimaryID)
+            cursor = try await loadCursor(peerID: currentPeerID)
         } catch {
             log("load cursor failed: \(error)")
             result.hadTransient = true
@@ -267,7 +291,7 @@ public actor PullWorker {
         switch sinceRes.outcome {
         case .ok(let page):
             do {
-                let applied = try await applyPage(page, primaryID: currentPrimaryID)
+                let applied = try await applyPage(page, peerID: currentPeerID)
                 result.applied = applied.written
                 result.skippedDedup = applied.dedupSkipped
                 result.skippedPasteEcho = applied.pasteEchoSkipped
@@ -289,34 +313,67 @@ public actor PullWorker {
         return result
     }
 
-    /// 比对 persisted peer_device_id 跟新探测到的 currentPrimaryID。不一致 → 清非 self origin
-    /// 行 + cursor 重拉。
+    /// 比对该 peer 在 pull_cursor 里的 persisted device_id 跟新探测到的 currentPeerID。
+    /// 不一致 → 精确删 origin=persisted 的所有行 + 删该行 cursor。
     ///
-    /// 合表（v7）后 item_mirror 没了，peer 行直接落 item 表；切 peer 时不能整表清，要保留本机
-    /// own-origin 行（origin=self），只删 origin != self 的 peer 行。PR 1 单 peer 部署下"非 self
-    /// origin"就等于"当前 peer 的行"；PR 2 多 peer 后这条 SQL 会演化（按具体被换的 peer_id 过滤）。
-    private func reconcilePrimary(currentPrimaryID: String) async throws {
-        let persisted = try await database.pool.read { db -> String? in
-            try String.fetchOne(db, sql: "SELECT peer_device_id FROM pull_cursor LIMIT 1")
+    /// 多 peer 拓扑下精度要求：pull_cursor 是 (peer_device_id) PK，每个 peer 一行；切 peer 时
+    /// 只删该 peer 自己的行（origin_device = persisted），**不动**本机 own（origin=self）也
+    /// **不动**其他 peer 的行。MeshStatus 同步移除该 peer 状态防 oldestLastPullNs 用错值。
+    ///
+    /// **怎么知道哪个 pull_cursor 行属于当前这个 PullWorker？**
+    /// - 严格模式（expectedPeerDeviceID 非 nil）：persisted = pull_cursor WHERE peer_device_id =
+    ///   expected。reconcile 检查 currentPeerID == expected（tick 入口已 guard），所以这里
+    ///   persisted 就是 expected 本身——纯启动后老 device_id 行（如果 expected 换了）由
+    ///   MeshSupervisor 配置切换路径清理，不在 reconcilePeer 范围。
+    /// - 学习模式（expectedPeerDeviceID nil）：peer 唯一识别符是 URL，但 pull_cursor 没存 URL。
+    ///   学习模式只能存最近一次 /health 学到的 device_id；persisted 就是上次学到的 ID。如果
+    ///   /health 这次返回新 ID（peer 重装），删旧 persisted 的行 + cursor 行。
+    ///
+    /// PR 2 单 peer 部署语义：跟 PR 1 reconcilePrimary 等价；多 peer 部署各自走自己 cursor 行。
+    private func reconcilePeer(currentPeerID: String) async throws {
+        // 学习模式 + 严格模式都从 pull_cursor 行学 persisted。但严格模式下 pull_cursor 行的
+        // peer_device_id 跟 expected 一致，currentPeerID == expected（前面 guard 保证），
+        // 所以 persisted == currentPeerID，reconcile 是 no-op。
+        //
+        // 学习模式才真有可能 persisted != currentPeerID（peer 重装 / device-id 重置）。
+        // 单 peer 部署历史只有一行 pull_cursor，LIMIT 1 拿出来；多 peer 部署用 expected 精确查。
+        let persisted: String?
+        if let expected = expectedPeerDeviceID {
+            // 严格模式：精准查 expected 那一行。学习模式不走这里。
+            persisted = try await database.pool.read { db -> String? in
+                try String.fetchOne(db, sql: """
+                    SELECT peer_device_id FROM pull_cursor WHERE peer_device_id = ?
+                """, arguments: [expected])
+            }
+        } else {
+            // 学习模式：只有单 peer 部署可能走这条路径（多 peer 必须传 expectedPeerDeviceID
+            // 避免多个学习 worker 抢同一行 cursor）。LIMIT 1 是历史兼容路径
+            persisted = try await database.pool.read { db -> String? in
+                try String.fetchOne(db, sql: "SELECT peer_device_id FROM pull_cursor LIMIT 1")
+            }
         }
         guard let persisted else { return }   // 首次启动 / 已被清空 → 啥也不做
-        if persisted == currentPrimaryID { return }
-        log("peer device changed (\(persisted) → \(currentPrimaryID))，重置 peer 行 + cursor")
-        let selfID = selfDeviceID
+        if persisted == currentPeerID { return }
+        log("peer device changed (\(persisted) → \(currentPeerID))，重置 peer 行 + cursor")
         try await database.pool.write { db in
             try db.execute(
-                sql: "DELETE FROM item WHERE origin_device != ?",
-                arguments: [selfID]
+                sql: "DELETE FROM item WHERE origin_device = ?",
+                arguments: [persisted]
             )
-            try db.execute(sql: "DELETE FROM pull_cursor")
+            try db.execute(
+                sql: "DELETE FROM pull_cursor WHERE peer_device_id = ?",
+                arguments: [persisted]
+            )
         }
+        // 同步清 MeshStatus 里 persisted 那个 peer 的状态，防 oldestLastPullNs 还用着旧值
+        meshStatus.removePeer(persisted)
     }
 
-    private func loadCursor(primaryID: String) async throws -> SinceCursor {
+    private func loadCursor(peerID: String) async throws -> SinceCursor {
         try await database.pool.read { db -> SinceCursor in
             let row = try Row.fetchOne(db, sql: """
                 SELECT cursor_ns, cursor_id FROM pull_cursor WHERE peer_device_id = ?
-            """, arguments: [primaryID])
+            """, arguments: [peerID])
             guard let row else { return .zero }
             let ns: Int64 = row["cursor_ns"] ?? 0
             let id: String = row["cursor_id"] ?? ""
@@ -340,7 +397,7 @@ public actor PullWorker {
     ///
     /// v7 合表后 peer 行直接落 item 表。强制写 push_state='acked'：mirror 来源行已经在 peer 上
     /// ingest 完成，PR 1 期间 push_state 列仍存在，必须给它有效终态值避免被 PushWorker 误推。
-    private func applyPage(_ page: SincePageWire, primaryID: String) async throws -> ApplyOutcome {
+    private func applyPage(_ page: SincePageWire, peerID: String) async throws -> ApplyOutcome {
         let device = selfDeviceID
         let now = nowNs()
         let windowNs = config.crossDeviceDedupWindowNs
@@ -438,7 +495,7 @@ public actor PullWorker {
                     cursor_ns = excluded.cursor_ns,
                     cursor_id = excluded.cursor_id,
                     updated_at_ns = excluded.updated_at_ns
-            """, arguments: [primaryID, page.nextCursor.ingestedAtNs, page.nextCursor.id, now])
+            """, arguments: [peerID, page.nextCursor.ingestedAtNs, page.nextCursor.id, now])
             return ApplyOutcome(
                 written: written,
                 dedupSkipped: dedupSkipped,

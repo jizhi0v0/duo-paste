@@ -106,33 +106,35 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         pages: [page(items: items, nextNs: 200, nextID: "p-2", hasMore: false)],
         healthDeviceID: "primary-device"
     )
-    let status = MirrorStatus()
+    let status = MeshStatus()
     let worker = PullWorker(
         database: db,
         transport: transport,
         selfDeviceID: "client-self",
-        mirrorStatus: status,
+        meshStatus: status,
         config: PullWorker.Config(intervalSec: 60),
         nowNs: { 999 }
     )
     await runWorkerBriefly(worker)
 
     let mirrored = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item_mirror ORDER BY id")
+        try Row.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
     #expect(mirrored.map { $0["id"] as String } == ["p-1", "p-2"])
     let cur = try await db.pool.read { conn in
-        try Row.fetchOne(conn, sql: "SELECT cursor_ns, cursor_id, primary_id FROM pull_cursor")
+        try Row.fetchOne(conn, sql: "SELECT cursor_ns, cursor_id, peer_device_id FROM pull_cursor")
     }
     #expect(cur?["cursor_ns"] as Int64? == 200)
     #expect(cur?["cursor_id"] as String? == "p-2")
-    #expect(cur?["primary_id"] as String? == "primary-device")
+    #expect(cur?["peer_device_id"] as String? == "primary-device")
     // lastPullNs 应该被标 —— 完整追平（hasMore=false）
-    #expect(status.lastPullNs() == 999)
+    // 学习模式下 PullWorker 用 /health 学到的 peer device_id 当 MeshStatus key，
+    // oldestLastPullNs == 单 peer 的 lastPullNs（PR 2 单 peer 部署等价语义）
+    #expect(status.oldestLastPullNs() == 999)
 }
 
 @Test func pullWorkerSkipsOwnOriginRows() async throws {
-    // origin == selfDeviceID 的条目不应该入 item_mirror（避免和 item 表重复）
+    // origin == selfDeviceID 的条目不应该入表（避免和本机 own 行重复）
     let db = try makeClientDB()
     let items = [
         mkItem(id: "self-row", origin: "client-self", ingestedAtNs: 50),
@@ -146,13 +148,13 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: "client-self",
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
     await runWorkerBriefly(worker)
 
     let mirrored = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item_mirror")
+        try Row.fetchAll(conn, sql: "SELECT id FROM item")
     }
     #expect(mirrored.map { $0["id"] as String } == ["primary-row"])
     // cursor 应该照样推进到 page 末（包括自家 origin 那次也"算"过）
@@ -179,13 +181,13 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: "self",
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
     await runWorkerBriefly(worker, ms: 500)
 
     let mirrored = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item_mirror ORDER BY id")
+        try Row.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
     #expect(mirrored.map { $0["id"] as String } == ["a", "b"])
     let calls = await transport.fetchSinceCalls
@@ -197,17 +199,19 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
 
 @Test func pullWorkerResetsMirrorWhenPrimaryDeviceChanges() async throws {
     let db = try makeClientDB()
-    // 预先放一些"旧 primary" 留下的 mirror 数据 + cursor
+    // 预先放一些"旧 peer" 留下的 peer 行 + cursor。v7 合表后 peer 行直接落 item 表，
+    // push_state='acked' 维持 PullWorker INSERT 路径兼容。
     try await db.pool.write { conn in
         try conn.execute(sql: """
-            INSERT INTO item_mirror
+            INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, mirrored_at_ns)
-            VALUES ('stale-1', 'old-primary', 100, 100, 'text', NULL, 'old', 'old', 'old', NULL, NULL, NULL, 0, NULL, 100)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+               push_state, push_attempts, last_push_error, ocr_state)
+            VALUES ('stale-1', 'old-primary', 100, 100, 'text', NULL, 'old', 'old', 'old', NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
         """)
         try conn.execute(sql: """
-            INSERT INTO pull_cursor (primary_id, cursor_ns, cursor_id, updated_at_ns)
+            INSERT INTO pull_cursor (peer_device_id, cursor_ns, cursor_id, updated_at_ns)
             VALUES ('old-primary', 999, 'stale-1', 100)
         """)
     }
@@ -222,19 +226,19 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: "self",
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
     await runWorkerBriefly(worker)
 
     let ids = try await db.pool.read { conn in
-        try String.fetchAll(conn, sql: "SELECT id FROM item_mirror ORDER BY id")
+        try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
     #expect(ids == ["fresh"])  // 旧的 stale-1 应已被清掉
     let row = try await db.pool.read { conn in
-        try Row.fetchOne(conn, sql: "SELECT primary_id, cursor_ns, cursor_id FROM pull_cursor")
+        try Row.fetchOne(conn, sql: "SELECT peer_device_id, cursor_ns, cursor_id FROM pull_cursor")
     }
-    #expect(row?["primary_id"] as String? == "new-primary")
+    #expect(row?["peer_device_id"] as String? == "new-primary")
     #expect(row?["cursor_ns"] as Int64? == 50)
     #expect(row?["cursor_id"] as String? == "fresh")
     // /since 第一次调用 cursor 应该是 .zero（重置后从头拉）
@@ -274,16 +278,21 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
     await runWorkerBriefly(worker)
 
-    // mirror 表应该是空的——dedup skip 了
-    let mirrorCount = try await db.pool.read { conn in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? -1
+    // v7 合表后 item 表里既有 own 行也有 peer 行。dedup 命中 = peer 行不应入表。
+    // 验证 origin != self 的 peer 行数 == 0
+    let peerRowCount = try await db.pool.read { conn in
+        try Int.fetchOne(
+            conn,
+            sql: "SELECT COUNT(*) FROM item WHERE origin_device != ?",
+            arguments: [selfID]
+        ) ?? -1
     }
-    #expect(mirrorCount == 0)
+    #expect(peerRowCount == 0)
     // own 那条还在
     let ownStill = try await db.pool.read { conn in
         try Item.filter(Column("id") == "own-1").fetchOne(conn)
@@ -318,7 +327,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         pasteSuppressions: suppressions,
         // crossDeviceDedupWindowNs=0：明确排除 own-item dedup 路径，保证测的是 paste-echo 拦截
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
@@ -326,7 +335,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     await runWorkerBriefly(worker)
 
     let mirrorCount = try await db.pool.read { conn in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror") ?? -1
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
     }
     #expect(mirrorCount == 0)
 }
@@ -366,7 +375,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         pasteSuppressions: suppressions,
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
     )
@@ -374,29 +383,30 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
 
     // 历史行应该正常写入 mirror —— 不被 suppression 误杀
     let mirrorCount = try await db.pool.read { conn in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='old-row'") ?? -1
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item WHERE id='old-row'") ?? -1
     }
     #expect(mirrorCount == 1)
 }
 
 @Test func pullWorkerPasteEchoDoesNotBlockAlreadyMirroredRowUpdate() async throws {
-    // 回归：paste-echo 抑制只对**首次入 mirror** 生效。若 item_mirror 已有此 id
+    // 回归：paste-echo 抑制只对**首次入表** 生效。若 item 表里 peer 行已有此 id
     // （race 中 mirror 先写、suppression 才 record；或 paste 同一历史项第二次），
     // 后续 state update（软删 / pin 变更）必须能盖上 mirror 行，不被 suppression 误挡。
     let db = try makeClientDB()
     let selfID = "mbp-self"
     let baseline: Int64 = 1_700_000_000_000_000_000
 
-    // 预置 mirror 表里已有 (id="mini-echo", "shared text") 一行
+    // 预置 item 表里已有 (id="mini-echo", origin=mini-primary, "shared text") 一行
     try await db.pool.write { conn in
         try conn.execute(sql: """
-            INSERT INTO item_mirror
+            INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, mirrored_at_ns)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+               push_state, push_attempts, last_push_error, ocr_state)
             VALUES (?, 'mini-primary', ?, ?, 'text', NULL, NULL, 'shared text', 'shared text',
-                    NULL, NULL, NULL, 0, NULL, ?)
-        """, arguments: ["mini-echo", baseline, baseline, baseline])
+                    NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
+        """, arguments: ["mini-echo", baseline, baseline])
     }
     // primary 推过来一次软删（同 id，新 ingested_at_ns）
     let softDelete = Item(
@@ -419,7 +429,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         pasteSuppressions: suppressions,
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
     )
@@ -427,7 +437,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
 
     // mirror 行应被软删盖上，不被 suppression 误挡
     let deletedAt: Int64? = try await db.pool.read { conn in
-        try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item_mirror WHERE id='mini-echo'")
+        try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item WHERE id='mini-echo'")
     }
     #expect(deletedAt == baseline + 1_000_000_000)
 }
@@ -449,13 +459,13 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
     await runWorkerBriefly(worker)
 
     let mirrorCount = try await db.pool.read { conn in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='mini-only'") ?? -1
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item WHERE id='mini-only'") ?? -1
     }
     #expect(mirrorCount == 1)
 }
@@ -478,16 +488,17 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
             pushState: .pending
         )
         try own.insert(conn)
-        // mirror 表里也有这条（已经入过，靠 fixture SQL 写入，避免被 dedup）
+        // item 表里也有这条 peer 行（已经入过，靠 fixture SQL 写入，避免被 dedup）
         try conn.execute(sql: """
-            INSERT INTO item_mirror
+            INSERT INTO item
               (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                source_app, source_app_name, preview, text_full,
-               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, mirrored_at_ns)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?)
+               blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
+               push_state, push_attempts, last_push_error, ocr_state)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, 0, NULL, 'acked', 0, NULL, NULL)
         """, arguments: [
             "mini-x", "mini-primary", baseline + 100_000_000, baseline + 100_000_000, "text",
-            "Test", "stale text", "stale text", baseline + 100_000_000
+            "Test", "stale text", "stale text"
         ])
     }
 
@@ -509,14 +520,14 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
     await runWorkerBriefly(worker)
 
     // mirror 表里 mini-x 的 deleted_at_ns 必须已被盖上，否则 stale 内容继续可搜
     let deletedAt = try await db.pool.read { conn in
-        try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item_mirror WHERE id='mini-x'")
+        try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item WHERE id='mini-x'")
     }
     #expect(deletedAt == 999_999_999)
 }
@@ -549,13 +560,13 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: selfID,
-        mirrorStatus: MirrorStatus(),
+        meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
     await runWorkerBriefly(worker)
 
     let mirrorCount = try await db.pool.read { conn in
-        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item_mirror WHERE id='mini-late'") ?? -1
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item WHERE id='mini-late'") ?? -1
     }
     #expect(mirrorCount == 1)
 }
@@ -573,19 +584,19 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         database: db,
         transport: transport,
         selfDeviceID: "self",
-        mirrorStatus: MirrorStatus()
+        meshStatus: MeshStatus()
     )
     await runWorkerBriefly(worker)
 
     let row = try await db.pool.read { conn in
-        try Row.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item_mirror WHERE id='dead'")
+        try Row.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item WHERE id='dead'")
     }
     #expect(row?["deleted_at_ns"] as Int64? == 999)
 }
 
 @Test func pullWorkerRecordsClockSkewFromHealth() async throws {
-    // /health 报 primary now_ms 比本机快 45s → MirrorStatus.clockSkewMs() 应反映出来。
-    // 用 nowNs 注入固定值让 skew 计算可预测：local = 1_000_000 ms，primary = 1_045_000 ms。
+    // /health 报 peer now_ms 比本机快 45s → MeshStatus.worstClockSkewMs() 应反映出来。
+    // 用 nowNs 注入固定值让 skew 计算可预测：local = 1_000_000 ms，peer = 1_045_000 ms。
     let db = try makeClientDB()
     let primaryNowMs: Int64 = 1_045_000
     let localNowNs: Int64 = 1_000_000 * 1_000_000  // 1_000_000 ms in ns
@@ -594,17 +605,17 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         healthDeviceID: "primary",
         healthNowMs: primaryNowMs
     )
-    let status = MirrorStatus()
+    let status = MeshStatus()
     let worker = PullWorker(
         database: db,
         transport: transport,
         selfDeviceID: "client-self",
-        mirrorStatus: status,
+        meshStatus: status,
         config: PullWorker.Config(intervalSec: 60, clockSkewWarnMs: 30_000),
         nowNs: { localNowNs }
     )
     await runWorkerBriefly(worker)
-    #expect(status.clockSkewMs() == 45_000)
+    #expect(status.worstClockSkewMs() == 45_000)
 }
 
 @Test func pullWorkerRecordsNegativeClockSkew() async throws {
@@ -615,17 +626,17 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         healthDeviceID: "primary",
         healthNowMs: 940_000
     )
-    let status = MirrorStatus()
+    let status = MeshStatus()
     let worker = PullWorker(
         database: db,
         transport: transport,
         selfDeviceID: "self",
-        mirrorStatus: status,
+        meshStatus: status,
         config: PullWorker.Config(intervalSec: 60),
         nowNs: { 1_000_000 * 1_000_000 }
     )
     await runWorkerBriefly(worker)
-    #expect(status.clockSkewMs() == -60_000)
+    #expect(status.worstClockSkewMs() == -60_000)
 }
 
 @Test func pullWorkerHTTPEndToEnd() async throws {
@@ -662,20 +673,21 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     let clientDB = try makeClientDB()
     let baseURL = URL(string: "http://127.0.0.1:\(port)")!
     let httpClient = HTTPIngestClient(baseURL: baseURL, auth: auth)
-    let status = MirrorStatus()
+    let status = MeshStatus()
     let worker = PullWorker(
         database: clientDB,
         transport: httpClient,
         selfDeviceID: "client-self",
-        mirrorStatus: status,
+        meshStatus: status,
         config: PullWorker.Config(intervalSec: 60)
     )
     await runWorkerBriefly(worker, ms: 600)
 
     let ids = try await clientDB.pool.read { conn in
-        try String.fetchAll(conn, sql: "SELECT id FROM item_mirror ORDER BY id")
+        try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
     #expect(ids == ["a", "b"])
-    #expect(status.primaryDeviceID() == primaryDeviceID)
-    #expect(status.lastPullNs() != nil)
+    // MeshStatus 学习模式：PullWorker 用 /health 学到的 peer device_id 注册状态
+    #expect(status.registeredPeerDeviceIDs().contains(primaryDeviceID))
+    #expect(status.oldestLastPullNs() != nil)
 }

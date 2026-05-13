@@ -230,9 +230,9 @@ final class AppState {
             self.searchMode = outcome.mode
             self.totalCount = outcome.totalCount
             self.kindCounts = outcome.kindCounts
-            // 每次 refresh 顺便快照 mirror 时钟偏移——PullWorker 在后台 30s 一次刷新，
-            // SearchView banner 用这个值
-            self.clockSkewMs = deps.mirrorStatus.clockSkewMs()
+            // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
+            // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）
+            self.clockSkewMs = deps.meshStatus.worstClockSkewMs()
             updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
             self.lastError = nil
         } catch is CancellationError {
