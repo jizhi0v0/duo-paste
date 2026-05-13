@@ -26,9 +26,13 @@ public actor CaptureService {
     public let database: Database
     public let blobs: BlobStore
     public let deviceID: String
-    /// 同内容合并窗口（纳秒）。默认从 limits.mergeWindowSec 推导（300s）。
+    /// Blob 路径合并窗口（纳秒）。默认从 limits.mergeWindowSec 推导（300s）。
     /// 显式参数仅用于测试覆盖：生产路径走 config.capture.merge_window_sec。
     public let mergeWindowNs: Int64
+    /// Text 路径合并窗口（纳秒）。`nil` = 永久 dedup（无时间限制）；
+    /// 非 nil 表示 N 纳秒内同 kind+text_full 合并。从 limits.textMergeWindowSec 推导：
+    /// nil → nil；0 → 0（完全禁用合并）；N>0 → N * 1e9。
+    public let textMergeWindowNs: Int64?
     /// 捕获字节守门 + 合并窗口配置源。
     public let limits: Config.CaptureLimits
 
@@ -37,6 +41,7 @@ public actor CaptureService {
         blobs: BlobStore,
         deviceID: String,
         mergeWindowNs: Int64? = nil,
+        textMergeWindowNs: Int64?? = nil,
         limits: Config.CaptureLimits = .default
     ) {
         self.database = database
@@ -44,6 +49,15 @@ public actor CaptureService {
         self.deviceID = deviceID
         // 显式 mergeWindowNs 用于测试；生产从 limits.mergeWindowSec 推导。
         self.mergeWindowNs = mergeWindowNs ?? Int64(limits.mergeWindowSec) * 1_000_000_000
+        // textMergeWindowNs 是 Int64?? —— 外层 nil 表示"用 limits 推导"，外层非 nil 表示
+        // 显式注入（包括 .some(nil) 表示永久 dedup）。生产代码不会传它，limits 决定。
+        if case .some(let explicit) = textMergeWindowNs {
+            self.textMergeWindowNs = explicit
+        } else if let sec = limits.textMergeWindowSec {
+            self.textMergeWindowNs = Int64(sec) * 1_000_000_000
+        } else {
+            self.textMergeWindowNs = nil  // 永久 dedup
+        }
         self.limits = limits
     }
 
@@ -85,18 +99,30 @@ public actor CaptureService {
         let preview = makePreview(text)
         let role = database.role
         let now = c.capturedAtNs
-        let mergeFloor = now - mergeWindowNs
 
         return try database.pool.write { db -> CaptureResult in
-            // 查最近一条候选 dedup（同 kind + 同内容 + 在窗口内）
-            if let last = try Item
-                .filter(Column("kind") == c.kind.rawValue)
-                .filter(Column("text_full") == text)
-                .filter(Column("captured_at_ns") >= mergeFloor)
-                .filter(Column("deleted_at_ns") == nil)
-                .order(Column("captured_at_ns").desc)
-                .fetchOne(db)
-            {
+            // 查最近一条候选 dedup（同 kind + 同内容 + 未删行）。
+            // textMergeWindowNs == nil → 永久 dedup，跨任意时间合并（剪贴板心智里
+            //   重复文本不像重复图片需要时间线，bump 一条最旧的让它浮顶即可）。
+            // textMergeWindowNs == 0 → 完全禁用合并（每次都插新行）。
+            // textMergeWindowNs > 0 → N 纳秒内合并，跟旧 mergeWindowNs 行为兼容。
+            let mergeCandidate: Item?
+            if textMergeWindowNs == 0 {
+                mergeCandidate = nil
+            } else {
+                var query = Item
+                    .filter(Column("kind") == c.kind.rawValue)
+                    .filter(Column("text_full") == text)
+                    .filter(Column("deleted_at_ns") == nil)
+                if let windowNs = textMergeWindowNs {
+                    let mergeFloor = now - windowNs
+                    query = query.filter(Column("captured_at_ns") >= mergeFloor)
+                }
+                mergeCandidate = try query
+                    .order(Column("captured_at_ns").desc)
+                    .fetchOne(db)
+            }
+            if let last = mergeCandidate {
                 var updated = last
                 updated.capturedAtNs = now
                 if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }

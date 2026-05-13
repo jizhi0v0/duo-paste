@@ -123,6 +123,34 @@ public struct SearchAPI: Sendable {
             }
         }
         var deduped = Array(byID.values)
+
+        // 文本永久 dedup：id-dedup 之后按 text_full 二次 fold。仅 blob_sha256 IS NULL 行参与
+        // （即 text/url/file，"字节相等即同"），blob kind 不动——同 sha 图片多次复制可能是
+        // 用户故意保留时间线。winner = max(capturedAtNs)，pinned 通过 OR 聚合（任一条 pinned
+        // → fold 结果 pinned=true），符合"pin 是对内容的属性而非具体 row"心智。
+        //
+        // 必须在下面的 kind/pinned 后置 filter **之前**——pinned 聚合后 winner.pinned 才是
+        // 正确的过滤依据，跟"按 winner 行字段过滤"不变量同源。
+        var byText: [String: (Item, String?)] = [:]
+        var nonTextFolded: [(Item, String?)] = []
+        nonTextFolded.reserveCapacity(deduped.count)
+        for hit in deduped {
+            let it = hit.0
+            if it.blobSha256 == nil, let tf = it.textFull, !tf.isEmpty {
+                if let existing = byText[tf] {
+                    let winner = it.capturedAtNs > existing.0.capturedAtNs ? hit : existing
+                    var w = winner.0
+                    w.pinned = it.pinned || existing.0.pinned
+                    byText[tf] = (w, winner.1)
+                } else {
+                    byText[tf] = hit
+                }
+            } else {
+                nonTextFolded.append(hit)
+            }
+        }
+        deduped = Array(byText.values) + nonTextFolded
+
         // 按 winner 行的字段过滤——不可前置到子查询。countByKindUnion / countUnion 走同源
         // 不变量（SQL 端 ROW_NUMBER → WHERE 过滤），保证 chip 数字、count、list 三者口径一致。
         if !q.kinds.isEmpty {
@@ -368,55 +396,20 @@ public struct SearchAPI: Sendable {
     }
 
     static func countUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
-        // kinds / pinnedOnly 在跨表 dedup **之后**按 winner 行字段过滤，跟 fetchUnion +
-        // countByKindUnionStatic 同源不变量（codex review P1 #1）。否则同 id 跨表 kind 分歧
-        // 时 list / kind-count / total-count 三条路径会算出不同值。
-        //
-        // 走 ROW_NUMBER OVER (PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC) 选 winner，
-        // _src 是 own=0 / mirror=1 tiebreak（同时间戳 own 赢，跟 fetchUnion Swift 端 `>` 严格
-        // 大于等价）。子查询 strip kinds + pinnedOnly，外层 WHERE 应用。
-        let stripped = SearchQuery(
+        // 走 fetchUnion 同源路径——id-dedup + 文本 fold + 按 winner 字段过滤——保证
+        // list / total-count / kind-count 三者口径一致。规模上剪贴板 item+mirror 万级，
+        // FTS 命中后通常千级以下，Swift 端 dedup 几毫秒；与 fetchUnion 顶头 tradeoff 注释同源。
+        let oversample = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
-            kinds: [],
-            pinnedOnly: false,
+            kinds: q.kinds,
+            pinnedOnly: q.pinnedOnly,
             includeDeleted: q.includeDeleted,
-            limit: 0, offset: 0
+            limit: Int.max,
+            offset: 0
         )
-        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: stripped)
-        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: stripped)
-        var winnerFilters: [String] = ["_rn = 1"]
-        var winnerArgs: [DatabaseValueConvertible] = []
-        if !q.kinds.isEmpty {
-            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
-            winnerFilters.append("kind IN (\(p))")
-            winnerArgs.append(contentsOf: q.kinds.map { $0.rawValue })
-        }
-        if q.pinnedOnly { winnerFilters.append("pinned = 1") }
-        let winnerWhere = winnerFilters.joined(separator: " AND ")
-        let sql = """
-            SELECT COUNT(*) FROM (
-              SELECT id, kind, pinned, ROW_NUMBER() OVER (
-                  PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC
-              ) AS _rn
-              FROM (
-                SELECT item.id AS id, item.kind AS kind, item.pinned AS pinned,
-                       item.captured_at_ns AS captured_at_ns, 0 AS _src
-                FROM item \(own.join) \(own.whereClause)
-                UNION ALL
-                SELECT item_mirror.id AS id, item_mirror.kind AS kind,
-                       item_mirror.pinned AS pinned,
-                       item_mirror.captured_at_ns AS captured_at_ns, 1 AS _src
-                FROM item_mirror \(mir.join) \(mir.whereClause)
-              )
-            )
-            WHERE \(winnerWhere)
-        """
-        var args: [DatabaseValueConvertible] = []
-        args.append(contentsOf: own.args)
-        args.append(contentsOf: mir.args)
-        args.append(contentsOf: winnerArgs)
-        return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
+        let hits = try fetchUnion(db, query: oversample)
+        return hits.count
     }
 
     /// 当前 (query / timeRange / pinnedOnly) 维度下，按 kind 分桶的命中数。
@@ -459,53 +452,24 @@ public struct SearchAPI: Sendable {
     }
 
     static func countByKindUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
-        // pinnedOnly 必须在跨表 dedup **之后**应用（跟 fetchUnion 顶头注释同源不变量）：
-        // own 上 pinned=false 新行 + mirror 上 pinned=true 旧行，子查询带 pinned=1 过滤会
-        // 让 mirror 旧行胜出，count 把已 unpin 的内容算进 pinned 桶。正确做法：子查询
-        // **不**带 pinned 过滤拿全候选，按 captured_at_ns DESC 选 winner，再用 winner 的
-        // pinned 字段过滤。
-        let stripped = SearchQuery(
+        // 走 fetchUnion 同源路径——id-dedup + 文本 fold + pinned 后置过滤——保证 chip
+        // 数字、total count、list 三条路径口径一致。q.kinds 已被 stripKinds 清空，所以
+        // fetchUnion 返回的是"所有 kind 的 winner"，外层按 winner.kind 分桶即可。
+        let oversample = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
-            kinds: [],
-            pinnedOnly: false,   // 子查询不带 pinned 过滤；winner 选完后再 filter
+            kinds: q.kinds,            // 通常已被 stripKinds 清空
+            pinnedOnly: q.pinnedOnly,
             includeDeleted: q.includeDeleted,
-            limit: 0, offset: 0
+            limit: Int.max,
+            offset: 0
         )
-        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: stripped)
-        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: stripped)
-        // ROW_NUMBER() OVER (PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC) = 1 选 winner。
-        // SQLite ≥ 3.25 (2018) 起支持 window function；macOS 14 系统 SQLite 已是 3.43+。
-        // UNION ALL 而非 UNION——窗口函数在外层做 dedup，内层不需要去重也跳过排序。
-        //
-        // tiebreak `_src`：own=0 / mirror=1，captured_at_ns 相等时 own 先赢。跟 fetchUnion
-        // Swift 端 `for hit in own + mirror` + 严格大于 (`>`) 才覆盖的不变量对齐——避免 SQL
-        // / Swift 两条路径在边界 case 上口径分裂。
-        let pinnedFilter = q.pinnedOnly ? " AND pinned = 1" : ""
-        let sql = """
-            SELECT kind, COUNT(*) AS cnt FROM (
-              SELECT id, kind, pinned, ROW_NUMBER() OVER (
-                  PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC
-              ) AS _rn
-              FROM (
-                SELECT item.id AS id, item.kind AS kind, item.pinned AS pinned,
-                       item.captured_at_ns AS captured_at_ns, 0 AS _src
-                FROM item \(own.join) \(own.whereClause)
-                UNION ALL
-                SELECT item_mirror.id AS id, item_mirror.kind AS kind,
-                       item_mirror.pinned AS pinned,
-                       item_mirror.captured_at_ns AS captured_at_ns, 1 AS _src
-                FROM item_mirror \(mir.join) \(mir.whereClause)
-              )
-            )
-            WHERE _rn = 1\(pinnedFilter)
-            GROUP BY kind
-        """
-        var args: [DatabaseValueConvertible] = []
-        args.append(contentsOf: own.args)
-        args.append(contentsOf: mir.args)
-        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
-        return decodeKindCountRows(rows)
+        let hits = try fetchUnion(db, query: oversample)
+        var out: [ItemKind: Int] = [:]
+        for hit in hits {
+            out[hit.0.kind, default: 0] += 1
+        }
+        return out
     }
 
     private static func decodeKindCountRows(_ rows: [Row]) -> [ItemKind: Int] {

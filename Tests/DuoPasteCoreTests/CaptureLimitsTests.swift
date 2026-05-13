@@ -148,11 +148,13 @@ private func makeService(limits: Config.CaptureLimits) throws -> (CaptureService
     #expect(d.mergeWindowSec == 300)
 }
 
-@Test func captureServiceMergeWindowDerivedFromLimits() async throws {
-    // 关键契约：CaptureService 默认从 limits.mergeWindowSec 推导窗口，
-    // 不再固定 2s。同内容 200s 后再次 ingest 应当 merge（300s 窗口内）
+@Test func captureServiceTextMergeWindowDerivedFromLimits() async throws {
+    // 文本 merge 由 textMergeWindowSec 驱动，跟 blob mergeWindowSec 独立。
+    // 显式设 300s 窗口，200s 后再次 ingest 同文本应当 merge。
     let limits = Config.CaptureLimits(
-        maxBlobBytes: 1024, maxTextBytes: 1024, mergeWindowSec: 300
+        maxBlobBytes: 1024, maxTextBytes: 1024,
+        mergeWindowSec: 0,             // blob 窗口设 0 也不影响 text
+        textMergeWindowSec: 300
     )
     let (service, db) = try makeService(limits: limits)
     let now: Int64 = 1_700_000_000_000_000_000
@@ -169,19 +171,70 @@ private func makeService(limits: Config.CaptureLimits) throws -> (CaptureService
     #expect(count == 1)
 }
 
-@Test func captureServiceMergeWindowZeroDisablesMerge() async throws {
+@Test func captureServiceTextMergeWindowZeroDisablesMerge() async throws {
     let limits = Config.CaptureLimits(
-        maxBlobBytes: 1024, maxTextBytes: 1024, mergeWindowSec: 0
+        maxBlobBytes: 1024, maxTextBytes: 1024,
+        mergeWindowSec: 300,
+        textMergeWindowSec: 0
     )
     let (service, db) = try makeService(limits: limits)
-    // 同 ns 也不 merge（窗口 = now - 0 = now，不包含 captured_at_ns == now 的旧行）
-    // 用稍微靠后的 ns 模拟两次复制
     let r1 = try await service.ingest(CapturedPasteboard(
         kind: .text, text: "same", capturedAtNs: 1_700_000_000_000_000_000
     ))
     #expect(r1.outcome == .inserted)
     let r2 = try await service.ingest(CapturedPasteboard(
         kind: .text, text: "same", capturedAtNs: 1_700_000_000_000_000_001
+    ))
+    #expect(r2.outcome == .inserted)
+    let count = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+    }
+    #expect(count == 2)
+}
+
+@Test func captureServiceTextPermanentDedupAcrossLongGap() async throws {
+    // 关键契约：默认 textMergeWindowSec=nil → 永久 dedup。
+    // 跨越 2 小时（远超历史 300s 窗口）的同文本应当合并 bump capturedAtNs。
+    let limits = Config.CaptureLimits(
+        maxBlobBytes: 1024, maxTextBytes: 1024,
+        mergeWindowSec: 300,
+        textMergeWindowSec: nil
+    )
+    let (service, db) = try makeService(limits: limits)
+    let now: Int64 = 1_700_000_000_000_000_000
+    let twoHoursLater = now + Int64(2 * 3600) * 1_000_000_000
+    let r1 = try await service.ingest(CapturedPasteboard(kind: .text, text: "cat ./snippets/x", capturedAtNs: now))
+    #expect(r1.outcome == .inserted)
+    let r2 = try await service.ingest(CapturedPasteboard(kind: .text, text: "cat ./snippets/x", capturedAtNs: twoHoursLater))
+    #expect(r2.outcome == .mergedWithPrevious)
+    let (count, latestCapturedAt) = try await db.pool.read { conn -> (Int, Int64?) in
+        let c = try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+        let t: Int64? = try Int64.fetchOne(conn, sql: "SELECT MAX(captured_at_ns) FROM item")
+        return (c, t)
+    }
+    #expect(count == 1)
+    #expect(latestCapturedAt == twoHoursLater)
+}
+
+@Test func captureServiceBlobMergeUnaffectedByTextWindow() async throws {
+    // 关键不变量：textMergeWindowSec 不影响 blob 路径——blob 仍走 mergeWindowSec。
+    // textMergeWindowSec=nil + mergeWindowSec=0 → 同 sha 图片即使瞬间复制两次也不合并。
+    let limits = Config.CaptureLimits(
+        maxBlobBytes: 32 * 1024 * 1024,
+        maxTextBytes: 1024,
+        mergeWindowSec: 0,
+        textMergeWindowSec: nil   // 永久——但只管 text
+    )
+    let (service, db) = try makeService(limits: limits)
+    let bytes = Data([1, 2, 3, 4, 5])
+    let r1 = try await service.ingest(CapturedPasteboard(
+        kind: .image, blob: bytes, blobExt: "png", blobMime: "image/png",
+        capturedAtNs: 1_700_000_000_000_000_000
+    ))
+    #expect(r1.outcome == .inserted)
+    let r2 = try await service.ingest(CapturedPasteboard(
+        kind: .image, blob: bytes, blobExt: "png", blobMime: "image/png",
+        capturedAtNs: 1_700_000_000_000_000_001
     ))
     #expect(r2.outcome == .inserted)
     let count = try await db.pool.read { conn in

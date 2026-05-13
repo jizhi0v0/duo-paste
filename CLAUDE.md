@@ -22,6 +22,7 @@
   - `SearchAPI.searchUnion` + `fetchHitsMirror`：item + item_mirror 各超量取 limit+offset，**先按 id dedupe（取 capturedAtNs 最大那份，无视 pinned 状态）**，再按 (pinned DESC, prefix DESC, captured_at_ns DESC) 排序，最后裁 limit/offset
   - `SearchProvider.Mode.localMirror(stalenessSec:)`：`mirrorLastPullNs()` 非 nil → 直接走 `searchUnion`，**不**打远端
   - UI banner：`.localMirror` 灰色「本地镜像 · 更新于 Xs/m/h 前」；`.remoteFallback` 黄色保留
+- **文本永久 dedup 完成**：`config.capture.text_merge_window_sec=null`（默认）→ 同 text_full 任意时间内 capture 合并 bump capturedAtNs；blob 路径独立保留 `merge_window_sec=300`。`searchUnion` 在 id-dedup 后按 text_full 二次 fold（仅 blob_sha256 IS NULL 行），winner=max(capturedAtNs) + pinned OR 聚合。countUnion/countByKindUnion 走同源 fetchUnion 算，list/count/chip 三路口径一致。详见下方"文本永久 dedup"设计决策段
 - **Capture 字节守门 完成**：`config.capture.{max_blob_mb=32, max_text_kb=512}` 默认。意外复制超大对象跳过入库（NSPasteboard 自身不受影响，Cmd+V 仍正常）。UI 端 orange skipBanner 5 分钟自动消失 + 手动 ✕ 关闭。详见下文设计决策段
 - **M3 完成**（PR#4 + PR#7 + PR#8 + PR#10 + PR#11 + blob 懒拉已就位）：
   - **时钟偏移 sanity check**：PullWorker 每 tick 在 `/health` 拿 `primary.now_ms` 跟本机 wall-clock 比对，通过 `MirrorStatus.clockSkewMs()` 暴露给 UI；|skew| ≥ 30s 时 log warn + `SearchView.clockSkewBanner` 黄色提示（HMAC 容忍 ±5 分钟，30s 是早期预警）
@@ -165,6 +166,22 @@ PullWorker `lastPullNs` 非 nil（至少完成过一轮 `has_more=false` 追平�
 SQL 端三处必须对称：`fetchHits` / `fetchHitsMirror` / `fetch`，每处 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 计算 `_prefix` 列 + `CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1e9 - captured_at_ns) < 86400e9 THEN _prefix ELSE 0 END DESC` 包进 ORDER BY。prefix 占位符必须 `args.insert(at: 0)`（SELECT 列表的 `?` 出现在所有 WHERE/LIMIT 占位符之前）。
 
 Swift 端 `fetchUnion.prefixScore` 跟 SQL 端口径**必须**一致——跨表 dedup 后 SQL 算的 `_prefix` 列已丢，重算。回归测试 `SearchPrefixBoostTests.swift` 4 条覆盖：单表 boost / pinned 优先 / 24h 窗外不 boost / union 跨表保留优先级。改动任何一条排序都要先看测试是否仍通过。
+
+### 文本永久 dedup（capture + searchUnion 双层）
+
+文本 kind（`text/url/file`，即 `blob_sha256 IS NULL`）走永久 dedup，跟 blob 路径独立：
+
+1. **Capture 层**（`CaptureService.ingestText`）：`config.capture.text_merge_window_sec` 默认 `null` = 永久。同 kind + 同 `text_full` + 未删行无论何时再次 capture，都合并 bump `captured_at_ns`（primary 还 bump `ingested_at_ns` 让 mirror 看见）。设 `0` 完全禁用，设 `N>0` 行为退化到固定窗口。`blob mergeWindowSec` 独立保留 300s——同 sha 图片多次复制时间线上可能有意保留。
+2. **搜索层**（`Search.fetchUnion`）：在 id-dedup 之后、kind/pinned filter 之前，对所有 `blob_sha256 IS NULL` 行按 `text_full` 二次 fold。Winner = `max(capturedAtNs)`，**pinned 通过 OR 聚合**（任一条 pinned → fold 结果 pinned=true，pin 是对内容的属性而非具体 row）。`countUnion` / `countByKindUnion` 走同源 `fetchUnion` 路径计算，保证 list / total / chip 三者口径一致。
+
+为什么要两层：
+- 单 Capture 层不够 —— ToDesk / 远程桌面把 mini pasteboard 同步到 MBP，两台 watcher 各自抓到一条 own-origin 行（不同 id 不同 origin_device），mini 行通过 mirror pull 进 MBP 的 item_mirror，搜索时本机 fold 拦不住跨表
+- 单 fold 层不够 —— 同设备短时间内重复 copy 仍会插多行，存储白浪费且 audit-push 桶数膨胀；capture 层 dedup 让 DB 干净
+- 两层防御互补，且各自有独立单测覆盖（`captureServiceTextPermanentDedupAcrossLongGap` / `unionFoldsSameTextAcrossOwnAndMirror` / `unionFoldPreservesPinnedViaOR` / `unionDoesNotFoldBlobsBySameSha` / `unionFoldRespectsKindFilter` / `unionFoldCountAndListConsistent`）
+
+**不要回退到固定窗口默认值**：用户心智是"剪贴板重复就该收起"，5 分钟窗口在 ToDesk 同步场景下两端时间错位常超窗，回退会再现"同文本并排两条"的 UI 问题。
+
+**不动 RemoteIngester Continuity dedup**：那条路径管的是 primary 接收 push 时的 reject 语义（影响 push_state / audit-push 桶定义），跟"减少 UI 重复行"目标不在一条主线上。两套机制可共存：Continuity dedup 还在按 ±300s 窗 reject 跨设备 dup push（primary item 表干净），搜索层 fold 兜底剩下的 own + mirror 字面重复。
 
 ### RTF 三层降级 + raw-size 守门
 

@@ -150,7 +150,9 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
 @Test func captureDoesNotMergeAcrossWindow() async throws {
     // 验证「跨窗口必定分裂」的策略不变量，跟具体窗口数值解耦：
-    // 显式构 2s 窗口的 service，间隔 3s 复制同一内容 → 应当分裂为两行
+    // 显式构 2s 文本窗口的 service，间隔 3s 复制同一内容 → 应当分裂为两行。
+    // 默认 textMergeWindowSec=nil（永久 dedup）会让 text 永远合并——本测试
+    // 要的是"有限窗口下跨窗分裂"，所以显式注入 textMergeWindowNs。
     let root = tempDir()
     let paths = Paths(root: root)
     paths.ensureExists()
@@ -158,7 +160,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let blobs = BlobStore(root: paths.blobsDir)
     let service = CaptureService(
         database: db, blobs: blobs, deviceID: "device-test",
-        mergeWindowNs: 2 * 1_000_000_000
+        textMergeWindowNs: .some(2 * 1_000_000_000)
     )
     let baseNs: Int64 = 6_000_000_000_000_000_000
     let first = CapturedPasteboard(kind: .text, text: "dup", capturedAtNs: baseNs)

@@ -193,11 +193,12 @@ private func insertOwn(
 }
 
 @Test func countUnionSkipsSoftDeletedOnBothSides() throws {
+    // 文本各 distinct，避免触发文本 fold 干扰这条 soft-delete 路径的不变量验证。
     let db = try makeDB()
-    try insertOwn(db, id: "alive-own", capturedAtNs: 100, text: "ok")
-    try insertMirror(db, id: "alive-mir", origin: "primary", capturedAtNs: 200, text: "ok")
-    try insertMirror(db, id: "dead-mir", origin: "primary", capturedAtNs: 300, text: "rip", deletedAtNs: 999)
-    try insertOwn(db, id: "dead-own", capturedAtNs: 400, text: "rip")
+    try insertOwn(db, id: "alive-own", capturedAtNs: 100, text: "alive own text")
+    try insertMirror(db, id: "alive-mir", origin: "primary", capturedAtNs: 200, text: "alive mirror text")
+    try insertMirror(db, id: "dead-mir", origin: "primary", capturedAtNs: 300, text: "rip mirror", deletedAtNs: 999)
+    try insertOwn(db, id: "dead-own", capturedAtNs: 400, text: "rip own")
     try db.pool.write { conn in
         try conn.execute(sql: "UPDATE item SET deleted_at_ns = 999 WHERE id = 'dead-own'")
     }
@@ -465,4 +466,117 @@ private func insertOwn(
     #expect(try api.countUnion(SearchQuery(kinds: [.text])) == 1)
     let hits = try api.searchUnion(SearchQuery(limit: 10))
     #expect(hits.first?.0.kind == .text)  // own 赢
+}
+
+// MARK: - 文本永久 dedup（跨表/跨设备 fold）
+
+/// Image 行带 blob_sha256 的 mirror 写入助手——验证 fold 跳过 blob kind 用。
+private func insertMirrorImage(
+    _ db: DuoDB,
+    id: String,
+    origin: String,
+    capturedAtNs: Int64,
+    blobSha256: String,
+    fileName: String
+) throws {
+    try db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item_mirror (
+                id, origin_device, captured_at_ns, ingested_at_ns, kind,
+                source_app, source_app_name, preview, text_full,
+                blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns, mirrored_at_ns
+            ) VALUES (?, ?, ?, ?, 'image', NULL, NULL, ?, ?, ?, ?, ?, 0, NULL, ?)
+        """, arguments: [
+            id, origin, capturedAtNs, capturedAtNs,
+            fileName, fileName, blobSha256, 100, "image/png", capturedAtNs
+        ])
+    }
+}
+
+private func insertOwnImage(
+    _ db: DuoDB,
+    id: String,
+    capturedAtNs: Int64,
+    blobSha256: String,
+    fileName: String
+) throws {
+    let it = Item(
+        id: id,
+        originDevice: "self",
+        capturedAtNs: capturedAtNs,
+        kind: .image,
+        preview: fileName,
+        textFull: fileName,
+        blobSha256: blobSha256,
+        blobSize: 100,
+        blobMime: "image/png",
+        pushState: .acked
+    )
+    try db.pool.write { conn in try it.insert(conn) }
+}
+
+@Test func unionFoldsSameTextAcrossOwnAndMirror() throws {
+    // 截图场景：MBP own 行（自家 watcher 抓到）+ mini mirror 行（远端推过来）同文本。
+    // searchUnion 应只出 1 条，winner = 较新 capturedAtNs。
+    let db = try makeDB()
+    try insertMirror(db, id: "mini-row", origin: "mini", capturedAtNs: 100, text: "cat ./snippets/x")
+    try insertOwn(db, id: "mbp-row", capturedAtNs: 200, text: "cat ./snippets/x")
+    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    #expect(hits.count == 1)
+    #expect(hits.first?.0.id == "mbp-row")  // 较新者赢
+    #expect(hits.first?.0.capturedAtNs == 200)
+}
+
+@Test func unionFoldPreservesPinnedViaOR() throws {
+    // pinned 通过 OR 聚合——mirror 那条 pinned=true / own 那条新 unpinned，
+    // fold 结果保留 pinned=true（pin 是对内容的属性而非具体 row）。
+    let db = try makeDB()
+    try insertMirror(db, id: "old", origin: "mini", capturedAtNs: 100, text: "snippet", pinned: true)
+    try insertOwn(db, id: "new", capturedAtNs: 200, text: "snippet", pinned: false)
+    // 另插一条 distinct 行验证排序（pinned 应排首位）
+    try insertOwn(db, id: "other", capturedAtNs: 500, text: "unrelated", pinned: false)
+    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    #expect(hits.count == 2)
+    #expect(hits.first?.0.textFull == "snippet")  // fold 后 pinned 排前
+    #expect(hits.first?.0.pinned == true)
+    #expect(hits.first?.0.capturedAtNs == 200)    // 来自较新那条
+}
+
+@Test func unionDoesNotFoldBlobsBySameSha() throws {
+    // 同 sha 图片不参与 text fold——blob_sha256 非 nil 走非文本分支。
+    // 用户在 mini 跟 MBP 各贴一次同图，时间线上保留两条（跟当前行为一致）。
+    let db = try makeDB()
+    let sha = String(repeating: "a", count: 64)
+    try insertMirrorImage(db, id: "mini-img", origin: "mini", capturedAtNs: 100, blobSha256: sha, fileName: "shot.png")
+    try insertOwnImage(db, id: "mbp-img", capturedAtNs: 200, blobSha256: sha, fileName: "shot.png")
+    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    #expect(hits.count == 2)
+    #expect(Set(hits.map(\.0.id)) == ["mini-img", "mbp-img"])
+}
+
+@Test func unionFoldRespectsKindFilter() throws {
+    // fold 后 winner 是 text kind，q.kinds=[.image] 应过滤掉这条 fold 结果。
+    let db = try makeDB()
+    try insertMirror(db, id: "txt-mirror", origin: "mini", capturedAtNs: 100, kind: .text, text: "shared")
+    try insertOwn(db, id: "txt-own", capturedAtNs: 200, kind: .text, text: "shared")
+    let sha = String(repeating: "b", count: 64)
+    try insertOwnImage(db, id: "img", capturedAtNs: 300, blobSha256: sha, fileName: "x.png")
+    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(kinds: [.image], limit: 10))
+    #expect(hits.map(\.0.id) == ["img"])  // text fold 结果被 kind filter 过滤
+}
+
+@Test func unionFoldCountAndListConsistent() throws {
+    // 不变量：fetchUnion / countUnion / countByKindUnion 三条路径口径必须一致。
+    // 否则 chip "文本 3" 但 list 出 2 条（fold 没在 count 端应用）。
+    let db = try makeDB()
+    try insertMirror(db, id: "a-mir", origin: "mini", capturedAtNs: 100, text: "same A")
+    try insertOwn(db, id: "a-own", capturedAtNs: 200, text: "same A")
+    try insertOwn(db, id: "b", capturedAtNs: 300, text: "distinct B")
+    let api = SearchAPI(database: db)
+    let listed = try api.searchUnion(SearchQuery(limit: 100))
+    let totalCount = try api.countUnion(SearchQuery())
+    let kindCount = try api.countByKindUnion(SearchQuery())
+    #expect(listed.count == 2)
+    #expect(totalCount == 2)
+    #expect(kindCount[.text] == 2)
 }

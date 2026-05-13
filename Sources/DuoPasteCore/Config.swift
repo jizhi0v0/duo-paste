@@ -66,27 +66,40 @@ public struct Config: Codable, Sendable, Equatable {
         /// JSON 编码 + 元数据（id / origin_device / source_app / preview...）
         /// 大约占 200B-1KB + escape 膨胀 ~1.3x，512KB 文本编码后 body 约 700KB。
         public var maxTextBytes: Int
-        /// 同内容合并窗口（秒）。窗口内同 kind+content 的重复复制只刷 captured_at_ns，
-        /// 不插新行。默认 300（5 分钟），覆盖"网页 selection overlay 反复写入"、
-        /// "用户短时间内重复复制相同内容"这类场景。
+        /// Blob (image / 同 sha 字节) 合并窗口（秒）。窗口内同 kind+blob_sha256 的重复粘贴
+        /// 只刷 captured_at_ns，不插新行。默认 300（5 分钟）。
+        /// 注意：**只**作用于 blob 路径（ingestBlob）；text 走 `textMergeWindowSec` 独立配置，
+        /// 因为文本字节相等即同（不需要 sha 抽象），永久 dedup 比窗口语义更符合剪贴板心智。
         public var mergeWindowSec: Int
+        /// Text (text/url/file 等文本路径) 合并窗口（秒）。
+        /// `nil`（默认）→ 永久 dedup：任意时间内同 kind+text_full 的重复都合并 bump capturedAtNs。
+        /// `0` → 完全禁用文本合并。`N>0` → N 秒内合并。
+        public var textMergeWindowSec: Int?
 
         public static let `default` = CaptureLimits(
             maxBlobBytes: 32 * 1024 * 1024,
             maxTextBytes: 512 * 1024,
-            mergeWindowSec: 300
+            mergeWindowSec: 300,
+            textMergeWindowSec: nil
         )
 
-        public init(maxBlobBytes: Int, maxTextBytes: Int, mergeWindowSec: Int = 300) {
+        public init(
+            maxBlobBytes: Int,
+            maxTextBytes: Int,
+            mergeWindowSec: Int = 300,
+            textMergeWindowSec: Int? = nil
+        ) {
             self.maxBlobBytes = maxBlobBytes
             self.maxTextBytes = maxTextBytes
             self.mergeWindowSec = mergeWindowSec
+            self.textMergeWindowSec = textMergeWindowSec
         }
 
         enum CodingKeys: String, CodingKey {
             case maxBlobMB = "max_blob_mb"
             case maxTextKB = "max_text_kb"
             case mergeWindowSec = "merge_window_sec"
+            case textMergeWindowSec = "text_merge_window_sec"
         }
 
         public init(from decoder: Decoder) throws {
@@ -96,6 +109,9 @@ public struct Config: Codable, Sendable, Equatable {
             self.maxBlobBytes = blobMB * 1024 * 1024
             self.maxTextBytes = textKB * 1024
             self.mergeWindowSec = try c.decodeIfPresent(Int.self, forKey: .mergeWindowSec) ?? 300
+            // 文本合并窗口缺省 nil = 永久。显式给 null / 不写 → nil。
+            // contains() 判断让"key 存在但值为 null"也能映射到 nil（decodeIfPresent 会返回 nil）
+            self.textMergeWindowSec = try c.decodeIfPresent(Int.self, forKey: .textMergeWindowSec)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -103,6 +119,7 @@ public struct Config: Codable, Sendable, Equatable {
             try c.encode(maxBlobBytes / (1024 * 1024), forKey: .maxBlobMB)
             try c.encode(maxTextBytes / 1024, forKey: .maxTextKB)
             try c.encode(mergeWindowSec, forKey: .mergeWindowSec)
+            try c.encodeIfPresent(textMergeWindowSec, forKey: .textMergeWindowSec)
         }
     }
 
@@ -358,6 +375,12 @@ public struct Config: Codable, Sendable, Equatable {
         captureDict["max_blob_mb"] = cfg.capture.maxBlobBytes / (1024 * 1024)
         captureDict["max_text_kb"] = cfg.capture.maxTextBytes / 1024
         captureDict["merge_window_sec"] = cfg.capture.mergeWindowSec
+        // textMergeWindowSec nil → 移除 key（=永久 dedup 缺省语义）。非 nil → 写值。
+        if let textWin = cfg.capture.textMergeWindowSec {
+            captureDict["text_merge_window_sec"] = textWin
+        } else {
+            captureDict.removeValue(forKey: "text_merge_window_sec")
+        }
         dict[CodingKeys.capture.rawValue] = captureDict
 
         // hotkey 同款 nested merge——用户/未来可能加 description / disabled 之类字段
@@ -441,6 +464,11 @@ public struct Config: Codable, Sendable, Equatable {
         }
         if capture.mergeWindowSec < 0 {
             throw ConfigError.invalidCombination("capture.merge_window_sec 必须 >= 0")
+        }
+        if let textWin = capture.textMergeWindowSec, textWin < 0 {
+            throw ConfigError.invalidCombination(
+                "capture.text_merge_window_sec 必须 >= 0 或省略（省略=永久 dedup）"
+            )
         }
         if serve && !(1...65535).contains(servePort) {
             throw ConfigError.invalidCombination("serve_port 超界 (1-65535)：\(servePort)")
