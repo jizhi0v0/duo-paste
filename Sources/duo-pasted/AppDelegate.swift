@@ -307,49 +307,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func revealInFinder(_ item: Item) {
         switch item.kind {
         case .file:
-            guard let raw = item.textFull ?? item.preview, !raw.isEmpty else { return }
-            let urls = raw.split(separator: "\n", omittingEmptySubsequences: true)
-                .map { URL(fileURLWithPath: String($0)) }
+            // Image file URLs are captured as `.file` so Finder paste-back still
+            // writes file URLs, but Command-Return should be able to open their
+            // bytes on mirror clients where the original source path does not exist.
+            if let sha = item.blobSha256 {
+                openBlobBackedItem(item, sha: sha)
+                return
+            }
+
+            let urls = fileURLs(from: item)
+            guard !urls.isEmpty else { return }
             NSWorkspace.shared.activateFileViewerSelecting(urls)
+            panel.hide()
 
         case .image:
-            currentPasteTask?.cancel()
-            currentPasteTask = nil
-            state.pasteProgress = .idle
-
             guard let sha = item.blobSha256 else { return }
-
-            // 本地已有 blob → 直接打开
-            if let url = deps.blobs.locate(sha256: sha) {
-                NSWorkspace.shared.open(url)
-                return
-            }
-
-            // 远端 blob 未缓存 → 复用 lazy fetch 路径，拉完后打开
-            guard let fetcher = pasteBlobFetcher else {
-                state.pasteProgress = .failed(reason: "图片在本机未缓存，且未配置 primary 拉取通道")
-                return
-            }
-
-            state.pasteProgress = .fetching(itemID: item.id, sizeHint: item.blobSize)
-            currentPasteTask = Task { @MainActor [weak self] in
-                guard let self else { return }
-                let outcome = await self.fetchBlobLazy(sha: sha, fetcher: fetcher)
-                if Task.isCancelled { return }
-                switch outcome {
-                case .success:
-                    self.state.pasteProgress = .idle
-                    if let url = self.deps.blobs.locate(sha256: sha) {
-                        NSWorkspace.shared.open(url)
-                    }
-                    self.panel.hide()
-                case .failure(let reason):
-                    self.state.pasteProgress = .failed(reason: reason)
-                }
-            }
+            openBlobBackedItem(item, sha: sha)
 
         default:
             break
+        }
+    }
+
+    private func fileURLs(from item: Item) -> [URL] {
+        guard let raw = item.textFull ?? item.preview, !raw.isEmpty else { return [] }
+        return raw.split(separator: "\n", omittingEmptySubsequences: true)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { URL(fileURLWithPath: $0) }
+    }
+
+    private func openBlobBackedItem(_ item: Item, sha: String) {
+        currentPasteTask?.cancel()
+        currentPasteTask = nil
+        state.pasteProgress = .idle
+
+        // 本地已有 blob -> 直接打开
+        if let url = deps.blobs.locate(sha256: sha) {
+            NSWorkspace.shared.open(url)
+            panel.hide()
+            return
+        }
+
+        // 远端 blob 未缓存 -> 复用 lazy fetch 路径，拉完后打开
+        guard let fetcher = pasteBlobFetcher else {
+            state.pasteProgress = .failed(reason: "图片在本机未缓存，且未配置 primary 拉取通道")
+            return
+        }
+
+        state.pasteProgress = .fetching(itemID: item.id, sizeHint: item.blobSize)
+        currentPasteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.fetchBlobLazy(sha: sha, fetcher: fetcher)
+            if Task.isCancelled { return }
+            switch outcome {
+            case .success:
+                self.state.pasteProgress = .idle
+                if let url = self.deps.blobs.locate(sha256: sha) {
+                    NSWorkspace.shared.open(url)
+                }
+                self.panel.hide()
+            case .failure(let reason):
+                self.state.pasteProgress = .failed(reason: reason)
+            }
         }
     }
 
