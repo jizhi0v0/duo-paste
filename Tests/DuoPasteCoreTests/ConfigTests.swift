@@ -201,6 +201,91 @@ private func tmpConfig(_ json: String) throws -> URL {
     #expect(cfg.hotkey.modifiers == ["command", "alt"])
 }
 
+// MARK: - ocr
+
+@Test func ocrDefaultsWhenAbsent() throws {
+    let url = try tmpConfig("{}")
+    let cfg = try Config.load(from: url)
+    #expect(cfg.ocr.enabled == true)
+    #expect(cfg.ocr.languages == ["zh-Hans", "en-US"])
+    #expect(cfg.ocr.maxBlobMB == 16)
+    #expect(cfg.ocr.recognitionLevel == "accurate")
+    #expect(cfg.ocr.perItemPauseMs == 100)
+}
+
+@Test func ocrRoundtripsAllFields() throws {
+    let url = try tmpConfig("""
+    {
+        "ocr": {
+            "enabled": false,
+            "languages": ["en-US", "ja-JP"],
+            "max_blob_mb": 32,
+            "recognition_level": "fast",
+            "per_item_pause_ms": 200
+        }
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.ocr.enabled == false)
+    #expect(cfg.ocr.languages == ["en-US", "ja-JP"])
+    #expect(cfg.ocr.maxBlobMB == 32)
+    #expect(cfg.ocr.recognitionLevel == "fast")
+    #expect(cfg.ocr.perItemPauseMs == 200)
+    // 再写出来 + 重读，字段保真
+    try Config.write(cfg, to: url)
+    let cfg2 = try Config.load(from: url)
+    #expect(cfg2.ocr == cfg.ocr)
+}
+
+@Test func ocrWritePreservesUnknownNestedFields() throws {
+    // 用户/未来给 ocr 子段加 debug_dump、custom_words 等键，write 后仍在
+    let url = try tmpConfig("""
+    {
+        "ocr": {
+            "enabled": true,
+            "debug_dump": true,
+            "custom_words": ["RAII", "k8s"]
+        }
+    }
+    """)
+    var cfg = try Config.load(from: url)
+    cfg.ocr.maxBlobMB = 24
+    try Config.write(cfg, to: url)
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    let ocr = dict["ocr"] as! [String: Any]
+    #expect((ocr["debug_dump"] as? Bool) == true)
+    #expect((ocr["custom_words"] as? [String]) == ["RAII", "k8s"])
+    #expect((ocr["max_blob_mb"] as? Int) == 24)
+}
+
+@Test func ocrRejectsInvalidRecognitionLevel() throws {
+    let url = try tmpConfig("""
+    { "ocr": { "recognition_level": "ultra" } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
+@Test func ocrRejectsEmptyLanguages() throws {
+    let url = try tmpConfig("""
+    { "ocr": { "languages": [] } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
+@Test func ocrRejectsZeroMaxBlobMB() throws {
+    let url = try tmpConfig("""
+    { "ocr": { "max_blob_mb": 0 } }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
 @Test func hotkeyWritePreservesUnknownNestedFields() throws {
     // hotkey 子 dict 也走 nested merge，未来加 "label" 之类字段不丢
     let url = try tmpConfig("""

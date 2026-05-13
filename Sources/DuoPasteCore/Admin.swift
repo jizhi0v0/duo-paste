@@ -250,6 +250,19 @@ public enum Admin {
             }
             let stampedRows = nullIDs.count
 
+            // c2. 【round 2 review fix】image 行 ocr_state 防御回填。v6 migration 一次性把
+            //     当时 item / item_mirror 表里所有 NULL→pending；但 v6 之后 PullWorker 从老
+            //     primary（v6 之前 binary，不发 ocr_state）拉新行时仍 NULL，promote 把它们搬
+            //     进 item 表。即便 phase 1 OCRWorker 只扫 origin=self 跳过这些跨 origin 行，
+            //     phase 2 加跨 origin OCR 时应该看到 pending；现在标好状态成本极低
+            try conn.execute(sql: """
+                UPDATE item
+                SET ocr_state = 'pending'
+                WHERE kind = 'image'
+                  AND ocr_state IS NULL
+                  AND deleted_at_ns IS NULL
+            """)
+
             // d. 清空 mirror + cursor。FTS 触发器同步清 item_mirror_fts，免费。
             try conn.execute(sql: "DELETE FROM item_mirror")
             let clearedRows = conn.changesCount
@@ -503,6 +516,76 @@ public enum Admin {
                     last_push_error = NULL
                 WHERE push_state = 'failed'
             """)
+            return conn.changesCount
+        }
+    }
+
+    /// OCR 重试范围。`all` 把所有 own-origin 的 image 行里 `ocr_state IN ('failed', 'skipped')`
+    /// 全部翻回 pending；`id(_)` 是单条手动 override（无视当前 state 黑名单——用户显式指定就
+    /// 信任）
+    public enum OCRRetryScope: Sendable, Equatable {
+        case all
+        case id(String)
+    }
+
+    /// 把 OCR `failed` / `skipped` 行重置回 pending 让 OCRWorker 重新扫。
+    ///
+    /// - `scope=.all`：仅本机 own-origin 的 image kind 且 ocr_state 落 failed/skipped。
+    ///   排除：tombstone（deleted_at_ns != nil）/ 非 image / 非 own-origin（别人家的行
+    ///   由对端 worker 负责）/ 已 pending（无需翻）/ done（用户没显式指定别动它）。
+    /// - `scope=.id(_)`：只看 id + kind=image + `origin_device = selfDeviceID`
+    ///   + `deleted_at_ns IS NULL`。无视 state——用户敲了 id 就是手动 override，
+    ///   包括把 done 翻成 pending 重 OCR 的场景。但仍守 origin / tombstone：
+    ///   OCRWorker.fetchPending 也只扫 own-origin + 非软删，翻 remote-origin /
+    ///   tombstone 的 ocr_state 没人处理会永卡 pending
+    ///
+    /// **清 `last_push_error` 的边界**（review fix）：OCRWorker 跟 PushWorker 共享这一列，
+    /// 仅在 `push_state != 'failed'` 时清——如果 push 真的失败着、错误信息是 push 的
+    /// （比如"rejected: bad blob"），不该被 OCR 重试无意中抹掉。`CASE` 让 push 失败行
+    /// 保留原 last_push_error，其余行清空（删 OCR 留下的 "blob too large" 之类）。
+    ///
+    /// **不** bump ingested_at_ns——重置本身不改 item 内容；worker 真跑 OCR 写
+    /// text_full 时再 bump。
+    ///
+    /// - Returns: 受影响的行数
+    public static func retryFailedOCR(
+        dbPath: URL,
+        selfDeviceID: String,
+        scope: OCRRetryScope
+    ) throws -> Int {
+        let db = try Database(path: dbPath, role: .client)
+        return try db.pool.write { conn -> Int in
+            switch scope {
+            case .all:
+                try conn.execute(sql: """
+                    UPDATE item
+                    SET ocr_state = 'pending',
+                        last_push_error = CASE
+                            WHEN push_state = 'failed' THEN last_push_error
+                            ELSE NULL
+                        END
+                    WHERE origin_device = ?
+                      AND kind = 'image'
+                      AND ocr_state IN ('failed', 'skipped')
+                      AND deleted_at_ns IS NULL
+                """, arguments: [selfDeviceID])
+            case .id(let id):
+                // origin_device + deleted_at_ns guard 与 .all 路径对齐：单条重置也只
+                // 翻本机 own-origin 且未软删的行，避免把 remote-origin / tombstone 翻回
+                // pending 但 OCRWorker.fetchPending 不扫导致永卡
+                try conn.execute(sql: """
+                    UPDATE item
+                    SET ocr_state = 'pending',
+                        last_push_error = CASE
+                            WHEN push_state = 'failed' THEN last_push_error
+                            ELSE NULL
+                        END
+                    WHERE id = ?
+                      AND origin_device = ?
+                      AND kind = 'image'
+                      AND deleted_at_ns IS NULL
+                """, arguments: [id, selfDeviceID])
+            }
             return conn.changesCount
         }
     }
