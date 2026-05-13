@@ -72,21 +72,27 @@ public struct SearchAPI: Sendable {
     }
 
     static func fetchUnion(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
-        // pinnedOnly 必须在跨表 dedup **之后**应用。否则：own 上 id=X 是新行 pinned=false、
-        // mirror 上 id=X 是旧行 pinned=true（primary 改了 pin 但还没回流到 own），子查询
-        // 各自带 `pinned=1` 过滤后只剩 mirror 旧行——dedup 没东西可合并，UI 看到陈旧文本
-        // 且仍然 pinned。正确顺序：拉**不**带 pinnedOnly 的候选集 → 按 captured_at_ns 取最新
-        // → 再用最新行的 pinned 字段做最后过滤。
+        // pinnedOnly / kinds 必须在跨表 dedup **之后**按 winner 行的字段过滤。否则：
+        // - pinned 分歧：own 上 id=X 新行 pinned=false + mirror 上 id=X 旧行 pinned=true，子查询
+        //   各自带 `pinned=1` 过滤后只剩 mirror 旧行，dedup 没东西可合并，UI 看到陈旧文本
+        // - kind 分歧：own=text 新 / mirror=image 旧，子查询带 `kind IN (image)` 过滤后只剩
+        //   mirror 旧行，UI list 出来一条 image——但 countByKindUnion 算出来 winner=text → 算
+        //   到 text 桶，chip 显示 "image 0" 跟 list 矛盾（即 codex review P1 #1 指出的口径分裂）
         //
-        // pinnedOnly=true 时 oversample 必须无界——否则若 mirror 顶部充满"在 mirror 里
-        // pinned=true 但在 own 里 pinned=false 的过期副本"，oversample 上界会先吃满这些
-        // 副本，让真正应进结果的 pinned 行（编号更后）落在 limit+offset 之外。
-        // pinned 项总数实际很小（用户手动 pin 的，几十量级），无上限不会有性能问题
-        let oversampleLimit = q.pinnedOnly ? Int.max : (q.limit + q.offset)
+        // 正确顺序：拉**不**带 pinnedOnly/kinds 的候选集 → 按 (captured_at_ns DESC, own>mirror)
+        // 取 winner → 再用 winner 行的 pinned / kind 字段过滤。SQL 端 `countByKindUnionStatic` /
+        // `countUnionStatic` 走同源逻辑（ROW_NUMBER + WHERE filter on winner）保证三者口径一致。
+        //
+        // pinnedOnly=true 或 q.kinds 非空时 oversample 必须无界——否则子查询按时间倒序取
+        // limit+offset 行可能全是不该出现在结果里的类型/未 pin 状态，dedup+filter 后凑不齐
+        // q.limit。剪贴板量级（item+mirror 通常万级；FTS 命中后通常千级以下），Int.max 拉全
+        // 集 Swift 端 dedup 几毫秒，跟 pinnedOnly 同源决策。
+        let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty
+        let oversampleLimit = needsPostFilter ? Int.max : (q.limit + q.offset)
         let oversample = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
-            kinds: q.kinds, pinnedOnly: false,
+            kinds: [], pinnedOnly: false,
             includeDeleted: q.includeDeleted,
             limit: oversampleLimit,
             offset: 0
@@ -110,6 +116,12 @@ public struct SearchAPI: Sendable {
             }
         }
         var deduped = Array(byID.values)
+        // 按 winner 行的字段过滤——不可前置到子查询。countByKindUnion / countUnion 走同源
+        // 不变量（SQL 端 ROW_NUMBER → WHERE 过滤），保证 chip 数字、count、list 三者口径一致。
+        if !q.kinds.isEmpty {
+            let allowed = Set(q.kinds)
+            deduped = deduped.filter { allowed.contains($0.0.kind) }
+        }
         if q.pinnedOnly {
             deduped = deduped.filter { $0.0.pinned }
         }
@@ -348,32 +360,54 @@ public struct SearchAPI: Sendable {
     }
 
     static func countUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
-        // UNION（不是 UNION ALL）自动按行去重，但我们只 select id 一列，所以等价于按 id dedupe。
-        // 用 sub-select 包一层让外层 COUNT(*) 数 dedup 后的行数。
+        // kinds / pinnedOnly 在跨表 dedup **之后**按 winner 行字段过滤，跟 fetchUnion +
+        // countByKindUnionStatic 同源不变量（codex review P1 #1）。否则同 id 跨表 kind 分歧
+        // 时 list / kind-count / total-count 三条路径会算出不同值。
         //
-        // pinnedOnly 走 fetchUnion 路径——子查询不带 pinned 过滤，dedup 后取胜者的 pinned
-        // 字段做过滤（跟 fetchUnion 的 dedupe-then-pinnedOnly 不变量对齐）。
-        if q.pinnedOnly {
-            return try fetchUnion(db, query: SearchQuery(
-                text: q.text,
-                fromNs: q.fromNs, toNs: q.toNs,
-                kinds: q.kinds, pinnedOnly: true,
-                includeDeleted: q.includeDeleted,
-                limit: Int.max, offset: 0
-            )).count
+        // 走 ROW_NUMBER OVER (PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC) 选 winner，
+        // _src 是 own=0 / mirror=1 tiebreak（同时间戳 own 赢，跟 fetchUnion Swift 端 `>` 严格
+        // 大于等价）。子查询 strip kinds + pinnedOnly，外层 WHERE 应用。
+        let stripped = SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs, toNs: q.toNs,
+            kinds: [],
+            pinnedOnly: false,
+            includeDeleted: q.includeDeleted,
+            limit: 0, offset: 0
+        )
+        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: stripped)
+        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: stripped)
+        var winnerFilters: [String] = ["_rn = 1"]
+        var winnerArgs: [DatabaseValueConvertible] = []
+        if !q.kinds.isEmpty {
+            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
+            winnerFilters.append("kind IN (\(p))")
+            winnerArgs.append(contentsOf: q.kinds.map { $0.rawValue })
         }
-        let own = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
-        let mir = buildCountClauses(table: "item_mirror", ftsTable: "item_mirror_fts", query: q)
+        if q.pinnedOnly { winnerFilters.append("pinned = 1") }
+        let winnerWhere = winnerFilters.joined(separator: " AND ")
         let sql = """
             SELECT COUNT(*) FROM (
-              SELECT item.id FROM item \(own.join) \(own.whereClause)
-              UNION
-              SELECT item_mirror.id FROM item_mirror \(mir.join) \(mir.whereClause)
+              SELECT id, kind, pinned, ROW_NUMBER() OVER (
+                  PARTITION BY id ORDER BY captured_at_ns DESC, _src ASC
+              ) AS _rn
+              FROM (
+                SELECT item.id AS id, item.kind AS kind, item.pinned AS pinned,
+                       item.captured_at_ns AS captured_at_ns, 0 AS _src
+                FROM item \(own.join) \(own.whereClause)
+                UNION ALL
+                SELECT item_mirror.id AS id, item_mirror.kind AS kind,
+                       item_mirror.pinned AS pinned,
+                       item_mirror.captured_at_ns AS captured_at_ns, 1 AS _src
+                FROM item_mirror \(mir.join) \(mir.whereClause)
+              )
             )
+            WHERE \(winnerWhere)
         """
         var args: [DatabaseValueConvertible] = []
         args.append(contentsOf: own.args)
         args.append(contentsOf: mir.args)
+        args.append(contentsOf: winnerArgs)
         return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
     }
 
