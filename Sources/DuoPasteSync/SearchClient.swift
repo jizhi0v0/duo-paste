@@ -238,13 +238,13 @@ public struct SearchProvider: Sendable {
             s.map { (item.id, $0) }
         })
         let total = (try? local.count(query)) ?? hits.count
-        let kindCounts = (try? local.countByKind(query)) ?? [:]
+        let raw = (try? local.countByKind(query)) ?? [:]
         return Outcome(
             items: hits.map(\.0),
             mode: mode,
             snippets: snippets,
             totalCount: total,
-            kindCounts: kindCounts
+            kindCounts: Self.normalizeKindCounts(raw)
         )
     }
 
@@ -254,13 +254,28 @@ public struct SearchProvider: Sendable {
             s.map { (item.id, $0) }
         })
         let total = (try? local.countUnion(query)) ?? hits.count
-        let kindCounts = (try? local.countByKindUnion(query)) ?? [:]
+        let raw = (try? local.countByKindUnion(query)) ?? [:]
         return Outcome(
             items: hits.map(\.0),
             mode: .localMirror(stalenessSec: stalenessSec),
             snippets: snippets,
             totalCount: total,
-            kindCounts: kindCounts
+            kindCounts: Self.normalizeKindCounts(raw)
         )
+    }
+
+    /// 本地 / unionLocal 路径下，把 `countByKind*` 返回的稀疏 dict 补全为「所有 ItemKind 都有 entry，
+    /// 缺的填 0」。这样 caller 能用 `kindCounts.isEmpty` 区分：
+    /// - 空 dict（remoteOK / 出错降级）→ unknown，UI 隐藏数字
+    /// - 非空 dict（本地命中或本地全空）→ 已知，缺 kind 渲染为 "图片 0"
+    ///
+    /// 不这样补的话：本地搜索 0 命中场景 kindCounts 也是空 dict，跟 remoteOK 撞同一种 nil 渲染，
+    /// KindChip 头注释 "0 也显示，避免误判 filter 失效" 的意图就 break（codex review P2 #2）。
+    static func normalizeKindCounts(_ raw: [ItemKind: Int]) -> [ItemKind: Int] {
+        var out = raw
+        for k in ItemKind.allCases where out[k] == nil {
+            out[k] = 0
+        }
+        return out
     }
 }

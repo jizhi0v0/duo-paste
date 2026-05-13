@@ -87,6 +87,13 @@ public struct SearchAPI: Sendable {
         // limit+offset 行可能全是不该出现在结果里的类型/未 pin 状态，dedup+filter 后凑不齐
         // q.limit。剪贴板量级（item+mirror 通常万级；FTS 命中后通常千级以下），Int.max 拉全
         // 集 Swift 端 dedup 几毫秒，跟 pinnedOnly 同源决策。
+        //
+        // **已知 tradeoff**（codex review round 2 P2 #1）：空搜索 + kind chip 场景这里会从
+        // item / item_mirror 拉全量行到 Swift，按 captured_at_ns DESC 取 q.limit+offset 后
+        // dedup + filter + sort。万级规模实测无感。若未来发现痛点，可改成 SQL CTE +
+        // ROW_NUMBER() 选 winner → WHERE kind/pinned 过滤 → LIMIT/OFFSET 一刀流（fetchHits /
+        // fetchHitsMirror 的 ORDER + LIMIT 都要重写，且 FTS join 路径要单独处理 snippet 列），
+        // 工作量较大不在本 PR 范围。
         let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty
         let oversampleLimit = needsPostFilter ? Int.max : (q.limit + q.offset)
         let oversample = SearchQuery(

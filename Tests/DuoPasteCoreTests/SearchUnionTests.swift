@@ -400,6 +400,33 @@ private func insertOwn(
     #expect(try api.countUnion(SearchQuery(kinds: [.text])) == 1)
 }
 
+@Test func unionPinnedOnlyAndKindsCombinedFilterAgreesAcrossThreePaths() throws {
+    // codex review round 2 Nit：pinnedOnly + kinds 同时过滤的组合 case，
+    // 钉死三条路径（list / countUnion / countByKindUnion）一致。
+    // 跨表分歧场景：winner unpinned 但 loser 在 mirror 里 pinned=true。
+    // 三路必须按 winner.pinned 判断，跳过这一行；不能让 mirror pinned=true 的旧行混进 pinned 桶。
+    let db = try makeDB()
+    // 分歧 row：own winner unpinned + mirror loser pinned —— 这条不该进 pinnedOnly 结果
+    try insertOwn(db, id: "div", capturedAtNs: 1000, kind: .text, text: "winner unpinned", pinned: false)
+    try insertMirror(db, id: "div", origin: "primary", capturedAtNs: 100, kind: .text, text: "stale pinned", pinned: true)
+    // 真 pinned 对照 row：should pass both kinds=[.text] and pinnedOnly
+    try insertOwn(db, id: "really-pinned", capturedAtNs: 500, kind: .text, text: "really pinned", pinned: true)
+    // 噪声：pinned 但 kind 不匹配 —— 应被 kinds=[.text] 过滤掉
+    try insertOwn(db, id: "img-pin", capturedAtNs: 700, kind: .image, pinned: true)
+    let api = SearchAPI(database: db)
+
+    let q = SearchQuery(kinds: [.text], pinnedOnly: true, limit: 10)
+    let hits = try api.searchUnion(q)
+    #expect(hits.map(\.0.id) == ["really-pinned"])
+    #expect(try api.countUnion(q) == 1)
+
+    // countByKindUnion **忽略** q.kinds（stripKinds），但 pinnedOnly 仍生效。
+    // div 行 winner unpinned → 不进 pinned 桶；really-pinned 进 text；img-pin 进 image。
+    let counts = try api.countByKindUnion(SearchQuery(pinnedOnly: true))
+    #expect(counts[.text] == 1)
+    #expect(counts[.image] == 1)
+}
+
 @Test func countUnionTieBreaksOwnOverMirrorOnSameTimestamp() throws {
     // captured_at_ns 相等时跟 fetchUnion 同源（own=0/_src ASC 赢），不会出现非确定 winner。
     // own.text 跟 mirror.image 同时间戳 → winner=own.text → image 桶 0 / text 桶 1。
