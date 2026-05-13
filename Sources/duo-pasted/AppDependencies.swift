@@ -22,6 +22,12 @@ final class AppDependencies {
     let meshStatus: MeshStatus
     /// 跨设备 paste-echo 抑制集合。AppDelegate.pasteBack 写入；PullWorker 应用 mirror 时查。
     let pasteSuppressions: PasteSuppressionSet
+    /// PR 3：进程级共享 WS broadcaster。**eagerly 创建**——server 起之前 connections 集合
+    /// 是空的，CaptureService 路径调 broadcastCursorAdvanced 自然 no-op；server 启动注入
+    /// 同一个实例后，新 connection 注册进来 fan-out 才生效。
+    /// 这样 CaptureService.onCursorAdvanced 不需要 Atomic<closure> 后置注入——闭包 capture
+    /// broadcaster 引用即可
+    let wsBroadcaster: WSBroadcaster
 
     init() throws {
         let paths = Paths.makeDefault()
@@ -34,11 +40,24 @@ final class AppDependencies {
         self.deviceID = deviceID
         self.database = database
         self.blobs = blobs
+        let wsBroadcaster = WSBroadcaster()
+        self.wsBroadcaster = wsBroadcaster
+        // Sendable closure 给 CaptureService.onCursorAdvanced——primary 路径 commit 后触发，
+        // 投递到 broadcaster fan-out 给所有连上的 peer。Task wrapper 让 actor 调用脱离
+        // capture 路径同步等待
         self.captureService = CaptureService(
             database: database,
             blobs: blobs,
             deviceID: deviceID,
-            limits: config.capture
+            limits: config.capture,
+            onCursorAdvanced: { [wsBroadcaster, deviceID] ns in
+                Task {
+                    await wsBroadcaster.broadcastCursorAdvanced(
+                        deviceID: deviceID,
+                        latestIngestedAtNs: ns
+                    )
+                }
+            }
         )
         let searchAPI = SearchAPI(database: database)
         self.searchAPI = searchAPI

@@ -12,50 +12,81 @@ import DuoPasteCore
 /// - 测试可直接构造 mock-transport 的 worker 列表传进来
 /// - supervisor 不依赖 transport / config 细节，可独立单测
 ///
-/// PR 2 不接 WSNotificationClient（PR 3 范围）；PR 3 会扩成 `[(PullWorker, WSNotificationClient)]` 对。
+/// PR 3：每个 peer 一个 (PullWorker, WSNotificationClient?) 对。WS client 可选——`mesh.ws_enabled=false`
+/// 或测试场景传 nil，行为退化为 PR 2 纯轮询模式。
 public final class MeshSupervisor: @unchecked Sendable {
-    /// 配置好的 PullWorker actor 列表。每个 actor 锚定一个 peer。
-    /// 初始化后不变；并发读 OK，@unchecked Sendable 因为 Swift 不能从 final class
-    /// 自动推出"不可变 array of actor 是 Sendable"。
-    public let workers: [PullWorker]
+    public struct Peer: Sendable {
+        public let worker: PullWorker
+        public let wsClient: WSNotificationClient?
+
+        public init(worker: PullWorker, wsClient: WSNotificationClient? = nil) {
+            self.worker = worker
+            self.wsClient = wsClient
+        }
+    }
+
+    /// 配置好的 peer 对列表。每对锚定一个 peer。初始化后不变；并发读 OK，
+    /// @unchecked Sendable 因为 Swift 不能从 final class 自动推出"不可变 array of actor 对是 Sendable"。
+    public let peers: [Peer]
     private let log: @Sendable (String) -> Void
 
     public init(
+        peers: [Peer],
+        log: @escaping @Sendable (String) -> Void = { msg in
+            FileHandle.standardError.write(Data("mesh: \(msg)\n".utf8))
+        }
+    ) {
+        self.peers = peers
+        self.log = log
+    }
+
+    /// PR 2 兼容入口：只有 PullWorker 列表 → 自动包成 Peer 对（wsClient = nil）。
+    /// 旧调用点（如 PR 2 时期 AppDelegate）和单 peer 测试可以继续 work。
+    public convenience init(
         workers: [PullWorker],
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("mesh: \(msg)\n".utf8))
         }
     ) {
-        self.workers = workers
-        self.log = log
+        self.init(peers: workers.map { Peer(worker: $0) }, log: log)
     }
 
-    /// 启动所有 worker。每个 PullWorker.start() 内部 guard 重入，多次调用幂等。
-    /// 并发启动各自的 runLoop（actor 间互不阻塞）。
+    /// 暴露 worker 列表的别名——很多旧测试 / 上层代码用 `supervisor.workers`，保留兼容。
+    public var workers: [PullWorker] { peers.map(\.worker) }
+
+    /// 启动所有 peer。每对内部各自的 PullWorker.start() / WSNotificationClient.start() 是
+    /// 幂等的（内部 guard 重入），并发启动各自 runLoop（actor 间互不阻塞）。
+    /// PullWorker 先起，WS client 后起——WS 触发 wake() 时 worker 已经在跑。
     public func start() async {
-        log("starting \(workers.count) peer worker(s)")
-        for w in workers {
-            await w.start()
+        let wsCount = peers.compactMap(\.wsClient).count
+        log("starting \(peers.count) peer worker(s) · ws=\(wsCount)")
+        for p in peers {
+            await p.worker.start()
+            if let ws = p.wsClient {
+                await ws.start()
+            }
         }
     }
 
-    /// 停所有 worker。每个 PullWorker.stop() 内部取消 currentSleep + runTask，
-    /// 串行 await 是 OK 的——stop 是测试 / shutdown 路径，不需要并发优化。
+    /// 停所有 peer。WS client 先停（cancel 长连接 task），PullWorker 后停——避免
+    /// WS 在停 worker 期间还触发 wake()。
     public func stop() async {
-        for w in workers {
-            await w.stop()
+        for p in peers {
+            if let ws = p.wsClient {
+                await ws.stop()
+            }
+            await p.worker.stop()
         }
         log("stopped all peer workers")
     }
 
-    /// 外部触发"立即拉一次"（PR 3 WebSocket notify 路径）。每个 worker wake 自家 sleep。
-    /// nonisolated 因为 PullWorker.wake() 是 nonisolated，supervisor 包装继承同语义。
+    /// 外部触发"立即拉一次"——主要给手动调试用；正常路径靠 WS client 的 onCursorAdvanced。
     public func wakeAll() {
-        for w in workers {
-            w.wake()
+        for p in peers {
+            p.worker.wake()
         }
     }
 
-    /// 当前 mesh 里活跃 peer 数（PR 2 = 配置 peer 数，PR 3 后可能扩展健康过滤）
-    public var peerCount: Int { workers.count }
+    /// 当前 mesh 里活跃 peer 数。
+    public var peerCount: Int { peers.count }
 }

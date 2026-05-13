@@ -35,6 +35,13 @@ public actor CaptureService {
     public let textMergeWindowNs: Int64?
     /// 捕获字节守门 + 合并窗口配置源。
     public let limits: Config.CaptureLimits
+    /// PR 3 mesh 通知钩子。primary 路径 / merge bump-ingestNs 路径 commit 后触发，
+    /// 闭包参数 = 这次刷新的 ingested_at_ns。生产 AppDelegate 注入"投递到 WSBroadcaster"
+    /// 闭包；standalone / client / 测试默认 no-op。
+    ///
+    /// **闭包必须 Sendable + 不能 throw**——CaptureService 是 actor，writer tx 已 commit
+    /// 后再调；闭包出错应该 log 不影响业务路径。
+    private let onCursorAdvanced: @Sendable (Int64) -> Void
 
     public init(
         database: Database,
@@ -42,7 +49,8 @@ public actor CaptureService {
         deviceID: String,
         mergeWindowNs: Int64? = nil,
         textMergeWindowNs: Int64?? = nil,
-        limits: Config.CaptureLimits = .default
+        limits: Config.CaptureLimits = .default,
+        onCursorAdvanced: @escaping @Sendable (Int64) -> Void = { _ in }
     ) {
         self.database = database
         self.blobs = blobs
@@ -59,6 +67,7 @@ public actor CaptureService {
             self.textMergeWindowNs = nil  // 永久 dedup
         }
         self.limits = limits
+        self.onCursorAdvanced = onCursorAdvanced
     }
 
     @discardableResult
@@ -100,7 +109,7 @@ public actor CaptureService {
         let role = database.role
         let now = c.capturedAtNs
 
-        return try database.pool.write { db -> CaptureResult in
+        let result: CaptureResult = try database.pool.write { db -> CaptureResult in
             // 查最近一条候选 dedup（同 kind + 同内容 + 未删行）。
             // textMergeWindowNs == nil → 永久 dedup，跨任意时间合并（剪贴板心智里
             //   重复文本不像重复图片需要时间线，bump 一条最旧的让它浮顶即可）。
@@ -163,6 +172,8 @@ public actor CaptureService {
             try item.insert(db)
             return CaptureResult(outcome: .inserted, item: item)
         }
+        broadcastIfAdvanced(role: role, item: result.item, outcome: result.outcome)
+        return result
     }
 
     private func ingestBlob(_ c: CapturedPasteboard, blob: Data) throws -> CaptureResult {
@@ -173,7 +184,7 @@ public actor CaptureService {
         let now = c.capturedAtNs
         let mergeFloor = now - mergeWindowNs
 
-        return try database.pool.write { db -> CaptureResult in
+        let result: CaptureResult = try database.pool.write { db -> CaptureResult in
             if let last = try Item
                 .filter(Column("kind") == c.kind.rawValue)
                 .filter(Column("blob_sha256") == info.sha256)
@@ -226,6 +237,21 @@ public actor CaptureService {
             )
             try item.insert(db)
             return CaptureResult(outcome: .inserted, item: item)
+        }
+        broadcastIfAdvanced(role: role, item: result.item, outcome: result.outcome)
+        return result
+    }
+
+    /// commit 后回调钩子：item.ingested_at_ns 非 nil → 这次 capture/merge 推进了 cursor，
+    /// 触发 onCursorAdvanced 让 server 端 broadcaster fan-out cursor_advanced 帧给 peers。
+    /// client role / skipped 路径不触发——client 行 ingested_at_ns 永远 nil；skipped 没 item。
+    private func broadcastIfAdvanced(role: DatabaseRole, item: Item?, outcome: CaptureResult.Outcome) {
+        guard role == .primary, let item, let ns = item.ingestedAtNs else { return }
+        switch outcome {
+        case .inserted, .mergedWithPrevious:
+            onCursorAdvanced(ns)
+        case .skippedEmpty, .skippedTooLarge:
+            return
         }
     }
 

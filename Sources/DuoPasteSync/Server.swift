@@ -1,7 +1,9 @@
 import Foundation
+import Logging
 import Hummingbird
 import HummingbirdCore
 import HummingbirdTLS
+import HummingbirdWebSocket
 import NIOSSL
 import HTTPTypes
 import DuoPasteCore
@@ -24,6 +26,10 @@ public struct SyncServer: Sendable {
     public let auth: HMACAuth
     /// 为空 → HTTP（依赖 Tailscale WG 加密）；非空 → HTTPS（PEM cert+key 路径）。
     public let tls: TLSPaths?
+    /// PR 3 WebSocket 通知层。`/sync/ws` 接到 Upgrade 后把 outbound writer 注册进去，
+    /// CaptureService 完成 writer tx 调 `broadcaster.broadcastCursorAdvanced(...)` fan-out。
+    /// nil → server 不支持 WS（standalone primary / 测试），仍能正常 serve HTTP。
+    public let broadcaster: WSBroadcaster?
     /// `POST /ingest` body 上限。单条 item 含 text_full + 元数据，
     /// 1 MB 已经远超任何剪贴文本场景；blob 走单独路由。
     public static let ingestBodyLimit = 1 * 1024 * 1024
@@ -46,7 +52,8 @@ public struct SyncServer: Sendable {
         host: String,
         port: Int,
         auth: HMACAuth,
-        tls: TLSPaths? = nil
+        tls: TLSPaths? = nil,
+        broadcaster: WSBroadcaster? = nil
     ) {
         self.deviceID = deviceID
         self.database = database
@@ -55,6 +62,7 @@ public struct SyncServer: Sendable {
         self.port = port
         self.auth = auth
         self.tls = tls
+        self.broadcaster = broadcaster
     }
 
     public func run() async throws {
@@ -74,6 +82,35 @@ public struct SyncServer: Sendable {
             serverName: "duo-paste"
         )
 
+        // PR 3：broadcaster 非 nil → 启用 WebSocket upgrade 路径。WS 路由独立 Router
+        // (BasicWebSocketRequestContext)，通过 `http1WebSocketUpgrade(webSocketRouter:)`
+        // 让 server 同时接 HTTP /ingest /since /blob /search /health + WS /sync/ws
+        if let broadcaster {
+            let wsRouter = Self.makeWebSocketRouter(
+                auth: auth,
+                deviceID: deviceID,
+                database: database,
+                broadcaster: broadcaster
+            )
+            let serverBuilder: HTTPServerBuilder
+            if let tls {
+                let tlsConfig = try Self.makeTLSConfiguration(certPath: tls.certPath, keyPath: tls.keyPath)
+                serverBuilder = try .tls(
+                    .http1WebSocketUpgrade(webSocketRouter: wsRouter),
+                    tlsConfiguration: tlsConfig
+                )
+            } else {
+                serverBuilder = .http1WebSocketUpgrade(webSocketRouter: wsRouter)
+            }
+            let app = Application(
+                router: router,
+                server: serverBuilder,
+                configuration: serverConfig
+            )
+            try await app.runService()
+            return
+        }
+
         if let tls {
             let tlsConfig = try Self.makeTLSConfiguration(certPath: tls.certPath, keyPath: tls.keyPath)
             let app = Application(
@@ -86,6 +123,66 @@ public struct SyncServer: Sendable {
             let app = Application(router: router, configuration: serverConfig)
             try await app.runService()
         }
+    }
+
+    /// 构造 WebSocket 路由。`/sync/ws` Upgrade 走 HMACAuthMiddleware 认证（沿用 HTTP 同款，
+    /// `<ts>\nGET\n/sync/ws\n<emptyHash>` 签名）；Upgrade 后注册到 broadcaster + 立刻
+    /// 发一条 hello 让 client 拿 baseline cursor。
+    ///
+    /// **server 配置 autoPing 30s**：跟 client 端 heartbeat 配对——客户端 30s 没收到任何帧
+    /// (含 server 主动 PING) 会自动断开，降级为周期 pull。
+    ///
+    /// inbound 当前不消费 client → server 帧（client 不发业务消息），但要 for-await 跑完
+    /// inbound 才能让 close 信号传播；defer unregister 保证连接关闭时 broadcaster 清理。
+    static func makeWebSocketRouter(
+        auth: HMACAuth,
+        deviceID: String,
+        database: DuoPasteCore.Database,
+        broadcaster: WSBroadcaster
+    ) -> Router<BasicWebSocketRequestContext> {
+        let wsRouter = Router(context: BasicWebSocketRequestContext.self)
+        wsRouter.middlewares.add(HMACAuthMiddleware<BasicWebSocketRequestContext>(auth: auth))
+        wsRouter.ws("/sync/ws") { _, _ in
+            .upgrade([:])
+        } onUpgrade: { inbound, outbound, _ in
+            // Hello：发出 baseline cursor。失败（连接已关）即 return，let onUpgrade 自然退出
+            let helloLatest = (try? await database.currentMaxIngestedNs()) ?? 0
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let hello = WSMessage.hello(
+                version: WSMessage.currentVersion,
+                deviceID: deviceID,
+                nowMs: nowMs,
+                latestIngestedAtNs: helloLatest
+            )
+            do {
+                try await outbound.write(.text(hello.encodeJSON()))
+            } catch {
+                FileHandle.standardError.write(Data("ws server hello write failed: \(error)\n".utf8))
+                return
+            }
+
+            // 注册到 broadcaster；onSlowKick 触发 outbound close 让 inbound 尽快收尾
+            let connID = await broadcaster.register(
+                writer: outbound,
+                peerHint: nil,
+                onSlowKick: { /* hbws 没有 channel-level cancel；2s 超时实际靠 write 抛错触发 inbound 退出 */ }
+            )
+            defer {
+                Task { await broadcaster.unregister(connID) }
+            }
+
+            // inbound for-await：消耗 client 端发的任何帧（当前协议 client 不主动发，
+            // 但跑完 stream 让 close 帧能传播 + autoPing pong 自动处理）
+            do {
+                for try await _ in inbound.messages(maxSize: 64 * 1024) {
+                    // 当前协议 client → server 无业务消息；忽略
+                }
+            } catch {
+                // inbound 抛错（连接异常 / autoPing 超时 / decode 失败）→ 让 onUpgrade 返回，
+                // hbws 自动关闭底层 channel。defer 清理 broadcaster
+            }
+        }
+        return wsRouter
     }
 
     /// 从 PEM 文件加载 cert chain + private key，构造 NIOSSL ServerConfiguration。

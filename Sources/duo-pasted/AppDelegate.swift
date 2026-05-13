@@ -163,6 +163,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// 启用条件：`config.pull.enabled=true` 且 primary_url 非空（Config.validate 已保证）。
     /// 启动失败（shared-secret / URL 解析）非致命，daemon 仍然能用本机捕获 + 本地搜索。
+    ///
+    /// PR 3：每个 peer 同时构造 WSNotificationClient——长连接到 peer `/sync/ws`，收到
+    /// `cursor_advanced` 通过 `worker.wake()` 立即触发 PullWorker 拉一页（< 1s 同步延迟）。
+    /// WS 断了自然退化为周期 pull，业务正确性靠 cursor 保证。
     private func startMeshSupervisor() {
         guard let primaryURL = deps.config.primaryURL else { return }
         do {
@@ -192,10 +196,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     eagerBlobs: deps.config.pull.eagerBlobs
                 )
             )
-            let supervisor = MeshSupervisor(workers: [worker])
+            // WSNotificationClient 收到 cursor_advanced → worker.wake() 取消当前 sleep
+            // 立即跑下一 tick；连接断 → 指数 backoff 重连，重连成功靠 server hello
+            // 自检追平。学习模式同 PullWorker（expectedPeerDeviceID=nil）
+            let wsClient = WSNotificationClient(
+                peerURL: primaryURL,
+                auth: auth,
+                expectedPeerDeviceID: nil,
+                onCursorAdvanced: { [weak worker] _ in worker?.wake() }
+            )
+            let supervisor = MeshSupervisor(peers: [
+                MeshSupervisor.Peer(worker: worker, wsClient: wsClient)
+            ])
             self.meshSupervisor = supervisor
             Task { await supervisor.start() }
-            fputs("mesh supervisor → 1 peer @ \(primaryURL.absoluteString) (interval=\(intervalSec)s)\n", stderr)
+            fputs("mesh supervisor → 1 peer @ \(primaryURL.absoluteString) (interval=\(intervalSec)s, ws=on)\n", stderr)
         } catch {
             fputs("mesh supervisor NOT started: \(error)\n", stderr)
         }
@@ -273,7 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 host: cfg.serveHost,
                 port: cfg.servePort,
                 auth: auth,
-                tls: tls
+                tls: tls,
+                broadcaster: deps.wsBroadcaster
             )
             serverTask = Task.detached(priority: .utility) {
                 do {

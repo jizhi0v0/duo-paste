@@ -290,6 +290,49 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
     #expect(!cursorIDs.contains(peerOldID))
 }
 
+@Test func wsKickWakesPullWorkerImmediately() async throws {
+    // 启动 PullWorker 配 30s interval（远大于测试时长）→ 跑一次 tick 后 sleep 长时间。
+    // 模拟 WS 通知：直接调 worker.wake() 取消 sleep，应该立即跑下一次 tick 拉到 page2。
+    // 真实路径下这一调用来自 WSNotificationClient.onCursorAdvanced，验证 PR 3 的关键不变量
+    // —— "WSNotificationClient 收到 cursorAdvanced → PullWorker.wake() → 立即追赶"
+    let db = try makeClientDB()
+    let selfID = "client-self"
+    let peerID = "peer-W"
+
+    let item1 = mkItem(id: "p1", origin: peerID, ingestedAtNs: 100, text: "first")
+    let item2 = mkItem(id: "p2", origin: peerID, ingestedAtNs: 200, text: "second")
+    let transport = FakeTransport(
+        pages: [
+            page(items: [item1], nextNs: 100, nextID: "p1", hasMore: false),
+            page(items: [item2], nextNs: 200, nextID: "p2", hasMore: false),
+        ],
+        healthDeviceID: peerID
+    )
+    let mesh = MeshStatus()
+    let worker = PullWorker(
+        database: db, transport: transport, selfDeviceID: selfID,
+        expectedPeerDeviceID: peerID, meshStatus: mesh,
+        // intervalSec 长到测试期内绝不会自然到期 → 第二条只能靠 wake() 触发
+        config: PullWorker.Config(intervalSec: 30)
+    )
+    await worker.start()
+    // 等第一页落表
+    try? await Task.sleep(nanoseconds: 250_000_000)
+    let firstCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+    }
+    #expect(firstCount == 1)
+
+    // wake() 模拟 WS notify
+    worker.wake()
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    let secondCount = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+    }
+    #expect(secondCount == 2, "wake() 应当让 worker 立即跑下一次 tick；实际行数=\(secondCount)")
+    await worker.stop()
+}
+
 @Test func meshSupervisorStartsAndStopsAllWorkers() async throws {
     // 纯生命周期测：MeshSupervisor.start/stop 把每个 worker 都启停。验证 N=2 时不漏 worker。
     let db = try makeClientDB()

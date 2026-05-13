@@ -415,6 +415,15 @@ public struct Database: Sendable {
         return Swift.max(now, prev &+ 1)
     }
 
+    /// 查本机当前 MAX(ingested_at_ns)，0 表示空表。WS hello + cursor_advanced 用——
+    /// peer 收到后跟自己 cursor 比，决定是否立即拉一页（无论是否在原本 30s tick 周期）。
+    /// 包装成 Database 方法是因为 broadcaster 不该直接看 GRDB 抽象。
+    public func currentMaxIngestedNs() async throws -> Int64 {
+        try await pool.read { db in
+            try Int64.fetchOne(db, sql: "SELECT MAX(ingested_at_ns) FROM item") ?? 0
+        }
+    }
+
     /// 在 item 表里找「本机近时间已有同内容」候选，用于 sync 层跨设备 dedup。
     ///
     /// 场景：mbp + mini 同一 Apple ID 登录开了 macOS Universal Clipboard，mbp 复制内容 X
