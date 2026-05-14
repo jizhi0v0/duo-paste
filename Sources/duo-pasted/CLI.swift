@@ -424,10 +424,8 @@ enum CLI {
                 lines.append("    health: ✗ rejected — \(reason)")
             }
             if let cur = peer.pullCursor {
-                let lag = max(0, r.selfMaxIngestedNs - cur.cursorNs)
-                let lagDesc = lag == 0 ? "(同步)" : "(本机 own 比对端记录的 cursor 多 \(lag) ns；正常对端拉本机时这差额是 0+)"
                 lines.append("    pull_cursor: ns=\(cur.cursorNs) id=\(cur.cursorID)")
-                lines.append("    cursor lag: \(lag) \(lagDesc)")
+                lines.append("                 (本机已从这个 peer 拉到 ingested_at_ns 为 \(cur.cursorNs) 的行)")
             } else {
                 lines.append("    pull_cursor: (无——首次启动 / device_id 学习中 / config 改 expected 后未追平)")
             }
