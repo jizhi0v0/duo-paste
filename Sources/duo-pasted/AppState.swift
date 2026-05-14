@@ -172,8 +172,11 @@ final class AppState {
         }
     }
 
-    /// 一次性 3s notice。同一文案在窗口内重复触发不会延长——只在过期后才能换新内容
-    private func postNotice(_ text: String) {
+    /// 一次性 3s notice。同一文案在窗口内重复触发不会延长——只在过期后才能换新内容。
+    /// **任何**写 recentNotice 的入口都必须走这条路,直接赋字段会绕过 3s timer 让 banner
+    /// 永久残留(踩过坑:pasteBack 跨 kind fallback 写 banner 后 panel 复用 state 让用户
+    /// 重开 panel 仍看见旧提示)
+    func postNotice(_ text: String) {
         self.recentNotice = text
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 3_000_000_000)

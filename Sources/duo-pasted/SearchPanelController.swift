@@ -193,8 +193,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         let sFrame = screen.visibleFrame
         let pFrame = p.frame
         let x = sFrame.midX - pFrame.width / 2
-        // 视觉重心略偏上 1/3 屏，跟 Spotlight 一致
-        let y = sFrame.minY + sFrame.height * 0.62 - pFrame.height / 2
+        // 屏幕中线居中。原版用 0.62 偏上 1/3 模仿 Spotlight,user 反馈太偏所以撤掉
+        let y = sFrame.midY - pFrame.height / 2
         p.setFrameOrigin(NSPoint(x: x, y: y))
     }
 

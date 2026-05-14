@@ -423,7 +423,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .crossKind:       label = "跨类型"
             case .multipleImages:  label = "多图片"
             }
-            state.recentNotice = "\(label)多选不可合并，已 paste 第 1 项 (共 \(items.count))"
+            // 走 postNotice 而不是直接赋 recentNotice——后者绕过 3s timer 会让 banner
+            // 永久残留(关 panel 再开仍看见旧提示,踩过)
+            state.postNotice("\(label)多选不可合并，已 paste 第 1 项 (共 \(items.count))")
             pasteBackSingle(items[0])
 
         case .mergedText, .mergedFile:
