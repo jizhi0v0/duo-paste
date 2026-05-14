@@ -21,6 +21,8 @@ enum CLI {
             runRetryFailedOCR(args: rest)
         case "mesh-init":
             runMeshInit(args: rest)
+        case "mesh-doctor":
+            runMeshDoctor(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -62,6 +64,11 @@ enum CLI {
                                   daemon 必须先停（先 launchctl bootout）。
                                   --allow-missing-blobs 跳过 blob 缺失预检（默认拒）。
                                   --dry-run 跑预检 + 算 result 但不真写 config。
+
+          mesh-doctor             探所有 peer /health + 对账本机 pull_cursor + 算本机 BlobStore
+                                  缺字节统计。**只读**，不动 DB / config / blobs。
+                                  退出码 0=都健康；1=任一 peer unreachable / device_id 不匹配 /
+                                  blob 缺失 → 给脚本接管。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -305,5 +312,151 @@ enum CLI {
         }
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
         exit(0)
+    }
+
+    private static func runMeshDoctor(args: [String]) {
+        // mesh-doctor 当前没参数（未来可加 --json / --peer 限定）
+        if !args.isEmpty {
+            FileHandle.standardError.write(Data("mesh-doctor: 未知参数 \(args.joined(separator: " "))\n".utf8))
+            exit(1)
+        }
+        let paths = Paths.makeDefault()
+        paths.ensureExists()
+        let cfg: Config
+        do {
+            cfg = try Config.load(from: paths.configFile)
+        } catch {
+            FileHandle.standardError.write(Data("mesh-doctor: 读 config 失败：\(error)\n".utf8))
+            exit(1)
+        }
+        let deviceID: String
+        do {
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("mesh-doctor: 读 device-id 失败：\(error)\n".utf8))
+            exit(1)
+        }
+        let blobs = BlobStore(root: paths.blobsDir)
+        let secret: Data?
+        do {
+            secret = try SharedSecret.load(from: paths.sharedSecretFile)
+        } catch {
+            // 没 shared-secret 时仍能跑（只是不能探 /health），把所有 peer 标 unreachable
+            secret = nil
+            FileHandle.standardError.write(Data(
+                "mesh-doctor: 加载 shared-secret 失败：\(error) — peer /health 全部 unreachable\n".utf8
+            ))
+        }
+        // 把 HTTPPeerClient.fetchPrimaryHealth 翻译成 Admin.HealthProbeOutcome
+        let probe: @Sendable (URL) async -> Admin.HealthProbeOutcome = { url in
+            guard let secret else {
+                return .unreachable(reason: "shared-secret 未配置")
+            }
+            // CLI 是 one-shot exit，没必要复用 keep-alive 连接池——URLSession.shared 够了
+            let client = HTTPPeerClient(
+                baseURL: url,
+                auth: HMACAuth(secret: secret)
+            )
+            do {
+                let r = try await client.fetchPrimaryHealth()
+                switch r.outcome {
+                case .ok(let did, let nowMs): return .ok(deviceID: did, nowMs: nowMs)
+                case .unreachable(let reason): return .unreachable(reason: reason)
+                case .rejected(let reason): return .rejected(reason: reason)
+                }
+            } catch {
+                return .unreachable(reason: "\(error)")
+            }
+        }
+        let report: Admin.MeshDoctorReport
+        do {
+            report = try runBlocking { @Sendable in
+                try await Admin.meshDoctor(
+                    selfDeviceID: deviceID,
+                    peers: cfg.peers,
+                    dbPath: paths.mainDB,
+                    blobs: blobs,
+                    healthProbe: probe
+                )
+            }
+        } catch {
+            FileHandle.standardError.write(Data("mesh-doctor failed: \(error)\n".utf8))
+            exit(1)
+        }
+        printMeshDoctorReport(report)
+        exit(meshDoctorExitCode(report))
+    }
+
+    /// async → sync 桥。CLI 路径上没有 runtime；用 DispatchSemaphore + 一个分离 task
+    private static func runBlocking<T: Sendable>(_ op: @Sendable @escaping () async throws -> T) throws -> T {
+        let sem = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var result: Result<T, Error>!
+        Task.detached {
+            do { result = .success(try await op()) }
+            catch { result = .failure(error) }
+            sem.signal()
+        }
+        sem.wait()
+        return try result.get()
+    }
+
+    private static func printMeshDoctorReport(_ r: Admin.MeshDoctorReport) {
+        var lines: [String] = []
+        lines.append("mesh-doctor")
+        lines.append("  self device_id: \(r.selfDeviceID)")
+        lines.append("  self max ingested_at_ns: \(r.selfMaxIngestedNs)")
+        lines.append("  peers: \(r.peers.count)")
+        for peer in r.peers {
+            lines.append("")
+            lines.append("  peer: \(peer.url.absoluteString)")
+            if let exp = peer.expectedDeviceID {
+                lines.append("    expected device_id: \(exp)")
+            } else {
+                lines.append("    expected device_id: (learn mode — config 没指定)")
+            }
+            switch peer.health {
+            case .ok(let did, let nowMs, let skewMs):
+                let mark = (peer.deviceIDMatches == false) ? " ⚠ MISMATCH" : ""
+                lines.append("    health: ✓ device_id=\(did)\(mark) · now_ms=\(nowMs) · skew=\(skewMs)ms")
+            case .unreachable(let reason):
+                lines.append("    health: ✗ unreachable — \(reason)")
+            case .rejected(let reason):
+                lines.append("    health: ✗ rejected — \(reason)")
+            }
+            if let cur = peer.pullCursor {
+                let lag = max(0, r.selfMaxIngestedNs - cur.cursorNs)
+                let lagDesc = lag == 0 ? "(同步)" : "(本机 own 比对端记录的 cursor 多 \(lag) ns；正常对端拉本机时这差额是 0+)"
+                lines.append("    pull_cursor: ns=\(cur.cursorNs) id=\(cur.cursorID)")
+                lines.append("    cursor lag: \(lag) \(lagDesc)")
+            } else {
+                lines.append("    pull_cursor: (无——首次启动 / device_id 学习中 / config 改 expected 后未追平)")
+            }
+        }
+        if r.missingBlobsTotal > 0 {
+            lines.append("")
+            lines.append("⚠ missing blobs: \(r.missingBlobsTotal) 个 sha 在本机 BlobStore 缺字节")
+            lines.append("  这些 image/file 历史在本机 /blob/<sha> 上将返回 404。示例 sha：")
+            for sha in r.missingBlobsSamples {
+                lines.append("    - \(sha)")
+            }
+        } else {
+            lines.append("")
+            lines.append("blobs: ✓ 本机 image/file 行的 sha 全部在 BlobStore")
+        }
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    /// 退出码：任一 peer unreachable/rejected/device_id 不匹配 / blob 缺失 → 1。便于脚本管控
+    private static func meshDoctorExitCode(_ r: Admin.MeshDoctorReport) -> Int32 {
+        if r.missingBlobsTotal > 0 { return 1 }
+        for peer in r.peers {
+            switch peer.health {
+            case .ok:
+                if peer.deviceIDMatches == false { return 1 }
+            case .unreachable, .rejected:
+                return 1
+            }
+        }
+        return 0
     }
 }

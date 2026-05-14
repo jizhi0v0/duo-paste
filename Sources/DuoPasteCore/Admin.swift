@@ -63,6 +63,134 @@ public enum Admin {
     /// 预检阶段 missing blob 样本上限。超过这数只报总数 + 前 N 个 sha，避免日志爆
     public static let missingBlobSampleLimit = 10
 
+    // MARK: - mesh-doctor
+
+    /// 单个 peer 的 doctor 报告。
+    public struct PeerDoctorReport: Sendable, Equatable {
+        public let url: URL
+        /// config 里写死的 expected device_id（mesh-init 时显式传），nil 走学习模式
+        public let expectedDeviceID: String?
+        /// /health 探测结果。reachable 时填 (deviceID, nowMs, skewMs)，不可达填 reason
+        public enum HealthOutcome: Sendable, Equatable {
+            case ok(deviceID: String, nowMs: Int64, skewMs: Int64)
+            case unreachable(reason: String)
+            case rejected(reason: String)
+        }
+        public let health: HealthOutcome
+        /// 跟 expectedDeviceID 是否匹配（health=ok 时才有意义）。
+        /// nil = 没有 expected，true/false = expected 给了且匹配/不匹配
+        public let deviceIDMatches: Bool?
+        /// 本机 pull_cursor 表里这个 peer 的行（peer_device_id, cursor_ns, cursor_id）。
+        /// nil = 还没 cursor 行（首次启动 / 学习模式 expected 跟 cursor PK 不同）
+        public let pullCursor: PullCursorSnapshot?
+    }
+
+    public struct PullCursorSnapshot: Sendable, Equatable {
+        public let peerDeviceID: String
+        public let cursorNs: Int64
+        public let cursorID: String
+        public let updatedAtNs: Int64
+    }
+
+    /// mesh-doctor 总报告。
+    public struct MeshDoctorReport: Sendable, Equatable {
+        public let selfDeviceID: String
+        public let peers: [PeerDoctorReport]
+        /// 本机当前 max(ingested_at_ns)，让操作员对端 cursor 跟这个数比看追平程度
+        public let selfMaxIngestedNs: Int64
+        /// 本机 BlobStore 缺字节的 sha 总数 + 样本（item.blob_sha256 IS NOT NULL +
+        /// kind IN image/file + 未删 + BlobStore.exists=false）
+        public let missingBlobsTotal: Int
+        public let missingBlobsSamples: [String]
+    }
+
+    /// /health 探测的 closure 返回值。Admin 在 Core 模块，不能依赖 Sync 的 SinceTransport
+    /// → 用闭包接口，CLI 包装层把 HTTPPeerClient.fetchPrimaryHealth 翻译成这个 enum
+    public enum HealthProbeOutcome: Sendable, Equatable {
+        case ok(deviceID: String, nowMs: Int64)
+        case unreachable(reason: String)
+        case rejected(reason: String)
+    }
+
+    /// 探测每个 peer 健康 + 对账 cursor + 本机 blob 缺失。CLI 包装层调它打印报告。
+    /// 纯函数（注入 healthProbe closure + db/blobs 路径），方便单测。
+    ///
+    /// 实现策略：
+    /// - 每 peer 一次 healthProbe（生产路径 = HTTPPeerClient.fetchPrimaryHealth），串行做
+    /// - 一次 DB read 拿 pull_cursor 全部行 + max ingested_at_ns + 算 missing blob 集
+    /// - 本机时钟跟 peer.now_ms 比算 skewMs
+    public static func meshDoctor(
+        selfDeviceID: String,
+        peers: [Config.PeerConfig],
+        dbPath: URL,
+        blobs: BlobStore,
+        healthProbe: @Sendable (URL) async -> HealthProbeOutcome,
+        nowNs: @Sendable () -> Int64 = { Clock.nowNs() }
+    ) async throws -> MeshDoctorReport {
+        let db = try Database(path: dbPath)
+        let cursorRows: [PullCursorSnapshot] = try await db.pool.read { conn -> [PullCursorSnapshot] in
+            try Row.fetchAll(conn, sql: """
+                SELECT peer_device_id, cursor_ns, cursor_id, updated_at_ns
+                  FROM pull_cursor
+            """).map { row in
+                PullCursorSnapshot(
+                    peerDeviceID: row["peer_device_id"] ?? "",
+                    cursorNs: row["cursor_ns"] ?? 0,
+                    cursorID: row["cursor_id"] ?? "",
+                    updatedAtNs: row["updated_at_ns"] ?? 0
+                )
+            }
+        }
+        let selfMax = try await db.currentMaxIngestedNs()
+        let (missingTotal, missingSamples) = try scanMissingBlobs(dbPath: dbPath, blobs: blobs)
+
+        var peerReports: [PeerDoctorReport] = []
+        let localNowMs = nowNs() / 1_000_000
+        for peer in peers {
+            let outcome = await healthProbe(peer.url)
+            let healthOutcome: PeerDoctorReport.HealthOutcome
+            var matches: Bool? = nil
+            switch outcome {
+            case .ok(let did, let nowMs):
+                let skew = nowMs - localNowMs
+                healthOutcome = .ok(deviceID: did, nowMs: nowMs, skewMs: skew)
+                if let expected = peer.deviceID {
+                    matches = (did == expected)
+                }
+            case .unreachable(let r):
+                healthOutcome = .unreachable(reason: r)
+            case .rejected(let r):
+                healthOutcome = .rejected(reason: r)
+            }
+
+            // 找本 peer 对应的 pull_cursor 行——按 expected device_id（严格模式）或
+            // 按 health 报的 device_id（学习模式）
+            let lookupID: String? = peer.deviceID
+                ?? {
+                    if case .ok(let did, _, _) = healthOutcome { return did } else { return nil }
+                }()
+            let cursor: PullCursorSnapshot? = lookupID.flatMap { id in
+                cursorRows.first(where: { $0.peerDeviceID == id })
+            }
+
+            peerReports.append(PeerDoctorReport(
+                url: peer.url,
+                expectedDeviceID: peer.deviceID,
+                health: healthOutcome,
+                deviceIDMatches: matches,
+                pullCursor: cursor
+            ))
+        }
+
+        return MeshDoctorReport(
+            selfDeviceID: selfDeviceID,
+            peers: peerReports,
+            selfMaxIngestedNs: selfMax,
+            missingBlobsTotal: missingTotal,
+            missingBlobsSamples: missingSamples
+        )
+    }
+
     /// 生成 32 字节随机 secret，写到 path（hex 编码 + 0600 权限）。
     /// 已存在且 force=false → throw alreadyExists；否则覆盖（atomic）。
     @discardableResult

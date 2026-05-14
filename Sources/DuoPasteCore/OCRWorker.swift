@@ -67,6 +67,11 @@ public actor OCRWorker {
     private let originDevice: String
     private let config: Config
     private let log: @Sendable (String) -> Void
+    /// OCR Phase 2：markDone 后调用让 server 端 WSBroadcaster fan-out cursor_advanced 帧——
+    /// 对端 PullWorker 收到立即拉一页拿到新 ocr_state + text_full，跨设备 OCR 结果 < 1s 推送。
+    /// 不接（默认 no-op）→ 对端要等 30s 周期 pull tick 才同步到 OCR 结果（也 acceptable）。
+    /// 跟 CaptureService.onCursorAdvanced 同款 hook 模式
+    private let onCursorAdvanced: @Sendable (Int64) -> Void
 
     private var runTask: Task<Void, Never>?
     private var currentSleep: Task<Void, Error>?
@@ -81,6 +86,7 @@ public actor OCRWorker {
         recognizer: OCRRecognizer,
         originDevice: String,
         config: Config = .default,
+        onCursorAdvanced: @escaping @Sendable (Int64) -> Void = { _ in },
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("ocr: \(msg)\n".utf8))
         }
@@ -90,6 +96,7 @@ public actor OCRWorker {
         self.recognizer = recognizer
         self.originDevice = originDevice
         self.config = config
+        self.onCursorAdvanced = onCursorAdvanced
         self.log = log
     }
 
@@ -284,8 +291,9 @@ public actor OCRWorker {
     private func markDone(id: String, text: String) async {
         let normalized: String? = text.isEmpty ? nil : text
         let now = Clock.nowNs()
+        var stampedNs: Int64? = nil
         do {
-            try await database.pool.write { db in
+            stampedNs = try await database.pool.write { db -> Int64 in
                 let stamp = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 try db.execute(sql: """
                     UPDATE item
@@ -295,9 +303,16 @@ public actor OCRWorker {
                     WHERE id = ?
                       AND deleted_at_ns IS NULL
                 """, arguments: [normalized, stamp, id])
+                return stamp
             }
         } catch {
             log("markDone failed for \(id): \(error)")
+        }
+        // OCR Phase 2：commit 后触发 cursor_advanced 让对端 < 1s 拿到 OCR 结果。
+        // tombstone 路径（UPDATE 0 行）也会 stamp + broadcast——浪费 1 个空 tick 不致命，
+        // PullWorker /since 拉到的也是空更新（id 已被自家 dedup / 软删），无害
+        if let ns = stampedNs {
+            onCursorAdvanced(ns)
         }
     }
 

@@ -99,6 +99,38 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(await recorder.count() == 1)
 }
 
+private actor OCRCursorAdvancedRecorder {
+    private var ns: [Int64] = []
+    func record(_ v: Int64) { ns.append(v) }
+    func values() -> [Int64] { ns }
+}
+
+/// OCR Phase 2 不变量：markDone 必须触发注入的 onCursorAdvanced 闭包，让 server 端
+/// broadcaster fan-out cursor_advanced 帧给对端 —— 不接的话对端要等 30s pull tick
+/// 才同步 OCR 结果。
+@Test func ocrWorkerMarkDoneTriggersOnCursorAdvanced() async throws {
+    let env = try makeEnv()
+    let sha = try seedBlob(env)
+    try seedItem(env, id: "p2-img", originDevice: env.deviceID, blobSha: sha)
+    let recognizer = StubOCRRecognizer(table: [sha: .success(OCRResult(text: "ocr text"))])
+    let cursorRecorder = OCRCursorAdvancedRecorder()
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig(),
+        onCursorAdvanced: { ns in
+            Task { await cursorRecorder.record(ns) }
+        }
+    )
+    let result = await w.tick()
+    #expect(result.done == 1)
+    // onCursorAdvanced 异步 Task → 等一小段让它落地
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    let recorded = await cursorRecorder.values()
+    #expect(recorded.count == 1)
+    #expect((recorded.first ?? 0) > 0)
+}
+
 @Test func ocrWorkerSkipsOtherOriginImages() async throws {
     let env = try makeEnv()
     let sha = try seedBlob(env)

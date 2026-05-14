@@ -236,12 +236,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             maxBlobBytes: max(1, cfg.maxBlobMB) * 1024 * 1024,
             languages: cfg.languages
         )
+        // OCR Phase 2：跟 CaptureService 共用 wsBroadcaster fan-out 路径，让 OCR 结果
+        // < 1s 推到对端（不接的话对端要等 30s 周期 pull tick 才看到 ocr_state=done）
+        let wsBroadcaster = deps.wsBroadcaster
+        let deviceID = deps.deviceID
         let worker = OCRWorker(
             database: deps.database,
             blobs: deps.blobs,
             recognizer: recognizer,
             originDevice: deps.deviceID,
-            config: workerConfig
+            config: workerConfig,
+            onCursorAdvanced: { ns in
+                Task {
+                    await wsBroadcaster.broadcastCursorAdvanced(
+                        deviceID: deviceID,
+                        latestIngestedAtNs: ns
+                    )
+                }
+            }
         )
         self.ocrWorker = worker
         Task { await worker.start() }
