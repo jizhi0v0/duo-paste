@@ -16,10 +16,12 @@
 - **跨设备 dedup**：两层防御。capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Continuity / ToDesk 副本通过 PullWorker `crossDeviceDedupWindowNs` (5s) + PasteSuppressionSet 拦
 - **Blob**：内容寻址 BlobStore；lazy paste-back（按需从 peer GET `/blob/<sha>`，TaskGroup 5s 超时 race）；可选 eager (`mesh.eager_blobs=true`) PullWorker 拉完元数据顺路拉字节
 - **HMAC 认证**：`<ts>\n<METHOD>\n<path>\n<body_sha256_hex>` 签名。HTTP middleware 不读 body（让多 MB blob 不占内存），handler 自己读 body 后再算 sha256 比对 header。WS upgrade 用相同模板（empty body hash），upgrade 后 frame 不签
-- **OCR worker**：本机 own-origin image 跑 Vision OCR 写 `text_full` 进 FTS5。分布式 MVP，每台 Mac 自跑自家 origin
+- **OCR**：Phase 1 + Phase 2 都已落地。Phase 1 = 本机 own-origin image 跑 Vision OCR 写 `text_full` 进 FTS5；Phase 2 = OCR markDone 触发 onCursorAdvanced 让对端 < 1s 同步 OCR 结果（共享 wsBroadcaster fan-out 路径），peer FTS5 trigger 自动重 index 让对端搜索可命中
+- **mesh-doctor CLI**：探每 peer /health (deviceID + skewMs + 跟 expected 是否匹配) + 本机 pull_cursor 行 + 本机 max(ingested_at_ns) + missing blob 统计。只读不动 DB / config。退出码 0=都健康；任一 peer unreachable / device_id 不匹配 / blob 缺失 → 1
+- **WS auth rotation**：`mesh.ws_rotation_sec`（默 4h，0 = 关）控制 WSBroadcaster 每周期主动 close 所有连接。合法 client 走 backoff 重连 + 重 HMAC upgrade（用最新 secret），shared-secret 被窃取后能监听窗口压到 ≤ 这个值
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS + hummingbird-websocket 2.6.0
-- **测试**：~265 个，PullWorker / BlobLazyPull 集成测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），用 `swift test --filter PullWorkerTests` / `--filter BlobLazyPullTests` 单独验证
-- **下一站**：**OCR worker (Phase 1)** —— image kind 跑 Vision OCR 把图里文字写 `text_full` 进 FTS5，让中文/英文截图能被搜到。Schema 已就位（PR#17），需要落 OCRWorker actor + Vision 集成 + Config OCR 段 + retry-failed-ocr CLI。MVP 走分布式（每台 Mac 自跑自家 `origin=self`），跨设备 OCR 结果同步留 Phase 2。详细拆解见 `plans/vivid-scanning-vellum.md`。M4 导出 / pinned UI / 快捷键自定义 / 自定义时间 picker 排在 OCR worker 之后
+- **测试**：~270 个，PullWorker / BlobLazyPull 集成测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），用 `swift test --filter PullWorkerTests` / `--filter BlobLazyPullTests` 单独验证
+- **下一站**（plan 之外可选）：M4 导出 / pinned UI / 快捷键自定义 / 自定义时间 picker；iOS peer (M5)
 
 ## 架构与 Non-Goals
 
@@ -49,6 +51,7 @@
 ~/Applications/duo-paste/duo-pasted --help                  # 子命令列表
 ~/Applications/duo-paste/duo-pasted init-secret             # 首次部署：生成 32 字节 shared secret
 ~/Applications/duo-paste/duo-pasted mesh-init --peer URL... # 切到 mesh 拓扑：写 peers/mesh config，删老 primary_url/pull
+~/Applications/duo-paste/duo-pasted mesh-doctor             # 探所有 peer /health + cursor 对账 + missing blob 统计（只读）
 ~/Applications/duo-paste/duo-pasted retry-failed-ocr        # 把 OCR failed/skipped 行翻回 pending
 ```
 
