@@ -113,25 +113,30 @@ struct SearchView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            filterBar
-            noticeBanner
-            pasteProgressBanner
-            skipBanner
-            modeBanner
-            clockSkewBanner
-            // Spotlight 风格不要硬 Divider，用一条细发丝线代替
-            Rectangle()
-                .fill(Color.primary.opacity(0.08))
-                .frame(height: 0.5)
-                .padding(.horizontal, 14)
+            compactHeader              // 搜索框 + count(单行 ~42px)
+            compactFilterBar           // chip 行 + 时间窗 + 仅置顶(~30px)
+            // 主体卡片区域,横向 LazyHStack 滚动
             if state.results.isEmpty {
                 emptyView
             } else {
-                list
+                cardScroller
             }
         }
-        .frame(minWidth: 640, idealWidth: 760, minHeight: 400, idealHeight: 520)
+        .overlay(alignment: .top) {
+            // banner 用 overlay 浮在 header 上方,不占主体高度。
+            // padding.top 让位给 header(42) + filterBar(30) = 72
+            VStack(spacing: 4) {
+                noticeBanner
+                pasteProgressBanner
+                skipBanner
+                modeBanner
+                clockSkewBanner
+            }
+            .padding(.top, 76)
+            .padding(.horizontal, 14)
+            .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
+        }
+        .frame(minWidth: 800, minHeight: 280, idealHeight: 280, maxHeight: 280)
         // Spotlight-style 玻璃：.ultraThickMaterial 比 .thinMaterial 更不透明、更"深色玻璃"质感。
         // clipShape 把 hosting view 内容裁成 22pt 大圆角（跟 SearchPanelController 里 layer.cornerRadius 一致）。
         .background(.ultraThickMaterial)
@@ -175,6 +180,135 @@ struct SearchView: View {
         }
         // 注：箭头 / Return / Esc 由 SearchPanelController 的 NSEvent local monitor
         // 截下来直接调 state.navigate / onPaste，绕过 SwiftUI TextField 对箭头键的吞噬。
+    }
+
+    /// Paste.app 风格紧凑搜索头:单行,~42px。原 header 是 22pt 大字体 + 上下 20px padding =
+    /// ~64px,在 280px panel 里占太多。这里压成 16pt + 上下 10px = ~42px
+    private var compactHeader: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 16, weight: .regular))
+                .foregroundStyle(.secondary)
+            TextField("搜索剪贴板历史", text: $state.query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 16, weight: .regular))
+                .focused($searchFieldFocused)
+            if !state.query.isEmpty {
+                Button {
+                    state.query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Text("\(state.totalCount) 条")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+    }
+
+    /// 紧凑 filter 行 ~30px。原 filterBar 高 ~46px,缩小 chip 字号 + padding 让它适配 280 高 panel
+    private var compactFilterBar: some View {
+        HStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(filterChipKinds, id: \.self) { kind in
+                        KindChip(
+                            kind: kind,
+                            isSelected: state.selectedKinds.contains(kind),
+                            count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
+                            onTap: { toggleKind(kind) }
+                        )
+                    }
+                    if !state.selectedKinds.isEmpty {
+                        Button {
+                            state.selectedKinds.removeAll()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("清除类型筛选")
+                    }
+                    pinnedOnlyChip
+                }
+            }
+            timeRangeMenu
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 6)
+    }
+
+    /// Paste.app 风格横向卡片滚动。LazyHStack 让千条 item 不卡——出视口的卡 unload。
+    /// ScrollViewReader.scrollTo 配 selectedIDs.last + scrollPulse 让箭头导航能滚到选中卡
+    private var cardScroller: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 12) {
+                    Color.clear.frame(width: 6)  // 起始 padding
+                    ForEach(state.results) { item in
+                        ItemCard(
+                            item: item,
+                            isSelected: state.selectedIDs.contains(item.id),
+                            selfDeviceID: state.deps.deviceID,
+                            snippet: state.snippets[item.id],
+                            blobs: state.deps.blobs
+                        )
+                        .id(item.id)
+                        // 双击粘贴(无视 selectedIDs)
+                        .gesture(
+                            TapGesture(count: 2).onEnded {
+                                onPaste([item])
+                            }
+                        )
+                        // 单击改 selection;NSEvent.modifierFlags 同步取 cmd/shift 状态
+                        .simultaneousGesture(
+                            TapGesture(count: 1).onEnded {
+                                let mods = NSEvent.modifierFlags
+                                if mods.contains(.command) {
+                                    if let i = state.selectedIDs.firstIndex(of: item.id) {
+                                        state.selectedIDs.remove(at: i)
+                                    } else {
+                                        state.selectedIDs.append(item.id)
+                                        state.anchorID = item.id
+                                    }
+                                } else if mods.contains(.shift) {
+                                    guard let anchor = state.anchorID,
+                                          let from = state.results.firstIndex(where: { $0.id == anchor }),
+                                          let to = state.results.firstIndex(where: { $0.id == item.id })
+                                    else {
+                                        state.selectedIDs = [item.id]
+                                        state.anchorID = item.id
+                                        return
+                                    }
+                                    let lo = min(from, to)
+                                    let hi = max(from, to)
+                                    state.selectedIDs = (lo...hi).map { state.results[$0].id }
+                                } else {
+                                    state.selectedIDs = [item.id]
+                                    state.anchorID = item.id
+                                }
+                            }
+                        )
+                    }
+                    Color.clear.frame(width: 6)  // 结束 padding
+                }
+                .padding(.vertical, 8)
+            }
+            .onChange(of: state.scrollPulse) { _, _ in
+                if let id = state.selectedIDs.last {
+                    withAnimation(.linear(duration: 0.12)) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                }
+            }
+        }
     }
 
     private var header: some View {
@@ -506,82 +640,7 @@ struct SearchView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var list: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    Color.clear.frame(height: 6)  // 列表顶部留点空气
-                    ForEach(state.results) { item in
-                        ItemRow(
-                            item: item,
-                            isSelected: state.selectedIDs.contains(item.id),
-                            selfDeviceID: state.deps.deviceID,
-                            snippet: state.snippets[item.id],
-                            blobs: state.deps.blobs
-                        )
-                        .contentShape(Rectangle())
-                        .id(item.id)
-                        // 双击粘贴。挂 .gesture（参与消歧），让双击能稳定识别。
-                        // 双击始终 paste 单条(无视 selectedIDs)——跟 Spotlight "双击 = 快捷直 paste"心智一致
-                        .gesture(
-                            TapGesture(count: 2).onEnded {
-                                onPaste([item])
-                            }
-                        )
-                        // 单击改 selection,挂 .simultaneousGesture 跳出消歧立即触发。
-                        // 读 NSEvent.modifierFlags 分支 cmd / shift / plain 三种交互。
-                        // **为什么不用 TapGesture().modifiers(.command)**:那会把同一 row 的
-                        // plain / cmd / shift tap 拆成多个 gesture,跟现有 count:2 双击 gesture
-                        // 一起会让双击消歧时序更脆(参考 CLAUDE.md 已踩过的坑)。
-                        // 读 NSEvent.modifierFlags 是同步类方法,onEnded 时拿当前键盘状态准确
-                        .simultaneousGesture(
-                            TapGesture(count: 1).onEnded {
-                                let mods = NSEvent.modifierFlags
-                                if mods.contains(.command) {
-                                    // toggle 单项,append 到末尾保持选择顺序
-                                    if let i = state.selectedIDs.firstIndex(of: item.id) {
-                                        state.selectedIDs.remove(at: i)
-                                    } else {
-                                        state.selectedIDs.append(item.id)
-                                        state.anchorID = item.id
-                                    }
-                                } else if mods.contains(.shift) {
-                                    // anchor 到点击位置 range,按 results 列表顺序展开(非点击顺序)
-                                    // 没 anchor → 退化单选 + 设 anchor
-                                    guard let anchor = state.anchorID,
-                                          let from = state.results.firstIndex(where: { $0.id == anchor }),
-                                          let to = state.results.firstIndex(where: { $0.id == item.id })
-                                    else {
-                                        state.selectedIDs = [item.id]
-                                        state.anchorID = item.id
-                                        return
-                                    }
-                                    let lo = min(from, to)
-                                    let hi = max(from, to)
-                                    state.selectedIDs = (lo...hi).map { state.results[$0].id }
-                                    // shift+点不动 anchor(Finder 行为)
-                                } else {
-                                    // 普通单击 → 单选 + 重置 anchor
-                                    state.selectedIDs = [item.id]
-                                    state.anchorID = item.id
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-            // 只在键盘导航（scrollPulse 改变）时滚动到选中项，鼠标点击不触发
-            .onChange(of: state.scrollPulse) { _, _ in
-                // 滚到 selectedIDs 末位(最后一次箭头 / cmd+点 / 普通点的那条)——shift+点 range
-                // 时滚到 range 的末尾让用户看见展开的边界
-                if let id = state.selectedIDs.last {
-                    withAnimation(.linear(duration: 0.08)) {
-                        proxy.scrollTo(id, anchor: .center)
-                    }
-                }
-            }
-        }
-    }
+    // 旧 list(LazyVStack 垂直列表)已被 cardScroller(LazyHStack 横向卡片)替代,见 body 调用
 }
 
 /// 类型 chip 单元。pill capsule，选中状态 accent 填充 + 白字。
@@ -648,33 +707,26 @@ private struct KindChip: View {
     }
 }
 
-private struct ItemRow: View {
+private struct ItemCard: View {
     let item: Item
     let isSelected: Bool
-    /// 本机 device-id。`item.originDevice != selfDeviceID` 表示这条是 PullWorker 从对端
-    /// 镜像过来的远端 item —— meta 行多一个 "远端" 标，让用户能跟"我自己在这台机器上
-    /// 复制的"区分开。已知场景：对端开了 ToDesk/向日葵 等远程桌面工具的"剪贴板同步"，
-    /// 本机内容被回环抓住后 origin=对端，搜索结果里出现"看起来跟本机复制一模一样但
-    /// source app 是 ToDesk"的条目；远端标识让冗余可解释、不再误以为是本地 capture bug
+    /// `item.originDevice != selfDeviceID` 表示 PullWorker 从对端镜像过来的远端 item,
+    /// 卡片左上角叠橙色 arrow.down.left 角标
     let selfDeviceID: String
-    /// 含 STX/ETX 高亮标记的 FTS snippet。仅 query 非空 + 命中时非 nil。
+    /// 含 STX/ETX 高亮标记的 FTS snippet,query 非空 + 命中时非 nil
     let snippet: String?
-    /// BlobStore reference 让 leadingIcon 异步加载 image kind / file-as-image 的缩略图。
-    /// struct + Sendable, 传引用 cheap
+    /// BlobStore reference 让 contentArea 异步加载 image kind / file-as-image 缩略图
     let blobs: BlobStore
 
-    /// 缩略图状态。.task 异步加载完 set;LazyVStack row 滚出视野 unload 时 cancel + 重置。
-    /// 加载中或非 image kind = nil → leadingIconCore 走 SF Symbol / app icon fallback
+    /// 缩略图状态。.task 异步加载完 set;LazyHStack 卡滚出视野 unload 时 cancel + 重置
     @State private var thumbnail: NSImage?
 
     private var isRemoteMirror: Bool {
         item.originDevice != selfDeviceID
     }
 
-    /// 是否应该尝试显示缩略图。三种命中:
-    /// (a) image kind + 有 blob sha
-    /// (b) file kind + blob mime 标 image/
-    /// (c) file kind + 路径后缀像 image(.png/.jpg 等)——blob mime 可能 nil 但内容是图
+    /// 是否应该显示缩略图。命中三路:image kind / file kind+blob mime=image/ / file kind+
+    /// 路径后缀像 image。前提是有 blob sha
     private var shouldShowThumbnail: Bool {
         guard item.blobSha256 != nil else { return false }
         if item.kind == .image { return true }
@@ -686,70 +738,45 @@ private struct ItemRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            leadingIcon
-            VStack(alignment: .leading, spacing: 3) {
-                previewText
-                    .lineLimit(2)
-                    .font(.system(size: 14))
-                    .foregroundStyle(isSelected ? Color.white : .primary)
-                HStack(spacing: 6) {
-                    Text(kindLabel)
-                    // file kind 路径后缀像图片 → 显示"文件 · 图片" hint。
-                    // 弱信号 badge，不参与 chip 计数也不改 kind —— ".jpg" 文本路径不一定真是图片
-                    if item.kind == .file,
-                       let path = item.textFull,
-                       fileLooksLikeImage(path: path)
-                    {
-                        Text("·")
-                        Text("图片")
-                    }
-                    Text("·")
-                    // TimelineView 周期重绘，否则 row 稳定后 Date() 不会被重算，
-                    // 相对时间永远停在初次渲染的瞬间。
-                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        Text(relativeFormatter.localizedString(for: capturedDate, relativeTo: ctx.date))
-                    }
-                    if item.kind == .image, let size = item.blobSize {
-                        Text("·")
-                        Text(humanSize(size))
-                    }
-                    if isRemoteMirror {
-                        Text("·")
-                        Text("远端")
-                    }
-                }
-                .font(.system(size: 12))
-                .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
-            }
-            Spacer()
-            if item.pinned {
-                // 已置顶 row 右侧 pin.fill 角标。accent 色，选中态翻白让两种状态都清晰。
-                // 不放在 meta 行里——meta 已经够拥挤，角标在 trailing 视觉更明确（跟"歌单
-                // pin 在最上"的 macOS Music app 心智一致）
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(isSelected ? Color.white : Color.accentColor)
-            }
+        VStack(spacing: 0) {
+            contentArea       // 主区 168(image aspectFill / 文本多行 / file 图标)
+            footer            // 32 (app icon + kind + meta + relative time)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        // Spotlight-style 选中行：inline 圆角块，不通栏到 panel 加 panel 边缘
+        .frame(width: 200, height: 200)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(isSelected ? Color.accentColor : Color.clear)
+                .fill(Color.primary.opacity(isSelected ? 0.08 : 0.04))
         )
-        // 外圈 horizontal padding 让选中块两侧留出空气
-        .padding(.horizontal, 10)
-        // 异步加载缩略图。LazyVStack row 进入视口时 fire,滚出 unload 时 task 自动 cancel。
-        // task id = sha——同 sha 不重跑(cache 同步命中);sha 变了(快路径不会发生,LazyVStack
-        // row identity 用 item.id) 才重跑
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            // 选中态加 accent 描边 + 加粗;未选中淡灰发丝线
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(
+                    isSelected ? Color.accentColor : Color.primary.opacity(0.10),
+                    lineWidth: isSelected ? 2 : 0.5
+                )
+        )
+        .overlay(alignment: .topTrailing) {
+            if item.pinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(6)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .padding(4)
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if isRemoteMirror {
+                remoteOriginBadge
+                    .padding(6)
+            }
+        }
         .task(id: item.blobSha256 ?? "") {
             guard shouldShowThumbnail, let sha = item.blobSha256 else {
                 if thumbnail != nil { thumbnail = nil }
                 return
             }
-            // 同步命中 cache → 立即设(避免 await yield 让 SwiftUI 跑两次 body)
             if let cached = ImageThumbnailCache.shared.cached(sha256: sha) {
                 if thumbnail !== cached { thumbnail = cached }
                 return
@@ -761,79 +788,108 @@ private struct ItemRow: View {
         }
     }
 
-    /// 左侧图标：优先 app 图标（按 bundleID 查 LaunchServices）；self capture 走专属
-    /// badge；其余 fallback 到 kind SF Symbol。
-    /// fallback 触发场景：item 来自 mirror 而本机没装那个 app；或源 app 没报 bundleID。
-    /// remote mirror（origin != self）在右下角叠 `arrow.down.left` 角标，跟 meta 行的
-    /// "· 远端" 文字双重强化——单纯文字过弱，纯角标新用户不知含义，两个一起最稳。
-    private var leadingIcon: some View {
-        ZStack(alignment: .bottomTrailing) {
-            leadingIconCore
-            if isRemoteMirror {
-                remoteOriginBadge
-            }
-        }
-    }
-
+    /// 卡片主区(200×168)。image kind 走真实缩略图占满;loading 走 placeholder;text 类走多行文字
     @ViewBuilder
-    private var leadingIconCore: some View {
+    private var contentArea: some View {
         if shouldShowThumbnail, let thumb = thumbnail {
-            // **优先级最高**:image kind / file-as-image 一旦缩略图加载好,显示真图。
-            // 不管 self-capture / app source / mirror —— 图片内容的信息量永远大于来源徽标。
-            // aspectFill + clipShape 圆角 6 让方形/长形图都裁成正方形占位,跟 app icon 视觉
-            // 重量一致;选中态加白色 stroke 跟蓝底分离
             Image(nsImage: thumb)
                 .resizable()
                 .interpolation(.high)
                 .aspectRatio(contentMode: .fill)
-                .frame(width: 32, height: 32)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(isSelected ? Color.white.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 0.5)
-                )
-        } else if item.isSelfCapture {
-            // duo-paste 自家复制：圆形 badge + 剪贴板 symbol，让"自家来源"在长列表里一眼
-            // 识别，而不是跟其他 fallback 共用 kind symbol。选中态翻成"白底 accent icon"
-            // 跟未选中态的"accent 底白 icon"反白对称——选中行整体已经是 accent 蓝高亮,
-            // 同色圆底会跟行融化，白底实色让 icon 跟选中行分离
+                .frame(width: 200, height: 168)
+                .clipped()
+        } else if shouldShowThumbnail {
+            // 加载中:placeholder
             ZStack {
-                Circle()
-                    .fill(isSelected ? Color.white : Color.accentColor)
-                Image(systemName: "doc.on.clipboard.fill")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(isSelected ? Color.accentColor : Color.white)
+                Color.primary.opacity(0.03)
+                Image(systemName: "photo")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.secondary.opacity(0.4))
             }
-            .frame(width: 32, height: 32)
+            .frame(width: 200, height: 168)
+        } else if item.kind == .file {
+            // file 卡(非 image-as-file):大文件 SF Symbol + 文件名
+            VStack(spacing: 8) {
+                Image(systemName: "doc.fill")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.secondary)
+                previewText
+                    .font(.system(size: 12))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .padding(.horizontal, 10)
+            }
+            .frame(width: 200, height: 168)
+        } else {
+            // text/url/rtf/html:多行内容
+            previewText
+                .font(.system(size: 13))
+                .lineLimit(8)
+                .multilineTextAlignment(.leading)
+                .frame(width: 200, height: 168, alignment: .topLeading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 10)
+        }
+    }
+
+    /// 卡片 footer(200×32):左 app icon + 中 kind/size/time meta + 右 spacer
+    private var footer: some View {
+        HStack(spacing: 6) {
+            footerIcon
+                .frame(width: 16, height: 16)
+            Text(footerMeta)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(width: 200, height: 32)
+        .background(Color.primary.opacity(0.04))
+    }
+
+    @ViewBuilder
+    private var footerIcon: some View {
+        if item.isSelfCapture {
+            ZStack {
+                Circle().fill(Color.accentColor)
+                Image(systemName: "doc.on.clipboard.fill")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
         } else if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
             Image(nsImage: img)
                 .resizable()
                 .interpolation(.high)
-                .frame(width: 32, height: 32)
         } else {
             Image(systemName: kindSymbol)
-                .font(.system(size: 18))
-                .frame(width: 32, height: 32)
-                .foregroundStyle(isSelected ? Color.white : Color.accentColor)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
         }
     }
 
-    /// 远端镜像角标：橙色填充小圆 + 白色 SF Symbol "arrow.down.left"（"从外面进来的"心智）。
-    /// 颜色选橙：避开 self badge 的 accent 蓝（撞色让两种来源辨识不开）；橙在 macOS 系统
-    /// 角标里常见（mail unread / dock badge）能被用户的视觉系统直觉认作"次级状态标记"。
-    /// 外圈白 stroke 让 badge 边界在深色 app icon（Chrome / Zed）跟浅色玻璃 panel 上都清晰。
+    /// "文本 · 34s" / "图片 · 4.5 MB · 41m" 之类
+    private var footerMeta: String {
+        var parts: [String] = [kindLabel]
+        if item.kind == .image, let size = item.blobSize {
+            parts.append(humanSize(size))
+        }
+        let rel = relativeFormatter.localizedString(for: capturedDate, relativeTo: Date())
+        parts.append(rel)
+        return parts.joined(separator: " · ")
+    }
+
+    /// 远端镜像角标——左上角橙色圆 + 白 stroke + arrow.down.left。
+    /// 卡片视觉重心在内容,角标移到左上不抢戏,跟右上 pin 错开
     private var remoteOriginBadge: some View {
         ZStack {
-            Circle()
-                .fill(Color.orange)
-            Circle()
-                .strokeBorder(Color.white, lineWidth: 1)
+            Circle().fill(Color.orange)
+            Circle().strokeBorder(Color.white, lineWidth: 1)
             Image(systemName: "arrow.down.left")
                 .font(.system(size: 7, weight: .bold))
                 .foregroundStyle(.white)
         }
         .frame(width: 14, height: 14)
-        .offset(x: 3, y: 3)
     }
 
     /// kind 中文标签——meta 行第一列显示。比 bundle name 更立刻能读懂"这是什么"。

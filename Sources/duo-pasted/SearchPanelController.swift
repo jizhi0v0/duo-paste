@@ -45,7 +45,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     func show() {
         let p = ensurePanel()
-        positionCenter(p)
+        positionBottom(p)
         // 临时切到 regular 让 panel 能拿到 key 状态，显示完再切回去
         // 但因为我们已经是 .accessory 且 panel 是 nonactivating，需要手动 makeKey
         NSApp.activate(ignoringOtherApps: true)
@@ -76,7 +76,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // MainActor 闭包，避免 NSEvent 非 Sendable 进入隔离边界。
             let keyCode = Int(event.keyCode)
             let isCmd = event.modifierFlags.contains(.command)
-            let interceptCodes: Set<Int> = [126, 125, 36, 76, 53]
+            // 横向卡片布局:←/→ 切换选中(123/124);↑/↓(126/125)继续兼容老用户 muscle memory
+            // (TextField 横向单行,↑/↓ 移光标无意义,可吞掉重定向到 navigate)
+            let interceptCodes: Set<Int> = [123, 124, 125, 126, 36, 76, 53]
             // ⌘P (keyCode=35) = 切换选中行的 pinned。仅 Cmd 修饰键命中时截走；
             // 不带修饰键的 P 透传给 TextField 当作正常字符输入
             let isCmdP = (keyCode == 35 && isCmd)
@@ -89,8 +91,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             MainActor.assumeIsolated {
                 guard let self, let panel = self.panel, panel.isKeyWindow else { return }
                 switch keyCode {
-                case 126: self.state.navigate(by: -1)           // ↑
-                case 125: self.state.navigate(by: 1)            // ↓
+                case 123: self.state.navigate(by: -1)           // ← 上一项
+                case 124: self.state.navigate(by: 1)            // → 下一项
+                case 126: self.state.navigate(by: -1)           // ↑ alias
+                case 125: self.state.navigate(by: 1)            // ↓ alias
                 case 36, 76:                                    // Return / Enter
                     // 多选时按 selectedIDs 顺序传整个数组;没显式多选 → 取 currentItem 兜底
                     let items: [Item]
@@ -133,7 +137,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     private func ensurePanel() -> NSPanel {
         if let p = panel { return p }
-        let contentRect = NSRect(x: 0, y: 0, width: 760, height: 520)
+        // Paste.app 风格底部条:宽 = 屏幕可用宽 - 80px(两侧 40px margin),高固定 280
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let panelWidth = max(800, screenFrame.width - 80)
+        let contentRect = NSRect(x: 0, y: 0, width: panelWidth, height: 280)
         let p = HUDPanel(
             contentRect: contentRect,
             styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView, .resizable],
@@ -188,13 +195,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         return p
     }
 
-    private func positionCenter(_ p: NSWindow) {
+    private func positionBottom(_ p: NSWindow) {
         guard let screen = NSScreen.main else { return }
         let sFrame = screen.visibleFrame
         let pFrame = p.frame
         let x = sFrame.midX - pFrame.width / 2
-        // 屏幕中线居中。原版用 0.62 偏上 1/3 模仿 Spotlight,user 反馈太偏所以撤掉
-        let y = sFrame.midY - pFrame.height / 2
+        // 贴底 + 30px gap 留呼吸感(避免紧贴任务栏)。Paste.app 同档体验
+        let y = sFrame.minY + 30
         p.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
