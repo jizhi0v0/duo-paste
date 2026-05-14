@@ -8,7 +8,6 @@ import DuoPasteCore
 /// 协议适配：
 /// - `SinceTransport` 在 SinceClient.swift 里 extension 实现 `/since` + `/health`
 /// - `BlobFetcher` 在 SinceClient.swift 里 extension 实现 `/blob/<sha>`
-/// - `SearchTransport` 在 SearchClient.swift 里 extension 实现 `/search`（PR 6 才删）
 ///
 /// 注入 URLSession 便于测试覆盖（mock URLProtocol）；生产用 .shared / AppDependencies.syncURLSession。
 public struct HTTPPeerClient: Sendable {

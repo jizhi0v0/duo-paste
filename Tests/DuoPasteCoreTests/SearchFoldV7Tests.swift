@@ -5,14 +5,14 @@ import GRDB
 
 /// v7 合表后 `item_mirror` 已 DROP，peer 行通过 PullWorker 直接落 `item` 表（push_state='acked'，
 /// origin_device 区分本机 vs peer）。原 SearchUnionTests 走"跨表 union + Swift fold"假设失效，
-/// 但 `searchUnion` 接口保留（PR 6 才清 SearchProvider.Mode 枚举），内部退化为"单表 fetchHits
+/// 但 `searchHits` 接口保留（PR 6 才清 SearchProvider.Mode 枚举），内部退化为"单表 fetchHits
 /// oversample + Swift 端 text-fold + 后置过滤 + 排序"。
 ///
 /// 本套覆盖 v7 单表语义下的 fold 不变量，保证 SearchProvider.localMirror 路径行为跟合表前一致：
 /// - 跨 origin 同 text_full 在单表内 fold 为一条（winner = max(capturedAtNs)，pinned OR 聚合）
 /// - 同 blob_sha256 不 fold（保留时间线，blob kind 独立）
 /// - kinds / pinnedOnly filter 应用到 winner 行（不前置到子查询）
-/// - fetchUnion / countUnion / countByKindUnion 三路口径一致
+/// - fetchUnion / count / countByKind 三路口径一致
 ///
 /// 老 SearchUnionTests 在 PR 1 期间整体挂（写 item_mirror 表挂掉）；PR 4 才删，是 plan 字面接受。
 
@@ -60,7 +60,7 @@ private func insertItem(
     let db = try makeDB()
     try insertItem(db, id: "own-old", origin: "self", capturedAtNs: 100, text: "duplicate text")
     try insertItem(db, id: "peer-new", origin: "peer", capturedAtNs: 500, text: "duplicate text")
-    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
     #expect(hits.count == 1)
     #expect(hits.first?.0.id == "peer-new")
 }
@@ -70,7 +70,7 @@ private func insertItem(
     let db = try makeDB()
     try insertItem(db, id: "own-pinned", origin: "self", capturedAtNs: 100, text: "shared", pinned: true)
     try insertItem(db, id: "peer-unpinned-newer", origin: "peer", capturedAtNs: 500, text: "shared", pinned: false)
-    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
     #expect(hits.count == 1)
     #expect(hits.first?.0.id == "peer-unpinned-newer")
     #expect(hits.first?.0.pinned == true)
@@ -82,7 +82,7 @@ private func insertItem(
     let sha = String(repeating: "a", count: 64)
     try insertItem(db, id: "own-img", origin: "self", capturedAtNs: 100, kind: .image, blobSha256: sha)
     try insertItem(db, id: "peer-img", origin: "peer", capturedAtNs: 500, kind: .image, blobSha256: sha)
-    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
     #expect(hits.count == 2)
     #expect(Set(hits.map(\.0.id)) == ["own-img", "peer-img"])
 }
@@ -96,20 +96,20 @@ private func insertItem(
     let api = SearchAPI(database: db)
 
     // 单选 text：fold 后 winner=txt-new，url-row 不进结果
-    let textHits = try api.searchUnion(SearchQuery(kinds: [.text], limit: 10))
+    let textHits = try api.searchHits(SearchQuery(kinds: [.text], limit: 10))
     #expect(textHits.map(\.0.id) == ["txt-new"])
 
     // 单选 url：只有 url-row
-    let urlHits = try api.searchUnion(SearchQuery(kinds: [.url], limit: 10))
+    let urlHits = try api.searchHits(SearchQuery(kinds: [.url], limit: 10))
     #expect(urlHits.map(\.0.id) == ["url-row"])
 
     // 全 kinds（默认）：fold 后两条（text fold 一条 + url 一条），按 captured DESC 排
-    let allHits = try api.searchUnion(SearchQuery(limit: 10))
+    let allHits = try api.searchHits(SearchQuery(limit: 10))
     #expect(allHits.map(\.0.id) == ["txt-new", "url-row"])
 }
 
 @Test func foldCountAndListConsistent() throws {
-    // 三路口径：searchUnion list, countUnion total, countByKindUnion chip —— 都基于同一 fetchUnion
+    // 三路口径：searchHits list, count total, countByKind chip —— 都基于同一 fetchUnion
     // oversample → fold 路径计算。fold 后 4 个原始行 → 3 个 winner（text 'A' fold + text 'B' + url）
     let db = try makeDB()
     try insertItem(db, id: "txt-a-old", origin: "self", capturedAtNs: 100, kind: .text, text: "A")
@@ -118,15 +118,15 @@ private func insertItem(
     try insertItem(db, id: "url-only", origin: "self", capturedAtNs: 200, kind: .url, text: "https://example.com")
     let api = SearchAPI(database: db)
 
-    let list = try api.searchUnion(SearchQuery(limit: 50))
-    let total = try api.countUnion(SearchQuery())
-    let byKind = try api.countByKindUnion(SearchQuery())
+    let list = try api.searchHits(SearchQuery(limit: 50))
+    let total = try api.count(SearchQuery())
+    let byKind = try api.countByKind(SearchQuery())
 
     #expect(list.count == 3)
     #expect(total == 3)
     #expect(byKind[.text] == 2)  // 'A' fold 一条 + 'B' 一条
     #expect(byKind[.url] == 1)
-    // 其它 kind 走 normalizeKindCounts 应该补 0（这里 SearchAPI.countByKindUnion 不补，由
+    // 其它 kind 走 normalizeKindCounts 应该补 0（这里 SearchAPI.countByKind 不补，由
     // SearchProvider.normalizeKindCounts 兜底；这里直接断言原始字典只含命中 kind）
     #expect(byKind[.image] == nil)
 }
@@ -138,7 +138,7 @@ private func insertItem(
     try insertItem(db, id: "own-pinned", origin: "self", capturedAtNs: 100, text: "shared", pinned: true)
     try insertItem(db, id: "peer-newer-unpinned", origin: "peer", capturedAtNs: 500, text: "shared", pinned: false)
     try insertItem(db, id: "lone-unpinned", origin: "self", capturedAtNs: 300, text: "other", pinned: false)
-    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(pinnedOnly: true, limit: 10))
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(pinnedOnly: true, limit: 10))
     #expect(hits.count == 1)
     #expect(hits.first?.0.id == "peer-newer-unpinned")
 }
@@ -148,7 +148,7 @@ private func insertItem(
     let db = try makeDB()
     try insertItem(db, id: "active", origin: "self", capturedAtNs: 100, text: "live")
     try insertItem(db, id: "deleted", origin: "peer", capturedAtNs: 500, text: "live", deletedAtNs: 600)
-    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(limit: 10))
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
     #expect(hits.count == 1)
     #expect(hits.first?.0.id == "active")
 }

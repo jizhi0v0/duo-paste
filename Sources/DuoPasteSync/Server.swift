@@ -67,7 +67,6 @@ public struct SyncServer: Sendable {
             on: router,
             deviceID: deviceID,
             blobs: blobs,
-            searchAPI: SearchAPI(database: database),
             sinceAPI: SinceAPI(database: database)
         )
 
@@ -78,7 +77,7 @@ public struct SyncServer: Sendable {
 
         // PR 3：broadcaster 非 nil → 启用 WebSocket upgrade 路径。WS 路由独立 Router
         // (BasicWebSocketRequestContext)，通过 `http1WebSocketUpgrade(webSocketRouter:)`
-        // 让 server 同时接 HTTP /since /blob /search /health + WS /sync/ws
+        // 让 server 同时接 HTTP /since /blob /health + WS /sync/ws
         if let broadcaster {
             let wsRouter = Self.makeWebSocketRouter(
                 auth: auth,
@@ -192,13 +191,13 @@ public struct SyncServer: Sendable {
     }
 
     /// 内部抽出来便于将来加路由 + 单测。
-    /// PR 4 之后只剩 mesh peer 间的 GET 路由：health / blob / since / search。
-    /// `/ingest` + PUT/HEAD `/blob` 已删——mesh 拓扑下不再有"client → primary push"语义。
+    /// PR 6 之后只剩 mesh peer 间的 GET 路由：health / blob / since。
+    /// `/ingest` + PUT/HEAD `/blob` 已删（PR 4，mesh 拓扑下不再有 "client → primary push"），
+    /// `/search` 也删（PR 6，每台 mac 自家 SearchAPI 走 fold-aware 算就够，对端永远口径一致）
     static func registerRoutes<Ctx: RequestContext>(
         on router: Router<Ctx>,
         deviceID: String,
         blobs: BlobStore,
-        searchAPI: SearchAPI,
         sinceAPI: SinceAPI
     ) {
         router.get("/health") { _, _ -> Response in
@@ -257,35 +256,11 @@ public struct SyncServer: Sendable {
             }
         }
 
-        // GET /search?q=foo&limit=200&offset=0&kinds=text,url&from_ns=...&to_ns=...&pinned=1
-        // 一次 SQL 同时拿 item + snippet；返回 { ok, items: [Item + 可选 snippet], count }
-        router.get("/search") { request, _ -> Response in
-            let q = parseSearchQuery(request.uri.queryParameters)
-            do {
-                let hits = try searchAPI.searchHits(q)
-                let itemsJSON = hits.map { hit -> [String: Any] in
-                    var d = itemToJSON(hit.0)
-                    if let s = hit.1 { d["snippet"] = s }
-                    return d
-                }
-                let payload: [String: Any] = [
-                    "ok": true,
-                    "count": hits.count,
-                    "items": itemsJSON,
-                ]
-                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
-                resp.headers[.contentType] = "application/json"
-                return resp
-            } catch {
-                return errorJSON(.internalServerError, "search failed: \(error)")
-            }
-        }
     }
 
     /// 把 URL query 参数转成 SinceQuery。空 cursor_ns / 非法值 → 视作从头拉。
-    /// 跟 parseSearchQuery 一致：limit 在 parse 层 clamp 到 [1, SinceAPI.maxLimit]，
-    /// 避免 wire 接受 0 / 巨大值（SinceAPI 内还有 clamp 兜底，是纵深防御）。
+    /// limit 在 parse 层 clamp 到 [1, SinceAPI.maxLimit]，避免 wire 接受 0 / 巨大值
+    /// （SinceAPI 内还有 clamp 兜底，是纵深防御）。
     static func parseSinceQuery(_ params: FlatDictionary<Substring, Substring>) -> SinceQuery {
         let cursorNs = params["cursor_ns"].flatMap { Int64($0) } ?? 0
         let cursorID = params["cursor_id"].map(String.init) ?? ""
@@ -294,26 +269,6 @@ public struct SyncServer: Sendable {
         return SinceQuery(
             cursor: SinceCursor(ingestedAtNs: cursorNs, id: cursorID),
             limit: limit
-        )
-    }
-
-    /// 把 URL query 参数转成 SearchQuery。容错原则：不合法值忽略，不报错——
-    /// 用户在 UI 打字时 query 参数随时变，不该因为半成品输入返回 400。
-    static func parseSearchQuery(_ params: FlatDictionary<Substring, Substring>) -> SearchQuery {
-        let text = params["q"].map(String.init)
-        let fromNs = params["from_ns"].flatMap { Int64($0) }
-        let toNs = params["to_ns"].flatMap { Int64($0) }
-        let limit = params["limit"].flatMap { Int($0) } ?? 200
-        let offset = params["offset"].flatMap { Int($0) } ?? 0
-        let kinds: [ItemKind] = params["kinds"].map { raw in
-            raw.split(separator: ",").compactMap { ItemKind(rawValue: String($0)) }
-        } ?? []
-        let pinnedOnly = params["pinned"] == "1" || params["pinned"] == "true"
-        return SearchQuery(
-            text: text, fromNs: fromNs, toNs: toNs,
-            kinds: kinds, pinnedOnly: pinnedOnly,
-            limit: max(1, min(limit, 1000)),  // 强制 1-1000 防止 DOS
-            offset: max(0, offset)
         )
     }
 

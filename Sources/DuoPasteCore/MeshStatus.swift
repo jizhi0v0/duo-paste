@@ -71,7 +71,7 @@ public final class MeshStatus: @unchecked Sendable {
     /// 返回 nil 的场景：
     /// - 没有任何 peer 已注册（PR 2 单 peer 部署首次启动 / standalone）
     /// - **任一**已注册 peer 的 lastPullNs == nil（这是关键：mesh 必须**所有** peer 都至少追平
-    ///   过一轮才算"可信本地"，否则 SearchProvider 不该走 .localMirror 路径——某 peer 还没追平
+    ///   过一轮才算"可信"，否则 SearchProvider 显示的 mesh staleness 没意义——某 peer 还没追平
     ///   时本地 item 表对该 peer 视角的全集是缺的，搜索可能漏行）
     ///
     /// 非 nil 时返回所有 lastPullNs 的 min（最悲观 = staleness 取最大值）。

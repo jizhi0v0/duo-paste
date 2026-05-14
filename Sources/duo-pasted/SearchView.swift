@@ -165,9 +165,8 @@ struct SearchView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(filterChipKinds, id: \.self) { kind in
-                        // 契约：空 dict（remoteOK / 出错）→ nil 隐藏数字；非空 dict（local /
-                        // unionLocal 路径）→ 缺 key 默认 0 显示 "图片 0"。这样 KindChip 头注释
-                        // 的 "0 也显示" 才真生效，否则缺 key 时跟 "远端未知" 撞同一种 nil 渲染。
+                        // 契约：空 dict（出错降级）→ nil 隐藏数字；非空 dict（fold-aware 正常路径）
+                        // → 缺 key 默认 0 显示 "图片 0"。这样 KindChip 头注释的 "0 也显示" 才真生效
                         KindChip(
                             kind: kind,
                             isSelected: state.selectedKinds.contains(kind),
@@ -372,41 +371,28 @@ struct SearchView: View {
     }
 
     /// 顶部 banner：
-    /// - `.local` / `.remoteOK` → 不显示（默认顺畅状态）
-    /// - `.localMirror` → 稳态隐藏；staleness 超阈值（5 分钟）才以黄色显示「镜像卡顿」
-    ///   pull interval 默认 30s，稳态 staleness 应在 0-60s 之间。超过 300s 说明 pull worker
-    ///   卡死 / primary 不可达 / 时钟漂移，这时才有告知价值
-    /// - `.remoteFallback` → 黄色提示 primary 离线
+    /// - `.local` → 不显示（standalone 或 mesh 还没追平任何 peer 的初始态）
+    /// - `.mesh(stalenessSec: nil)` → 不显示（peer 配了但还没成功跑过 pull tick）
+    /// - `.mesh(stalenessSec)` 稳态 0-60s → 不显示
+    /// - `.mesh(stalenessSec)` > 300s → 黄色显示「peer 同步滞后」
+    ///   pull interval 默认 30s，稳态 staleness 应在 0-60s。超过 300s 说明 PullWorker
+    ///   卡死 / peer 不可达 / 时钟漂移，这时才有告知价值
     @ViewBuilder
     private var modeBanner: some View {
         switch state.searchMode {
-        case .localMirror(let stalenessSec) where stalenessSec > 300:
+        case .mesh(let stalenessSec) where (stalenessSec ?? 0) > 300:
             HStack(spacing: 6) {
                 Image(systemName: "internaldrive.badge.exclamationmark")
-                Text("本地镜像更新滞后")
+                Text("peer 同步滞后")
                 Text("·").foregroundStyle(.secondary)
-                Text("已 \(humanStaleness(stalenessSec)) 未同步").foregroundStyle(.secondary)
+                Text("已 \(humanStaleness(stalenessSec ?? 0)) 未拉取").foregroundStyle(.secondary)
             }
             .font(.caption)
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.yellow.opacity(0.15))
-        case .localMirror:
-            EmptyView()
-        case .remoteFallback(let reason):
-            HStack(spacing: 6) {
-                Image(systemName: "wifi.exclamationmark")
-                Text("primary 离线，使用本地结果")
-                Text("·").foregroundStyle(.secondary)
-                Text(reason).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-            }
-            .font(.caption)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.yellow.opacity(0.15))
-        case .local, .remoteOK:
+        case .mesh, .local:
             EmptyView()
         }
     }
@@ -509,9 +495,9 @@ struct SearchView: View {
 /// 单击 toggle 选中状态。视觉跟 timeRangeMenu 的 capsule 保持一致——padding / radius 同步
 ///
 /// `count` 非 nil 时尾巴挂活计数 "图片 19"——让用户立刻看出哪个类稀疏。
-/// 0 也显示（"图片 0"），避免用户误以为 filter 失效；nil = 远端模式拿不到时隐藏。
-/// nil/0 的区分发生在 caller：空 kindCounts dict（remoteOK / 出错）→ nil；非空 dict
-/// （本地有命中）→ 缺 key 默认 0。
+/// 0 也显示（"图片 0"），避免用户误以为 filter 失效；nil = 出错降级时隐藏。
+/// nil/0 的区分发生在 caller：空 kindCounts dict（出错降级）→ nil；非空 dict
+/// （fold-aware 路径有命中）→ 缺 key 默认 0。
 private struct KindChip: View {
     let kind: ItemKind
     let isSelected: Bool

@@ -50,31 +50,24 @@ public struct SearchAPI: Sendable {
     public static let snippetStartMarker = "\u{02}"
     public static let snippetEndMarker   = "\u{03}"
 
-    /// 一次 SQL 同时返回 item + FTS snippet——比 search() + snippets() 两次查询快一倍以上。
-    /// snippet 仅当 query.text 非空时填；其它情况第二元素为 nil。
+    /// 一次 SQL 同时返回 item + FTS snippet，**fold-aware**——跨 origin 同 text_full 的行
+    /// 折成一条（capture 层 dedup 只防同 origin，跨 origin 兜底靠这一层；详 CLAUDE.md
+    /// "文本永久 dedup"）。snippet 仅当 query.text 非空时填；其它情况第二元素为 nil。
     /// max tokens=8：紧密围绕匹配词，SwiftUI `lineLimit(2)` 一定能显示到高亮段。
+    ///
+    /// PR 6 之前还有 `searchUnion` 是"fold-aware"路径、`searchHits` 是"raw"路径，mesh
+    /// 拓扑下 item 表本身就混 own + peer 行，raw 路径出来的总数跟对端不齐——直接合并
+    /// 成单一 fold-aware 路径，删 raw 公开 API。
     public func searchHits(_ q: SearchQuery) throws -> [(Item, String?)] {
         try database.pool.read { db in
-            try Self.fetchHits(db, query: q)
+            try Self.fetchHitsFolded(db, query: q)
         }
     }
 
-    /// Mesh 模式：v7 合表后 peer 行直接落 `item` 表，本机 own 行也在 `item` 表。原来的
-    /// "本机 item ∪ 远端 item_mirror" 跨表 union 退化为单表 fetchHits + Swift 端 text-fold。
-    ///
-    /// **保留 fetchUnion 接口**：SearchProvider.localMirror 路径仍调它（PR 6 才清 Mode 枚举）。
-    /// 内部逻辑：fetchHits oversample（无 kinds/pinnedOnly 过滤）→ text-fold（pinned OR 聚合）
-    /// → 后置 kinds/pinnedOnly 过滤 → 排序契约（pinned/prefix24h/captured DESC）→ LIMIT/OFFSET。
-    ///
-    /// text-fold 必须保留：合表后同文本可能跨 origin 重复（本机 own 行 + peer mirror 行），capture
-    /// 层 dedup 只过滤同 origin，跨 origin 兜底靠这一层（详 CLAUDE.md "文本永久 dedup"）。
-    public func searchUnion(_ q: SearchQuery) throws -> [(Item, String?)] {
-        try database.pool.read { db in
-            try Self.fetchUnion(db, query: q)
-        }
-    }
-
-    static func fetchUnion(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
+    /// Fold-aware fetch 内部实现：oversample raw（无 kinds/pinnedOnly 过滤）→ text-fold
+    /// （跨 origin 同 text_full 折一条，pinned OR 聚合）→ 后置 kinds/pinnedOnly 过滤 →
+    /// 排序契约（pinned/prefix24h/captured DESC）→ LIMIT/OFFSET。
+    static func fetchHitsFolded(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
         // pinnedOnly / kinds 必须在 text-fold **之后**按 winner 行的字段过滤——fold 会做 pinned
         // OR 聚合，过滤依据必须是聚合后 winner。否则：跨 origin 同文本一边 pinned=true 一边
         // false，子查询带 `pinned=1` 过滤后只剩 pinned 那条参与 fold，winner 不变；但 list /
@@ -93,7 +86,7 @@ public struct SearchAPI: Sendable {
             limit: oversampleLimit,
             offset: 0
         )
-        let raw = try fetchHits(db, query: oversample)
+        let raw = try fetchHitsRaw(db, query: oversample)
 
         // 文本永久 dedup：单表 item 内按 text_full 二次 fold。仅 blob_sha256 IS NULL 行参与
         // （即 text/url/file，"字节相等即同"），blob kind 不动——同 sha 图片多次复制可能是
@@ -158,7 +151,9 @@ public struct SearchAPI: Sendable {
         return Array(deduped[start..<end])
     }
 
-    static func fetchHits(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
+    /// Raw 单表 fetch：纯 SQL，没有 Swift 端 fold。仅 `fetchHitsFolded` 内部 oversample
+    /// 时用——公开 API 永远走 fold-aware 的 `searchHits`，跟对端口径一致
+    private static func fetchHitsRaw(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
         var wheres: [String] = []
         var args: [DatabaseValueConvertible] = []
 
@@ -225,143 +220,45 @@ public struct SearchAPI: Sendable {
         }
     }
 
-    /// 当前 query 条件下本机 `item` 表里的匹配总数（忽略 limit/offset）。
-    /// UI 用来显示真实 counter，不受 200 cap 截断影响。
+    /// 当前 query 条件下匹配的真实总数（忽略 limit/offset，**fold-aware**）。
+    /// UI 用来显示真实 counter，不受 200 cap 截断影响。跟 `searchHits` 同源走
+    /// fold 路径——保证 list / total / chip 三者口径一致。
     public func count(_ q: SearchQuery) throws -> Int {
         try database.pool.read { db in
-            try Self.countItem(db, query: q)
+            let oversample = SearchQuery(
+                text: q.text,
+                fromNs: q.fromNs, toNs: q.toNs,
+                kinds: q.kinds,
+                pinnedOnly: q.pinnedOnly,
+                includeDeleted: q.includeDeleted,
+                limit: Int.max,
+                offset: 0
+            )
+            return try Self.fetchHitsFolded(db, query: oversample).count
         }
     }
 
-    /// Mesh 模式下：合表后 `item` 单表，countUnion 跟 fetchUnion 同源走 text-fold 路径
-    /// （`countUnionStatic` 内部调 `fetchUnion(limit=.max)`），保证 list / total / chip 三者口径
-    /// 一致。原跨表 union 语义在 v7 合表后退化为单表 fold，但 API 保留给 SearchProvider 用。
-    public func countUnion(_ q: SearchQuery) throws -> Int {
-        try database.pool.read { db in
-            try Self.countUnionStatic(db, query: q)
-        }
-    }
-
-    /// 构造 count 用的 WHERE/JOIN 片段。复用 fetchHits 的过滤逻辑，
-    /// 只是不取列也不排序——保证 counter 跟 list 的过滤口径一致。
-    private static func buildCountClauses(
-        table: String,
-        ftsTable: String,
-        query q: SearchQuery
-    ) -> (join: String, whereClause: String, args: [DatabaseValueConvertible]) {
-        var wheres: [String] = []
-        var args: [DatabaseValueConvertible] = []
-
-        if !q.includeDeleted { wheres.append("\(table).deleted_at_ns IS NULL") }
-        if let from = q.fromNs { wheres.append("\(table).captured_at_ns >= ?"); args.append(from) }
-        if let to = q.toNs { wheres.append("\(table).captured_at_ns <= ?"); args.append(to) }
-        if !q.kinds.isEmpty {
-            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
-            wheres.append("\(table).kind IN (\(p))")
-            args.append(contentsOf: q.kinds.map { $0.rawValue })
-        }
-        if q.pinnedOnly { wheres.append("\(table).pinned = 1") }
-
-        var join = ""
-        if let text = q.text, let match = ftsQuery(from: text) {
-            join = "JOIN \(ftsTable) ON \(ftsTable).rowid = \(table).rowid"
-            wheres.append("\(ftsTable) MATCH ?")
-            args.append(match)
-        }
-        let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
-        return (join, whereClause, args)
-    }
-
-    static func countItem(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
-        let (join, whereClause, args) = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
-        let sql = "SELECT COUNT(*) FROM item \(join) \(whereClause)"
-        return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
-    }
-
-    static func countUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> Int {
-        // 走 fetchUnion 同源路径——id-dedup + 文本 fold + 按 winner 字段过滤——保证
-        // list / total-count / kind-count 三者口径一致。规模上剪贴板 item+mirror 万级，
-        // FTS 命中后通常千级以下，Swift 端 dedup 几毫秒；与 fetchUnion 顶头 tradeoff 注释同源。
-        let oversample = SearchQuery(
-            text: q.text,
-            fromNs: q.fromNs, toNs: q.toNs,
-            kinds: q.kinds,
-            pinnedOnly: q.pinnedOnly,
-            includeDeleted: q.includeDeleted,
-            limit: Int.max,
-            offset: 0
-        )
-        let hits = try fetchUnion(db, query: oversample)
-        return hits.count
-    }
-
-    /// 当前 (query / timeRange / pinnedOnly) 维度下，按 kind 分桶的命中数。
+    /// 当前 (query / timeRange / pinnedOnly) 维度下，按 kind 分桶的 fold 后命中数。
     /// **忽略**输入 `q.kinds`——chip count 显示的是"如果我只点这个 kind 会得到多少"，
     /// 跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法判断稀疏类型。
+    /// 跟 `searchHits` / `count` 同源走 fold 路径，保证 chip / total / list 口径一致。
     public func countByKind(_ q: SearchQuery) throws -> [ItemKind: Int] {
-        let stripped = Self.stripKinds(q)
-        return try database.pool.read { db in
-            try Self.countByKindItem(db, query: stripped)
-        }
-    }
-
-    /// Mesh 模式下：合表后单表 `item` 按 text-fold 后 GROUP BY kind。`countByKindUnionStatic`
-    /// 走 fetchUnion 同源路径——text-fold + pinned 后置过滤——保证 chip / count / list 口径一致。
-    public func countByKindUnion(_ q: SearchQuery) throws -> [ItemKind: Int] {
-        let stripped = Self.stripKinds(q)
-        return try database.pool.read { db in
-            try Self.countByKindUnionStatic(db, query: stripped)
-        }
-    }
-
-    private static func stripKinds(_ q: SearchQuery) -> SearchQuery {
-        SearchQuery(
+        let stripped = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
             kinds: [],
             pinnedOnly: q.pinnedOnly,
             includeDeleted: q.includeDeleted,
-            limit: 0, offset: 0
+            limit: Int.max, offset: 0
         )
-    }
-
-    static func countByKindItem(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
-        let (join, whereClause, args) = buildCountClauses(table: "item", ftsTable: "item_fts", query: q)
-        let sql = "SELECT item.kind AS kind, COUNT(*) AS cnt FROM item \(join) \(whereClause) GROUP BY item.kind"
-        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
-        return decodeKindCountRows(rows)
-    }
-
-    static func countByKindUnionStatic(_ db: GRDB.Database, query q: SearchQuery) throws -> [ItemKind: Int] {
-        // 走 fetchUnion 同源路径——id-dedup + 文本 fold + pinned 后置过滤——保证 chip
-        // 数字、total count、list 三条路径口径一致。q.kinds 已被 stripKinds 清空，所以
-        // fetchUnion 返回的是"所有 kind 的 winner"，外层按 winner.kind 分桶即可。
-        let oversample = SearchQuery(
-            text: q.text,
-            fromNs: q.fromNs, toNs: q.toNs,
-            kinds: q.kinds,            // 通常已被 stripKinds 清空
-            pinnedOnly: q.pinnedOnly,
-            includeDeleted: q.includeDeleted,
-            limit: Int.max,
-            offset: 0
-        )
-        let hits = try fetchUnion(db, query: oversample)
-        var out: [ItemKind: Int] = [:]
-        for hit in hits {
-            out[hit.0.kind, default: 0] += 1
+        return try database.pool.read { db in
+            let hits = try Self.fetchHitsFolded(db, query: stripped)
+            var out: [ItemKind: Int] = [:]
+            for hit in hits {
+                out[hit.0.kind, default: 0] += 1
+            }
+            return out
         }
-        return out
-    }
-
-    private static func decodeKindCountRows(_ rows: [Row]) -> [ItemKind: Int] {
-        var out: [ItemKind: Int] = [:]
-        for r in rows {
-            let raw: String? = r["kind"]
-            guard let raw, let k = ItemKind(rawValue: raw) else { continue }
-            let cnt: Int = r["cnt"] ?? 0
-            out[k] = cnt
-        }
-        return out
     }
 
     /// 把用户输入的自由文本转成 FTS5 MATCH 表达式。

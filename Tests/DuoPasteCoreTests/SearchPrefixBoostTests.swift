@@ -121,6 +121,6 @@ private func nowNs() -> Int64 {
     try insertMirror(db, id: "mir-noprefix",
                      capturedAtNs: now - 15 * 60 * 1_000_000_000, // 15min ago, 更新
                      text: "tracking git issues")
-    let hits = try SearchAPI(database: db).searchUnion(SearchQuery(text: "git", limit: 10))
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(text: "git", limit: 10))
     #expect(hits.map(\.0.id) == ["own-prefix", "mir-noprefix"])
 }

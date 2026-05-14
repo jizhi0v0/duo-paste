@@ -4,6 +4,14 @@ import GRDB
 import DuoPasteCore
 @testable import DuoPasteSync
 
+/// PR 6 之后 SearchProvider 永远走本机 fold-aware 路径——SearchTransport / 远端 /search /
+/// SearchProvider.Mode 的 .remoteOK / .remoteFallback / .localMirror 全删。
+/// 这套测试覆盖剩下的两条不变量：
+///  - 模式选择正确（.local 还是 .mesh(stalenessSec:)）
+///  - 本机命中带 snippet（FTS 命中时填）
+///  - 空 query 不带 snippet
+///  - kindCounts 永远是 fold-aware 算出来的非空 dict（保证 chip 数字不消失）
+
 private typealias DuoDB = DuoPasteCore.Database
 
 private func makeDBWithItems(_ items: [Item]) throws -> DuoDB {
@@ -38,255 +46,85 @@ private func sampleItem(
     )
 }
 
-@Test func searchProviderFallsBackOnRemoteUnreachable() async throws {
-    // 远端 transport 永远 unreachable → provider 应回退本地并标 .remoteFallback
-    let db = try makeDBWithItems([sampleItem(text: "hello local")])
-    let local = SearchAPI(database: db)
-    struct DownTransport: SearchTransport {
-        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
-            RemoteSearchResult(outcome: .unreachable(reason: "connection refused"))
-        }
-    }
-    let provider = SearchProvider(local: local, remote: DownTransport())
-    let outcome = try await provider.search(SearchQuery(text: "hello"))
-    #expect(outcome.items.count == 1)
-    #expect(outcome.items.first?.textFull == "hello local")
-    if case .remoteFallback(let reason) = outcome.mode {
-        #expect(reason.contains("connection refused"))
-    } else {
-        Issue.record("expected .remoteFallback, got \(outcome.mode)")
-    }
-}
-
-@Test func searchProviderUsesRemoteWhenAvailable() async throws {
-    // 远端 transport 正常 → 应返回 remote items + .remoteOK，不打本地
-    let localDB = try makeDBWithItems([sampleItem(text: "this is local, should not appear")])
-    let remoteItem = sampleItem(text: "from remote")
-    struct OKTransport: SearchTransport {
-        let remoteItem: Item
-        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
-            RemoteSearchResult(outcome: .ok([SearchHit(item: remoteItem, snippet: nil)]))
-        }
-    }
-    let provider = SearchProvider(
-        local: SearchAPI(database: localDB),
-        remote: OKTransport(remoteItem: remoteItem)
-    )
-    let outcome = try await provider.search(SearchQuery())
-    #expect(outcome.mode == .remoteOK)
-    #expect(outcome.items.count == 1)
-    #expect(outcome.items.first?.textFull == "from remote")
-}
-
 @Test func searchProviderLocalReturnsSnippets() async throws {
-    // Provider 走本地路径时，应当为命中项填上 snippet（含 STX/ETX 标记）
     let db = try makeDBWithItems([
         sampleItem(id: "s1", text: "this is a foo bar baz quux test"),
         sampleItem(id: "s2", text: "another row without keyword"),
     ])
-    let provider = SearchProvider(local: SearchAPI(database: db), remote: nil)
+    let provider = SearchProvider(local: SearchAPI(database: db))
     let outcome = try await provider.search(SearchQuery(text: "foo"))
     #expect(outcome.items.count == 1)
     let snippet = outcome.snippets["s1"]
     #expect(snippet != nil)
-    #expect(snippet?.contains("\u{02}") == true)  // STX 起始标记
-    #expect(snippet?.contains("\u{03}") == true)  // ETX 终止标记
+    #expect(snippet?.contains("\u{02}") == true)
+    #expect(snippet?.contains("\u{03}") == true)
     #expect(snippet?.contains("foo") == true)
 }
 
 @Test func searchProviderEmptyQueryHasNoSnippets() async throws {
     let db = try makeDBWithItems([sampleItem(text: "anything")])
-    let provider = SearchProvider(local: SearchAPI(database: db), remote: nil)
+    let provider = SearchProvider(local: SearchAPI(database: db))
     let outcome = try await provider.search(SearchQuery())
     #expect(outcome.snippets.isEmpty)
 }
 
-@Test func searchProviderLocalOnlyWhenNoRemote() async throws {
+@Test func searchProviderModeIsLocalWhenNoPeerPullYet() async throws {
+    // 没有任何 peer 的 lastPullNs（standalone / 还没起 PullWorker / 首次启动未跑过 tick）
+    // → mode 应当是 .local
     let db = try makeDBWithItems([sampleItem(text: "alpha"), sampleItem(text: "beta")])
-    let provider = SearchProvider(local: SearchAPI(database: db), remote: nil)
+    let provider = SearchProvider(
+        local: SearchAPI(database: db),
+        oldestPeerLastPullNs: { nil }
+    )
     let outcome = try await provider.search(SearchQuery())
     #expect(outcome.mode == .local)
     #expect(outcome.items.count == 2)
 }
 
-@Test func searchProviderPropagatesCancellation() async throws {
-    // Transport 抛 CancellationError → SearchProvider 应原样上抛，**不**降级本地。
-    // 否则 SwiftUI .task(id:) 取消时会显示假的 "primary 离线" banner + 本地结果。
-    let db = try makeDBWithItems([sampleItem(text: "should not appear")])
-    struct CancellingTransport: SearchTransport {
-        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
-            throw CancellationError()
-        }
-    }
-    let provider = SearchProvider(local: SearchAPI(database: db), remote: CancellingTransport())
-    await #expect(throws: CancellationError.self) {
-        _ = try await provider.search(SearchQuery())
-    }
-}
-
-/// 测试 SearchProvider 是否调用了 remote。actor 形态满足 Sendable 协议要求 +
-/// 给 await 的 callsCount() 提供线程安全的串行访问。
-private actor CountingSearchTransport: SearchTransport {
-    private var calls = 0
-
-    nonisolated func searchRemote(_ q: SearchQuery) async throws -> RemoteSearchResult {
-        await self.bump()
-        return RemoteSearchResult(outcome: .ok([]))
-    }
-
-    private func bump() { calls += 1 }
-    func callsCount() -> Int { calls }
-}
-
-@Test func searchProviderSkipsRemoteWhenMirrorActive() async throws {
-    // 关键回归保护：mirrorLastPullNs 非 nil → SearchProvider 不应调远端。
-    // 这是第二刀核心收益（不过 Tailscale）的不变量；reorder 即红。
-    let db = try makeDBWithItems([sampleItem(text: "local mirror reachable")])
-    let transport = CountingSearchTransport()
+@Test func searchProviderModeIsMeshWhenPeerPullActive() async throws {
+    // 有 peer 已追平过 → mode 应当是 .mesh(stalenessSec:)，stalenessSec 是 (now-last)/1e9
+    let db = try makeDBWithItems([sampleItem(text: "row")])
     let provider = SearchProvider(
         local: SearchAPI(database: db),
-        remote: transport,
-        mirrorLastPullNs: { 1_000_000_000 },  // 任何非 nil 即视为 mirror 可用
-        nowNs: { 2_000_000_000 }
+        oldestPeerLastPullNs: { 1_000_000_000 },
+        nowNs: { 5_000_000_000 }
     )
     let outcome = try await provider.search(SearchQuery())
-    #expect(await transport.callsCount() == 0)
-    if case .localMirror(let staleness) = outcome.mode {
-        #expect(staleness == 1)   // (2e9 - 1e9) / 1e9 = 1
+    if case .mesh(let staleness) = outcome.mode {
+        #expect(staleness == 4)  // (5e9 - 1e9) / 1e9
     } else {
-        Issue.record("expected .localMirror, got \(outcome.mode)")
+        Issue.record("expected .mesh, got \(outcome.mode)")
     }
 }
 
-@Test func searchProviderUsesRemoteWhenMirrorNotReady() async throws {
-    // 反向：mirrorLastPullNs 返回 nil → 必须走远端（标准 M2 行为）
-    let db = try makeDBWithItems([sampleItem(text: "local fallback")])
-    let transport = CountingSearchTransport()
-    let provider = SearchProvider(
-        local: SearchAPI(database: db),
-        remote: transport,
-        mirrorLastPullNs: { nil }
-    )
-    _ = try await provider.search(SearchQuery())
-    #expect(await transport.callsCount() == 1)
-}
-
-@Test func searchProviderRemoteOKHasEmptyKindCounts() async throws {
-    // .remoteOK 路径 hits 来自远端，本地 own/mirror 是局部子集——用本地算 kindCounts
-    // 会跟远端 hits 的 kind 分布矛盾（chip "图片 200" 但点击后 remote 重打返回 0）。
-    // 这条用例钉死契约：transient remote-OK 状态下 kindCounts 必须为空（UI 端 nil → 隐藏）。
-    let localDB = try makeDBWithItems([
-        sampleItem(text: "local text", kind: .text),
-        sampleItem(text: "local img", kind: .image),
-    ])
-    struct OKTransport: SearchTransport {
-        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
-            RemoteSearchResult(outcome: .ok([]))
-        }
-    }
-    let provider = SearchProvider(local: SearchAPI(database: localDB), remote: OKTransport())
-    let outcome = try await provider.search(SearchQuery())
-    #expect(outcome.mode == .remoteOK)
-    #expect(outcome.kindCounts.isEmpty)
-}
-
-@Test func searchProviderLocalMirrorHasUnionKindCounts() async throws {
-    // 对照：localMirror 路径必须填 kindCounts（union 算的），让 UI chip 显示数字。
+@Test func searchProviderKindCountsAlwaysNonEmpty() async throws {
+    // chip 数字契约：normalizeKindCounts 把所有 ItemKind 都补到 dict，缺的填 0。
+    // 即使 0 命中也不能返回空 dict（空 dict 在 UI caller 端被解释为 "未知 → 隐藏"）。
     let db = try makeDBWithItems([
-        sampleItem(id: "own-t", text: "own text", kind: .text),
-        sampleItem(id: "own-i", text: "own img", kind: .image),
+        sampleItem(text: "t1", kind: .text),
+        sampleItem(text: "u1", kind: .url),
     ])
-    let provider = SearchProvider(
-        local: SearchAPI(database: db),
-        remote: nil,
-        mirrorLastPullNs: { 1_000_000_000 },
-        nowNs: { 1_000_000_000 }
-    )
+    let provider = SearchProvider(local: SearchAPI(database: db))
     let outcome = try await provider.search(SearchQuery())
-    if case .localMirror = outcome.mode {
-        #expect(outcome.kindCounts[.text] == 1)
-        #expect(outcome.kindCounts[.image] == 1)
-    } else {
-        Issue.record("expected .localMirror, got \(outcome.mode)")
+    // 全部 ItemKind 都应有 entry
+    for k in ItemKind.allCases {
+        #expect(outcome.kindCounts[k] != nil, "kind \(k) 缺 entry")
     }
+    #expect(outcome.kindCounts[.text] == 1)
+    #expect(outcome.kindCounts[.url] == 1)
+    #expect(outcome.kindCounts[.image] == 0)
 }
 
-@Test func searchProviderRejectedFallsBackToo() async throws {
-    // 401/4xx 也应该回退本地（保活），但 banner 显示具体原因
-    let db = try makeDBWithItems([sampleItem(text: "local only")])
-    struct RejectedTransport: SearchTransport {
-        func searchRemote(_ query: SearchQuery) async throws -> RemoteSearchResult {
-            RemoteSearchResult(outcome: .rejected(reason: "unauthorized"))
-        }
-    }
-    let provider = SearchProvider(local: SearchAPI(database: db), remote: RejectedTransport())
-    let outcome = try await provider.search(SearchQuery())
-    if case .remoteFallback(let reason) = outcome.mode {
-        #expect(reason.contains("unauthorized"))
-    } else {
-        Issue.record("expected fallback for rejected")
-    }
-    #expect(outcome.items.count == 1)
-}
-
-/// 端到端：起 in-process server + 真打远端搜索，验证 client 能拿到 server 库里的 items。
-@Test func searchHTTPEndToEnd() async throws {
-    let serverDB = try makeDBWithItems([
-        sampleItem(id: "server-1", text: "hello world from primary"),
-        sampleItem(id: "server-2", text: "another text"),
-        sampleItem(id: "server-3", text: "URL: https://example.com", kind: .url),
+@Test func searchProviderTotalCountMatchesFoldedRowCount() async throws {
+    // PR 6 核心目标：count() 永远走 fold-aware，跨 origin 同 text 折成 1 条。
+    // 这条直接钉死路径正确——两条 own + peer 同 text 应当 fold 后 total=1
+    let db = try makeDBWithItems([
+        sampleItem(id: "own", origin: "self", text: "shared content", capturedAtNs: 100),
+        sampleItem(id: "peer", origin: "other", text: "shared content", capturedAtNs: 500),
+        sampleItem(id: "uniq", origin: "self", text: "unique", capturedAtNs: 200),
     ])
-    let primaryBlobs = BlobStore(root: FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-search-blobs-\(UUID().uuidString)", isDirectory: true))
-    try FileManager.default.createDirectory(at: primaryBlobs.root, withIntermediateDirectories: true)
-
-    let secret = Data(repeating: 0xCD, count: 32)
-    let auth = HMACAuth(secret: secret)
-    let port = Int.random(in: 19000..<20000)
-    let server = SyncServer(
-        deviceID: "primary",
-        database: serverDB,
-        blobs: primaryBlobs,
-        host: "127.0.0.1", port: port, auth: auth
-    )
-    let serverTask = Task { try? await server.run() }
-    let baseURL = URL(string: "http://127.0.0.1:\(port)")!
-    let client = HTTPPeerClient(baseURL: baseURL, auth: auth)
-
-    // 等 server 启动
-    var ready = false
-    for _ in 0..<50 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        let r = (try? await client.searchRemote(SearchQuery(limit: 1)))?.outcome
-        if case .ok = r { ready = true; break }
-    }
-    #expect(ready)
-
-    // 文本 "hello" 应该命中 server-1
-    let textHit = try await client.searchRemote(SearchQuery(text: "hello"))
-    if case .ok(let hits) = textHit.outcome {
-        #expect(hits.count == 1)
-        #expect(hits.first?.item.id == "server-1")
-        // FTS 查询时 server 应该附 snippet
-        #expect(hits.first?.snippet?.contains("\u{02}") == true)
-    } else {
-        Issue.record("expected .ok for text query")
-    }
-
-    // kind 过滤
-    let urlOnly = try await client.searchRemote(SearchQuery(kinds: [.url]))
-    if case .ok(let hits) = urlOnly.outcome {
-        #expect(hits.count == 1)
-        #expect(hits.first?.item.id == "server-3")
-    } else {
-        Issue.record("expected .ok for kind filter")
-    }
-
-    // 空查询取全部
-    let all = try await client.searchRemote(SearchQuery())
-    if case .ok(let items) = all.outcome {
-        #expect(items.count == 3)
-    }
-
-    serverTask.cancel()
+    let provider = SearchProvider(local: SearchAPI(database: db))
+    let outcome = try await provider.search(SearchQuery())
+    #expect(outcome.totalCount == 2, "fold 后 shared content 折成 1 条 + unique 一条 = 2")
+    #expect(outcome.items.count == 2)
 }

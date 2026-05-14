@@ -469,7 +469,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     // 回归 P2：dedup 只对首次入 mirror 生效。如果 mirror 表里已有此 id（race 时
     // own 表写晚了一拍，mirror 已收下副本），后续 primary 软删该行通过 /since 推
     // 过来时 dedup 不能再挡——必须让 INSERT OR REPLACE 把 deleted_at_ns 盖上，
-    // 否则 mirror 表里的 stale row 永远不会被标软删，searchUnion 继续返回。
+    // 否则 mirror 表里的 stale row 永远不会被标软删，searchHits 继续返回。
     let db = try makeClientDB()
     let selfID = "mbp-self"
     let baseline: Int64 = 1_700_000_000_000_000_000
@@ -564,7 +564,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
 
 @Test func pullWorkerHandlesSoftDeletedRows() async throws {
     // /since 含 deleted_at_ns 非空的行：mirror 应该写入（mirror 表也支持软删，
-    // searchUnion 的 fetchHitsMirror 会过滤掉）
+    // searchHits 的 fetchHitsMirror 会过滤掉）
     let db = try makeClientDB()
     let items = [mkItem(id: "dead", origin: "primary", ingestedAtNs: 100, deletedAtNs: 999)]
     let transport = FakeSinceTransport(

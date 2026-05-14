@@ -12,13 +12,12 @@ final class AppDependencies {
     let deviceID: String
     let captureService: CaptureService
     let searchAPI: SearchAPI
-    /// 搜索选择层。standalone / pure-primary 时 remote=nil → 等价直接打本地。
-    /// `pull.enabled=true` 时 mirrorStatus 通过 PullWorker 更新 → SearchProvider 看到非 nil
-    /// 自动切 union 本地路径，不再过远端。
+    /// 搜索选择层。Mesh 拓扑下永远走本机 fold-aware 路径——item 表本身就是单表混存
+    /// own + peer 行，`SearchAPI.searchHits/count/countByKind` 内部 text-fold 让两端口径一致。
+    /// `mode` 显示靠 MeshStatus.oldestLastPullNs() 推断（nil = 还没追平任何 peer）。
     let searchProvider: SearchProvider
     /// Mesh peer PullWorker 跟 SearchProvider / UI 间的非阻塞状态通道。`pull.enabled=false`
-    /// 时这个对象永远不被 set → SearchProvider 走原 .local / .remoteOK 逻辑。多 peer 部署下
-    /// SearchProvider 看 `oldestLastPullNs()`（最悲观）—— 任一 peer 还没追平就不走 localMirror。
+    /// 时这个对象永远不被 set，SearchProvider 走 `.local` mode（行为不变，只是 banner 文案变）。
     let meshStatus: MeshStatus
     /// 跨设备 paste-echo 抑制集合。AppDelegate.pasteBack 写入；PullWorker 应用 mirror 时查。
     let pasteSuppressions: PasteSuppressionSet
@@ -65,30 +64,17 @@ final class AppDependencies {
         self.meshStatus = meshStatus
         self.pasteSuppressions = PasteSuppressionSet()
 
-        // primary_url 配置好且能加载到 shared secret → 准备远端搜索；否则 nil 走本地
-        var remote: SearchTransport? = nil
-        if let primaryURL = config.primaryURL {
-            if let secret = try? SharedSecret.load(from: paths.sharedSecretFile) {
-                remote = HTTPPeerClient(
-                    baseURL: primaryURL,
-                    auth: HMACAuth(secret: secret),
-                    session: Self.syncURLSession
-                )
-            } else {
-                fputs("search remote disabled: shared-secret load failed\n", stderr)
-            }
-        }
+        // PR 6 之后 SearchProvider 永远走本机 fold-aware，没有 remote 路径——chip 总数
+        // 跨设备口径一致是 plan §"Search 改动"硬不变量
         self.searchProvider = SearchProvider(
             local: searchAPI,
-            remote: remote,
-            mirrorLastPullNs: { [meshStatus] in meshStatus.oldestLastPullNs() }
+            oldestPeerLastPullNs: { [meshStatus] in meshStatus.oldestLastPullNs() }
         )
     }
 
-    /// 进程级共享 URLSession，push worker 和 search 都用同一个——确保 keep-alive
-    /// 连接池跨用例复用，避免每次新建 TLS 握手。
-    /// timeoutIntervalForRequest=10s：search keystroke 不该卡用户太久，
-    /// 超时即降级本地比让 UI 等死好。
+    /// 进程级共享 URLSession，PullWorker / WSNotificationClient / paste blob fetcher 共用——
+    /// 确保 keep-alive 连接池跨用例复用，避免每次新建 TLS 握手。
+    /// timeoutIntervalForRequest=10s：单次 /since / /blob 不该卡用户太久。
     static let syncURLSession: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 10

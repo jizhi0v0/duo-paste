@@ -1,24 +1,19 @@
 import Foundation
 import DuoPasteCore
 
-/// PullWorker 用的传输抽象。与 SearchTransport / IngestTransport 平行，
-/// 让 PullWorker 只依赖最小契约，测试可注入 fake。
+/// PullWorker 用的传输抽象。让 PullWorker 只依赖最小契约，测试可注入 fake。
 ///
 /// 两个方法：
 /// - `fetchSince` — 增量拉一页
-/// - `fetchPrimaryHealth` — 拿 primary 的 device_id（用于检测 primary 是否换了 →
+/// - `fetchPrimaryHealth` — 拿对端 peer 的 device_id（用于检测 peer 是否换了 →
 ///   清空 mirror 重拉，详见 PullWorker.swift）
 public protocol SinceTransport: Sendable {
     func fetchSince(cursor: SinceCursor, limit: Int) async throws -> RemoteSinceResult
     func fetchPrimaryHealth() async throws -> PrimaryHealthResult
 }
 
-/// PullWorker eager_blobs 路径用的最小依赖。生产由 HTTPPeerClient 顺路实现
-/// （它的 IngestTransport.getBlob 已经在 PushClient.swift 里），测试可独立 mock。
-///
-/// **签名故意跟 IngestTransport.getBlob 一致**——HTTPPeerClient 一份实现满足两个
-/// 协议。BlobFetcher 单独存在让 PullWorker 不用吃 IngestTransport 的 ingest/putBlob
-/// 这两个跟 pull 无关的方法
+/// PullWorker eager_blobs + paste-back lazy 路径用的最小依赖。生产由 HTTPPeerClient 实现
+/// （`getBlob` 在 BlobClient.swift），测试可独立 mock。
 public protocol BlobFetcher: Sendable {
     func getBlob(sha256: String) async throws -> GetBlobOutcome
 }
