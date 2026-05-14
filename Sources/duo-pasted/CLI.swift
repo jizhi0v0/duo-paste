@@ -48,11 +48,16 @@ enum CLI {
 
           mesh-init --peer URL[,DEVICE_ID] [--peer URL[,DEVICE_ID]]...
                     [--serve-host H] [--serve-port P]
+                    [--serve-tls | --no-serve-tls]
+                    [--tls-cert PATH] [--tls-key PATH]
                     [--allow-missing-blobs] [--dry-run]
                                   把本机切到 mesh 拓扑：写 config.json 的 peers/mesh 段，
                                   显式删老 primary_url / pull 字段。--peer 可重复，每个
                                   对端 URL 一次（DEVICE_ID 可选；省略走学习模式）。
                                   默认 serve_host=0.0.0.0 / serve_port=8443，给原值不变。
+                                  --serve-tls 开 TLS（peer URL 用 https://）；要配
+                                  --tls-cert / --tls-key（PEM 路径，文件不存在直接 throw）。
+                                  通常先 `tailscale cert <hostname>` 拿一对 cert。
                                   完成后需手动重启 daemon 让新 config 生效。
                                   daemon 必须先停（先 launchctl bootout）。
                                   --allow-missing-blobs 跳过 blob 缺失预检（默认拒）。
@@ -144,6 +149,9 @@ enum CLI {
         var peerSpecs: [String] = []   // 原始 "URL[,DEVICE_ID]" 串，按出现顺序
         var serveHost: String? = nil
         var servePort: Int? = nil
+        var serveTLS: Bool? = nil
+        var tlsCertPath: String? = nil
+        var tlsKeyPath: String? = nil
         var allowMissingBlobs = false
         var dryRun = false
         var i = 0
@@ -171,6 +179,28 @@ enum CLI {
                     i += 2
                 } else {
                     FileHandle.standardError.write(Data("mesh-init: --serve-port 缺值或越界 (1-65535)\n".utf8))
+                    exit(1)
+                }
+            case "--serve-tls":
+                serveTLS = true
+                i += 1
+            case "--no-serve-tls":
+                serveTLS = false
+                i += 1
+            case "--tls-cert":
+                if i + 1 < args.count {
+                    tlsCertPath = args[i + 1]
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-init: --tls-cert 缺值\n".utf8))
+                    exit(1)
+                }
+            case "--tls-key":
+                if i + 1 < args.count {
+                    tlsKeyPath = args[i + 1]
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-init: --tls-key 缺值\n".utf8))
                     exit(1)
                 }
             case "--allow-missing-blobs":
@@ -230,6 +260,9 @@ enum CLI {
                 peerDeviceIDs: peerDeviceIDs,
                 serveHost: serveHost ?? "0.0.0.0",  // mesh 部署默认开 LAN，不像 standalone 默 127.0.0.1
                 servePort: servePort,
+                serveTLS: serveTLS,
+                tlsCertPath: tlsCertPath,
+                tlsKeyPath: tlsKeyPath,
                 allowMissingBlobs: allowMissingBlobs,
                 dryRun: dryRun,
                 daemonRunning: daemonRunning,

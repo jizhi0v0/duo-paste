@@ -1,59 +1,38 @@
 # duo-paste
 
-替换 Paste.app 的自托管剪贴板管理器，Apple-only。M1（单机）+ M2（multi-Mac primary/client）已上线 daily-driver；M3 第一刀 + 第二刀（mirror pull worker + 本地 union 搜索）已完工，client 搜索不再过 Tailscale。
+替换 Paste.app 的自托管剪贴板管理器，Apple-only。**Mesh 拓扑**：每台 Mac 都是对等 peer，没有 primary/client 角色。当前 daily-driver 双 Mac (mini + MBP) 双向同步生效。
 
-正式架构计划：`plans/https-pasteapp-io-macos-ios-paste-moonlit-wave.md`。
+历史架构计划：`plans/https-pasteapp-io-macos-ios-paste-moonlit-wave.md`（M1-M3 primary/client 阶段）；
+当前 mesh 重构计划：`plans/mesh-polished-chipmunk.md`（PR 1-6 已全部落地）。
 
 ## 项目当前状态
-
-- **M1 完成**：捕获 + SQLite/FTS5 + 内容寻址 blob + SwiftUI 搜索窗（NSPanel HUD）+ ⌥⌘V 全局快捷键 + 菜单栏 + LaunchAgent + 小时级 snapshot
-- **M2 已上线生产**：mini = primary（HTTPS @ 0.0.0.0:8443，`bobbys-mac-mini.tail69730a.ts.net`）+ MBP（`100.68.44.27`）= client。双向同步在 DB 层验证通过
-- **M3 第一刀 完成**：`GET /since` 增量 cursor API + 一致性根因修复
-  - `SinceAPI` / `SinceCursor (ns, id)` 二元 cursor / `SincePageWire` Codable wire 形态
-  - `Database.nextIngestNs(db, now:)` 在 writer tx 内 stamp ingested_at_ns，保证 commit 顺序 = ns 顺序（避免 mirror cursor 漏行）；RemoteIngester + CaptureService 全用它
-  - v3 migration：`idx_item_ingested(ingested_at_ns, id) WHERE ingested_at_ns IS NOT NULL` partial index，配 /since cursor 走 index-only seek
-  - `parseSinceQuery` parse 层 clamp limit；handler 返回 `{items, next_cursor, has_more, count}`
-  - primary 上 capture merge 路径也 bump ingested_at_ns，让 mirror 看见合并更新
-- **M3 第二刀 完成**：mirror pull worker + 本地 union 搜索
-  - v4 migration：pull_cursor 加 cursor_id 列（SinceCursor 二元 cursor 持久化）
-  - `MirrorStatus` 共享对象（NSLock）：PullWorker 写 `lastPullNs`/`primaryDeviceID`，SearchProvider 读
-  - `SinceClient` (HTTPIngestClient extension) 实现 `SinceTransport`：`/since` + `/health`（容忍 String/Int64/Double 三种 `now_ms` 编码）
-  - `PullWorker` actor：仿 PushWorker 单 actor 串行 tick。每 tick = `/health` → 比对 persisted primary_id（变了 → 清空 mirror + cursor 重拉）→ `/since` → INSERT OR REPLACE item_mirror（**跳过 origin=self**，让 union 不重叠）→ 更新 pull_cursor。`has_more=true` 立刻接下一页，否则 sleep `pull.interval_sec`（默认 30s）。`lastPullNs` 只在 `!hadTransient && !hasMore` 时设——表示"已严格追平"
-  - `SearchAPI.searchUnion` + `fetchHitsMirror`：item + item_mirror 各超量取 limit+offset，**先按 id dedupe（取 capturedAtNs 最大那份，无视 pinned 状态）**，再按 (pinned DESC, prefix DESC, captured_at_ns DESC) 排序，最后裁 limit/offset
-  - `SearchProvider.Mode.localMirror(stalenessSec:)`：`mirrorLastPullNs()` 非 nil → 直接走 `searchUnion`，**不**打远端
-  - UI banner：`.localMirror` 灰色「本地镜像 · 更新于 Xs/m/h 前」；`.remoteFallback` 黄色保留
-- **文本永久 dedup 完成**：`config.capture.text_merge_window_sec=null`（默认）→ 同 text_full 任意时间内 capture 合并 bump capturedAtNs；blob 路径独立保留 `merge_window_sec=300`。`searchUnion` 在 id-dedup 后按 text_full 二次 fold（仅 blob_sha256 IS NULL 行），winner=max(capturedAtNs) + pinned OR 聚合。countUnion/countByKindUnion 走同源 fetchUnion 算，list/count/chip 三路口径一致。详见下方"文本永久 dedup"设计决策段
-- **Capture 字节守门 完成**：`config.capture.{max_blob_mb=32, max_text_kb=512}` 默认。意外复制超大对象跳过入库（NSPasteboard 自身不受影响，Cmd+V 仍正常）。UI 端 orange skipBanner 5 分钟自动消失 + 手动 ✕ 关闭。详见下文设计决策段
-- **M3 完成**（PR#4 + PR#7 + PR#8 + PR#10 + PR#11 + blob 懒拉已就位）：
-  - **时钟偏移 sanity check**：PullWorker 每 tick 在 `/health` 拿 `primary.now_ms` 跟本机 wall-clock 比对，通过 `MirrorStatus.clockSkewMs()` 暴露给 UI；|skew| ≥ 30s 时 log warn + `SearchView.clockSkewBanner` 黄色提示（HMAC 容忍 ±5 分钟，30s 是早期预警）
-  - **audit-push 子命令**：`duo-pasted audit-push [--sample N]` 拿本机 own-origin item 跟 primary `/since` 全量对账。输出 push_state 分布 + missing on primary + failed 详情 + **Continuity dedup absorbed**（acked 但 id 不在 primary，内容在跨 origin 行 ±5s 找到）+ **stale on primary**（同 id 但 pinned / deletedAtNs / capturedAtNs diverge，RemoteIngester 不更新已有行造成）+ **dedupAbsorbedThenDeleted**（吸收源后被软删，单独成桶让操作员判断是否预期）。exit 码：missing/failed/stale 任一非 0 → 1
-  - **promote-to-primary 子命令**（PR#7）：`duo-pasted promote-to-primary [--serve-host H] [--serve-port P]` 把本机从 client 提升为 primary。一个 writer tx 内：(1) `INSERT OR IGNORE INTO item SELECT ... FROM item_mirror` 把 mirror 抬进 item（保留 origin_device，新行 push_state='acked'），(2) 清空 item_mirror + pull_cursor，(3) 写 `primary_lineage` 两行——`(self, now, NULL)` 开新任期 + `(old_primary, 0, now)` 闭老任期（started=0=未知起点）。然后用 `Config.write` 改 config.json：`serve=true`、移除 primary_url、`pull.enabled=false`，**保留未知字段**（capture / tls / 用户手动加的注释 key 都不丢）。子命令不动 LaunchAgent，打印 kickstart 提示
-  - **v5 migration**：`primary_lineage(device_id TEXT, started_at_ns INTEGER, ended_at_ns INTEGER, PK(device_id, started_at_ns))`。PR#7 埋数据；PR#8 切 audit-push：按 row.capturedAtNs 落在 `[started_at_ns, ended_at_ns)` 区间确定该 push 时刻的 active primary，dedup 候选必须 origin 严格 == 这个 device_id。空 lineage / 时间未覆盖 / expected==self 的 stale 边界回退 `origin != self` 启发式保单 primary 部署零回归
-  - **migrate-primary 子命令**：`duo-pasted migrate-primary [--new-primary-host HOST]` 在老 primary 上跑 prepare 阶段：校验 primary 模式 + daemon 不在跑 + VACUUM INTO 落一份 snapshot 到 `snapshots/`（复用 `Snapshot.filename` 命名）+ walk `blobs/` 统计 files/bytes + 读 item/item_mirror 行数。命令本身只读（除快照副产物），不动 DB/config/blobs；输出 rsync 命令模板 + 新机配置步骤 + 其他 client 后续动作（改 primary_url + audit-push 补齐）。**MVP 不写 lineage** —— 新 primary 接管行没人写，单 primary 部署 audit-push 不受影响，多次换 primary 链路下可能产生跨任期 dedup 误判（plan §b 原文也没要求；后续可加 `--demote-and-record` flag 补）
-  - **blob 懒拉**：两条互补路径覆盖"mirror client 上图片 paste-back"痛点
-    - **Lazy (paste-back)**：`AppDelegate.pasteBack` 在 image kind + 本机 `BlobStore` 缺字节时起 `currentPasteTask`：UI banner `.fetching(spinner)` → `BlobFetcher.getBlob` (2 次 backoff 2s/4s，总超时 5s) → `BlobStore.putVerified` (sha 校验防 MITM) → `Copyback.write` + `panel.hide`。失败 → banner `.failed(reason)`，panel 保持显示让用户看错误。多次按 Enter 自动 cancel 旧 task 避免重复 GET 竞争 BlobStore.put
-    - **Eager (`pull.eager_blobs=true`)**：PullWorker `applyPage` 同事务收集本页 image/file + deleted_at_ns IS NULL 的 sha 集合；tick 完 cursor 已 commit 后 best-effort 循环 GET missing blobs → `putVerified`。失败 only log，**不阻塞 cursor 推进**——下次 tick 同 sha 自然重试。已存在的 sha 直接 short-circuit 走 BlobStore.exists 不发请求
-    - **新协议 `BlobFetcher`**：`HTTPIngestClient.getBlob` 实现 GET /blob + HMAC + 200 时本地重算 sha 校验防字节篡改。返回 `.found(Data)` / `.notFound`；4xx 非 404 / 5xx / sha mismatch 走 `GetBlobError`（rejected / transient / shaMismatch）。新增 `BlobStore.putVerified` 防御接口先校验 expected sha 再落盘
-    - **UI 入口契约改动**：`SearchPanelController.installKeyMonitor` 的 Enter case 不再立刻 `self.hide()`——把 "何时 hide" 交给 onPaste 回调实现。AppDelegate.pasteBack 在同步路径完成后 `panel.hide()`、慢路径（image + missing）由 currentPasteTask 完成时再 hide。不变量：panel 持有引用 = 控制权
-- M3 全部完成；URL 文本启发分类 + image OCR state schema 预埋已落地（PR#17，hazy-hatching-bentley.md）；下一站 OCR worker
-- **RTF 三层降级 完成**（PR#3 + PR#5 合作）：watcher 抓 RTF 时优先 (a) pasteboard 自带非空 .string → 直接用；(b) raw RTF 字节 ≤ `maxTextBytes` cap → `decodeRTFToPlain` 用 NSAttributedString 解出 plain；(c) 失败/全空白/raw 太大 → 兜底存 raw rtf 让 CaptureService 字节守门拦下。`PasteboardWatcher.maxRawRTFBytes` 由 AppDelegate 注入 `deps.config.capture.maxTextBytes`，避免 50MB RTF 在 @MainActor 轮询路径上同步分配巨型 NSAttributedString
-- **搜索 prefix boost 完成**（PR#6）：搜索排序契约 `(pinned DESC, prefix DESC, captured_at_ns DESC)`。`preview` 起始命中 = 2 分 / `text_full` 起始命中 = 1 分 / 否则 0。**24h 时间窗**：只对 24h 内的项生效，跨天老内容哪怕起头匹配也按时间倒序排——剪贴板心智是"搜=找最近用过的"。SQL 端三条路径（`fetchHits` / `fetchHitsMirror` / `fetch`）+ Swift 端 `fetchUnion.prefixScore` 全部对称实现，回归测试见 `SearchPrefixBoostTests.swift`
-- **测试**：236 个测试（含 BlobStoreTests 4 + BlobLazyPullTests 10）。BlobLazyPullTests 覆盖 `eager_blobs` 拉 missing + off skip / 已有字节短路 / tombstone 跳过 / own-origin 跳过 / fetcher 失败不回滚 mirror / notFound 不致命 + HTTPIngestClient.getBlob 端到端（200/404/401）。BlobStoreTests 覆盖 putVerified 接受/拒绝/已存在短路/byteOrder。PullWorker HTTP 端到端 + 部分 in-memory eager 测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），跟 `swift test --filter PullWorker` / `--filter BlobLazyPull` 单独验证
-- **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS（SwiftPM 远程依赖）
+- **Schema v8**：单 `item` 表混存本机 own + 对端 peer 行（PR 1 v7 合并 `item_mirror`、PR 4 v8 DROP `push_state/push_attempts/last_push_error` 列）。`pull_cursor(peer_device_id, cursor_ns, cursor_id)` per-peer 一行。`primary_lineage` 表 v7 时也 DROP
+- **Config schema**：`peers: [{url, device_id?}]` 数组 + `mesh: {pull_interval_sec, ws_enabled, ws_heartbeat_sec, cross_device_dedup_window_ns, eager_blobs, ...}` 段。老 `primary_url` / `pull` 字段已删（PR 5 mesh-init 自动 removeValue）
+- **同步路径**：每个 peer 一对 `(PullWorker, WSNotificationClient)`。PullWorker 周期 `/since` 拉对端增量到本机 item 表（origin=对端 device_id）；WSNotificationClient 长连接订阅对端 `/sync/ws` cursor_advanced 帧 → 收到立即 `worker.wake()` 跳过 sleep（< 1s 同步延迟）。WS 断了自然退化为周期 pull
+- **HTTP routes**：仅剩 `GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /sync/ws`（HTTP Upgrade）。`POST /ingest` + `PUT/HEAD /blob` + `GET /search` 都已删（PR 4 + PR 6）
+- **CaptureService**：永远走 `Database.nextIngestNs` stamp（writer tx 内）；merge candidate 查询带 `origin_device == selfDeviceID` 过滤防 bump 对端行；commit 后回调 `onCursorAdvanced` 闭包让 server 端 `WSBroadcaster` fan-out
+- **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → text-fold（跨 origin 同 text_full 折一条，pinned OR 聚合）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量
+- **SearchProvider.Mode**：仅 `.local` / `.mesh(stalenessSec:)`，删 `.remoteOK / .remoteFallback / .localMirror`。永远走本机 fold 不打远端，跨设备 chip 总数自动对齐
+- **跨设备 dedup**：两层防御。capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Continuity / ToDesk 副本通过 PullWorker `crossDeviceDedupWindowNs` (5s) + PasteSuppressionSet 拦
+- **Blob**：内容寻址 BlobStore；lazy paste-back（按需从 peer GET `/blob/<sha>`，TaskGroup 5s 超时 race）；可选 eager (`mesh.eager_blobs=true`) PullWorker 拉完元数据顺路拉字节
+- **HMAC 认证**：`<ts>\n<METHOD>\n<path>\n<body_sha256_hex>` 签名。HTTP middleware 不读 body（让多 MB blob 不占内存），handler 自己读 body 后再算 sha256 比对 header。WS upgrade 用相同模板（empty body hash），upgrade 后 frame 不签
+- **OCR worker**：本机 own-origin image 跑 Vision OCR 写 `text_full` 进 FTS5。分布式 MVP，每台 Mac 自跑自家 origin
+- **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS + hummingbird-websocket 2.6.0
+- **测试**：~265 个，PullWorker / BlobLazyPull 集成测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），用 `swift test --filter PullWorkerTests` / `--filter BlobLazyPullTests` 单独验证
 - **下一站**：**OCR worker (Phase 1)** —— image kind 跑 Vision OCR 把图里文字写 `text_full` 进 FTS5，让中文/英文截图能被搜到。Schema 已就位（PR#17），需要落 OCRWorker actor + Vision 集成 + Config OCR 段 + retry-failed-ocr CLI。MVP 走分布式（每台 Mac 自跑自家 `origin=self`），跨设备 OCR 结果同步留 Phase 2。详细拆解见 `plans/vivid-scanning-vellum.md`。M4 导出 / pinned UI / 快捷键自定义 / 自定义时间 picker 排在 OCR worker 之后
 
 ## 架构与 Non-Goals
 
-- 拓扑（未来）：家里 Mac mini = 初始 primary；主 Mac / MBP / iOS = 客户端。Primary 不是终身制——任一 mirror client 可 `duo-pasted promote-to-primary` 顶上
-- **单一归属**：每条剪贴项归属捕获它的设备（`origin_device`），primary 只做聚合，从根上消除冲突
-- **写读分离**：写是多 master（每台设备本地 commit 再异步 push），读由 primary 聚合；mirror 模式让 client 可选周期 pull 全量到 `item_mirror` 表（DR + 离线全集搜索）
-- 传输：Tailscale / Surge Ponte 等 P2P 隧道，**不走公网**
+- **拓扑**：每台 Mac 是平等 peer（mini + MBP 双向）。没有 primary，没有 promote。`mesh-init` CLI 配双向 peer URL，daemon 启动时为每个 peer 起一对 `(PullWorker, WSNotificationClient)`
+- **单一归属**：每条剪贴项归属捕获它的设备（`origin_device`），跨设备 dedup 在 PullWorker / search fold 兜底
+- **同步对称**：peer A 通过 `/since` 从 peer B 拉数据，反过来同时也跑（双向 mesh）。WS 通知层让推送延迟 < 1s
+- 传输：Tailscale 网络，**不走公网**
 
 **Non-Goals**（被用户明确排除，不要主动建议）：
 - iOS 客户端在 M5 前不做
 - iCloud 加密备份（用户拒绝）
-- 双向同步 / 端到端冲突解决（架构上不需要）
-- 自动 leader election / 共识算法（Mac 数量个位数，promote 走手动子命令）
+- 双向同步冲突解决（mesh 拓扑下 own/peer 单一归属，无需冲突解决）
+- 自动 leader election / 共识算法（mesh 拓扑没 leader 概念）
 
 ## 部署与运行
 
@@ -67,38 +46,54 @@
 ### CLI 子命令（直接调装好的二进制）
 
 ```sh
-~/Applications/duo-paste/duo-pasted --help                # 子命令列表
-~/Applications/duo-paste/duo-pasted init-secret           # 首次部署：生成 32 字节 shared secret
-~/Applications/duo-paste/duo-pasted retry-failed          # 把 push_state=failed 全部重置回 pending
-~/Applications/duo-paste/duo-pasted audit-push            # 跟 primary /since 对账（仅 client 模式）
-~/Applications/duo-paste/duo-pasted promote-to-primary    # 本机从 client 升级为 primary（详 plan §c）
-~/Applications/duo-paste/duo-pasted migrate-primary       # 老 primary 上跑 prepare：snapshot + rsync 模板（详 plan §b）
+~/Applications/duo-paste/duo-pasted --help                  # 子命令列表
+~/Applications/duo-paste/duo-pasted init-secret             # 首次部署：生成 32 字节 shared secret
+~/Applications/duo-paste/duo-pasted mesh-init --peer URL... # 切到 mesh 拓扑：写 peers/mesh config，删老 primary_url/pull
+~/Applications/duo-paste/duo-pasted retry-failed-ocr        # 把 OCR failed/skipped 行翻回 pending
 ```
 
 无参运行 → 进入 SwiftUI daemon 流程（这是 LaunchAgent 的调用方式）。任何已识别的子命令在 SwiftUI 接管 NSApp 之前 exit。
 
-### 多设备配置（M2）
+### 多设备配置（mesh）
 
-详细步骤见 `docs/deploy-multi-mac.md`。要点：
+`config.json` 不存在 → standalone 模式（peers 空 + serve=false，零回归）。要起 mesh：
 
-`config.json` 不存在 → standalone 模式（= M1，零回归）。要起 multi-Mac：
+**两台都跑 `mesh-init`**（先 `launchctl bootout` 停 daemon，否则 mesh-init 拒）：
 
-**Primary（mini）**：
+```sh
+# Mini 上：peer = MBP，启 TLS
+~/Applications/duo-paste/duo-pasted mesh-init \
+    --peer https://bobbys-macbook-pro.tail69730a.ts.net:8443 \
+    --serve-host 0.0.0.0 --serve-port 8443 \
+    --serve-tls \
+    --tls-cert ~/Library/Application\ Support/duo-paste/tls/bobbys-mac-mini.tail69730a.ts.net.crt \
+    --tls-key  ~/Library/Application\ Support/duo-paste/tls/bobbys-mac-mini.tail69730a.ts.net.key
 
-```json
-{ "serve": true, "serve_host": "0.0.0.0", "serve_port": 8443 }
+# MBP 上：peer = mini，启 TLS（cert 路径换成本机）
+~/Applications/duo-paste/duo-pasted mesh-init \
+    --peer https://bobbys-mac-mini.tail69730a.ts.net:8443 \
+    --serve-host 0.0.0.0 --serve-port 8443 \
+    --serve-tls \
+    --tls-cert ~/Library/Application\ Support/duo-paste/tls/bobbys-macbook-pro.tail69730a.ts.net.crt \
+    --tls-key  ~/Library/Application\ Support/duo-paste/tls/bobbys-macbook-pro.tail69730a.ts.net.key
 ```
 
-**Client（主 Mac / MBP）**：
+写好的 config 形如：
 
 ```json
 {
-  "primary_url": "https://duo-paste-primary.tailXXXX.ts.net:8443",
-  "pull": { "enabled": true, "interval_sec": 30, "eager_blobs": false }
+  "serve": true, "serve_host": "0.0.0.0", "serve_port": 8443,
+  "serve_tls": true, "tls_cert_path": "...", "tls_key_path": "...",
+  "peers": [{ "url": "https://<peer-host>:8443" }],
+  "mesh": { "enabled": true, "pull_interval_sec": 30, "ws_enabled": true, ... }
 }
 ```
 
-`pull.enabled=true` 才会启动 PullWorker mirror（DR + 离线全集搜索；实现细节见上方"M3 第二刀 完成"段）。`shared-secret` 文件三台机同份（`scp` 过去 + `chmod 600`）。
+要点：
+- TLS cert 一对从 `tailscale cert <hostname>` 拿。两端 scheme 必须对齐——一端 https 一端 http 会让 ws-client TLS 握手 EOF
+- `shared-secret` 文件两台同份（`scp` 过去 + `chmod 600`）
+- 两端 peer URL 互指（A 的 config peer = B URL，B 的 config peer = A URL）。两端 daemon 都跑 `serve` + 跑 PullWorker
+- `mesh-init` 会预检 blob 缺失（image/file 行 sha 不在本机 BlobStore 上），默认拒；`--allow-missing-blobs` 跳过。完成后手动 `launchctl bootstrap + kickstart` 拉起 daemon
 
 ### 关键路径
 
@@ -151,37 +146,36 @@ UI 反馈：AppState.recentSkip + SearchView orange skipBanner（含 ✕ 关闭�
 
 **作用域注意**：是 per-device capture policy 不是 sync-wide invariant。Primary `/ingest` `/blob` handler 只校验 body 总上限（1MB / 64MB），不重新校验单字段大小。HMAC + 共享 secret = 已认证内部边界，threat model 允许 trust。所以 A 设备配 max_text_kb=900 推一条 900KB，primary + 其他 client mirror 都接受。这是有意的，不是漏洞。
 
-### Mirror 模式：本地 union 路径优先于远端
+### SearchProvider 永远走本机 fold-aware（chip 总数对齐）
 
-PullWorker `lastPullNs` 非 nil（至少完成过一轮 `has_more=false` 追平）→ SearchProvider 直接走 `searchUnion(item + item_mirror)`，**跳过远端**。这是 M3 第二刀的核心收益：client 搜索连过 Tailscale 的 100-200ms 延迟都没有了。
+`SearchProvider.search` 永远走 `SearchAPI.searchHits / count / countByKind` —— 内部 fold-aware（跨 origin 同 text_full 折一条），不再有"raw count vs fold count"双路径。
 
-不变量保护：`Tests/DuoPasteSyncTests/SearchTests.swift` 有 `searchProviderSkipsRemoteWhenMirrorActive` —— mock 远端 transport，断言 `callsCount() == 0`。reorder `if let last = mirrorLastPullNs()` 跟 `guard let remote else` 的次序就会红。
+**核心不变量**：mesh 拓扑下 `item` 表混存本机 own + 对端 peer 行，跨 origin 同 text 是常态。raw count（`COUNT(*) FROM item`）会把每个 ToDesk/Continuity 副本算一遍，跟对端口径不齐——这是 PR 6 之前 chip 总数差 ~265 条的根因。
 
-跨表 dedupe（同 id 在 item 跟 item_mirror 都有，promote-to-primary 过渡期 / pin 状态分歧时常见）：**先**按 `captured_at_ns` 取最新那份，**后**做 (pinned DESC) 排序——否则旧 mirror 行带 pinned=true 会赢过新 own 行的 unpinned 文本。位置：`Search.swift fetchUnion`。
+PR 6 之前的 `SearchProvider.Mode` 有 `.local / .localMirror / .remoteOK / .remoteFallback` 四种，按"是否有 PullWorker (mirrorLastPullNs 非 nil)"决定走 raw 还是 fold。新代码只剩 `.local / .mesh(stalenessSec:)` 两种，count 永远 fold——对端 chip 数自动对齐到 1 条 race 范围内。
+
+回归测试 `searchProviderTotalCountMatchesFoldedRowCount` 钉死路径正确：own + peer 同 text 必须 fold 成 1 条。
 
 ### 搜索排序契约：pinned > prefix(24h) > time
 
 完整排序：`(pinned DESC, prefix_score DESC, captured_at_ns DESC)`。prefix_score：preview 以 query 起始 = 2 / text_full 起始 = 1 / 否则 0。**仅对 24h 内的项生效**——跨天老内容哪怕起头匹配也走纯时间倒序，剪贴板心智是"搜=找最近用过的"，不希望陈年老条目被翻上来。
 
-SQL 端三处必须对称：`fetchHits` / `fetchHitsMirror` / `fetch`，每处 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 计算 `_prefix` 列 + `CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1e9 - captured_at_ns) < 86400e9 THEN _prefix ELSE 0 END DESC` 包进 ORDER BY。prefix 占位符必须 `args.insert(at: 0)`（SELECT 列表的 `?` 出现在所有 WHERE/LIMIT 占位符之前）。
+SQL 端 `fetchHitsRaw` 内 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 计算 `_prefix` 列 + `CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END DESC` 包进 ORDER BY。prefix 占位符必须 `args.insert(at: 0)`（SELECT 列表的 `?` 出现在所有 WHERE/LIMIT 占位符之前）。
 
-Swift 端 `fetchUnion.prefixScore` 跟 SQL 端口径**必须**一致——跨表 dedup 后 SQL 算的 `_prefix` 列已丢，重算。回归测试 `SearchPrefixBoostTests.swift` 4 条覆盖：单表 boost / pinned 优先 / 24h 窗外不 boost / union 跨表保留优先级。改动任何一条排序都要先看测试是否仍通过。
+Swift 端 `fetchHitsFolded.prefixScore` 跟 SQL 端口径**必须**一致——fold 后 SQL 算的 `_prefix` 列已丢，重算。回归测试 `SearchPrefixBoostTests.swift` 4 条覆盖：单表 boost / pinned 优先 / 24h 窗外不 boost / fold 后保留优先级。
 
-### 文本永久 dedup（capture + searchUnion 双层）
+### 文本永久 dedup（capture + search 双层）
 
 文本 kind（`text/url/file`，即 `blob_sha256 IS NULL`）走永久 dedup，跟 blob 路径独立：
 
-1. **Capture 层**（`CaptureService.ingestText`）：`config.capture.text_merge_window_sec` 默认 `null` = 永久。同 kind + 同 `text_full` + 未删行无论何时再次 capture，都合并 bump `captured_at_ns`（primary 还 bump `ingested_at_ns` 让 mirror 看见）。设 `0` 完全禁用，设 `N>0` 行为退化到固定窗口。`blob mergeWindowSec` 独立保留 300s——同 sha 图片多次复制时间线上可能有意保留。
-2. **搜索层**（`Search.fetchUnion`）：在 id-dedup 之后、kind/pinned filter 之前，对所有 `blob_sha256 IS NULL` 行按 `text_full` 二次 fold。Winner = `max(capturedAtNs)`，**pinned 通过 OR 聚合**（任一条 pinned → fold 结果 pinned=true，pin 是对内容的属性而非具体 row）。`countUnion` / `countByKindUnion` 走同源 `fetchUnion` 路径计算，保证 list / total / chip 三者口径一致。
+1. **Capture 层**（`CaptureService.ingestText`）：`config.capture.text_merge_window_sec` 默认 `null` = 永久。同 kind + 同 `text_full` + 未删 + **同 origin** 行无论何时再次 capture，都合并 bump `captured_at_ns` + `ingested_at_ns` 让对端 peer 通过 /since 看到刷新。**merge candidate 必须加 origin_device 过滤**——合表后 item 表含 peer 行，不加过滤会 bump 对端行（等于本机改了别人数据）。设 `0` 完全禁用，设 `N>0` 退化到固定窗口。`blob mergeWindowSec` 独立保留 300s
+2. **搜索层**（`Search.fetchHitsFolded`）：oversample 后按 `text_full` 跨 origin fold。Winner = `max(capturedAtNs)`，**pinned 通过 OR 聚合**（任一条 pinned → fold 结果 pinned=true，pin 是对内容的属性而非具体 row）。`count` / `countByKind` 走同源 fold 路径，保证 list / total / chip 三者口径一致
 
 为什么要两层：
-- 单 Capture 层不够 —— ToDesk / 远程桌面把 mini pasteboard 同步到 MBP，两台 watcher 各自抓到一条 own-origin 行（不同 id 不同 origin_device），mini 行通过 mirror pull 进 MBP 的 item_mirror，搜索时本机 fold 拦不住跨表
-- 单 fold 层不够 —— 同设备短时间内重复 copy 仍会插多行，存储白浪费且 audit-push 桶数膨胀；capture 层 dedup 让 DB 干净
-- 两层防御互补，且各自有独立单测覆盖（`captureServiceTextPermanentDedupAcrossLongGap` / `unionFoldsSameTextAcrossOwnAndMirror` / `unionFoldPreservesPinnedViaOR` / `unionDoesNotFoldBlobsBySameSha` / `unionFoldRespectsKindFilter` / `unionFoldCountAndListConsistent`）
+- 单 Capture 层不够 —— ToDesk / Continuity 把 mini pasteboard 同步到 MBP，两台 watcher 各自抓到一条 own-origin 行（不同 id 不同 origin_device），mini 行通过 PullWorker 进 MBP 的 item 表（origin=mini），搜索时跨 origin 同 text 仍要 fold
+- 单 fold 层不够 —— 同设备短时间内重复 copy 仍会插多行，存储白浪费；capture 层 dedup 让 DB 干净
 
-**不要回退到固定窗口默认值**：用户心智是"剪贴板重复就该收起"，5 分钟窗口在 ToDesk 同步场景下两端时间错位常超窗，回退会再现"同文本并排两条"的 UI 问题。
-
-**不动 RemoteIngester Continuity dedup**：那条路径管的是 primary 接收 push 时的 reject 语义（影响 push_state / audit-push 桶定义），跟"减少 UI 重复行"目标不在一条主线上。两套机制可共存：Continuity dedup 还在按 ±300s 窗 reject 跨设备 dup push（primary item 表干净），搜索层 fold 兜底剩下的 own + mirror 字面重复。
+**不要回退到固定窗口默认值**：5 分钟窗口在 ToDesk 同步场景下两端时间错位常超窗，回退会再现"同文本并排两条"的 UI 问题。
 
 ### RTF 三层降级 + raw-size 守门
 
@@ -194,38 +188,21 @@ RTF 抓取走三层降级：
 
 **不要回退**：把 `maxRawRTFBytes` 默认调大或去掉 guard 等于让 main actor 在 RTF 路径上裸跑——卡顿出现时极难溯源（轮询每 200ms 一次，单次 spike 会被淹没在 Instruments 噪声里）。
 
-### promote-to-primary 的不变量
+### mesh-init 的不变量
 
-`Admin.promoteToPrimary` 把本机从 client 升级到 primary，writer tx 包住步骤 3-7。重要不变量：
+`Admin.meshInit` 把本机切到 mesh schema：写 `peers/mesh` config + 删老 `primary_url/pull` 字段。重要不变量：
 
-1. **`item_mirror` → `item` 用 `INSERT OR IGNORE`，不是 REPLACE**。本机自家 own-origin item 比 mirror 行可信（mirror 是从老 primary 拉的，可能漏更新；自家 own 是源头）。冲突时 own 行赢，mirror 行被丢弃。回归测试 `promoteWithIDConflictSkipsMirrorRow`。
-2. **被 promote 进来的 item `push_state` 强制设 'acked'**。`push_state` 是 NOT NULL DEFAULT 'pending' —— 如果不显式设 'acked'，INSERT 进来变成 pending，本机如果之后又被改回 client 模式会让 PushWorker 误推。强制 acked 让这些行从 sync 角度看是"终态"。
-3. **改 config 前先 commit DB tx**。Swift 抛出 `Config.write` 失败时 DB 已经 promote 完。这是有意的：DB 状态是事实根（mirror 已经空了，lineage 已经写了），config 写失败的恢复方式是手动改文件让它 match。反过来——先改 config 后改 DB——失败时 daemon 会按新 config 起 server 但 DB 还是 client 状态，更糟。
-4. **`primary_lineage` 闭老任期行用 `started_at_ns=0`**，表示"未知何时开始"。audit-push 读全表按区间挑 active primary，闭区间 `[0, ended)` 让该行能覆盖 ended 之前的所有时刻；新 self 任期 `(self, now, NULL)` 覆盖 `[now, ∞)`，两行合起来无缝覆盖全时间轴。PK 是 `(device_id, started_at_ns)`，同一 device 多次任期可记，但 (id, 0) 行不会重复——`INSERT OR IGNORE` 兜底。
-5. **`Config.write` 保留未知字段（含嵌套）**。读原 JSON 成 dict 做 base，逐 key 覆盖 cfg 内部字段——**`pull` / `capture` 子 dict 是 merge 而非 replace**（P2 review fix）。这样顶层 + 嵌套层未来加的字段、用户手动加的注解 key 都不丢。回归测试 `promotePreservesUserConfigFields`（顶层）+ `promotePreservesNestedUserConfigFields`（嵌套）。
-6. **不主动改 LaunchAgent 但要查它在不在跑**——P1 review fix。CLI 子命令是单次 exit 进程，不应该 bootout/kickstart 自己；但 promote 入口必须查 `launchctl list io.duopaste.agent` 看 PID 字段，daemon 在跑就直接 refuse + 让用户手动 `launchctl bootout` 再重试。**为什么必须停**：promote 跑完后到用户手动 kickstart 之间存在窗口，daemon 仍以 client mode capture 新行（`ingested_at_ns=nil`，stamp 阶段已经过去）。promote 后 PushWorker 不再启动，这些行也不会再被 stamp——永远过滤掉在 `/since` 之外。回归测试 `promoteRefusesWhenDaemonRunning` / `promoteProceedsWhenDaemonNotRunning`。dev 场景 `swift run` 不在 launchctl 管理下，`isRunning=false` 放行——"跑 dev 二进制前先 launchctl bootout" 是用户责任。
-7. **必须 stamp `ingested_at_ns IS NULL` 的所有 item 行**——P1 review 修复。`CaptureService` 在 `.client` role 下从不 stamp（line 121-122）：client 行 ACK 后只翻 `push_state`，`ingested_at_ns` 永远 nil。promote 后 `/since` `WHERE ingested_at_ns IS NOT NULL` 会过滤掉这些行，其它 client 拉不到。修：writer tx 内 INSERT mirror→item **之后**扫所有 nil 行，按 `captured_at_ns ASC` 排序后逐行 `Database.nextIngestNs` UPDATE，同步 `push_state='acked'` + attempts/error 清零。覆盖：own-origin 老遗留 + mirror 异常 nil 行（防御）。回归测试 `promoteStampsOwnOriginNullIngestedNs` / `promoteStampsMirrorOriginatedRowsAsLastResort` / `promoteDoesNotReStampAlreadyIngestedRows`。
-8. **必须预检 blob 缺失**——P2 review 修复。PullWorker 默认 `eager_blobs=false` 只镜像 blob 元数据；本机变 primary 后 `/blob/<sha>` 找不到字节即 404。promote 入口预扫 item + item_mirror 里 `blob_sha256 IS NOT NULL AND deleted_at_ns IS NULL` 的去重 sha 集合，逐个 `BlobStore.exists`。缺失 + 默认 → throw `AdminError.missingBlobs`，writer tx 不开。`--allow-missing-blobs` flag 让 promote 继续，缺失走 PromoteResult 报告字段 + CLI warning。回归测试 `promoteRefusesWhenBlobsMissingByDefault` / `promoteWithAllowMissingBlobsReportsAndContinues` / `promoteIgnoresMissingBlobOnSoftDeletedRows`（tombstone 不需要字节）/ `promotePassesWhenBlobBytesPresent`。
-
-### migrate-primary 的不变量
-
-`Admin.migratePrimary` 在**老 primary** 上跑 plan §b 的 prepare 阶段。跟 `promoteToPrimary`（计划外抢救）对应，是计划内换 primary 的辅助命令。重要不变量：
-
-1. **命令只读**——除写 snapshot 文件这个副产物外，不动 DB / config / blobs。回归测试 `migrateDoesNotMutateConfigOrMainDB`。这是跟 promote 最大的差异：promote 是事实根重写（DB 状态变了，config 也变），migrate 是"我帮你准备好快照和命令模板，剩下的你跑"。理由跟 promote 不变量 #3 同一脉络：跨机 rsync 涉及 ssh 凭证 / 网络 / 防火墙，封进 Swift 命令容易卡在边界条件上调试困难——打印模板让操作员手跑反而最可控。
-
-2. **daemon 必须停**——同 promote 不变量 #6 用 `LaunchAgent.isRunning` 检测，但理由不同：promote 怕的是 daemon 仍以 client 角色 capture 出 ingested_at_ns=nil 漏 stamp 的行；migrate 怕的是 VACUUM INTO 完之后 daemon 继续 ingest 新行，rsync 完成时新机数据比老机落后，等于静默丢数据。回归测试 `migrateRefusesWhenDaemonRunning` / `migrateProceedsWhenDaemonNotRunning`。
-
-3. **不写 lineage**——MVP 已知缺口。plan §b 原文没要求写。后果：rsync 到新机后，新 primary DB 里没有"新 primary 接管"的 lineage 记录，其它 client 跑 audit-push 时 `activePrimaryDeviceID` 找不到新 primary 任期 → 回退 `origin != self` 启发式。单 primary 部署 audit 不受影响；多次换 primary 链路下可能产生跨任期 dedup 误判。后续若需要可加 `--demote-and-record` flag 在本机写一行 + 让新机 daemon 启动时检测"我是 primary 但 lineage 表里没我"自动补——是新运行时行为，要新增测试。
-
-4. **快照路径复用 `Snapshot.filename`**——文件名 `duo-paste-YYYYMMDD-HHmmss.sqlite`，跟小时级 snapshot 同形态落在 `snapshots/`，享用现有 prune 策略。但 migrate 是手动触发的"迁移用一次性快照"语义不同于小时级备份，文件混在一起后操作员靠时间戳区分。**不**单独再造一个 migrate-snapshots/ 子目录——保持 `Paths` 不变。
-
-5. **blob 校验只统计不算 sha**——递归 walk `blobs/` 算文件数 + 字节数。**不**重算每个 sha256（10 万 blob × 100KB 跑半小时不切实际）。靠 rsync `--checksum` 在传输时校验。如果操作员要"传完后核对"，CLI 输出里有 `blobsTotalFiles` + `blobsTotalBytes` 让新机跑 `find blobs -type f | wc -l` + `du -sb blobs` 自己比。
-
-6. **`walkBlobsDir` 跳过非 regular file** —— BlobStore.put 只写 regular file，但用户可能手动放 symlink / pipe / 目录在 blobs 下。统计只算 regular file 让结果可解释。目录不存在时返回 (0, 0) 不抛错，让命令对"全新 primary 机器没 blobs/"边界鲁棒。回归测试 `migrateHandlesEmptyBlobsDir` / `migrateHandlesMissingBlobsDir`。
+1. **不动 DB**：本机 item 表里可能有老 push 链路 / 老 PullWorker 留下来的对端行，让 daemon 启动后 PullWorker 自己的 reconcilePeer 流程清理（peer device_id 不匹配时清行 + cursor）。PR 1 v7 migration 已合表，PR 4 v8 已 DROP push_*；不需要再开 tx
+2. **daemon 必须停**——`LaunchAgent.isRunning` 检测在跑直接 throw。理由：mesh-init 改 config 期间 daemon 仍以老 config 跑可能 capture 行 + 启 PullWorker 抢锁
+3. **预检 blob 缺失**：扫 item 表 blob_sha256 非空 + image/file + 未删的去重 sha，逐个 `BlobStore.exists`。缺失 + 默认 → throw `missingBlobs`；`--allow-missing-blobs` 跳过；tombstone (deleted_at_ns 非空) 不计
+4. **`Config.write` 显式 removeValue 老字段**：`primary_url` / `pull` 在新写入路径里删掉，避免 daemon 读 config 时两套字段共存让用户困惑
+5. **TLS 字段一致性**：`mesh-init --serve-tls` 必须配 `--tls-cert/--tls-key`（或 oldConfig 已经有）+ 文件存在性预检。两端 peer URL scheme 必须对齐——一端 https 一端 http 会让 ws-client TLS 握手 EOF（用户曾踩过）。回归测试 `meshInitRefusesServeTLSWithoutCertAndKey` / `meshInitRefusesServeTLSWhenCertFileMissing` / `meshInitInheritsTLSFromOldConfigWhenNotGiven`
+6. **不主动改 LaunchAgent**——CLI 子命令是单次 exit 进程，不应该 bootout/kickstart 自己；mesh-init 完成后打印 kickstart 提示让用户手动重启 daemon
+7. **保留无关字段**——hotkey / capture / ocr / shared_secret_keychain_account 等不动。Config.write 走 nested merge 路径让用户手动加的未知字段也保留。回归测试 `meshInitPreservesUnrelatedConfigFields`
 
 ### blob 懒拉的不变量
 
-`pull.eager_blobs` 字段（默认 false）+ `AppDelegate.pasteBack` lazy 路径 + `PullWorker.fetchBlobsEager` 三处协同。重要不变量：
+`mesh.eager_blobs` 字段（默认 false）+ `AppDelegate.pasteBack` lazy 路径 + `PullWorker.fetchBlobsEager` 三处协同。重要不变量：
 
 1. **content-addressed 接收方必须重算 sha** —— `HTTPIngestClient.getBlob` 200 时本地重算 SHA256 比 path-sha；不匹配抛 `GetBlobError.shaMismatch`。理由：HMAC 签名只保 request 完整性，不保 response body；MITM 或 server bug 给错字节会污染本机 BlobStore。`BlobStore.putVerified` 第二层兜底（lazy / eager 两条路径都调它）。回归测试 `putVerifiedRejectsMismatchedSha` / `httpGetBlobReturnsBytesOn200`（本地校验隐含在通过路径里）
 
@@ -243,11 +220,15 @@ RTF 抓取走三层降级：
 
 8. **lazy 5s 总超时靠 TaskGroup race，不靠 `Date()` 检查**——P1 review fix。`fetchBlobLazy` 用 `withThrowingTaskGroup` race 两个 task：(a) `fetchBlobLazyInner` 重试循环 `backoffs=[0, 2, 4]` 处理 transient（`.transient` 进入下一轮；`.rejected`/`.shaMismatch`/`.notFound` 立即 fail），(b) `Task.sleep(5s)` 抛 timeout outcome。先完成的赢 + `group.cancelAll()`。**不要回退**——只靠 inner 循环开头 `Date() > deadline` 早退不够：URLSession 单 request 默认 60s timeout，server hang 在 connection 建立但不返回数据时，inner 根本没机会 check Date()；group cancel 让 URLSession 抛 `URLError.cancelled` 立即返回，是唯一能保证 5s 内一定有结果的姿态。`lazyBlobTimeoutSec` 必须 `nonisolated`（sleeper task capture 要求）
 
-9. **`pasteBlobFetcher` 跟 PullWorker / PushWorker 解耦**——P1 review fix。`setupPasteBlobFetcher` 在 `applicationDidFinishLaunching` 跟 `startPullWorker` 平行调用，只依赖 `primary_url + shared-secret 可加载`，**不**依赖 `pull.enabled` / `serve`。理由：用户配了 primary_url 但关掉 `pull.enabled`（不想拉全量元数据、只想 paste 时按需取单个 blob）是合法配置；fetcher 绑在 PullWorker 启动里会让这种配置下 image paste 永远失败
+9. **`pasteBlobFetcher` 跟 PullWorker 解耦**。`setupPasteBlobFetcher` 在 `applicationDidFinishLaunching` 跟 `startMeshSupervisor` 平行调用，只依赖 `peers[0] + shared-secret 可加载`，**不**依赖 `mesh.enabled` / `serve`。理由：用户配了 peers 但关掉 `mesh.enabled`（不想周期 pull、只想 paste 时按需取单个 blob）是合法配置；fetcher 绑在 PullWorker 启动里会让这种配置下 image paste 永远失败
 
-### PullWorker primary 换了的检测
+### PullWorker peer 换了的检测（reconcilePeer）
 
-每 tick 第一步 `/health` 拿 `device_id`，跟 `pull_cursor.primary_id` 比。不一致 → `DELETE FROM item_mirror; DELETE FROM pull_cursor` 重拉。这是 plan §c 的 promote-follower 流程兼容性保证。
+每 tick 第一步 `/health` 拿 `device_id`，跟 `pull_cursor.peer_device_id` 比。不一致 → 精确清该 peer 的旧 origin 行 + 该 peer cursor 行（不动其他 peer 的行 / 自家 own 行）。
+
+**严格模式 vs 学习模式**：
+- `expectedPeerDeviceID` 非 nil（mesh-init 时显式给 deviceID）→ 严格模式。/health 返回的 device_id 跟 expected 不一致立即 transient skip 不污染 DB
+- `expectedPeerDeviceID` nil（mesh-init 没给 / 学习模式）→ 首次 /health 拿到 device_id 后 stamp 进 pull_cursor。学习模式只能用于单 peer 部署（多 peer LIMIT 1 不可靠）
 
 边界：`/health` 返回 `device_id=""` 当 transient 跳过（不污染 pull_cursor PK）；`now_ms` 解码三种形态都接（String/Int64/Double）—— `SinceClient.HealthResponse`。
 
@@ -255,9 +236,9 @@ RTF 抓取走三层降级：
 
 `Database.nextIngestNs(db, now:)` 返回 `max(now, MAX(item.ingested_at_ns)+1)`。**唯一**正确的 stamp 时机是 `pool.write { db in ... }` 闭包内——不能提前到外面算 `now`。
 
-为什么：GRDB DatabasePool 让 reader 并发但 writer 串行。两路并发 `pool.write` 在 writer 队列排队，外面打的 `now` 时间戳跟 commit 顺序可以反过来 → reader 看到 `ns=200` 推进 cursor，之后 `ns=100` 才 commit → `/since` WHERE `ns > 200` 永远漏掉那行 → mirror 漏数据。
+为什么：GRDB DatabasePool 让 reader 并发但 writer 串行。两路并发 `pool.write` 在 writer 队列排队，外面打的 `now` 时间戳跟 commit 顺序可以反过来 → reader 看到 `ns=200` 推进 cursor，之后 `ns=100` 才 commit → `/since` WHERE `ns > 200` 永远漏掉那行 → 对端漏数据。
 
-调用点：`RemoteIngester.ingest`、`CaptureService.ingestText` / `ingestBlob` 的 primary 路径 + merge 路径。
+调用点：`CaptureService.ingestText` / `ingestBlob` 的 insert + merge 路径，`PullWorker.applyPage`。
 
 ### NSPasteboard 自写回环——双层防御
 
@@ -299,13 +280,13 @@ GRDB 的 `pool.write { ... }` 自动包事务，SQLite 禁止事务内 VACUUM。
 
 签名输入：`<ts_ms>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`，hex 在 header `X-DP-Body-SHA256` 里发出。中间件**只**校验 header 上的 hex 跟签名匹配——**不读 body**（让 multi-MB blob 不占中间件内存）。Handler 读完 body 必须**自己**再 sha256 跟 header 对比，否则攻击者可伪造合法签名 + 任意 body。`/ingest` 和 `/blob/{sha}` 的 handler 都做了二次校验；`/blob` 的还多校验 path sha = body sha = header sha 三方一致（content-addressed 契约）。位置：`AuthMiddleware.swift` + `Server.swift` 各 handler。
 
-### Push worker 不能用共享 AsyncStream.Iterator 跨 Task
+### Worker 不能用共享 AsyncStream.Iterator 跨 Task
 
-Swift 6 strict concurrency 拒绝把同一个 iterator 实例 capture 进多个 child task（`group.addTask`）。当前方案：`PushWorker` 持有 `currentSleep: Task<Void, Error>?`，每 tick 起一个新 sleep task，`wake()` nonisolated 调用 actor method 取消这个 task 让 sleep 提前结束。注意 `wake()` 必须 `nonisolated`，否则外部回调拿不到非阻塞接口。位置：`PushWorker.runLoop` / `cancelCurrentSleep`。
+Swift 6 strict concurrency 拒绝把同一个 iterator 实例 capture 进多个 child task（`group.addTask`）。当前方案：`PullWorker` 持有 `currentSleep: Task<Void, Error>?`，每 tick 起一个新 sleep task，`wake()` nonisolated 调用 actor method 取消这个 task 让 sleep 提前结束。注意 `wake()` 必须 `nonisolated`，否则外部回调（WSNotificationClient.onCursorAdvanced）拿不到非阻塞接口。位置：`PullWorker.runLoop` / `cancelCurrentSleep`。
 
 ### Server 序列化 Item：pinned 必须是 Bool，不能是 0/1
 
-`Item.Codable` 的 `pinned: Bool` 期望 JSON true/false。一开始误用 `pinned ? 1 : 0` 让 client 端 `JSONDecoder().decode(Item.self)` 报 typeMismatch。除此之外 `push_state` / `push_attempts` client 内部字段虽然没语义，但 Item.Codable 标了必填，server 也要原样下发。位置：`Server.itemToJSON`。
+`Item.Codable` 的 `pinned: Bool` 期望 JSON true/false。一开始误用 `pinned ? 1 : 0` 让对端 `JSONDecoder().decode(Item.self)` 报 typeMismatch。位置：`Server.itemToJSON`。
 
 ### CLI 子命令在 SwiftUI 接管之前 exit
 

@@ -111,6 +111,9 @@ public enum Admin {
         peerDeviceIDs: [String?] = [],
         serveHost: String? = nil,
         servePort: Int? = nil,
+        serveTLS: Bool? = nil,
+        tlsCertPath: String? = nil,
+        tlsKeyPath: String? = nil,
         allowMissingBlobs: Bool = false,
         dryRun: Bool = false,
         daemonRunning: Bool,
@@ -150,13 +153,42 @@ public enum Admin {
             if dict["pull"] != nil { removedLegacy.append("pull") }
         }
 
+        // TLS 选项：显式给 → 用 / nil → 沿用 oldConfig 现值。
+        // serveTLS=true 时 cert/key 必须给（要么本次显式传，要么 oldConfig 已经有）
+        // —— 路径存在性校验留到 Config.validate（启动时按现有逻辑 server 启动时再校验文件）
+        let finalServeTLS = serveTLS ?? oldConfig.serveTLS
+        let finalCertPath = tlsCertPath ?? oldConfig.tlsCertPath
+        let finalKeyPath = tlsKeyPath ?? oldConfig.tlsKeyPath
+        if finalServeTLS {
+            guard let cert = finalCertPath, !cert.isEmpty,
+                  let key = finalKeyPath, !key.isEmpty else {
+                throw AdminError.writeConfigFailed(
+                    underlying: "serve_tls=true 时 tls_cert_path 和 tls_key_path 必填（"
+                        + "可用 --tls-cert / --tls-key 显式传，或先在 config.json 里配好）"
+                )
+            }
+            // 文件存在性预检——cert / key 不在路径上启动时 server 跑 NIOSSLCertificate.fromPEMFile
+            // 会挂，提前 throw 比让 daemon 起来后失败友好
+            let fm = FileManager.default
+            if !fm.fileExists(atPath: cert) {
+                throw AdminError.writeConfigFailed(
+                    underlying: "tls_cert_path 文件不存在：\(cert)"
+                )
+            }
+            if !fm.fileExists(atPath: key) {
+                throw AdminError.writeConfigFailed(
+                    underlying: "tls_key_path 文件不存在：\(key)"
+                )
+            }
+        }
+
         let newConfig = Config(
             serve: true,
             serveHost: serveHost ?? oldConfig.serveHost,
             servePort: servePort ?? oldConfig.servePort,
-            serveTLS: oldConfig.serveTLS,
-            tlsCertPath: oldConfig.tlsCertPath,
-            tlsKeyPath: oldConfig.tlsKeyPath,
+            serveTLS: finalServeTLS,
+            tlsCertPath: finalCertPath,
+            tlsKeyPath: finalKeyPath,
             peers: peers,
             mesh: oldConfig.mesh,
             ocr: oldConfig.ocr,

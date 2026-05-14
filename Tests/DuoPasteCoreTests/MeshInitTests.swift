@@ -212,6 +212,98 @@ private func makeEmptyDB(at dir: URL) throws -> URL {
     #expect(peers[1]["device_id"] as? String == "b-id")
 }
 
+@Test func meshInitWritesTLSFieldsWhenServeTLSGiven() throws {
+    let dir = tempDir()
+    let cfg = try writeConfig("{}", to: dir)
+    let dbPath = try makeEmptyDB(at: dir)
+    let blobs = try makeBlobs(at: dir)
+    // 准备假 cert / key 文件（内容不需是真 PEM，meshInit 只查文件存在）
+    let certPath = dir.appendingPathComponent("test.crt").path
+    let keyPath = dir.appendingPathComponent("test.key").path
+    try "fake cert".data(using: .utf8)!.write(to: URL(fileURLWithPath: certPath))
+    try "fake key".data(using: .utf8)!.write(to: URL(fileURLWithPath: keyPath))
+
+    _ = try Admin.meshInit(
+        configPath: cfg, dbPath: dbPath, blobs: blobs,
+        peerURLs: [URL(string: "https://x.ts.net:8443")!],
+        serveTLS: true, tlsCertPath: certPath, tlsKeyPath: keyPath,
+        daemonRunning: false,
+        daemonLabel: "io.duopaste.agent"
+    )
+    let written = try Data(contentsOf: cfg)
+    let dict = try JSONSerialization.jsonObject(with: written) as! [String: Any]
+    #expect((dict["serve_tls"] as? Bool) == true)
+    #expect((dict["tls_cert_path"] as? String) == certPath)
+    #expect((dict["tls_key_path"] as? String) == keyPath)
+}
+
+@Test func meshInitRefusesServeTLSWithoutCertAndKey() throws {
+    let dir = tempDir()
+    let cfg = try writeConfig("{}", to: dir)
+    let dbPath = try makeEmptyDB(at: dir)
+    let blobs = try makeBlobs(at: dir)
+    // 没传 cert/key 也没在 oldConfig 里 → throw writeConfigFailed
+    #expect(throws: Admin.AdminError.self) {
+        _ = try Admin.meshInit(
+            configPath: cfg, dbPath: dbPath, blobs: blobs,
+            peerURLs: [URL(string: "https://x.ts.net:8443")!],
+            serveTLS: true,
+            daemonRunning: false,
+            daemonLabel: "io.duopaste.agent"
+        )
+    }
+}
+
+@Test func meshInitRefusesServeTLSWhenCertFileMissing() throws {
+    let dir = tempDir()
+    let cfg = try writeConfig("{}", to: dir)
+    let dbPath = try makeEmptyDB(at: dir)
+    let blobs = try makeBlobs(at: dir)
+    let certPath = "/does/not/exist.crt"
+    let keyPath = dir.appendingPathComponent("test.key").path
+    try "fake key".data(using: .utf8)!.write(to: URL(fileURLWithPath: keyPath))
+    #expect(throws: Admin.AdminError.self) {
+        _ = try Admin.meshInit(
+            configPath: cfg, dbPath: dbPath, blobs: blobs,
+            peerURLs: [URL(string: "https://x.ts.net:8443")!],
+            serveTLS: true, tlsCertPath: certPath, tlsKeyPath: keyPath,
+            daemonRunning: false,
+            daemonLabel: "io.duopaste.agent"
+        )
+    }
+}
+
+@Test func meshInitInheritsTLSFromOldConfigWhenNotGiven() throws {
+    // oldConfig 已经有 serve_tls + cert/key（之前手动配过 / 老 promote 留下）
+    // → mesh-init 不传 --serve-tls 时应当**沿用**老值，而不是默 false
+    let dir = tempDir()
+    let certPath = dir.appendingPathComponent("inherit.crt").path
+    let keyPath = dir.appendingPathComponent("inherit.key").path
+    try "c".data(using: .utf8)!.write(to: URL(fileURLWithPath: certPath))
+    try "k".data(using: .utf8)!.write(to: URL(fileURLWithPath: keyPath))
+    let cfg = try writeConfig("""
+    {
+        "serve": true,
+        "serve_tls": true,
+        "tls_cert_path": "\(certPath)",
+        "tls_key_path": "\(keyPath)"
+    }
+    """, to: dir)
+    let dbPath = try makeEmptyDB(at: dir)
+    let blobs = try makeBlobs(at: dir)
+    _ = try Admin.meshInit(
+        configPath: cfg, dbPath: dbPath, blobs: blobs,
+        peerURLs: [URL(string: "https://x.ts.net:8443")!],
+        // serveTLS / tlsCertPath / tlsKeyPath 都不传
+        daemonRunning: false,
+        daemonLabel: "io.duopaste.agent"
+    )
+    let after = try Config.load(from: cfg)
+    #expect(after.serveTLS == true)
+    #expect(after.tlsCertPath == certPath)
+    #expect(after.tlsKeyPath == keyPath)
+}
+
 @Test func meshInitPreservesUnrelatedConfigFields() throws {
     // hotkey / capture / ocr / shared_secret_keychain_account 不动
     let dir = tempDir()
