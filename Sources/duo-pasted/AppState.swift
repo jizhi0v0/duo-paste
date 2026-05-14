@@ -13,7 +13,13 @@ final class AppState {
     /// `id → snippet`（含 STX/ETX 高亮标记）。仅 query 非空 + FTS 命中时有内容。
     /// SearchView ItemRow 用 `snippet(for:)` 拿；为 nil 时 fallback 到 item.preview。
     var snippets: [String: String] = [:]
-    var selectedID: String?
+    /// 按选择顺序追加的选中 id 列表。空 = 没显式选中(currentItem 取 results.first 兜底)。
+    /// 单选 = 长度 1。多选 = 长度 N,顺序就是 paste 时的合并顺序——cmd+点 append 到末尾,
+    /// shift+点按 results 列表顺序整段替换(不按点击顺序)
+    var selectedIDs: [String] = []
+    /// shift+点的 range 锚点。普通单击 / 箭头导航 / cmd+点 → 更新到当前;
+    /// shift+点 → 不动 anchor,只改 selectedIDs(Finder 行为)。没 anchor 时 shift+点退化单选
+    var anchorID: String?
     var lastError: String?
     /// 当前搜索源——决定顶部 banner 显示什么。
     var searchMode: SearchProvider.Mode = .local
@@ -76,7 +82,7 @@ final class AppState {
         return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
     }
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
-    /// 鼠标点击只改 selectedID 不动这个，避免不必要的滚动。
+    /// 鼠标点击只改 selectedIDs 不动这个，避免不必要的滚动。
     var scrollPulse: Int = 0
     /// 面板每次显示的脉冲计数。SearchPanelController.show() 每次 +1。
     /// SearchView 用 .onChange 监听：把 TextField 焦点抢回来 + 立即 kick 一次 refresh。
@@ -186,7 +192,10 @@ final class AppState {
         // 用本地不走 searchProvider，绕开 remote 慢路径——0 ms 同步可拿到结果。
         let initial = (try? deps.searchAPI.search(SearchQuery(limit: Self.listLimit))) ?? []
         self.results = initial
-        self.selectedID = initial.first?.id
+        if let firstID = initial.first?.id {
+            self.selectedIDs = [firstID]
+            self.anchorID = firstID
+        }
         // 同步 init 阶段 mirror union 还没接入（searchProvider 没跑），用本机 item 计数作初值——
         // panel 打开后第一次 refresh() 会替换成正确的 union/mirror 总数。
         self.totalCount = (try? deps.searchAPI.count(SearchQuery())) ?? initial.count
@@ -198,19 +207,30 @@ final class AppState {
     /// 染千行不卡，SQLite 拉千行 row ~10ms 内
     static let listLimit = 1000
 
-    /// 当前应该粘贴的项：优先选中项，否则取列表首项。
+    /// 当前应该粘贴的项：优先选中项(取 selectedIDs 末位 = 最后一次 cmd+点 / 单击的那个),
+    /// 否则取列表首项兜底。**注**:多项 paste 用 `selectedItems`,这里只是单项 fallback
     var currentItem: Item? {
-        if let id = selectedID, let it = results.first(where: { $0.id == id }) {
+        if let last = selectedIDs.last, let it = results.first(where: { $0.id == last }) {
             return it
         }
         return results.first
     }
 
+    /// 多项 paste 入口。按 selectedIDs 顺序拿 Item;被 filter chip 过滤掉的 id 自动跳过。
+    /// 空数组 = 没显式选中,调用方应该 fallback 到 currentItem
+    var selectedItems: [Item] {
+        selectedIDs.compactMap { id in results.first(where: { $0.id == id }) }
+    }
+
+    /// 箭头键导航。任何方向键都重置成单选 + 重置 anchor——多选只走鼠标 cmd/shift+点
     func navigate(by delta: Int) {
         guard !results.isEmpty else { return }
-        let idx = results.firstIndex(where: { $0.id == selectedID }) ?? 0
+        let curID = selectedIDs.last
+        let idx = results.firstIndex(where: { $0.id == curID }) ?? 0
         let next = max(0, min(results.count - 1, idx + delta))
-        selectedID = results[next].id
+        let id = results[next].id
+        selectedIDs = [id]
+        anchorID = id
         scrollPulse &+= 1
     }
 
@@ -243,25 +263,29 @@ final class AppState {
     }
 
     /// 列表刷新后调整选中行：
-    /// - **query 空**（首次打开 / 清空搜索）→ 强制选第一项（最新捕获），并触发滚回顶部
-    /// - **query 非空 + 原选中行仍在结果里** → 保持选中（让"缩小关键词"流不丢焦点）
-    /// - **query 非空 + 原选中行不在结果里** → 选第一项
+    /// - **query 空**（首次打开 / 清空搜索）→ 强制单选第一项（最新捕获），清空多选,触发滚到顶
+    /// - **query 非空 + 至少一个原选中行仍在结果里** → 保持那部分顺序（让"缩小关键词" /
+    ///   切 filter chip 流不丢已选项）
+    /// - **query 非空 + 原选中行全被过滤掉** → 退化单选第一项
     private func updateSelection(forItems items: [Item], queryIsEmpty: Bool) {
-        let newSelection: String?
+        let available = Set(items.map { $0.id })
+        let kept = selectedIDs.filter { available.contains($0) }
+
         if queryIsEmpty {
-            newSelection = items.first?.id
-        } else if let id = self.selectedID, items.contains(where: { $0.id == id }) {
-            newSelection = id  // preserve
-        } else {
-            newSelection = items.first?.id
-        }
-        if newSelection != self.selectedID {
-            self.selectedID = newSelection
-            // selection 跳到非临近行（清空搜索时常见），SearchView 需要重新滚到选中项；
-            // scrollPulse 是唯一让它滚动的入口
-            if newSelection != nil {
-                self.scrollPulse &+= 1
+            let firstID = items.first?.id
+            let target: [String] = firstID.map { [$0] } ?? []
+            if selectedIDs != target {
+                selectedIDs = target
+                anchorID = firstID
+                if firstID != nil { scrollPulse &+= 1 }
             }
+        } else if !kept.isEmpty {
+            if kept != selectedIDs { selectedIDs = kept }
+        } else {
+            let firstID = items.first?.id
+            selectedIDs = firstID.map { [$0] } ?? []
+            anchorID = firstID
+            if firstID != nil { scrollPulse &+= 1 }
         }
     }
 }

@@ -9,8 +9,11 @@ import DuoPasteCore
 @MainActor
 final class SearchPanelController: NSObject, NSWindowDelegate {
     private let state: AppState
-    private let onPaste: (Item) -> Void
-    /// ⌘Return 时触发——file/image kind。AppDelegate 用它调 NSWorkspace reveal/open。
+    /// Enter / 双击触发。多选时按 selectedIDs 顺序传整个数组;空选 fallback 到 currentItem 单项。
+    /// 多选合并 vs 降级首项的语义由 AppDelegate.pasteBack 决定
+    private let onPaste: ([Item]) -> Void
+    /// ⌘Return 时触发——file/image kind 且**单选**。AppDelegate 用它调 NSWorkspace reveal/open。
+    /// 多选 reveal 语义不清,仅单选生效
     private let onReveal: ((Item) -> Void)?
     /// panel hide / dismiss 路径调用——AppDelegate 用它 cancel 进行中的 lazy paste
     /// task + 重置 state.pasteProgress。覆盖三条触发点：Esc 键 / windowDidResignKey
@@ -19,7 +22,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var localKeyMonitor: Any?
 
-    init(state: AppState, onPaste: @escaping (Item) -> Void,
+    init(state: AppState, onPaste: @escaping ([Item]) -> Void,
          onReveal: ((Item) -> Void)? = nil,
          onDismiss: @escaping () -> Void = {}) {
         self.state = state
@@ -89,18 +92,25 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 case 126: self.state.navigate(by: -1)           // ↑
                 case 125: self.state.navigate(by: 1)            // ↓
                 case 36, 76:                                    // Return / Enter
-                    if let item = self.state.currentItem {
-                        if isCmd && (item.kind == .file || item.kind == .image) {
-                            // 不在这里 hide。远端 blob 可能要异步拉取，立即 hide 会触发
-                            // onDismiss 取消任务；同步成功/异步成功由 AppDelegate 关 panel。
-                            self.onReveal?(item)
-                        } else {
-                            // 不在这里 hide——把"何时 hide"交给 onPaste 回调实现方。
-                            // image kind + blob 缺字节走 lazy 拉路径时 panel 要保持可见显示
-                            // spinner overlay；同步路径由 AppDelegate.pasteBack 拿 panel 引用
-                            // 自己关
-                            self.onPaste(item)
-                        }
+                    // 多选时按 selectedIDs 顺序传整个数组;没显式多选 → 取 currentItem 兜底
+                    let items: [Item]
+                    if !self.state.selectedItems.isEmpty {
+                        items = self.state.selectedItems
+                    } else if let cur = self.state.currentItem {
+                        items = [cur]
+                    } else {
+                        items = []
+                    }
+                    guard !items.isEmpty else { break }
+                    // Cmd+Return reveal 仅对单选生效(多选 reveal 语义不清)
+                    if isCmd && items.count == 1,
+                       items[0].kind == .file || items[0].kind == .image {
+                        self.onReveal?(items[0])
+                    } else {
+                        // 不在这里 hide——把"何时 hide"交给 onPaste 回调实现方。
+                        // image kind + blob 缺字节走 lazy 拉路径时 panel 要保持可见显示
+                        // spinner overlay；同步路径由 AppDelegate.pasteBack 拿 panel 引用自己关
+                        self.onPaste(items)
                     }
                 case 53: self.hide()                            // Esc
                 case 35 where isCmd:                            // ⌘P = toggle pin
@@ -151,11 +161,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
         let root = SearchView(
             state: state,
-            onPaste: { [weak self] item in
+            onPaste: { [weak self] items in
                 guard let self else { return }
                 // 同上：不在这里 hide；onPaste 回调实现方决定（lazy 路径要 keep panel
-                // 显示 spinner，同步路径在完成后调 controller.hide）
-                self.onPaste(item)
+                // 显示 spinner，同步路径在完成后调 controller.hide）。
+                // 双击行 → SearchView 传 [item] 单项;直接走 pasteBack 处理 single 路径
+                self.onPaste(items)
             },
             onClose: { [weak self] in
                 self?.hide()

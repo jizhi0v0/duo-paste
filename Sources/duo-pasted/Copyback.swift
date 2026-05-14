@@ -75,6 +75,43 @@ enum Copyback {
         return true
     }
 
+    /// 合并写多项到 NSPasteboard 单次粘贴。调用方已通过 `PasteMerge.strategy(for:)` 判定走
+    /// mergedText / mergedFile 路径。本函数只负责副作用:FileManager.fileExists 校验 + 写 pb。
+    /// - 全 text/url/rtf/html → 拼成单字符串(\n 分隔),写 .string 一份
+    /// - 全 file → 收集所有 NSURL writeObjects 一次,Finder paste 多文件
+    ///
+    /// 返回 false = 没数据可写(textFull 全空 / file URL 全失效)
+    @MainActor
+    @discardableResult
+    static func writeMerged(items: [Item], blobs: BlobStore) -> Bool {
+        guard !items.isEmpty else { return false }
+
+        let allFile = items.allSatisfy { $0.kind == .file }
+        if allFile {
+            // 纯函数展平 + 这里加 FileManager.fileExists 兜底——路径可能在库里但磁盘已删
+            let paths = PasteMerge.flattenFilePaths(items)
+            let urls: [NSURL] = paths.compactMap { p in
+                guard FileManager.default.fileExists(atPath: p) else { return nil }
+                return NSURL(fileURLWithPath: p)
+            }
+            guard !urls.isEmpty else { return false }
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            _ = pb.writeObjects(urls)
+            return true
+        }
+
+        // 文本类(text/url/rtf/html)——只取 textFull,拼 \n。
+        // 多选合并丢掉 rtf/html 的富文本表示,只输出 plain(多份 rtf 拼起来未必合法,plain 是安全降级)
+        guard let joined = PasteMerge.joinTextual(items, separator: "\n") else {
+            return false
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(joined, forType: .string)
+        return true
+    }
+
     private static func isImageMime(_ mime: String?) -> Bool {
         guard let mime else { return false }
         return mime.hasPrefix("image/")

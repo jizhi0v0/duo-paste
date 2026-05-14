@@ -49,7 +49,9 @@ final class AppIconCache {
 
 struct SearchView: View {
     @Bindable var state: AppState
-    var onPaste: (Item) -> Void
+    /// Enter / 双击触发的 paste 回调。双击行传 `[item]` 单条;Enter 由 SearchPanelController
+    /// 走 selectedItems 传多条。AppDelegate.pasteBack 根据数量决定单项 / 合并 / 降级路径
+    var onPaste: ([Item]) -> Void
     var onClose: () -> Void
 
     @FocusState private var searchFieldFocused: Bool
@@ -457,23 +459,56 @@ struct SearchView: View {
                     ForEach(state.results) { item in
                         ItemRow(
                             item: item,
-                            isSelected: item.id == state.selectedID,
+                            isSelected: state.selectedIDs.contains(item.id),
                             selfDeviceID: state.deps.deviceID,
                             snippet: state.snippets[item.id]
                         )
                         .contentShape(Rectangle())
                         .id(item.id)
                         // 双击粘贴。挂 .gesture（参与消歧），让双击能稳定识别。
+                        // 双击始终 paste 单条(无视 selectedIDs)——跟 Spotlight "双击 = 快捷直 paste"心智一致
                         .gesture(
                             TapGesture(count: 2).onEnded {
-                                onPaste(item)
+                                onPaste([item])
                             }
                         )
-                        // 单击仅改 selection，挂 .simultaneousGesture 跳出消歧、立即触发，
-                        // 不会被双击监听拖到 500ms 之后。
+                        // 单击改 selection,挂 .simultaneousGesture 跳出消歧立即触发。
+                        // 读 NSEvent.modifierFlags 分支 cmd / shift / plain 三种交互。
+                        // **为什么不用 TapGesture().modifiers(.command)**:那会把同一 row 的
+                        // plain / cmd / shift tap 拆成多个 gesture,跟现有 count:2 双击 gesture
+                        // 一起会让双击消歧时序更脆(参考 CLAUDE.md 已踩过的坑)。
+                        // 读 NSEvent.modifierFlags 是同步类方法,onEnded 时拿当前键盘状态准确
                         .simultaneousGesture(
                             TapGesture(count: 1).onEnded {
-                                state.selectedID = item.id
+                                let mods = NSEvent.modifierFlags
+                                if mods.contains(.command) {
+                                    // toggle 单项,append 到末尾保持选择顺序
+                                    if let i = state.selectedIDs.firstIndex(of: item.id) {
+                                        state.selectedIDs.remove(at: i)
+                                    } else {
+                                        state.selectedIDs.append(item.id)
+                                        state.anchorID = item.id
+                                    }
+                                } else if mods.contains(.shift) {
+                                    // anchor 到点击位置 range,按 results 列表顺序展开(非点击顺序)
+                                    // 没 anchor → 退化单选 + 设 anchor
+                                    guard let anchor = state.anchorID,
+                                          let from = state.results.firstIndex(where: { $0.id == anchor }),
+                                          let to = state.results.firstIndex(where: { $0.id == item.id })
+                                    else {
+                                        state.selectedIDs = [item.id]
+                                        state.anchorID = item.id
+                                        return
+                                    }
+                                    let lo = min(from, to)
+                                    let hi = max(from, to)
+                                    state.selectedIDs = (lo...hi).map { state.results[$0].id }
+                                    // shift+点不动 anchor(Finder 行为)
+                                } else {
+                                    // 普通单击 → 单选 + 重置 anchor
+                                    state.selectedIDs = [item.id]
+                                    state.anchorID = item.id
+                                }
                             }
                         )
                     }
@@ -481,7 +516,9 @@ struct SearchView: View {
             }
             // 只在键盘导航（scrollPulse 改变）时滚动到选中项，鼠标点击不触发
             .onChange(of: state.scrollPulse) { _, _ in
-                if let id = state.selectedID {
+                // 滚到 selectedIDs 末位(最后一次箭头 / cmd+点 / 普通点的那条)——shift+点 range
+                // 时滚到 range 的末尾让用户看见展开的边界
+                if let id = state.selectedIDs.last {
                     withAnimation(.linear(duration: 0.08)) {
                         proxy.scrollTo(id, anchor: .center)
                     }

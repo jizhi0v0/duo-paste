@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state = AppState(deps: deps)
         panel = SearchPanelController(
             state: state,
-            onPaste: { [weak self] item in self?.pasteBack(item) },
+            onPaste: { [weak self] items in self?.pasteBack(items) },
             onReveal: { [weak self] item in self?.revealInFinder(item) },
             onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() }
         )
@@ -396,12 +396,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func pasteBack(_ item: Item) {
+    /// 多项 paste 入口。分三条路径:
+    /// 1. 单项 → pasteBackSingle(保留 image lazy 拉 blob 能力)
+    /// 2. 多项同 kind 非 image → Copyback.writeMerged 合并写一次 NSPasteboard
+    /// 3. 多项跨 kind 或多 image → 按选择顺序取首项 fallback + recentNotice banner 告知用户
+    ///
+    /// **为什么多项不记 PasteSuppressionSet**:它是单条 item fingerprint(text_full / blob_sha)
+    /// 的去重,用于"用户 Cmd+V 粘回的内容 5 分钟内不再 capture"。多项合并后写入的字符串不
+    /// 对应库里任何已有行(临时拼接),做 suppression 也匹配不上。`suppressUpToCurrent()` 仍调,
+    /// 防 watcher 立刻把 self-write 那次 changeCount 当成新 capture
+    private func pasteBack(_ items: [Item]) {
+        guard !items.isEmpty else { return }
+
         // 多次按 Enter（拉一半再按 Enter）→ cancel 旧 task，避免重复 GET 同 sha 竞争 BlobStore.put
         currentPasteTask?.cancel()
         currentPasteTask = nil
         state.pasteProgress = .idle
 
+        switch PasteMerge.strategy(for: items) {
+        case .singleItem:
+            pasteBackSingle(items[0])
+
+        case .fallbackToFirst(let reason):
+            let label: String
+            switch reason {
+            case .crossKind:       label = "跨类型"
+            case .multipleImages:  label = "多图片"
+            }
+            state.recentNotice = "\(label)多选不可合并，已 paste 第 1 项 (共 \(items.count))"
+            pasteBackSingle(items[0])
+
+        case .mergedText, .mergedFile:
+            // 同 kind 非 image → 同步 merge 写 NSPasteboard。文本 / 文件的内容(textFull / 路径)
+            // 同步可拿,不走 lazy 拉 blob,一次性写完
+            watcher.flushPendingIfAny()
+            let wrote = Copyback.writeMerged(items: items, blobs: deps.blobs)
+            watcher.suppressUpToCurrent()
+            if !wrote {
+                state.pasteProgress = .failed(reason: "选中项无可写入内容")
+                return
+            }
+            panel.hide()
+        }
+    }
+
+    /// 单项 paste 实现——原 pasteBack 内容搬来,签名改名。快路径(本机有可粘内容)同步;
+    /// 慢路径(image kind 缺字节 / file kind 跨设备同步过来无本机路径+无本机 blob)起 task 拉 blob 5s 超时
+    private func pasteBackSingle(_ item: Item) {
         // 快路径：不需要 lazy 拉字节 → 同步 Copyback.write + 关 panel。
         // 慢路径触发条件（任一）：
         //   (a) .image kind 且本机 BlobStore 没字节 —— 没字节没法粘贴
