@@ -191,7 +191,8 @@ struct SearchView: View {
     }
 
     /// Paste.app 风格紧凑搜索头:单行,~42px。原 header 是 22pt 大字体 + 上下 20px padding =
-    /// ~64px,在 280px panel 里占太多。这里压成 16pt + 上下 10px = ~42px
+    /// ~64px,在 280px panel 里占太多。这里压成 16pt + 上下 10px = ~42px。
+    /// 内容 maxWidth 1000 居中——panel 全宽时左右铺开看着空旷,限宽让搜索框/计数视觉聚焦
     private var compactHeader: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
@@ -218,9 +219,12 @@ struct SearchView: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
+        .frame(maxWidth: 1000)
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 
-    /// 紧凑 filter 行 ~30px。原 filterBar 高 ~46px,缩小 chip 字号 + padding 让它适配 280 高 panel
+    /// 紧凑 filter 行 ~30px。原 filterBar 高 ~46px,缩小 chip 字号 + padding 让它适配 panel。
+    /// chip 行 + 时间窗内容 maxWidth 1000 居中,跟 compactHeader 视觉对齐
     private var compactFilterBar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
@@ -252,6 +256,8 @@ struct SearchView: View {
             }
             .padding(.horizontal, 18)
             .padding(.bottom, 8)
+            .frame(maxWidth: 1000)
+            .frame(maxWidth: .infinity, alignment: .center)
             // 跟卡片区域分隔的 hairline
             Rectangle()
                 .fill(Color.primary.opacity(0.06))
@@ -264,7 +270,11 @@ struct SearchView: View {
     private var cardScroller: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 14) {
+                // alignment .top 让卡片顶贴 ScrollView 顶,frame maxHeight infinity + top
+                // alignment 让 LazyHStack 占满 ScrollView 高度但卡片靠顶——消除 user 反馈
+                // 的"第二次打开 panel 底部还有大空隙"(SwiftUI 默认 vertical centering 让卡片
+                // 在 ScrollView 内居中,下方留空白)
+                LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(state.results) { item in
                         ItemCard(
                             item: item,
@@ -316,7 +326,8 @@ struct SearchView: View {
                         )
                     }
                 }
-                .padding(.vertical, 6)      // 仅留 6pt 给 shadow/border 不被裁,scaleEffect 撤了不需要 10
+                .padding(.vertical, 6)
+                .frame(maxHeight: .infinity, alignment: .top)  // 配合上面 alignment .top
             }
             // 把 horizontal padding 从 LazyHStack 移到 ScrollView 外:这样 viewport(滚动可视
             // 区) 边离 panel 左右边各 18pt。LazyHStack 内 padding 时 viewport=panel.width,
@@ -324,8 +335,11 @@ struct SearchView: View {
             .padding(.horizontal, 18)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
+                    // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
+                    // 卡片已在 viewport 内不动,只在边缘部分可见才滚最少距离让它完整露出。
+                    // 之前 anchor: .center 会让每次点击都把卡片硬居中,中间卡也被强滚很烦
                     withAnimation(.linear(duration: 0.12)) {
-                        proxy.scrollTo(id, anchor: .center)
+                        proxy.scrollTo(id)
                     }
                 }
             }
