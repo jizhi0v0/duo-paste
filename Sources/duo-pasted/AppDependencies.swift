@@ -16,8 +16,8 @@ final class AppDependencies {
     /// own + peer 行，`SearchAPI.searchHits/count/countByKind` 内部 text-fold 让两端口径一致。
     /// `mode` 显示靠 MeshStatus.oldestLastPullNs() 推断（nil = 还没追平任何 peer）。
     let searchProvider: SearchProvider
-    /// Mesh peer PullWorker 跟 SearchProvider / UI 间的非阻塞状态通道。`pull.enabled=false`
-    /// 时这个对象永远不被 set，SearchProvider 走 `.local` mode（行为不变，只是 banner 文案变）。
+    /// Mesh peer PullWorker 跟 SearchProvider / UI 间的非阻塞状态通道。`mesh.enabled=false`
+    /// 或 peers 空时这个对象永远不被 set，SearchProvider 走 `.local` mode（行为不变，只是 banner 文案变）。
     let meshStatus: MeshStatus
     /// 跨设备 paste-echo 抑制集合。AppDelegate.pasteBack 写入；PullWorker 应用 mirror 时查。
     let pasteSuppressions: PasteSuppressionSet

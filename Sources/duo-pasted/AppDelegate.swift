@@ -73,13 +73,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if deps.config.serve {
             startSyncServer()
         }
-        if deps.config.pull.enabled {
+        if deps.config.mesh.enabled && !deps.config.peers.isEmpty {
             startMeshSupervisor()
         }
-        // lazy paste-back blob fetcher 跟 PullWorker 独立——只要配了 primary_url
-        // + shared-secret，即使 pull.enabled=false（用户不想拉全量元数据）也能
-        // 在 paste 时按需拉单个 blob。P1 review fix：原实现把 fetcher 绑在
-        // startPullWorker 里，pull.enabled=false 时 image paste 永远失败
+        // lazy paste-back blob fetcher 跟 PullWorker 独立——只要配了 peers + shared-secret，
+        // 即使 mesh.enabled=false 也能在 paste 时按需拉单个 blob。
+        // 多 peer 部署下 fetcher 当前只指 peers[0]——image 通常一台主力机产，找到的概率最高。
+        // 若 peers[0] 缺字节会 404，PR 6 之后 lazy 路径不再有 fallback chain（plan 留作未来）
         setupPasteBlobFetcher()
 
         // OCR worker：本机 own-origin image 跑 Vision OCR 把图里文字写 text_full 进 FTS5。
@@ -128,80 +128,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
 
-    /// Mesh supervisor：周期把每个 peer 全量同步到本地 item 表。PR 2 单 peer 适配——把
-    /// 现有 `Config.primaryURL` + `Config.pull` 字段当成 single-peer mesh。PR 5 mesh-init
-    /// 后 Config 改成 `peers: [PeerConfig]` 列表，这里 fan-out 多个 PullWorker。
+    /// Mesh supervisor：每个 peer 起一对 (PullWorker, WSNotificationClient)，supervisor 统一
+    /// 启停。PR 5 后从 `config.peers` + `config.mesh` 读，多 peer 自然 fan-out。
     ///
-    /// 启用条件：`config.pull.enabled=true` 且 primary_url 非空（Config.validate 已保证）。
-    /// 启动失败（shared-secret / URL 解析）非致命，daemon 仍然能用本机捕获 + 本地搜索。
-    ///
-    /// PR 3：每个 peer 同时构造 WSNotificationClient——长连接到 peer `/sync/ws`，收到
-    /// `cursor_advanced` 通过 `worker.wake()` 立即触发 PullWorker 拉一页（< 1s 同步延迟）。
-    /// WS 断了自然退化为周期 pull，业务正确性靠 cursor 保证。
+    /// 启用条件：`config.mesh.enabled=true` 且 `peers` 非空（applicationDidFinishLaunching guard）。
+    /// 启动失败（shared-secret / 单个 peer URL 解析）非致命，daemon 仍然能用本机捕获 + 本地搜索。
     private func startMeshSupervisor() {
-        guard let primaryURL = deps.config.primaryURL else { return }
+        let cfg = deps.config
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
-            let client = HTTPPeerClient(
-                baseURL: primaryURL,
-                auth: auth,
-                session: AppDependencies.syncURLSession
-            )
-            let intervalSec = max(1, deps.config.pull.intervalSec)
-            // PR 2 单 peer 适配：现有 Config 没有 peer.deviceID 字段（PR 5 才加），所以走
-            // **学习模式**（expectedPeerDeviceID=nil）—— 首次 /health 拿到 device_id 后
-            // stamp 进 pull_cursor.peer_device_id，reconcile 比对靠这条 cursor。
-            // 行为跟 PR 1 reconcilePrimary 等价。
-            let worker = PullWorker(
-                database: deps.database,
-                transport: client,
-                selfDeviceID: deps.deviceID,
-                expectedPeerDeviceID: nil,
-                meshStatus: deps.meshStatus,
-                pasteSuppressions: deps.pasteSuppressions,
-                blobFetcher: client,
-                blobs: deps.blobs,
-                config: PullWorker.Config(
-                    intervalSec: TimeInterval(intervalSec),
-                    eagerBlobs: deps.config.pull.eagerBlobs
+            let intervalSec = max(1, cfg.mesh.pullIntervalSec)
+            var supervisorPeers: [MeshSupervisor.Peer] = []
+            for peer in cfg.peers {
+                let client = HTTPPeerClient(
+                    baseURL: peer.url,
+                    auth: auth,
+                    session: AppDependencies.syncURLSession
                 )
-            )
-            // WSNotificationClient 收到 cursor_advanced → worker.wake() 取消当前 sleep
-            // 立即跑下一 tick；连接断 → 指数 backoff 重连，重连成功靠 server hello
-            // 自检追平。学习模式同 PullWorker（expectedPeerDeviceID=nil）
-            let wsClient = WSNotificationClient(
-                peerURL: primaryURL,
-                auth: auth,
-                expectedPeerDeviceID: nil,
-                onCursorAdvanced: { [weak worker] _ in worker?.wake() }
-            )
-            let supervisor = MeshSupervisor(peers: [
-                MeshSupervisor.Peer(worker: worker, wsClient: wsClient)
-            ])
+                // 严格模式：peer.deviceID 显式给了 → 严格校验对端 /health 返回 device_id
+                // 不匹配立即 transient skip。学习模式：deviceID=nil → 首次 /health 学到
+                let worker = PullWorker(
+                    database: deps.database,
+                    transport: client,
+                    selfDeviceID: deps.deviceID,
+                    expectedPeerDeviceID: peer.deviceID,
+                    meshStatus: deps.meshStatus,
+                    pasteSuppressions: deps.pasteSuppressions,
+                    blobFetcher: client,
+                    blobs: deps.blobs,
+                    config: PullWorker.Config(
+                        intervalSec: TimeInterval(intervalSec),
+                        batchLimit: cfg.mesh.pullBatchLimit,
+                        initialBackoffSec: cfg.mesh.pullInitialBackoffSec,
+                        maxBackoffSec: cfg.mesh.pullMaxBackoffSec,
+                        crossDeviceDedupWindowNs: cfg.mesh.crossDeviceDedupWindowNs,
+                        clockSkewWarnMs: cfg.mesh.clockSkewWarnMs,
+                        eagerBlobs: cfg.mesh.eagerBlobs
+                    )
+                )
+                let wsClient: WSNotificationClient?
+                if cfg.mesh.wsEnabled {
+                    wsClient = WSNotificationClient(
+                        peerURL: peer.url,
+                        auth: auth,
+                        expectedPeerDeviceID: peer.deviceID,
+                        onCursorAdvanced: { [weak worker] _ in worker?.wake() },
+                        config: WSNotificationClient.Config(
+                            heartbeatSec: cfg.mesh.wsHeartbeatSec,
+                            reconnectInitialSec: cfg.mesh.wsReconnectInitialSec,
+                            reconnectMaxSec: cfg.mesh.wsReconnectMaxSec
+                        )
+                    )
+                } else {
+                    wsClient = nil  // mesh.ws_enabled=false 退化为周期 pull
+                }
+                supervisorPeers.append(MeshSupervisor.Peer(worker: worker, wsClient: wsClient))
+            }
+            let supervisor = MeshSupervisor(peers: supervisorPeers)
             self.meshSupervisor = supervisor
             Task { await supervisor.start() }
-            fputs("mesh supervisor → 1 peer @ \(primaryURL.absoluteString) (interval=\(intervalSec)s, ws=on)\n", stderr)
+            fputs("mesh supervisor → \(supervisorPeers.count) peer(s) (interval=\(intervalSec)s, ws=\(cfg.mesh.wsEnabled ? "on" : "off"))\n", stderr)
+            for peer in cfg.peers {
+                fputs("  · \(peer.url.absoluteString)\(peer.deviceID.map { " device_id=\($0)" } ?? " (learn mode)")\n", stderr)
+            }
         } catch {
             fputs("mesh supervisor NOT started: \(error)\n", stderr)
         }
     }
 
-    /// lazy paste-back blob fetcher 初始化——跟 PullWorker / PushWorker 独立。
-    /// 只要 config 配了 primary_url + shared-secret 可加载就建一个 HTTPPeerClient
-    /// 给 pasteBack 用，**不依赖** pull.enabled / serve 配置。**这是 paste-back
-    /// 不可降级的最低要求**：用户已经选中图片按 Enter 了，没 fetcher 等于挂掉
+    /// lazy paste-back blob fetcher 初始化——跟 PullWorker 独立。
+    /// 只要 config 配了至少 1 个 peer + shared-secret 可加载就建一个 HTTPPeerClient
+    /// 给 pasteBack 用，**不依赖** mesh.enabled / serve 配置。**这是 paste-back
+    /// 不可降级的最低要求**：用户已经选中图片按 Enter 了，没 fetcher 等于挂掉。
+    /// 多 peer 部署当前只用 peers[0]——通常 image 在某一台主力机产，命中率最高
     private func setupPasteBlobFetcher() {
-        guard let primaryURL = deps.config.primaryURL else { return }
+        guard let firstPeer = deps.config.peers.first else { return }
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
             self.pasteBlobFetcher = HTTPPeerClient(
-                baseURL: primaryURL,
+                baseURL: firstPeer.url,
                 auth: auth,
                 session: AppDependencies.syncURLSession
             )
-            fputs("paste blob fetcher → \(primaryURL.absoluteString)\n", stderr)
+            fputs("paste blob fetcher → \(firstPeer.url.absoluteString)\n", stderr)
         } catch {
             fputs("paste blob fetcher NOT initialized: \(error)\n", stderr)
         }

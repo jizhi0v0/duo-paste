@@ -19,6 +19,8 @@ enum CLI {
             runInitSecret(force: force)
         case "retry-failed-ocr":
             runRetryFailedOCR(args: rest)
+        case "mesh-init":
+            runMeshInit(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -43,6 +45,18 @@ enum CLI {
                                   ocr_state IN ('failed', 'skipped') 的行（done 不动）。
                                   --id 模式忽略 state 黑名单——给指定 image 行强制重
                                   OCR（如 Vision 模型升级后想刷某条 done 行）。
+
+          mesh-init --peer URL[,DEVICE_ID] [--peer URL[,DEVICE_ID]]...
+                    [--serve-host H] [--serve-port P]
+                    [--allow-missing-blobs] [--dry-run]
+                                  把本机切到 mesh 拓扑：写 config.json 的 peers/mesh 段，
+                                  显式删老 primary_url / pull 字段。--peer 可重复，每个
+                                  对端 URL 一次（DEVICE_ID 可选；省略走学习模式）。
+                                  默认 serve_host=0.0.0.0 / serve_port=8443，给原值不变。
+                                  完成后需手动重启 daemon 让新 config 生效。
+                                  daemon 必须先停（先 launchctl bootout）。
+                                  --allow-missing-blobs 跳过 blob 缺失预检（默认拒）。
+                                  --dry-run 跑预检 + 算 result 但不真写 config。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -124,5 +138,139 @@ enum CLI {
             FileHandle.standardError.write(Data("retry-failed-ocr failed: \(error)\n".utf8))
             exit(1)
         }
+    }
+
+    private static func runMeshInit(args: [String]) {
+        var peerSpecs: [String] = []   // 原始 "URL[,DEVICE_ID]" 串，按出现顺序
+        var serveHost: String? = nil
+        var servePort: Int? = nil
+        var allowMissingBlobs = false
+        var dryRun = false
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--peer":
+                if i + 1 < args.count {
+                    peerSpecs.append(args[i + 1])
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-init: --peer 缺值\n".utf8))
+                    exit(1)
+                }
+            case "--serve-host":
+                if i + 1 < args.count {
+                    serveHost = args[i + 1]
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-init: --serve-host 缺值\n".utf8))
+                    exit(1)
+                }
+            case "--serve-port":
+                if i + 1 < args.count, let p = Int(args[i + 1]), (1...65535).contains(p) {
+                    servePort = p
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-init: --serve-port 缺值或越界 (1-65535)\n".utf8))
+                    exit(1)
+                }
+            case "--allow-missing-blobs":
+                allowMissingBlobs = true
+                i += 1
+            case "--dry-run":
+                dryRun = true
+                i += 1
+            default:
+                FileHandle.standardError.write(Data("mesh-init: 未知参数 \(args[i])\n".utf8))
+                exit(1)
+            }
+        }
+
+        if peerSpecs.isEmpty {
+            FileHandle.standardError.write(Data("mesh-init: 至少要 --peer 一次\n".utf8))
+            exit(1)
+        }
+
+        // parse "URL[,DEVICE_ID]" → URL + optional deviceID
+        var peerURLs: [URL] = []
+        var peerDeviceIDs: [String?] = []
+        for spec in peerSpecs {
+            let parts = spec.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+            let urlStr = String(parts[0]).trimmingCharacters(in: .whitespaces)
+            guard let url = URL(string: urlStr),
+                  let scheme = url.scheme?.lowercased(),
+                  ["http", "https"].contains(scheme),
+                  url.host != nil
+            else {
+                FileHandle.standardError.write(Data("mesh-init: --peer URL 非法 (需 http/https + host)：\(urlStr)\n".utf8))
+                exit(1)
+            }
+            peerURLs.append(url)
+            if parts.count == 2 {
+                let did = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                peerDeviceIDs.append(did.isEmpty ? nil : did)
+            } else {
+                peerDeviceIDs.append(nil)
+            }
+        }
+
+        let paths = Paths.makeDefault()
+        paths.ensureExists()
+        let blobs = BlobStore(root: paths.blobsDir)
+        // 同 promote 路径 #6：dev 跑 swift run 不在 launchctl 管理下 → false 放行
+        // 用户手动 bootout 是责任
+        let daemonRunning = LaunchAgent.isRunning(label: LaunchAgent.duoPastedLabel)
+
+        let result: Admin.MeshInitResult
+        do {
+            result = try Admin.meshInit(
+                configPath: paths.configFile,
+                dbPath: paths.mainDB,
+                blobs: blobs,
+                peerURLs: peerURLs,
+                peerDeviceIDs: peerDeviceIDs,
+                serveHost: serveHost ?? "0.0.0.0",  // mesh 部署默认开 LAN，不像 standalone 默 127.0.0.1
+                servePort: servePort,
+                allowMissingBlobs: allowMissingBlobs,
+                dryRun: dryRun,
+                daemonRunning: daemonRunning,
+                daemonLabel: LaunchAgent.duoPastedLabel
+            )
+        } catch {
+            FileHandle.standardError.write(Data("mesh-init failed: \(error)\n".utf8))
+            exit(1)
+        }
+
+        var lines: [String] = []
+        if result.dryRun {
+            lines.append("mesh-init dry-run · 未写 config")
+        } else {
+            lines.append("mesh-init done · config 已写到 \(result.configWrittenTo.path)")
+        }
+        lines.append("  peers: \(result.peerURLs.count)")
+        for (i, url) in result.peerURLs.enumerated() {
+            let did = (i < peerDeviceIDs.count) ? (peerDeviceIDs[i] ?? "(learn)") : "(learn)"
+            lines.append("    - \(url.absoluteString) · device_id=\(did)")
+        }
+        if !result.removedLegacyKeys.isEmpty {
+            lines.append("  removed legacy keys: \(result.removedLegacyKeys.joined(separator: ", "))")
+        }
+        if result.missingBlobsTotal > 0 {
+            lines.append("")
+            lines.append("⚠ WARNING: \(result.missingBlobsTotal) 个 blob 在本机 BlobStore 缺字节")
+            lines.append("  这些 image/file 历史在本机 /blob/<sha> 上将返回 404。示例 sha：")
+            for sha in result.missingBlobsSamples {
+                lines.append("    - \(sha)")
+            }
+        }
+        if !result.dryRun {
+            lines.append("")
+            lines.append("下一步：重启 daemon 让新 config 生效")
+            lines.append("  launchctl bootstrap gui/$UID ~/Library/LaunchAgents/\(LaunchAgent.duoPastedLabel).plist")
+            lines.append("  launchctl enable    gui/$UID/\(LaunchAgent.duoPastedLabel)")
+            lines.append("  launchctl kickstart -k gui/$UID/\(LaunchAgent.duoPastedLabel)")
+            lines.append("  （若 daemon 仍处于 loaded 状态，跳过 bootstrap/enable 直接 kickstart）")
+        }
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+        exit(0)
     }
 }

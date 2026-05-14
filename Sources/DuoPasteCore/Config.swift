@@ -25,11 +25,14 @@ public struct Config: Codable, Sendable, Equatable {
     /// PEM 私钥路径。`tailscale cert <hostname>` 输出的 `<hostname>.key`。
     public var tlsKeyPath: String?
 
-    /// 非空 → 启动 push worker，把本地 origin pending 推到这里。
-    /// 为空 → 没有外部 primary，本机即权威源（standalone 或自己就是 primary）。
-    public var primaryURL: URL?
+    /// Mesh 拓扑下的对端 peer 列表。每台机器把别的所有 mac 写到这里——本机会为
+    /// 每个 peer 起 PullWorker（拉对端 /since）+ WSNotificationClient（订阅对端
+    /// /sync/ws cursor_advanced 通知）。空数组 = standalone（不主动连任何对端）。
+    public var peers: [PeerConfig]
 
-    public var pull: PullConfig
+    /// Mesh 全局参数：pull 周期 / WS 心跳 / dedup 窗 / 时钟偏移阈值 等。
+    /// 各 peer 共享同一份配置——不需要 per-peer 调参（plan §"Config schema"）。
+    public var mesh: MeshConfig
 
     /// OCR 段：是否启用 + 语言 + blob 上限 + Vision 识别精度。详 plan vivid-scanning-vellum.md
     /// 第 3 刀。enabled=false → AppDelegate 不启 OCRWorker；CaptureService 仍标 pending
@@ -221,25 +224,143 @@ public struct Config: Codable, Sendable, Equatable {
         }
     }
 
-    public struct PullConfig: Codable, Sendable, Equatable {
-        /// true → 启动 pull worker，周期拉 primary 全量到 item_mirror。
+    /// Mesh 对端 peer。`url` 必填指向对端 server（http/https，scheme 决定 WS 走 ws/wss）。
+    /// `deviceID` 可选——`mesh-init` 写新 config 时一般不知道（要等首次 /health 探测才能学到），
+    /// 留 nil 让 PullWorker 跑学习模式（首次 tick 时把对端 device_id stamp 进 pull_cursor）。
+    /// 显式给 deviceID 走严格模式：peer URL 指错机器时 PullWorker 立刻 transient skip 不污染 DB。
+    public struct PeerConfig: Codable, Sendable, Equatable {
+        public var url: URL
+        public var deviceID: String?
+
+        public init(url: URL, deviceID: String? = nil) {
+            self.url = url
+            self.deviceID = deviceID
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case url
+            case deviceID = "device_id"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let s = try c.decode(String.self, forKey: .url)
+            // URL(string:) 接受很多畸形串；scheme + host guard 防"not a url"误读
+            guard let u = URL(string: s),
+                  let scheme = u.scheme?.lowercased(),
+                  ["http", "https"].contains(scheme),
+                  u.host != nil
+            else {
+                throw ConfigError.invalidPeerURL(s)
+            }
+            self.url = u
+            self.deviceID = try c.decodeIfPresent(String.self, forKey: .deviceID)
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(url.absoluteString, forKey: .url)
+            try c.encodeIfPresent(deviceID, forKey: .deviceID)
+        }
+    }
+
+    /// Mesh 全局参数。各 peer 共享，不分 per-peer 配置。详 plan §"Config schema"。
+    public struct MeshConfig: Codable, Sendable, Equatable {
+        /// false → 退化为 standalone（peers 字段也应为空；validate 强制）。
         public var enabled: Bool
-        public var intervalSec: Int
-        /// true → blob 也预拉（默认懒拉：搜索结果点开时才拉）。
+        /// PullWorker 周期 floor。WS cursor_advanced 通了仍每 N 秒拉一次兜底（防 WS 漏推）。
+        public var pullIntervalSec: Int
+        public var pullBatchLimit: Int
+        public var pullInitialBackoffSec: TimeInterval
+        public var pullMaxBackoffSec: TimeInterval
+        /// 跨设备 Continuity dedup 窗口（纳秒）。0 = 关。默认 5e9 (5s) 兜 Universal Clipboard 副本。
+        public var crossDeviceDedupWindowNs: Int64
+        /// 时钟偏移告警阈值（毫秒）。HMAC 容忍 ±5min skew，30s 是早期预警。
+        public var clockSkewWarnMs: Int64
+        /// true → PullWorker 拉完一页 metadata 顺路 GET 缺的 blob 字节。
+        /// 默认 false，走 lazy paste-back 路径即可。
         public var eagerBlobs: Bool
+        /// false → 关 WS 通知层退化为 30s 周期 pull。
+        public var wsEnabled: Bool
+        public var wsReconnectInitialSec: TimeInterval
+        public var wsReconnectMaxSec: TimeInterval
+        /// WS 协议层 autoPing 周期（秒）。客户端跟服务端都用这个值。
+        /// 不设 wsServerHeartbeatTimeoutSec 单独项——交给 hbws autoPing 隐式 2x ping 期超时。
+        public var wsHeartbeatSec: TimeInterval
 
-        public static let `default` = PullConfig(enabled: false, intervalSec: 30, eagerBlobs: false)
+        public static let `default` = MeshConfig(
+            enabled: true,
+            pullIntervalSec: 30,
+            pullBatchLimit: 500,
+            pullInitialBackoffSec: 2,
+            pullMaxBackoffSec: 120,
+            crossDeviceDedupWindowNs: 5_000_000_000,
+            clockSkewWarnMs: 30_000,
+            eagerBlobs: false,
+            wsEnabled: true,
+            wsReconnectInitialSec: 1,
+            wsReconnectMaxSec: 60,
+            wsHeartbeatSec: 30
+        )
 
-        public init(enabled: Bool, intervalSec: Int, eagerBlobs: Bool) {
+        public init(
+            enabled: Bool,
+            pullIntervalSec: Int,
+            pullBatchLimit: Int,
+            pullInitialBackoffSec: TimeInterval,
+            pullMaxBackoffSec: TimeInterval,
+            crossDeviceDedupWindowNs: Int64,
+            clockSkewWarnMs: Int64,
+            eagerBlobs: Bool,
+            wsEnabled: Bool,
+            wsReconnectInitialSec: TimeInterval,
+            wsReconnectMaxSec: TimeInterval,
+            wsHeartbeatSec: TimeInterval
+        ) {
             self.enabled = enabled
-            self.intervalSec = intervalSec
+            self.pullIntervalSec = pullIntervalSec
+            self.pullBatchLimit = pullBatchLimit
+            self.pullInitialBackoffSec = pullInitialBackoffSec
+            self.pullMaxBackoffSec = pullMaxBackoffSec
+            self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
+            self.clockSkewWarnMs = clockSkewWarnMs
             self.eagerBlobs = eagerBlobs
+            self.wsEnabled = wsEnabled
+            self.wsReconnectInitialSec = wsReconnectInitialSec
+            self.wsReconnectMaxSec = wsReconnectMaxSec
+            self.wsHeartbeatSec = wsHeartbeatSec
         }
 
         enum CodingKeys: String, CodingKey {
             case enabled
-            case intervalSec = "interval_sec"
+            case pullIntervalSec = "pull_interval_sec"
+            case pullBatchLimit = "pull_batch_limit"
+            case pullInitialBackoffSec = "pull_initial_backoff_sec"
+            case pullMaxBackoffSec = "pull_max_backoff_sec"
+            case crossDeviceDedupWindowNs = "cross_device_dedup_window_ns"
+            case clockSkewWarnMs = "clock_skew_warn_ms"
             case eagerBlobs = "eager_blobs"
+            case wsEnabled = "ws_enabled"
+            case wsReconnectInitialSec = "ws_reconnect_initial_sec"
+            case wsReconnectMaxSec = "ws_reconnect_max_sec"
+            case wsHeartbeatSec = "ws_heartbeat_sec"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let d = MeshConfig.default
+            self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
+            self.pullIntervalSec = try c.decodeIfPresent(Int.self, forKey: .pullIntervalSec) ?? d.pullIntervalSec
+            self.pullBatchLimit = try c.decodeIfPresent(Int.self, forKey: .pullBatchLimit) ?? d.pullBatchLimit
+            self.pullInitialBackoffSec = try c.decodeIfPresent(TimeInterval.self, forKey: .pullInitialBackoffSec) ?? d.pullInitialBackoffSec
+            self.pullMaxBackoffSec = try c.decodeIfPresent(TimeInterval.self, forKey: .pullMaxBackoffSec) ?? d.pullMaxBackoffSec
+            self.crossDeviceDedupWindowNs = try c.decodeIfPresent(Int64.self, forKey: .crossDeviceDedupWindowNs) ?? d.crossDeviceDedupWindowNs
+            self.clockSkewWarnMs = try c.decodeIfPresent(Int64.self, forKey: .clockSkewWarnMs) ?? d.clockSkewWarnMs
+            self.eagerBlobs = try c.decodeIfPresent(Bool.self, forKey: .eagerBlobs) ?? d.eagerBlobs
+            self.wsEnabled = try c.decodeIfPresent(Bool.self, forKey: .wsEnabled) ?? d.wsEnabled
+            self.wsReconnectInitialSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsReconnectInitialSec) ?? d.wsReconnectInitialSec
+            self.wsReconnectMaxSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsReconnectMaxSec) ?? d.wsReconnectMaxSec
+            self.wsHeartbeatSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsHeartbeatSec) ?? d.wsHeartbeatSec
         }
     }
 
@@ -250,8 +371,8 @@ public struct Config: Codable, Sendable, Equatable {
         serveTLS: false,
         tlsCertPath: nil,
         tlsKeyPath: nil,
-        primaryURL: nil,
-        pull: .default,
+        peers: [],
+        mesh: .default,
         ocr: .default,
         capture: .default,
         hotkey: .default,
@@ -265,8 +386,8 @@ public struct Config: Codable, Sendable, Equatable {
         serveTLS: Bool,
         tlsCertPath: String?,
         tlsKeyPath: String?,
-        primaryURL: URL?,
-        pull: PullConfig,
+        peers: [PeerConfig],
+        mesh: MeshConfig = .default,
         ocr: OCRSettings = .default,
         capture: CaptureLimits = .default,
         hotkey: HotkeyConfig = .default,
@@ -278,8 +399,8 @@ public struct Config: Codable, Sendable, Equatable {
         self.serveTLS = serveTLS
         self.tlsCertPath = tlsCertPath
         self.tlsKeyPath = tlsKeyPath
-        self.primaryURL = primaryURL
-        self.pull = pull
+        self.peers = peers
+        self.mesh = mesh
         self.ocr = ocr
         self.capture = capture
         self.hotkey = hotkey
@@ -293,8 +414,8 @@ public struct Config: Codable, Sendable, Equatable {
         case serveTLS = "serve_tls"
         case tlsCertPath = "tls_cert_path"
         case tlsKeyPath = "tls_key_path"
-        case primaryURL = "primary_url"
-        case pull
+        case peers
+        case mesh
         case ocr
         case capture
         case hotkey
@@ -309,21 +430,8 @@ public struct Config: Codable, Sendable, Equatable {
         self.serveTLS = try c.decodeIfPresent(Bool.self, forKey: .serveTLS) ?? false
         self.tlsCertPath = try c.decodeIfPresent(String.self, forKey: .tlsCertPath)
         self.tlsKeyPath = try c.decodeIfPresent(String.self, forKey: .tlsKeyPath)
-        if let s = try c.decodeIfPresent(String.self, forKey: .primaryURL), !s.isEmpty {
-            // URL(string:) 出奇地宽松（接受 "not a url"），用 scheme 是否存在做硬约束。
-            // 真实 primary_url 必然是 http/https。
-            guard let url = URL(string: s),
-                  let scheme = url.scheme?.lowercased(),
-                  ["http", "https"].contains(scheme),
-                  url.host != nil
-            else {
-                throw ConfigError.invalidPrimaryURL(s)
-            }
-            self.primaryURL = url
-        } else {
-            self.primaryURL = nil
-        }
-        self.pull = try c.decodeIfPresent(PullConfig.self, forKey: .pull) ?? .default
+        self.peers = try c.decodeIfPresent([PeerConfig].self, forKey: .peers) ?? []
+        self.mesh = try c.decodeIfPresent(MeshConfig.self, forKey: .mesh) ?? .default
         self.ocr = try c.decodeIfPresent(OCRSettings.self, forKey: .ocr) ?? .default
         self.capture = try c.decodeIfPresent(CaptureLimits.self, forKey: .capture) ?? .default
         self.hotkey = try c.decodeIfPresent(HotkeyConfig.self, forKey: .hotkey) ?? .default
@@ -335,15 +443,14 @@ public struct Config: Codable, Sendable, Equatable {
     /// 把 cfg 序列化写到 `path`（atomic + 0600 权限）。
     ///
     /// **保留未知字段**（含嵌套）：如果 path 已存在且能解析成 JSON dict，先用原 dict 做 base，
-    /// 再用 cfg 的字段**逐 key 覆盖**——top-level 和 `pull` / `capture` 子 dict 都是 merge 而
-    /// 非 replace。这样：
-    /// - 用户/运维往 config.json 手动加的非 Config 字段不被吞掉（顶层注释 key、调试开关等）
-    /// - `pull` / `capture` 子段内的未知键也不丢（未来新增字段、运维手动加的注解都安全）
-    /// - 老版本 daemon 写回时不会误删新版本字段
+    /// 再用 cfg 的字段**逐 key 覆盖**——top-level 和子 dict 都是 merge 而非 replace。
+    /// **数组例外**：`peers` 数组没法 merge（每条目顺序 + 字段语义跟"未知字段"无关），
+    /// 直接 replace。
+    ///
+    /// PR 5 mesh-init 写新格式 config 时**显式 removeValue 老字段** `primary_url` / `pull`，
+    /// 避免老 daemon 留下来的字段跟新字段冲突。
     ///
     /// 写入前调 `validate()`，非法字段组合直接 throw，不写半成品文件。
-    ///
-    /// 唯一已知调用方：`Admin.promoteToPrimary`。普通启动路径只读不写。
     public static func write(_ cfg: Config, to path: URL) throws {
         try cfg.validate()
 
@@ -355,21 +462,39 @@ public struct Config: Codable, Sendable, Equatable {
             dict = parsed
         }
 
+        // PR 5：清掉老 schema 的 primary_url / pull——升级路径上 mesh-init 写新 config
+        // 时这两 key 一定要消失，否则启动时 Decodable 不会因为有未知字段报错（已经
+        // decodeIfPresent + 缺省值），但用户读 config.json 会看到语义冲突的两套字段
+        dict.removeValue(forKey: "primary_url")
+        dict.removeValue(forKey: "pull")
+
         dict[CodingKeys.serve.rawValue] = cfg.serve
         dict[CodingKeys.serveHost.rawValue] = cfg.serveHost
         dict[CodingKeys.servePort.rawValue] = cfg.servePort
         dict[CodingKeys.serveTLS.rawValue] = cfg.serveTLS
         Self.setOrRemove(&dict, CodingKeys.tlsCertPath.rawValue, cfg.tlsCertPath)
         Self.setOrRemove(&dict, CodingKeys.tlsKeyPath.rawValue, cfg.tlsKeyPath)
-        Self.setOrRemove(&dict, CodingKeys.primaryURL.rawValue, cfg.primaryURL?.absoluteString)
 
-        // P2 review fix: nested merge——读原 sub-dict 做 base 后只覆盖目标 key，保留任何
-        // 未来字段或用户手动加的 sub-keys（之前是整段 replace，会丢嵌套未知字段）
-        var pullDict = (dict[CodingKeys.pull.rawValue] as? [String: Any]) ?? [:]
-        pullDict["enabled"] = cfg.pull.enabled
-        pullDict["interval_sec"] = cfg.pull.intervalSec
-        pullDict["eager_blobs"] = cfg.pull.eagerBlobs
-        dict[CodingKeys.pull.rawValue] = pullDict
+        // peers 数组 replace（数组无嵌套 merge 语义；每条 PeerConfig 是值类型，整体覆盖）。
+        // 序列化用 JSONEncoder 统一 snake_case：encode → decode 回 [[String: Any]] 嵌进 dict
+        let peersJSON = try JSONEncoder().encode(cfg.peers)
+        dict[CodingKeys.peers.rawValue] = (try? JSONSerialization.jsonObject(with: peersJSON)) ?? []
+
+        // mesh 段 nested merge——读原 sub-dict 做 base，只覆盖 cfg 内字段，保留未来字段
+        var meshDict = (dict[CodingKeys.mesh.rawValue] as? [String: Any]) ?? [:]
+        meshDict["enabled"] = cfg.mesh.enabled
+        meshDict["pull_interval_sec"] = cfg.mesh.pullIntervalSec
+        meshDict["pull_batch_limit"] = cfg.mesh.pullBatchLimit
+        meshDict["pull_initial_backoff_sec"] = cfg.mesh.pullInitialBackoffSec
+        meshDict["pull_max_backoff_sec"] = cfg.mesh.pullMaxBackoffSec
+        meshDict["cross_device_dedup_window_ns"] = cfg.mesh.crossDeviceDedupWindowNs
+        meshDict["clock_skew_warn_ms"] = cfg.mesh.clockSkewWarnMs
+        meshDict["eager_blobs"] = cfg.mesh.eagerBlobs
+        meshDict["ws_enabled"] = cfg.mesh.wsEnabled
+        meshDict["ws_reconnect_initial_sec"] = cfg.mesh.wsReconnectInitialSec
+        meshDict["ws_reconnect_max_sec"] = cfg.mesh.wsReconnectMaxSec
+        meshDict["ws_heartbeat_sec"] = cfg.mesh.wsHeartbeatSec
+        dict[CodingKeys.mesh.rawValue] = meshDict
 
         var captureDict = (dict[CodingKeys.capture.rawValue] as? [String: Any]) ?? [:]
         captureDict["max_blob_mb"] = cfg.capture.maxBlobBytes / (1024 * 1024)
@@ -443,18 +568,38 @@ public struct Config: Codable, Sendable, Equatable {
 
     /// 字段组合校验。语义上无意义的组合在启动时就报错，比留到运行时悄悄失败好。
     public func validate() throws {
-        if pull.enabled && primaryURL == nil {
-            throw ConfigError.invalidCombination(
-                "pull.enabled=true 但 primary_url 为空——没有可拉取的源"
-            )
+        if mesh.enabled && peers.isEmpty && !serve {
+            // mesh 开启但既无对端可拉、本机也不 serve 让别人来连——配置无意义
+            // standalone 部署应当 mesh.enabled=false 或显式留 peers 空 + serve=false（合法的独立模式）
+            // 这里只当用户标明 mesh.enabled=true 还啥都没配时才报，让 standalone 隐式 mesh.enabled=true
+            // + peers 空通过（因为 default 就是这样）
         }
-        if serve && primaryURL != nil {
-            throw ConfigError.invalidCombination(
-                "serve=true 且 primary_url 非空——primary 不应同时作为别人的 client"
-            )
+        if mesh.pullIntervalSec < 1 {
+            throw ConfigError.invalidCombination("mesh.pull_interval_sec 必须 >= 1")
         }
-        if pull.intervalSec < 1 {
-            throw ConfigError.invalidCombination("pull.interval_sec 必须 >= 1")
+        if mesh.pullBatchLimit < 1 {
+            throw ConfigError.invalidCombination("mesh.pull_batch_limit 必须 >= 1")
+        }
+        if mesh.crossDeviceDedupWindowNs < 0 {
+            throw ConfigError.invalidCombination("mesh.cross_device_dedup_window_ns 必须 >= 0")
+        }
+        if mesh.wsHeartbeatSec < 1 {
+            throw ConfigError.invalidCombination("mesh.ws_heartbeat_sec 必须 >= 1")
+        }
+        // peers 内 url 重复 / device_id 重复检查——启动时撞了立刻报，免得运行时
+        // 两个 PullWorker 抢同一行 cursor / 同一份 mirror
+        var seenURLs = Set<String>()
+        var seenDeviceIDs = Set<String>()
+        for p in peers {
+            let key = p.url.absoluteString
+            if !seenURLs.insert(key).inserted {
+                throw ConfigError.invalidCombination("peers 列表里 url 重复：\(key)")
+            }
+            if let did = p.deviceID, !did.isEmpty {
+                if !seenDeviceIDs.insert(did).inserted {
+                    throw ConfigError.invalidCombination("peers 列表里 device_id 重复：\(did)")
+                }
+            }
         }
         if capture.maxBlobBytes < 1 {
             throw ConfigError.invalidCombination("capture.max_blob_mb 必须 >= 1")
@@ -535,21 +680,23 @@ public struct Config: Codable, Sendable, Equatable {
     }
 
     /// 用户可读的单行摘要，启动日志用。
+    /// Mesh 拓扑下不再有 primary/client 角色，只描述 serve 状态 + peer 数。
     public var summary: String {
         let scheme = serveTLS ? "https" : "http"
-        switch (serve, primaryURL) {
-        case (false, nil): return "standalone"
-        case (true, nil):  return "primary @ \(scheme)://\(serveHost):\(servePort)"
-        case (false, let url?): return pull.enabled ? "client+mirror→\(url.absoluteString)" : "client→\(url.absoluteString)"
-        case (true, _?): return "INVALID"  // validate() 应已拦截
+        let serveDesc = serve ? "serve@\(scheme)://\(serveHost):\(servePort)" : "no-serve"
+        if peers.isEmpty {
+            return serve ? "standalone · \(serveDesc)" : "standalone"
         }
+        let peerCount = peers.count
+        let wsState = mesh.wsEnabled ? "ws=on" : "ws=off"
+        return "mesh · \(peerCount) peer\(peerCount == 1 ? "" : "s") · \(serveDesc) · \(wsState)"
     }
 }
 
 public enum ConfigError: Error, CustomStringConvertible, Sendable {
     case readFailed(path: URL, underlying: Error)
     case decodeFailed(path: URL, underlying: Error)
-    case invalidPrimaryURL(String)
+    case invalidPeerURL(String)
     case invalidCombination(String)
 
     public var description: String {
@@ -558,8 +705,8 @@ public enum ConfigError: Error, CustomStringConvertible, Sendable {
             return "读取 config 失败 (\(p.path)): \(e)"
         case .decodeFailed(let p, let e):
             return "解析 config JSON 失败 (\(p.path)): \(e)"
-        case .invalidPrimaryURL(let s):
-            return "primary_url 不是合法 URL: \(s)"
+        case .invalidPeerURL(let s):
+            return "peer url 不是合法 http(s) URL: \(s)"
         case .invalidCombination(let msg):
             return "config 字段组合非法: \(msg)"
         }

@@ -25,47 +25,90 @@ private func tmpConfig(_ json: String) throws -> URL {
     #expect(cfg == Config.default)
 }
 
-@Test func configClientMode() throws {
+@Test func configMeshSinglePeer() throws {
+    // 单 peer 部署：本机 serve + 配一个 peer URL
     let url = try tmpConfig("""
     {
-        "primary_url": "https://primary.tail.ts.net:8443",
+        "serve": true,
+        "peers": [{ "url": "https://other.tail.ts.net:8443" }],
         "shared_secret_keychain_account": "io.duopaste.secret"
     }
     """)
     let cfg = try Config.load(from: url)
-    #expect(cfg.primaryURL?.absoluteString == "https://primary.tail.ts.net:8443")
-    #expect(cfg.summary.hasPrefix("client→"))
-}
-
-@Test func configMirrorClientMode() throws {
-    let url = try tmpConfig("""
-    {
-        "primary_url": "https://primary.tail.ts.net:8443",
-        "pull": { "enabled": true, "interval_sec": 30, "eager_blobs": false }
-    }
-    """)
-    let cfg = try Config.load(from: url)
-    #expect(cfg.pull.enabled == true)
-    #expect(cfg.summary.hasPrefix("client+mirror→"))
-}
-
-@Test func configPrimaryMode() throws {
-    let url = try tmpConfig("""
-    {
-        "serve": true
-    }
-    """)
-    let cfg = try Config.load(from: url)
     #expect(cfg.serve == true)
-    #expect(cfg.primaryURL == nil)
-    #expect(cfg.summary.hasPrefix("primary @"))
+    #expect(cfg.peers.count == 1)
+    #expect(cfg.peers[0].url.absoluteString == "https://other.tail.ts.net:8443")
+    #expect(cfg.peers[0].deviceID == nil)
+    #expect(cfg.summary.contains("mesh"))
+    #expect(cfg.summary.contains("1 peer"))
 }
 
-@Test func configRejectsServeWithPrimaryURL() throws {
+@Test func configMeshMultiPeerWithDeviceIDs() throws {
+    // 多 peer 部署：每条带 device_id 走严格模式
     let url = try tmpConfig("""
     {
         "serve": true,
-        "primary_url": "https://other.tail.ts.net:8443"
+        "peers": [
+            { "url": "https://mini.ts.net:8443", "device_id": "mini-device-uuid" },
+            { "url": "https://mbp.ts.net:8443", "device_id": "mbp-device-uuid" }
+        ]
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.peers.count == 2)
+    #expect(cfg.peers[0].deviceID == "mini-device-uuid")
+    #expect(cfg.peers[1].deviceID == "mbp-device-uuid")
+    #expect(cfg.summary.contains("2 peers"))
+}
+
+@Test func configStandalonePrimaryMode() throws {
+    // 只 serve 不连任何 peer——standalone primary（接受其他人来连，但本机不主动出去）
+    let url = try tmpConfig("""
+    { "serve": true }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.serve == true)
+    #expect(cfg.peers.isEmpty)
+    #expect(cfg.summary.hasPrefix("standalone"))
+}
+
+@Test func configMeshSegmentDefaults() throws {
+    // mesh 段没写 → 全默认值
+    let url = try tmpConfig("{}")
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.enabled == true)
+    #expect(cfg.mesh.pullIntervalSec == 30)
+    #expect(cfg.mesh.wsEnabled == true)
+    #expect(cfg.mesh.eagerBlobs == false)
+    #expect(cfg.mesh.crossDeviceDedupWindowNs == 5_000_000_000)
+}
+
+@Test func configMeshSegmentRoundtrip() throws {
+    let url = try tmpConfig("""
+    {
+        "mesh": {
+            "enabled": true,
+            "pull_interval_sec": 60,
+            "ws_enabled": false,
+            "eager_blobs": true,
+            "ws_heartbeat_sec": 45
+        }
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.pullIntervalSec == 60)
+    #expect(cfg.mesh.wsEnabled == false)
+    #expect(cfg.mesh.eagerBlobs == true)
+    #expect(cfg.mesh.wsHeartbeatSec == 45)
+}
+
+@Test func configRejectsDuplicatePeerURLs() throws {
+    let url = try tmpConfig("""
+    {
+        "peers": [
+            { "url": "https://a.ts.net:8443" },
+            { "url": "https://a.ts.net:8443" }
+        ]
     }
     """)
     #expect(throws: ConfigError.self) {
@@ -73,11 +116,23 @@ private func tmpConfig(_ json: String) throws -> URL {
     }
 }
 
-@Test func configRejectsPullWithoutPrimary() throws {
+@Test func configRejectsDuplicatePeerDeviceIDs() throws {
     let url = try tmpConfig("""
     {
-        "pull": { "enabled": true, "interval_sec": 30, "eager_blobs": false }
+        "peers": [
+            { "url": "https://a.ts.net:8443", "device_id": "X" },
+            { "url": "https://b.ts.net:8443", "device_id": "X" }
+        ]
     }
+    """)
+    #expect(throws: ConfigError.self) {
+        _ = try Config.load(from: url)
+    }
+}
+
+@Test func configRejectsInvalidPeerURL() throws {
+    let url = try tmpConfig("""
+    { "peers": [{ "url": "not a url at all" }] }
     """)
     #expect(throws: ConfigError.self) {
         _ = try Config.load(from: url)
@@ -91,14 +146,52 @@ private func tmpConfig(_ json: String) throws -> URL {
     }
 }
 
-@Test func configRejectsInvalidPrimaryURL() throws {
-    // 包含空格的 string 不是合法 URL
+@Test func configWriteRemovesLegacyKeys() throws {
+    // 老 config.json 含 primary_url + pull 字段，write 必须显式 removeValue 这两 key——
+    // 否则升级后 daemon 启动看到两套字段共存（虽然代码忽略，但用户读 config 困惑）
     let url = try tmpConfig("""
-    { "primary_url": "not a url at all" }
-    """)
-    #expect(throws: ConfigError.self) {
-        _ = try Config.load(from: url)
+    {
+        "primary_url": "https://old.ts.net:8443",
+        "pull": { "enabled": true, "interval_sec": 30 },
+        "serve": false
     }
+    """)
+    var cfg = try Config.load(from: url)
+    cfg.peers = [Config.PeerConfig(url: URL(string: "https://new.ts.net:8443")!)]
+    cfg.serve = true
+    try Config.write(cfg, to: url)
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    #expect(dict["primary_url"] == nil)
+    #expect(dict["pull"] == nil)
+    #expect(dict["peers"] != nil)
+    #expect(dict["mesh"] != nil)
+    let peersArr = dict["peers"] as! [[String: Any]]
+    #expect(peersArr.count == 1)
+    #expect(peersArr[0]["url"] as? String == "https://new.ts.net:8443")
+}
+
+@Test func configWriteMeshSegmentNestedMerge() throws {
+    // mesh 段 nested merge——用户/未来加的未知字段不丢
+    let url = try tmpConfig("""
+    {
+        "mesh": {
+            "enabled": true,
+            "pull_interval_sec": 30,
+            "future_field": "preserved",
+            "debug_dump": true
+        }
+    }
+    """)
+    var cfg = try Config.load(from: url)
+    cfg.mesh.pullIntervalSec = 60
+    try Config.write(cfg, to: url)
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    let mesh = dict["mesh"] as! [String: Any]
+    #expect((mesh["future_field"] as? String) == "preserved")
+    #expect((mesh["debug_dump"] as? Bool) == true)
+    #expect((mesh["pull_interval_sec"] as? Int) == 60)
 }
 
 @Test func captureMergeWindowDefaultsTo300() throws {
@@ -133,13 +226,14 @@ private func tmpConfig(_ json: String) throws -> URL {
     }
 }
 
-@Test func configEmptyPrimaryURLStringTreatedAsNil() throws {
-    // 用户手抖把 primary_url 留空字符串，应当走默认（standalone），不报错
+@Test func configIgnoresUnknownLegacyPrimaryURLKey() throws {
+    // PR 5 删了 primary_url 字段——老 config.json 里残留这个 key 时
+    // Config.load 应当忽略（unknown key），不报错。peers 仍走默认空数组。
     let url = try tmpConfig("""
-    { "primary_url": "" }
+    { "primary_url": "https://old.ts.net:8443" }
     """)
     let cfg = try Config.load(from: url)
-    #expect(cfg.primaryURL == nil)
+    #expect(cfg.peers.isEmpty)  // primary_url 不被映射成 peer
 }
 
 // MARK: - hotkey
