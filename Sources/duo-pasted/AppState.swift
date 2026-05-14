@@ -265,30 +265,24 @@ final class AppState {
         }
     }
 
-    /// 列表刷新后调整选中行：
-    /// - **query 空**（首次打开 / 清空搜索）→ 强制单选第一项（最新捕获），清空多选,触发滚到顶
-    /// - **query 非空 + 至少一个原选中行仍在结果里** → 保持那部分顺序（让"缩小关键词" /
-    ///   切 filter chip 流不丢已选项）
-    /// - **query 非空 + 原选中行全被过滤掉** → 退化单选第一项
+    /// 列表刷新后调整选中行,策略统一 "kept 优先":
+    /// - **原选中行至少一个仍在 results 里** → 保留那部分顺序(过滤掉已被删的)
+    /// - **原选中行全被过滤掉 / 当前空选** → 退化单选第一项 + 触发滚到顶
+    ///
+    /// **不分 queryIsEmpty**——原版 query 空时强制 reset 到第一项,导致 panel 已打开时
+    /// 新 capture refresh 把用户当前 cmd/shift 多选状态吹掉(user 反馈"选择中有新 copy
+    /// 丢失所有状态还滚到最前面")。改成只在 kept 真的空时才 reset
     private func updateSelection(forItems items: [Item], queryIsEmpty: Bool) {
         let available = Set(items.map { $0.id })
         let kept = selectedIDs.filter { available.contains($0) }
 
-        if queryIsEmpty {
-            let firstID = items.first?.id
-            let target: [String] = firstID.map { [$0] } ?? []
-            if selectedIDs != target {
-                selectedIDs = target
-                anchorID = firstID
-                if firstID != nil { scrollPulse &+= 1 }
-            }
-        } else if !kept.isEmpty {
+        if !kept.isEmpty {
             if kept != selectedIDs { selectedIDs = kept }
-        } else {
-            let firstID = items.first?.id
-            selectedIDs = firstID.map { [$0] } ?? []
-            anchorID = firstID
-            if firstID != nil { scrollPulse &+= 1 }
+            return
         }
+        let firstID = items.first?.id
+        selectedIDs = firstID.map { [$0] } ?? []
+        anchorID = firstID
+        if firstID != nil { scrollPulse &+= 1 }
     }
 }

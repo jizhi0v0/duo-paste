@@ -136,7 +136,7 @@ struct SearchView: View {
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
-        .frame(minWidth: 800, minHeight: 320, idealHeight: 320, maxHeight: 320)
+        .frame(minWidth: 800, minHeight: 300, idealHeight: 300, maxHeight: 300)
         // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
         .background(.ultraThickMaterial)
         .clipShape(
@@ -274,9 +274,8 @@ struct SearchView: View {
                             blobs: state.deps.blobs
                         )
                         .id(item.id)
-                        // 选中态轻微放大,让眼睛能瞬间锁定;animation 配合 scrollPulse 节奏
-                        .scaleEffect(state.selectedIDs.contains(item.id) ? 1.03 : 1.0)
-                        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: state.selectedIDs.contains(item.id))
+                        // user 反馈不要点击放大动画 + 首卡 scale 会让左边框超出 viewport 被裁,
+                        // scaleEffect 全撤掉,选中态靠 accent border + shadow 高亮即可
                         // 双击粘贴(无视 selectedIDs)
                         .gesture(
                             TapGesture(count: 2).onEnded {
@@ -307,15 +306,17 @@ struct SearchView: View {
                                     let hi = max(from, to)
                                     state.selectedIDs = (lo...hi).map { state.results[$0].id }
                                 } else {
+                                    // 普通单击 → 单选 + 触发 scrollTo center,让点击 viewport
+                                    // 边缘的卡也滚到完整可见(原版只有键盘 navigate 才滚)
                                     state.selectedIDs = [item.id]
                                     state.anchorID = item.id
+                                    state.scrollPulse &+= 1
                                 }
                             }
                         )
                     }
                 }
-                .padding(.vertical, 10)     // 让选中卡 scaleEffect 不被裁
-                .padding(.bottom, 6)        // 底部多留一点跟 panel 底沿分离
+                .padding(.vertical, 6)      // 仅留 6pt 给 shadow/border 不被裁,scaleEffect 撤了不需要 10
             }
             // 把 horizontal padding 从 LazyHStack 移到 ScrollView 外:这样 viewport(滚动可视
             // 区) 边离 panel 左右边各 18pt。LazyHStack 内 padding 时 viewport=panel.width,
@@ -792,12 +793,8 @@ private struct ItemCard: View {
                     .padding(4)
             }
         }
-        .overlay(alignment: .topLeading) {
-            if isRemoteMirror {
-                remoteOriginBadge
-                    .padding(6)
-            }
-        }
+        // 远端镜像角标移到 footer icon 右下角(见 footerIcon ZStack),原 topLeading
+        // overlay 在 text/url 卡顶上会遮第一个字符,user 反馈"对端标签遮文字"
         .task(id: item.blobSha256 ?? "") {
             guard shouldShowThumbnail, let sha = item.blobSha256 else {
                 if thumbnail != nil { thumbnail = nil }
@@ -887,8 +884,18 @@ private struct ItemCard: View {
         }
     }
 
-    @ViewBuilder
     private var footerIcon: some View {
+        ZStack(alignment: .bottomTrailing) {
+            footerIconCore
+            if isRemoteMirror {
+                remoteOriginBadge
+                    .offset(x: 4, y: 4)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var footerIconCore: some View {
         if item.isSelfCapture {
             ZStack {
                 Circle().fill(Color.accentColor)
