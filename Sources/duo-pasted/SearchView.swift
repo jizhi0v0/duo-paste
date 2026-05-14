@@ -222,35 +222,41 @@ struct SearchView: View {
 
     /// 紧凑 filter 行 ~30px。原 filterBar 高 ~46px,缩小 chip 字号 + padding 让它适配 280 高 panel
     private var compactFilterBar: some View {
-        HStack(spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(filterChipKinds, id: \.self) { kind in
-                        KindChip(
-                            kind: kind,
-                            isSelected: state.selectedKinds.contains(kind),
-                            count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
-                            onTap: { toggleKind(kind) }
-                        )
-                    }
-                    if !state.selectedKinds.isEmpty {
-                        Button {
-                            state.selectedKinds.removeAll()
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(filterChipKinds, id: \.self) { kind in
+                            KindChip(
+                                kind: kind,
+                                isSelected: state.selectedKinds.contains(kind),
+                                count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
+                                onTap: { toggleKind(kind) }
+                            )
                         }
-                        .buttonStyle(.plain)
-                        .help("清除类型筛选")
+                        if !state.selectedKinds.isEmpty {
+                            Button {
+                                state.selectedKinds.removeAll()
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("清除类型筛选")
+                        }
+                        pinnedOnlyChip
                     }
-                    pinnedOnlyChip
                 }
+                timeRangeMenu
             }
-            timeRangeMenu
+            .padding(.horizontal, 18)
+            .padding(.bottom, 8)
+            // 跟卡片区域分隔的 hairline
+            Rectangle()
+                .fill(Color.primary.opacity(0.06))
+                .frame(height: 0.5)
         }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 6)
     }
 
     /// Paste.app 风格横向卡片滚动。LazyHStack 让千条 item 不卡——出视口的卡 unload。
@@ -258,8 +264,7 @@ struct SearchView: View {
     private var cardScroller: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 12) {
-                    Color.clear.frame(width: 6)  // 起始 padding
+                LazyHStack(spacing: 14) {
                     ForEach(state.results) { item in
                         ItemCard(
                             item: item,
@@ -269,6 +274,9 @@ struct SearchView: View {
                             blobs: state.deps.blobs
                         )
                         .id(item.id)
+                        // 选中态轻微放大,让眼睛能瞬间锁定;animation 配合 scrollPulse 节奏
+                        .scaleEffect(state.selectedIDs.contains(item.id) ? 1.03 : 1.0)
+                        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: state.selectedIDs.contains(item.id))
                         // 双击粘贴(无视 selectedIDs)
                         .gesture(
                             TapGesture(count: 2).onEnded {
@@ -305,9 +313,10 @@ struct SearchView: View {
                             }
                         )
                     }
-                    Color.clear.frame(width: 6)  // 结束 padding
                 }
-                .padding(.vertical, 8)
+                .padding(.horizontal, 18)   // 卡片区两侧留呼吸
+                .padding(.vertical, 10)     // 让选中卡 scaleEffect 不被裁
+                .padding(.bottom, 6)        // 底部多留一点跟 panel 底沿分离
             }
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
@@ -752,17 +761,23 @@ private struct ItemCard: View {
         }
         .frame(width: 200, height: 200)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.primary.opacity(isSelected ? 0.08 : 0.04))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.primary.opacity(isSelected ? 0.07 : 0.035))
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
-            // 选中态加 accent 描边 + 加粗;未选中淡灰发丝线
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            // 选中态 accent 描边 + 加粗;未选中淡灰发丝线
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(
-                    isSelected ? Color.accentColor : Color.primary.opacity(0.10),
+                    isSelected ? Color.accentColor : Color.primary.opacity(0.08),
                     lineWidth: isSelected ? 2 : 0.5
                 )
+        )
+        // 选中卡加微阴影抬升效果
+        .shadow(
+            color: isSelected ? Color.accentColor.opacity(0.25) : .clear,
+            radius: isSelected ? 8 : 0,
+            x: 0, y: 2
         )
         .overlay(alignment: .topTrailing) {
             if item.pinned {
@@ -820,30 +835,32 @@ private struct ItemCard: View {
             .frame(width: 200, height: 168)
         } else if item.kind == .file {
             // file 卡(非 image-as-file):大文件 SF Symbol + 文件名
-            VStack(spacing: 8) {
+            VStack(spacing: 10) {
                 Image(systemName: "doc.fill")
-                    .font(.system(size: 36))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 38))
+                    .foregroundStyle(.secondary.opacity(0.7))
                 previewText
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 12)
             }
             .frame(width: 200, height: 168)
         } else {
-            // text/url/rtf/html:多行内容
+            // text/url/rtf/html:多行内容,内部留 12pt padding 让文字呼吸
             previewText
                 .font(.system(size: 13))
                 .lineLimit(8)
+                .lineSpacing(1.5)
                 .multilineTextAlignment(.leading)
                 .frame(width: 200, height: 168, alignment: .topLeading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 12)
         }
     }
 
-    /// 卡片 footer(200×32):左 app icon + 中 kind/size/time meta + 右 spacer
+    /// 卡片 footer(200×32):左 app icon + 中 kind/size/time meta + 右 spacer。
+    /// 顶部 0.5pt hairline divider 让 footer 跟内容区视觉分隔
     private var footer: some View {
         HStack(spacing: 6) {
             footerIcon
@@ -854,9 +871,14 @@ private struct ItemCard: View {
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .frame(width: 200, height: 32)
-        .background(Color.primary.opacity(0.04))
+        .background(Color.primary.opacity(0.05))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 0.5)
+        }
     }
 
     @ViewBuilder
