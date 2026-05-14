@@ -9,7 +9,9 @@ private func makeItem(
     id: String,
     kind: ItemKind,
     textFull: String? = nil,
-    preview: String? = nil
+    preview: String? = nil,
+    blobSha256: String? = nil,
+    blobMime: String? = nil
 ) -> Item {
     Item(
         id: id,
@@ -17,7 +19,9 @@ private func makeItem(
         capturedAtNs: 0,
         kind: kind,
         preview: preview,
-        textFull: textFull
+        textFull: textFull,
+        blobSha256: blobSha256,
+        blobMime: blobMime
     )
 }
 
@@ -74,6 +78,65 @@ private func makeItem(
         makeItem(id: "2", kind: .text, textFull: "b"),
     ]
     #expect(PasteMerge.strategy(for: items) == .mergedText)
+}
+
+@Test func strategyFileImageMimePlusImageReturnsMergedImages() {
+    // 2026-05-14 三修:微信/WeType 场景同一张图以 file URL+image bytes 同时入库,
+    // 前几次 watcher 抓到 file URL 走 .file kind(blob_mime=image/png),后几次裸 image bytes 走 .image。
+    // 用户多选这种"实际都是图"的混合时应走 mergedImages 让 4 张都粘成图,不是 mergedText 输出
+    // 路径+占位
+    let items = [
+        makeItem(id: "1", kind: .file, textFull: "/Users/bobby/foo.png",
+                 blobSha256: "sha1", blobMime: "image/png"),
+        makeItem(id: "2", kind: .file, textFull: "/Users/bobby/bar.heic",
+                 blobSha256: "sha2", blobMime: "image/heic"),
+        makeItem(id: "3", kind: .image, preview: "[image 130 KB]",
+                 blobSha256: "sha3", blobMime: "image/png"),
+    ]
+    #expect(PasteMerge.strategy(for: items) == .mergedImages)
+}
+
+@Test func strategyAllFileImageMimeReturnsMergedImages() {
+    // 全 file 但 blob 都是 image MIME → 也算 image-like,走 mergedImages。
+    // 代价:接收端拿到 temp 路径(sha 前 16 位.ext)而非原文件名;多图 paste 场景接受这权衡
+    let items = [
+        makeItem(id: "1", kind: .file, textFull: "/Users/bobby/a.png",
+                 blobSha256: "sha1", blobMime: "image/png"),
+        makeItem(id: "2", kind: .file, textFull: "/Users/bobby/b.heic",
+                 blobSha256: "sha2", blobMime: "image/heic"),
+    ]
+    #expect(PasteMerge.strategy(for: items) == .mergedImages)
+}
+
+@Test func strategyFileNonImageMimePlusFileImageMimeStaysMergedFile() {
+    // 1 个 file=image MIME + 1 个 file=PDF/zip 非 image MIME → 不全 image-like → mergedFile(原路径)。
+    // 避免把 PDF 也错落 temp 当图粘
+    let items = [
+        makeItem(id: "1", kind: .file, textFull: "/Users/bobby/a.png",
+                 blobSha256: "sha1", blobMime: "image/png"),
+        makeItem(id: "2", kind: .file, textFull: "/Users/bobby/b.pdf",
+                 blobSha256: "sha2", blobMime: "application/pdf"),
+    ]
+    #expect(PasteMerge.strategy(for: items) == .mergedFile)
+}
+
+@Test func strategyFileImageMimePlusTextStaysMergedText() {
+    // file image-mime + text → 不全 image-like → mergedText
+    let items = [
+        makeItem(id: "1", kind: .file, textFull: "/Users/bobby/a.png",
+                 blobSha256: "sha1", blobMime: "image/png"),
+        makeItem(id: "2", kind: .text, textFull: "hello"),
+    ]
+    #expect(PasteMerge.strategy(for: items) == .mergedText)
+}
+
+@Test func isImageLikeIdentifiesFileWithImageMime() {
+    #expect(PasteMerge.isImageLike(makeItem(id: "1", kind: .image)))
+    #expect(PasteMerge.isImageLike(makeItem(id: "2", kind: .file, blobMime: "image/png")))
+    #expect(PasteMerge.isImageLike(makeItem(id: "3", kind: .file, blobMime: "image/heic")))
+    #expect(!PasteMerge.isImageLike(makeItem(id: "4", kind: .file, blobMime: "application/pdf")))
+    #expect(!PasteMerge.isImageLike(makeItem(id: "5", kind: .file, blobMime: nil)))
+    #expect(!PasteMerge.isImageLike(makeItem(id: "6", kind: .text)))
 }
 
 @Test func strategyMixedTextSubkindsAreMergedText() {
@@ -134,7 +197,7 @@ private func makeItem(
 }
 
 @Test func joinTextualFallsBackToPreviewWhenTextFullNil() {
-    // image kind 通常 textFull = nil(OCR 才填),preview 是人类可读占位。
+    // image kind OCR 未跑时 textFull = nil,preview 是人类可读占位。
     // 跨 kind paste 时 image 必须能用 preview 进入拼接结果
     let items = [
         makeItem(id: "1", kind: .text, textFull: "hi"),
@@ -142,6 +205,29 @@ private func makeItem(
         makeItem(id: "3", kind: .text, textFull: "bye"),
     ]
     #expect(PasteMerge.joinTextual(items) == "hi\n[image 4.5 MB]\nbye")
+}
+
+@Test func joinTextualImageKindUsesPreviewEvenWhenOCRFilledTextFull() {
+    // 回归 2026-05-14 bug:用户多选 3 个 file kind + 1 个 image kind 一次 Enter
+    // 合并 paste,image 的 textFull 经 OCR worker 写入是 OCR 文本
+    // ("R\n臻选美式 巴厘岛..."),被错当 plain text 拼到结果里。
+    // 修复:image kind 始终走 preview 占位,不读 textFull。
+    // 期望:image 项的 OCR 文本不应出现在拼接输出
+    let items = [
+        makeItem(id: "1", kind: .file, textFull: "/Users/bobby/Library/Caches/WeType/dsclp/mac_1.png"),
+        makeItem(id: "2", kind: .file, textFull: "/Users/bobby/Library/Caches/WeType/dsclp/ios_1.heic"),
+        makeItem(
+            id: "3",
+            kind: .image,
+            textFull: "R\n臻选美式 巴厘岛 巴图尔火山\n中杯（355ml）",
+            preview: "[image 130 KB]"
+        ),
+    ]
+    let joined = PasteMerge.joinTextual(items)
+    #expect(joined == "/Users/bobby/Library/Caches/WeType/dsclp/mac_1.png\n/Users/bobby/Library/Caches/WeType/dsclp/ios_1.heic\n[image 130 KB]")
+    // 显式断言:OCR 文本不应泄漏到合并结果
+    #expect(joined?.contains("臻选美式") == false)
+    #expect(joined?.contains("R\n") == false)
 }
 
 @Test func joinTextualPrefersTextFullOverPreview() {

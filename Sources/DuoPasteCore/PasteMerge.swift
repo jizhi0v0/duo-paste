@@ -15,12 +15,12 @@ public enum PasteMerge {
         case mergedImages  // 全 image 多张,落 temp 文件 + writeObjects 多 file URL
     }
 
-    /// 根据 items 的 kind 组合决定合并策略。**纯函数**:不依赖 items 内容,只依赖 kind 集合。
+    /// 根据 items 的 kind 组合决定合并策略。**纯函数**:依赖每项 kind + blobMime,不读 textFull 内容。
     /// - 0 / 1 项 → singleItem(保留原单项 paste 的 image lazy 拉 blob 能力)
-    /// - 多项全 file → mergedFile(writeObjects 多 NSURL)
-    /// - 多项全 image → mergedImages(blob 字节落 temp 文件 + writeObjects 多 file URL,
-    ///   接收端是 Finder/iMessage/微信会拿到多张图)
-    /// - 多项其他(含跨 kind)→ mergedText,image/file 用 preview 兜底
+    /// - 多项全 image-like(image kind / file kind+blob_mime=image/*)→ mergedImages
+    ///   (按 sha 落 temp 文件 + writeObjects 多 file URL,接收端 Finder/iMessage/微信拿到多张图)
+    /// - 多项全 file 且非全 image-like → mergedFile(writeObjects 多 NSURL,原路径)
+    /// - 多项其他(含跨 kind 文本+图)→ mergedText,image/file 用 preview 兜底
     ///
     /// **设计变更历史**:
     /// 1. (2026-05-14) 原版跨 kind 走 fallback 取首项,user 反馈"选 4 文本+1 图 paste 只
@@ -28,20 +28,46 @@ public enum PasteMerge {
     /// 2. (2026-05-14 二修) 多 image 原本 fallback 取首项,user 觉得太弱。改成
     ///    mergedImages:每张图落 temp 文件 + writeObjects 多 file URL。接收端按"多文件 paste"
     ///    处理——Finder/Slack/iMessage/浏览器原生支持,Word 显示成多 attachment
+    /// 3. (2026-05-14 三修) image-like 判定扩展:file kind 但 blob_mime=image/* 也算
+    ///    image-like。原因:微信/WeType 等场景同一张图可能以 file URL+image bytes 两套 type
+    ///    被 capture 进库,kind 由 watcher 优先级决定(file > image),用户多选这种"实际都是图"
+    ///    的混合时,意图是"4 张都粘成图",不是"plain text 拼路径列表"。代价:接收端拿到 temp
+    ///    路径(sha 前 16 位+ext)而非原 mac_xxx.png 路径,多图 paste 场景下可接受
     public static func strategy(for items: [Item]) -> Strategy {
         if items.count <= 1 { return .singleItem }
         let kinds = Set(items.map { $0.kind })
-        if kinds == [.image] { return .mergedImages }
-        if kinds == [.file]  { return .mergedFile }
+        // image-like:image kind 或 file kind+blob 是 image MIME。allSatisfy 空 items 返 true
+        // 但上面 count<=1 已 short-circuit,这里至少 2 项
+        let allImageLike = items.allSatisfy { isImageLike($0) }
+        if allImageLike { return .mergedImages }
+        if kinds == [.file] { return .mergedFile }
         return .mergedText
     }
 
+    /// "实际是图"判定:image kind 直接是;file kind 且 blob_mime 以 `image/` 开头算。
+    /// **不**靠路径后缀——blob_mime 在 CaptureService 由 NSPasteboard UTI 推断,比文件名
+    /// 后缀靠谱(用户可能 cp foo.png bar.txt 之类)
+    public static func isImageLike(_ item: Item) -> Bool {
+        if item.kind == .image { return true }
+        if item.kind == .file, let mime = item.blobMime, mime.hasPrefix("image/") {
+            return true
+        }
+        return false
+    }
+
     /// 把 items 内容按顺序拼成单字符串(separator 分隔)。
-    /// 取值优先级:`textFull ?? preview`——image kind 的 textFull 通常 nil(OCR 才填),
-    /// preview 是 "[image 4.5 MB]" 这类人类可读占位,跨 kind paste 时用 preview 兜底让
-    /// image 也能进入拼接结果。全空 → 返回 nil(调用方据此判定"无可写入内容")
+    /// 取值优先级:
+    /// - image kind:**强制走 preview**("[image NNN KB]" / 文件名)。image 的 textFull
+    ///   被 OCR worker 填进的是 OCR 文本(常含识别噪声,如 "R\n臻选美式..."),
+    ///   跨 kind 合并 paste 用户期望的是占位/文件名而非 OCR 文本——image 的"可粘贴形式"
+    ///   是字节(走 mergedImages 路径),不是 OCR 出的字
+    /// - 其他 kind:`textFull ?? preview`——textFull 不空时直接用,nil 时退 preview 兜底
+    /// 全空 → 返回 nil(调用方据此判定"无可写入内容")
     public static func joinTextual(_ items: [Item], separator: String = "\n") -> String? {
-        let parts = items.compactMap { $0.textFull ?? $0.preview }
+        let parts = items.compactMap { item -> String? in
+            if item.kind == .image { return item.preview }
+            return item.textFull ?? item.preview
+        }
         guard !parts.isEmpty else { return nil }
         return parts.joined(separator: separator)
     }
