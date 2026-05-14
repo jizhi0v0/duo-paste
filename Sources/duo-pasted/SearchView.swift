@@ -11,7 +11,7 @@ import DuoPasteSync
     return f
 }()
 
-/// 按 sha256 → 缩略图的进程内 LRU-less 缓存。ItemCard 主区 200×168 显示原图 aspectFit。
+/// 按 sha256 → 缩略图的进程内 LRU-less 缓存。ItemCard 主区 200×188 显示原图 aspectFit。
 ///
 /// content-addressed 缓存:同一 sha 的字节内容固定 → 缩略图也固定,缓存命中率高。
 /// **maxPx=400** ≈ 卡片宽 200 × 2x retina,够清晰;原 Spotlight 列表 32pt row 用 64 太低,
@@ -136,7 +136,7 @@ struct SearchView: View {
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
-        .frame(minWidth: 800, minHeight: 280, idealHeight: 280, maxHeight: 280)
+        .frame(minWidth: 800, minHeight: 320, idealHeight: 320, maxHeight: 320)
         // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
         .background(.ultraThickMaterial)
         .clipShape(
@@ -756,10 +756,10 @@ private struct ItemCard: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            contentArea       // 主区 168(image aspectFill / 文本多行 / file 图标)
+            contentArea       // 主区 188(image aspectFill / 文本多行 / file 图标)
             footer            // 32 (app icon + kind + meta + relative time)
         }
-        .frame(width: 200, height: 200)
+        .frame(width: 200, height: 220)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(Color.primary.opacity(isSelected ? 0.07 : 0.035))
@@ -811,7 +811,7 @@ private struct ItemCard: View {
         }
     }
 
-    /// 卡片主区(200×168)。image kind 走原图 aspectFit(显示完整,letterbox 用深色背景填充);
+    /// 卡片主区(200×188)。image kind 走原图 aspectFit(显示完整,letterbox 用深色背景填充);
     /// loading 走 placeholder;text 类走多行文字
     @ViewBuilder
     private var contentArea: some View {
@@ -823,7 +823,7 @@ private struct ItemCard: View {
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
             }
-            .frame(width: 200, height: 168)
+            .frame(width: 200, height: 188)
         } else if shouldShowThumbnail {
             // 加载中:placeholder
             ZStack {
@@ -832,7 +832,7 @@ private struct ItemCard: View {
                     .font(.system(size: 32))
                     .foregroundStyle(.secondary.opacity(0.4))
             }
-            .frame(width: 200, height: 168)
+            .frame(width: 200, height: 188)
         } else if item.kind == .file {
             // file 卡(非 image-as-file):大文件 SF Symbol + 文件名
             VStack(spacing: 10) {
@@ -845,7 +845,7 @@ private struct ItemCard: View {
                     .lineLimit(2)
                     .padding(.horizontal, 12)
             }
-            .frame(width: 200, height: 168)
+            .frame(width: 200, height: 188)
         } else {
             // text/url/rtf/html:多行内容,内部留 12pt padding 让文字呼吸
             previewText
@@ -853,7 +853,7 @@ private struct ItemCard: View {
                 .lineLimit(8)
                 .lineSpacing(1.5)
                 .multilineTextAlignment(.leading)
-                .frame(width: 200, height: 168, alignment: .topLeading)
+                .frame(width: 200, height: 188, alignment: .topLeading)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 12)
         }

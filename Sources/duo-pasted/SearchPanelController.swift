@@ -140,7 +140,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         // Paste.app 风格底部条:全屏宽 + 完全贴底,只保留**顶部**两个圆角。
         // user 反馈"没有完全贴紧底部和两侧",原版 width-80 + y=minY+30 留 margin 撤掉
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 280)
+        // 280 → 320:header(42) + filterBar(32) + 卡片 220 + scrollPadding(26) ≈ 320,装得下不裁切
+        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 320)
         let p = HUDPanel(
             contentRect: contentRect,
             styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView, .resizable],
