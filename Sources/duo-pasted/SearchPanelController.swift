@@ -137,10 +137,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     private func ensurePanel() -> NSPanel {
         if let p = panel { return p }
-        // Paste.app 风格底部条:宽 = 屏幕可用宽 - 80px(两侧 40px margin),高固定 280
+        // Paste.app 风格底部条:全屏宽 + 完全贴底,只保留**顶部**两个圆角。
+        // user 反馈"没有完全贴紧底部和两侧",原版 width-80 + y=minY+30 留 margin 撤掉
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let panelWidth = max(800, screenFrame.width - 80)
-        let contentRect = NSRect(x: 0, y: 0, width: panelWidth, height: 280)
+        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 280)
         let p = HUDPanel(
             contentRect: contentRect,
             styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView, .resizable],
@@ -182,10 +182,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         let hosting = NSHostingView(rootView: root)
         hosting.frame = contentRect
         hosting.autoresizingMask = [.width, .height]
-        // 让系统 drop shadow 跟着圆角走（否则 panel rect 矩形阴影会从圆角外露出来）
+        // 全宽贴底布局:只让**顶部**两个角圆,底部直角(贴屏幕底)+左右直角(贴屏幕边)。
+        // CALayer.maskedCorners 在 macOS y-up 坐标系下 MaxY = top → 选 top-left + top-right
         hosting.wantsLayer = true
         hosting.layer?.cornerRadius = 22
         hosting.layer?.cornerCurve = .continuous
+        hosting.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
         hosting.layer?.masksToBounds = true
         p.contentView = hosting
         // wantsLayer/cornerRadius 后 invalidate 让 shadow 重新按 mask 计算
@@ -198,11 +200,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private func positionBottom(_ p: NSWindow) {
         guard let screen = NSScreen.main else { return }
         let sFrame = screen.visibleFrame
-        let pFrame = p.frame
-        let x = sFrame.midX - pFrame.width / 2
-        // 贴底 + 30px gap 留呼吸感(避免紧贴任务栏)。Paste.app 同档体验
-        let y = sFrame.minY + 30
-        p.setFrameOrigin(NSPoint(x: x, y: y))
+        // 完全贴左右屏幕边 + 完全贴底(Dock 上沿).visibleFrame 已排除 Dock,所以 minY = Dock 顶
+        p.setFrameOrigin(NSPoint(x: sFrame.minX, y: sFrame.minY))
     }
 
     // MARK: - NSWindowDelegate

@@ -11,11 +11,11 @@ import DuoPasteSync
     return f
 }()
 
-/// 按 sha256 → 缩略图的进程内 LRU-less 缓存。Image kind item / file kind 但 blob 是 image
-/// 的 item 在 ItemRow 左侧 32×32 区域显示真实缩略图替代 SF Symbol / app icon。
+/// 按 sha256 → 缩略图的进程内 LRU-less 缓存。ItemCard 主区 200×168 显示原图 aspectFit。
 ///
 /// content-addressed 缓存:同一 sha 的字节内容固定 → 缩略图也固定,缓存命中率高。
-/// **maxPx=64** = 32pt × 2x retina,downscale 不浪费内存。
+/// **maxPx=400** ≈ 卡片宽 200 × 2x retina,够清晰;原 Spotlight 列表 32pt row 用 64 太低,
+/// 改卡片布局后调高让缩略图不糊。1000 image 缓存 ~10-30MB 内存,可接受
 ///
 /// 加载策略:
 /// - `cached(sha:)` 同步查 dict,命中直接返回(SwiftUI body 内可直接调,不卡)
@@ -27,7 +27,7 @@ final class ImageThumbnailCache {
     static let shared = ImageThumbnailCache()
     private var cache: [String: NSImage] = [:]
     private var notDecodable: Set<String> = []
-    private static let maxPx: Int = 64
+    private static let maxPx: Int = 400
 
     func cached(sha256: String) -> NSImage? { cache[sha256] }
 
@@ -137,14 +137,22 @@ struct SearchView: View {
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
         .frame(minWidth: 800, minHeight: 280, idealHeight: 280, maxHeight: 280)
-        // Spotlight-style 玻璃：.ultraThickMaterial 比 .thinMaterial 更不透明、更"深色玻璃"质感。
-        // clipShape 把 hosting view 内容裁成 22pt 大圆角（跟 SearchPanelController 里 layer.cornerRadius 一致）。
+        // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
         .background(.ultraThickMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .clipShape(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 22, bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0, topTrailingRadius: 22,
+                style: .continuous
+            )
+        )
         .overlay(
-            // 0.5pt hairline 描边——dark mode 下让圆角边缘比 material 更清晰
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
+            UnevenRoundedRectangle(
+                topLeadingRadius: 22, bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0, topTrailingRadius: 22,
+                style: .continuous
+            )
+            .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
         )
         // 让内容延伸到 NSPanel titlebar 区域（fullSizeContentView 把 contentView 占位让出来，
         // 但 SwiftUI 默认仍把 titlebar 计入 top safe area，所以 header 上方会留 ~28pt 空白）
@@ -788,16 +796,19 @@ private struct ItemCard: View {
         }
     }
 
-    /// 卡片主区(200×168)。image kind 走真实缩略图占满;loading 走 placeholder;text 类走多行文字
+    /// 卡片主区(200×168)。image kind 走原图 aspectFit(显示完整,letterbox 用深色背景填充);
+    /// loading 走 placeholder;text 类走多行文字
     @ViewBuilder
     private var contentArea: some View {
         if shouldShowThumbnail, let thumb = thumbnail {
-            Image(nsImage: thumb)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 200, height: 168)
-                .clipped()
+            ZStack {
+                Color.primary.opacity(0.08)  // letterbox 填充色,跟 footer 一致
+                Image(nsImage: thumb)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+            }
+            .frame(width: 200, height: 168)
         } else if shouldShowThumbnail {
             // 加载中:placeholder
             ZStack {
