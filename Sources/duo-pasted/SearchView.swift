@@ -777,7 +777,22 @@ private struct ItemRow: View {
 
     @ViewBuilder
     private var leadingIconCore: some View {
-        if item.isSelfCapture {
+        if shouldShowThumbnail, let thumb = thumbnail {
+            // **优先级最高**:image kind / file-as-image 一旦缩略图加载好,显示真图。
+            // 不管 self-capture / app source / mirror —— 图片内容的信息量永远大于来源徽标。
+            // aspectFill + clipShape 圆角 6 让方形/长形图都裁成正方形占位,跟 app icon 视觉
+            // 重量一致;选中态加白色 stroke 跟蓝底分离
+            Image(nsImage: thumb)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 32, height: 32)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(isSelected ? Color.white.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
+        } else if item.isSelfCapture {
             // duo-paste 自家复制：圆形 badge + 剪贴板 symbol，让"自家来源"在长列表里一眼
             // 识别，而不是跟其他 fallback 共用 kind symbol。选中态翻成"白底 accent icon"
             // 跟未选中态的"accent 底白 icon"反白对称——选中行整体已经是 accent 蓝高亮,
@@ -790,19 +805,6 @@ private struct ItemRow: View {
                     .foregroundStyle(isSelected ? Color.accentColor : Color.white)
             }
             .frame(width: 32, height: 32)
-        } else if shouldShowThumbnail, let thumb = thumbnail {
-            // 真实图片缩略图。aspectFill + clipShape 圆角 6 让方形 / 长形图都裁成正方形
-            // 占位,跟 app icon 视觉重量一致;选中态加白色 stroke 跟蓝底分离
-            Image(nsImage: thumb)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 32, height: 32)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(isSelected ? Color.white.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 0.5)
-                )
         } else if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
             Image(nsImage: img)
                 .resizable()
