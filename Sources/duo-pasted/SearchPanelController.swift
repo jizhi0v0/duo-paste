@@ -140,19 +140,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         // Paste.app 风格底部条:全屏宽 + 完全贴底,只保留**顶部**两个圆角。
         // user 反馈"没有完全贴紧底部和两侧",原版 width-80 + y=minY+30 留 margin 撤掉
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // 精确 fit:header(~42) + filterBar(~32) + ScrollView(226) + 底 padding(8) = 308
-        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 308)
+        // header(~42) + filterBar(~32) + ScrollView(226) + 底 padding(12) = 312
+        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 312)
+        // borderless 让 window frame 直接 = content rect,setFrameOrigin 设的 y 就是 content
+        // 底沿。原 .titled + fullSizeContentView 组合下 window.frame.height = content + 28pt
+        // titlebar,setFrameOrigin 让 window 底沿(含 titlebar 下方区)贴 Dock,content 底沿
+        // 比 Dock 上沿低 28pt,看着像"panel 没贴 Dock 有缝隙"
         let p = HUDPanel(
             contentRect: contentRect,
-            styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView, .resizable],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        p.titlebarAppearsTransparent = true
-        p.titleVisibility = .hidden
-        p.standardWindowButton(.closeButton)?.isHidden = true
-        p.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        p.standardWindowButton(.zoomButton)?.isHidden = true
         p.isFloatingPanel = true
         p.level = .floating
         p.hidesOnDeactivate = false   // 自己控制 hide

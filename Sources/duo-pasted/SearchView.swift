@@ -136,7 +136,7 @@ struct SearchView: View {
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
-        .frame(minWidth: 800, minHeight: 308, idealHeight: 308, maxHeight: 308)
+        .frame(minWidth: 800, minHeight: 312, idealHeight: 312, maxHeight: 312)
         // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
         .background(.ultraThickMaterial)
         .clipShape(
@@ -346,7 +346,7 @@ struct SearchView: View {
             // 底沿到卡片下沿 8pt 呼吸,符合 user "底部加 padding" 需求
             .frame(height: 226)
             .padding(.horizontal, 18)
-            .padding(.bottom, 8)
+            .padding(.bottom, 12)  // 卡片下沿到 panel 下沿 12pt 呼吸,user 反馈"底部需要 padding"
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
