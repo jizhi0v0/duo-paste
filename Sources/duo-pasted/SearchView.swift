@@ -11,6 +11,61 @@ import DuoPasteSync
     return f
 }()
 
+/// 按 sha256 → 缩略图的进程内 LRU-less 缓存。Image kind item / file kind 但 blob 是 image
+/// 的 item 在 ItemRow 左侧 32×32 区域显示真实缩略图替代 SF Symbol / app icon。
+///
+/// content-addressed 缓存:同一 sha 的字节内容固定 → 缩略图也固定,缓存命中率高。
+/// **maxPx=64** = 32pt × 2x retina,downscale 不浪费内存。
+///
+/// 加载策略:
+/// - `cached(sha:)` 同步查 dict,命中直接返回(SwiftUI body 内可直接调,不卡)
+/// - `thumbnail(sha:blobs:)` async,miss 时 Task.detached 跑 background CPU decode +
+///   downscale(用 CGImageSourceCreateThumbnailAtIndex 是 Core Graphics 最快路径,~毫秒级)
+/// - decode 失败的 sha 进 `notDecodable` 黑名单,LazyVStack 重渲不再反复重试
+@MainActor
+final class ImageThumbnailCache {
+    static let shared = ImageThumbnailCache()
+    private var cache: [String: NSImage] = [:]
+    private var notDecodable: Set<String> = []
+    private static let maxPx: Int = 64
+
+    func cached(sha256: String) -> NSImage? { cache[sha256] }
+
+    func thumbnail(sha256: String, blobs: BlobStore) async -> NSImage? {
+        if let img = cache[sha256] { return img }
+        if notDecodable.contains(sha256) { return nil }
+        let maxPx = Self.maxPx
+        let img = await Task.detached(priority: .userInitiated) { () -> NSImage? in
+            guard let data = try? blobs.read(sha256: sha256) ?? nil else { return nil }
+            return Self.decodeThumbnail(data: data, maxPx: maxPx)
+        }.value
+        if let img {
+            cache[sha256] = img
+        } else {
+            notDecodable.insert(sha256)
+        }
+        return img
+    }
+
+    /// `nonisolated` 让 Task.detached 闭包能直接调——本函数纯 CG 调用 + 局部变量,无
+    /// MainActor 状态访问,跑 background CPU 安全
+    nonisolated private static func decodeThumbnail(data: Data, maxPx: Int) -> NSImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPx,
+        ]
+        guard let cgImg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+            return nil
+        }
+        // point size = pixel / 2(2x retina) 让 SwiftUI 用 point 摆放跟 32pt frame 对齐
+        let size = NSSize(width: CGFloat(cgImg.width) / 2, height: CGFloat(cgImg.height) / 2)
+        return NSImage(cgImage: cgImg, size: size)
+    }
+}
+
 /// 按 bundleID → app icon 的进程内 LRU-less 缓存。
 /// NSWorkspace.icon(forFile:) 每次都 IO 一次（读 Info.plist + .icns），row 渲染时不能每次重算。
 /// 没装的 bundleID（mirror 来的对端独有 app）会进 notFound 集合避免反复查 LaunchServices。
@@ -461,7 +516,8 @@ struct SearchView: View {
                             item: item,
                             isSelected: state.selectedIDs.contains(item.id),
                             selfDeviceID: state.deps.deviceID,
-                            snippet: state.snippets[item.id]
+                            snippet: state.snippets[item.id],
+                            blobs: state.deps.blobs
                         )
                         .contentShape(Rectangle())
                         .id(item.id)
@@ -603,9 +659,30 @@ private struct ItemRow: View {
     let selfDeviceID: String
     /// 含 STX/ETX 高亮标记的 FTS snippet。仅 query 非空 + 命中时非 nil。
     let snippet: String?
+    /// BlobStore reference 让 leadingIcon 异步加载 image kind / file-as-image 的缩略图。
+    /// struct + Sendable, 传引用 cheap
+    let blobs: BlobStore
+
+    /// 缩略图状态。.task 异步加载完 set;LazyVStack row 滚出视野 unload 时 cancel + 重置。
+    /// 加载中或非 image kind = nil → leadingIconCore 走 SF Symbol / app icon fallback
+    @State private var thumbnail: NSImage?
 
     private var isRemoteMirror: Bool {
         item.originDevice != selfDeviceID
+    }
+
+    /// 是否应该尝试显示缩略图。三种命中:
+    /// (a) image kind + 有 blob sha
+    /// (b) file kind + blob mime 标 image/
+    /// (c) file kind + 路径后缀像 image(.png/.jpg 等)——blob mime 可能 nil 但内容是图
+    private var shouldShowThumbnail: Bool {
+        guard item.blobSha256 != nil else { return false }
+        if item.kind == .image { return true }
+        if item.kind == .file {
+            if let mime = item.blobMime, mime.hasPrefix("image/") { return true }
+            if let p = item.textFull, fileLooksLikeImage(path: p) { return true }
+        }
+        return false
     }
 
     var body: some View {
@@ -657,13 +734,31 @@ private struct ItemRow: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        // Spotlight-style 选中行：inline 圆角块，不通栏到 panel 边缘
+        // Spotlight-style 选中行：inline 圆角块，不通栏到 panel 加 panel 边缘
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(isSelected ? Color.accentColor : Color.clear)
         )
         // 外圈 horizontal padding 让选中块两侧留出空气
         .padding(.horizontal, 10)
+        // 异步加载缩略图。LazyVStack row 进入视口时 fire,滚出 unload 时 task 自动 cancel。
+        // task id = sha——同 sha 不重跑(cache 同步命中);sha 变了(快路径不会发生,LazyVStack
+        // row identity 用 item.id) 才重跑
+        .task(id: item.blobSha256 ?? "") {
+            guard shouldShowThumbnail, let sha = item.blobSha256 else {
+                if thumbnail != nil { thumbnail = nil }
+                return
+            }
+            // 同步命中 cache → 立即设(避免 await yield 让 SwiftUI 跑两次 body)
+            if let cached = ImageThumbnailCache.shared.cached(sha256: sha) {
+                if thumbnail !== cached { thumbnail = cached }
+                return
+            }
+            let img = await ImageThumbnailCache.shared.thumbnail(sha256: sha, blobs: blobs)
+            if !Task.isCancelled, thumbnail !== img {
+                thumbnail = img
+            }
+        }
     }
 
     /// 左侧图标：优先 app 图标（按 bundleID 查 LaunchServices）；self capture 走专属
@@ -695,6 +790,19 @@ private struct ItemRow: View {
                     .foregroundStyle(isSelected ? Color.accentColor : Color.white)
             }
             .frame(width: 32, height: 32)
+        } else if shouldShowThumbnail, let thumb = thumbnail {
+            // 真实图片缩略图。aspectFill + clipShape 圆角 6 让方形 / 长形图都裁成正方形
+            // 占位,跟 app icon 视觉重量一致;选中态加白色 stroke 跟蓝底分离
+            Image(nsImage: thumb)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 32, height: 32)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(isSelected ? Color.white.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
         } else if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
             Image(nsImage: img)
                 .resizable()
