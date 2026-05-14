@@ -417,11 +417,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .singleItem:
             pasteBackSingle(items[0])
 
-        case .fallbackToFirst(.multipleImages):
-            // 多张图片 NSPasteboard 没法合并(单 type 单实例),退到首项。走 postNotice 拿
-            // 3s timer——直接赋 recentNotice 会绕过 timer 让 banner 永久残留(踩过)
-            state.postNotice("多张图片不可合并，已 paste 第 1 项 (共 \(items.count))")
-            pasteBackSingle(items[0])
+        case .mergedImages:
+            pasteBackMergedImages(items)
 
         case .mergedText, .mergedFile:
             // mergedText 含跨 kind:image/file 用 preview 占位; mergedFile 是全 file 多 URL。
@@ -434,6 +431,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             panel.hide()
+        }
+    }
+
+    /// 多 image 多选 paste 路径。三种情况:
+    /// 1. 全部 image 字节本机已有 → 同步走 Copyback.writeMergedImages 落 temp + writeObjects
+    /// 2. 部分缺字节 + 有 fetcher → 起 task 并发拉缺的(总 10s 超时)→ 拉完(成功 / 部分)再写
+    /// 3. 部分缺字节 + 无 fetcher → 失败 banner
+    ///
+    /// 错误策略:partial(拉到 N/M)仍写已拉的部分,banner 提示余 K 张未拉到——比"整体失败"对
+    /// 用户更友好
+    private func pasteBackMergedImages(_ items: [Item]) {
+        let missing: [String] = items.compactMap { it -> String? in
+            guard let sha = it.blobSha256 else { return nil }
+            return deps.blobs.exists(sha256: sha) ? nil : sha
+        }
+
+        if missing.isEmpty {
+            // 都在本机 → 同步 paste
+            watcher.flushPendingIfAny()
+            let (wrote, _) = Copyback.writeMergedImages(items: items, blobs: deps.blobs)
+            watcher.suppressUpToCurrent()
+            if !wrote {
+                state.pasteProgress = .failed(reason: "选中图片无可写入内容")
+                return
+            }
+            panel.hide()
+            return
+        }
+
+        guard let fetcher = pasteBlobFetcher else {
+            state.pasteProgress = .failed(reason: "部分图片在本机未缓存，且未配置 primary 拉取通道")
+            return
+        }
+
+        state.pasteProgress = .fetching(itemID: items[0].id, sizeHint: items[0].blobSize)
+        currentPasteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.fetchBlobsConcurrent(shas: missing, fetcher: fetcher, timeoutSec: 10)
+            if Task.isCancelled { return }
+            self.state.pasteProgress = .idle
+            self.watcher.flushPendingIfAny()
+            let (wrote, stillMissing) = Copyback.writeMergedImages(items: items, blobs: self.deps.blobs)
+            self.watcher.suppressUpToCurrent()
+            if !wrote {
+                self.state.pasteProgress = .failed(reason: "未能拉到任何图片字节")
+                return
+            }
+            if !stillMissing.isEmpty {
+                let got = items.count - stillMissing.count
+                self.state.postNotice("已 paste \(got) 张图（共 \(items.count)，余 \(stillMissing.count) 张未拉到）")
+            }
+            self.panel.hide()
+        }
+    }
+
+    private enum ConcurrentFetchOutcome { case fetchDone; case timeout }
+
+    /// 并发拉多个 sha 的 blob 字节。每个 sha 用现有 fetchBlobLazyInner 单条重试 backoff,
+    /// 整体用 TaskGroup + 一条 timeout task 控总时长。
+    ///
+    /// 退出条件:**所有 fetch 完成** OR **timeout 触发**(取较早者)。task 返回 outcome 让
+    /// group.next 能区分——单 group.next() 只等第一个完成会过早 cancel 还在跑的 fetch。
+    /// **不抛错**——失败的 sha 留给上层 writeMergedImages 检测(`blobs.exists` 仍 false)
+    private func fetchBlobsConcurrent(shas: [String], fetcher: BlobFetcher, timeoutSec: TimeInterval) async {
+        await withTaskGroup(of: ConcurrentFetchOutcome.self) { group in
+            let total = shas.count
+            for sha in shas {
+                group.addTask { [weak self] in
+                    if let self {
+                        _ = await self.fetchBlobLazyInner(sha: sha, fetcher: fetcher)
+                    }
+                    return .fetchDone
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSec * 1_000_000_000))
+                return .timeout
+            }
+            var fetchDone = 0
+            while let outcome = await group.next() {
+                switch outcome {
+                case .fetchDone:
+                    fetchDone += 1
+                    if fetchDone >= total {
+                        group.cancelAll()  // 所有 fetch 完成 → 取消 timer 早退
+                        return
+                    }
+                case .timeout:
+                    group.cancelAll()  // timer 先 fire → 取消还在跑的 fetch
+                    return
+                }
+            }
         }
     }
 

@@ -112,6 +112,51 @@ enum Copyback {
         return true
     }
 
+    /// 多 image 多选 paste 入口。每张 image blob 字节落 temp 文件 + writeObjects 多 file URL。
+    /// 接收端把它当"多文件 paste"——Finder/iMessage/微信/浏览器 input[type=file] 原生支持,
+    /// Word 显示成多 attachment。
+    ///
+    /// **前提**:所有 image 字节本机已就绪(调用方负责先 lazy 拉缺的)。
+    /// 返回 `(wrote, missingShas)`:
+    /// - wrote = true: 至少写了一张到 pasteboard
+    /// - missingShas: 没本机字节的 sha 列表;wrote=true 时调用方可 banner 提示用户"已 paste N 张
+    ///   (共 M,余 K 张未拉到)"。空数组 = 全部 paste 成功
+    ///
+    /// **文件名 dedupe**:用 sha 前 16 位 + mime ext 作文件名(不用 originalPath basename),
+    /// 避免 N 张同源 image(比如同一聊天工具截图缓存目录的 mac_xxx.png 列表)走 materializeTempCopy
+    /// 的 basename 推理会冲突。代价:用户在 Finder paste 后看到的是 "abc123def456...png"
+    /// 而非原文件名——多图 paste 场景下接受这个权衡(语义是"多文件",不是单文件复刻)
+    @MainActor
+    static func writeMergedImages(items: [Item], blobs: BlobStore) -> (wrote: Bool, missingShas: [String]) {
+        var urls: [NSURL] = []
+        var missing: [String] = []
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("duo-paste-paste", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        for it in items {
+            guard let sha = it.blobSha256 else { continue }
+            guard let data = try? blobs.read(sha256: sha) ?? nil else {
+                missing.append(sha)
+                continue
+            }
+            let ext = extFromMime(it.blobMime ?? "") ?? "png"
+            let name = "\(sha.prefix(16)).\(ext)"
+            let url = dir.appendingPathComponent(String(name))
+            do {
+                try data.write(to: url, options: .atomic)
+                urls.append(NSURL(fileURLWithPath: url.path))
+            } catch {
+                missing.append(sha)
+            }
+        }
+        guard !urls.isEmpty else { return (false, missing) }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        _ = pb.writeObjects(urls)
+        return (true, missing)
+    }
+
     private static func isImageMime(_ mime: String?) -> Bool {
         guard let mime else { return false }
         return mime.hasPrefix("image/")

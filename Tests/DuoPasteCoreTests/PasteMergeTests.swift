@@ -48,12 +48,14 @@ private func makeItem(
     #expect(PasteMerge.strategy(for: items) == .mergedFile)
 }
 
-@Test func strategyMultipleImageReturnsFallback() {
+@Test func strategyMultipleImageReturnsMergedImages() {
+    // **设计变更**(2026-05-14 二修):原本多图 fallback 取首项,user 觉得太弱。改成
+    // mergedImages 让多图也能落 temp 文件 + writeObjects 多 URL paste
     let items = [
         makeItem(id: "1", kind: .image),
         makeItem(id: "2", kind: .image),
     ]
-    #expect(PasteMerge.strategy(for: items) == .fallbackToFirst(reason: .multipleImages))
+    #expect(PasteMerge.strategy(for: items) == .mergedImages)
 }
 
 @Test func strategyCrossKindReturnsMergedText() {
