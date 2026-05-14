@@ -402,16 +402,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentPasteTask = nil
         state.pasteProgress = .idle
 
-        // 快路径：非 image 或 blob 本机已有 → 同步 Copyback.write + 关 panel
-        if item.kind != .image
-            || (item.blobSha256.map { deps.blobs.exists(sha256: $0) } ?? true)
-        {
+        // 快路径：不需要 lazy 拉字节 → 同步 Copyback.write + 关 panel。
+        // 慢路径触发条件（任一）：
+        //   (a) .image kind 且本机 BlobStore 没字节 —— 没字节没法粘贴
+        //   (b) .file kind 且本机文件路径不存在 + 本机 BlobStore 也没字节 ——
+        //       跨设备同步过来的 image 文件，无路径无字节时直接粘会落到 raw 路径字符串
+        //       (Copyback fallback)，看起来"粘出的是路径"。先拉字节再走 image 字节粘贴路径
+        if !needsBlobFetchForPaste(item) {
             performLocalPaste(item)
             panel.hide()
             return
         }
 
-        // 慢路径：image kind + 本机 BlobStore 没字节 → 起异步 task 拉 blob
+        // 慢路径：起异步 task 拉 blob
         guard let fetcher = pasteBlobFetcher,
               let sha = item.blobSha256
         else {
@@ -434,6 +437,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.state.pasteProgress = .failed(reason: reason)
                 // 保持 panel 显示让用户看错误——Esc 关、Enter 重试都由现有 key monitor 处理
             }
+        }
+    }
+
+    /// 判断 pasteBack 是否需要先拉 blob。.image kind 没本机字节必拉；.file kind 只在
+    /// 本机文件路径全不在 + BlobStore 也没字节时拉（跨设备同步过来的 image file item）。
+    /// 路径若在本机存在则走 Copyback `.file` 分支写 file URL，不需要 blob 字节
+    private func needsBlobFetchForPaste(_ item: Item) -> Bool {
+        guard let sha = item.blobSha256 else { return false }
+        if deps.blobs.exists(sha256: sha) { return false }
+        switch item.kind {
+        case .image:
+            return true
+        case .file:
+            return !fileItemHasUsableLocalPath(item)
+        default:
+            return false
+        }
+    }
+
+    private func fileItemHasUsableLocalPath(_ item: Item) -> Bool {
+        guard let raw = item.textFull ?? item.preview else { return false }
+        let fm = FileManager.default
+        return raw.split(separator: "\n", omittingEmptySubsequences: true).contains { line in
+            let path = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            return !path.isEmpty && fm.fileExists(atPath: path)
         }
     }
 
