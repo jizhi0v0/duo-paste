@@ -314,10 +314,13 @@ struct SearchView: View {
                         )
                     }
                 }
-                .padding(.horizontal, 18)   // 卡片区两侧留呼吸
                 .padding(.vertical, 10)     // 让选中卡 scaleEffect 不被裁
                 .padding(.bottom, 6)        // 底部多留一点跟 panel 底沿分离
             }
+            // 把 horizontal padding 从 LazyHStack 移到 ScrollView 外:这样 viewport(滚动可视
+            // 区) 边离 panel 左右边各 18pt。LazyHStack 内 padding 时 viewport=panel.width,
+            // 卡片在 viewport 右边会贴 panel 右边没 padding,user 反馈"右侧没 padding"就是这个
+            .padding(.horizontal, 18)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     withAnimation(.linear(duration: 0.12)) {
@@ -847,15 +850,18 @@ private struct ItemCard: View {
             }
             .frame(width: 200, height: 188)
         } else {
-            // text/url/rtf/html:多行内容,内部留 12pt padding 让文字呼吸
+            // text/url/rtf/html:多行内容。**padding 必须在 frame 之前**——SwiftUI 顺序
+            // 决定 padding 加在 frame 内还是外:frame 在 padding 之前会让 padding 加到 frame
+            // 外面被外层 ItemCard 200×220 strict frame 吃掉,padding 失效文字顶到卡边
             previewText
                 .font(.system(size: 13))
                 .lineLimit(8)
                 .lineSpacing(1.5)
                 .multilineTextAlignment(.leading)
-                .frame(width: 200, height: 188, alignment: .topLeading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 12)
+                .frame(width: 200, height: 188)
         }
     }
 
