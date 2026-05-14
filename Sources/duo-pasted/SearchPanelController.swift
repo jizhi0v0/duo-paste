@@ -140,9 +140,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         // Paste.app 风格底部条:全屏宽 + 完全贴底,只保留**顶部**两个圆角。
         // user 反馈"没有完全贴紧底部和两侧",原版 width-80 + y=minY+30 留 margin 撤掉
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // 精确 fit:header(~42) + filterBar(~32) + 卡片 220 + 上下 buffer 6 = 300。
-        // 高于这个值 panel 内部出现"底部空隙",user 反馈"间隔了"
-        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 300)
+        // 精确 fit:header(~42) + filterBar(~32) + ScrollView(226) + 底 padding(8) = 308
+        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 308)
         let p = HUDPanel(
             contentRect: contentRect,
             styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView, .resizable],
@@ -159,7 +158,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         p.hidesOnDeactivate = false   // 自己控制 hide
         p.becomesKeyOnlyIfNeeded = false
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        p.isMovableByWindowBackground = true
+        // panel 贴底全宽 + 卡片是主交互区,user 反馈"不应该可以移动"——拖动会让 panel
+        // 飘离贴底位置,误操作 + 位置紊乱
+        p.isMovableByWindowBackground = false
+        p.isMovable = false
         p.delegate = self
         // Spotlight-style 大圆角 + 透明 panel：让 SwiftUI .ultraThickMaterial 背景
         // 配 RoundedRectangle clipShape 自己控制形状；panel 自身透明只用来定位 + 投影。

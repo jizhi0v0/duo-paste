@@ -136,7 +136,7 @@ struct SearchView: View {
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
-        .frame(minWidth: 800, minHeight: 300, idealHeight: 300, maxHeight: 300)
+        .frame(minWidth: 800, minHeight: 308, idealHeight: 308, maxHeight: 308)
         // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
         .background(.ultraThickMaterial)
         .clipShape(
@@ -190,36 +190,47 @@ struct SearchView: View {
         // 截下来直接调 state.navigate / onPaste，绕过 SwiftUI TextField 对箭头键的吞噬。
     }
 
-    /// Paste.app 风格紧凑搜索头:单行,~42px。原 header 是 22pt 大字体 + 上下 20px padding =
-    /// ~64px,在 280px panel 里占太多。这里压成 16pt + 上下 10px = ~42px。
-    /// 内容 maxWidth 1000 居中——panel 全宽时左右铺开看着空旷,限宽让搜索框/计数视觉聚焦
+    /// 紧凑搜索头。search field 自带 capsule border + bg 像 macOS 标准 input;count 跟着
+    /// 一起在 maxWidth 800 box 内居中。user 反馈"搜索框 + label + 时间是一个整体" → 三者
+    /// 共享 maxWidth 让视觉聚焦同一区域;search 加 border 让它看着是"输入框"而非裸文字
     private var compactHeader: some View {
         HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 16, weight: .regular))
-                .foregroundStyle(.secondary)
-            TextField("搜索剪贴板历史", text: $state.query)
-                .textFieldStyle(.plain)
-                .font(.system(size: 16, weight: .regular))
-                .focused($searchFieldFocused)
-            if !state.query.isEmpty {
-                Button {
-                    state.query = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
-                        .foregroundStyle(.secondary)
+            // search 加 capsule bg + border,像标准 macOS 搜索 input
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(.secondary)
+                TextField("搜索剪贴板历史", text: $state.query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, weight: .regular))
+                    .focused($searchFieldFocused)
+                if !state.query.isEmpty {
+                    Button {
+                        state.query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                Capsule().fill(Color.primary.opacity(0.05))
+            )
+            .overlay(
+                Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
             Text("\(state.totalCount) 条")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .frame(maxWidth: 1000)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 800)
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
@@ -256,7 +267,7 @@ struct SearchView: View {
             }
             .padding(.horizontal, 18)
             .padding(.bottom, 8)
-            .frame(maxWidth: 1000)
+            .frame(maxWidth: 800)
             .frame(maxWidth: .infinity, alignment: .center)
             // 跟卡片区域分隔的 hairline
             Rectangle()
@@ -326,13 +337,16 @@ struct SearchView: View {
                         )
                     }
                 }
-                .padding(.vertical, 6)
-                .frame(maxHeight: .infinity, alignment: .top)  // 配合上面 alignment .top
+                .padding(.top, 6)  // 卡片顶部跟 filter 行 hairline 留 6pt 间距
             }
-            // 把 horizontal padding 从 LazyHStack 移到 ScrollView 外:这样 viewport(滚动可视
-            // 区) 边离 panel 左右边各 18pt。LazyHStack 内 padding 时 viewport=panel.width,
-            // 卡片在 viewport 右边会贴 panel 右边没 padding,user 反馈"右侧没 padding"就是这个
+            // 横向 padding 在 ScrollView 外让 viewport 离 panel 左右各 18pt。
+            // 精确 frame height 226 = 卡片 220 + top padding 6,让 ScrollView 不 fill remaining
+            // (user 反馈"重复打开 window 下方仍有 padding" = ScrollView fill remaining 时
+            // SwiftUI 让内容 vertical center 留下方空白)。下面 padding(.bottom, 8) 给 panel
+            // 底沿到卡片下沿 8pt 呼吸,符合 user "底部加 padding" 需求
+            .frame(height: 226)
             .padding(.horizontal, 18)
+            .padding(.bottom, 8)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
