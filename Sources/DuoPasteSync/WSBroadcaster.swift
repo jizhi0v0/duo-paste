@@ -15,6 +15,12 @@ import HummingbirdWebSocket
 /// **actor 而非 NSLock**：`broadcast` 内部要 await（write + sleep），actor 让 register/
 /// unregister/broadcast 串行天然防 dict mutate-while-iterate。`connections` 字段非 Sendable
 /// dict 也不会逃出 actor。
+///
+/// **定期 rotation（auth 安全 hardening）**：`start()` 起周期任务，每 `rotationIntervalSec`
+/// 秒主动 close 所有 connections。合法 client 走 backoff 重连 + 重 HMAC upgrade（用最新
+/// secret），attacker 偷了旧 secret 维持的"永生连接"被压缩到最长一个 rotation 窗口。
+/// **不调 start()** → broadcaster 仍然 work（fan-out 正常），只是不 rotation——测试可以
+/// 不起 lifecycle 直接用
 public actor WSBroadcaster {
     public struct ConnectionID: Hashable, Sendable, CustomStringConvertible {
         public let raw: UUID
@@ -30,16 +36,66 @@ public actor WSBroadcaster {
 
     private var connections: [ConnectionID: Connection] = [:]
     public let perBroadcastTimeoutNs: UInt64
+    /// rotation 周期（秒）。0 = 不 rotation（测试 / 开发场景）。生产默 4h
+    public let rotationIntervalSec: TimeInterval
     private let log: @Sendable (String) -> Void
+    private var rotationTask: Task<Void, Never>?
 
     public init(
         perBroadcastTimeoutSec: TimeInterval = 2,
+        rotationIntervalSec: TimeInterval = 4 * 3600,
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("ws-broadcast: \(msg)\n".utf8))
         }
     ) {
         self.perBroadcastTimeoutNs = UInt64(perBroadcastTimeoutSec * 1_000_000_000)
+        self.rotationIntervalSec = rotationIntervalSec
         self.log = log
+    }
+
+    /// 起 rotation 任务。重入幂等。`rotationIntervalSec=0` → 不起。
+    /// 应当在 daemon 启动时（AppDelegate.applicationDidFinishLaunching）调一次
+    public func start() {
+        guard rotationIntervalSec > 0, rotationTask == nil else { return }
+        let interval = rotationIntervalSec
+        rotationTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                } catch {
+                    return  // cancelled
+                }
+                await self?.rotateAllConnections()
+            }
+        }
+        // 用 String(format:) 让 0.5s 这种亚秒值也能显示，不被 Int 截 0
+        log("rotation task started · interval=\(String(format: "%.1f", interval))s")
+    }
+
+    /// 停 rotation 任务。daemon shutdown 路径调；测试 teardown 也调避免泄漏 Task
+    public func stop() {
+        rotationTask?.cancel()
+        rotationTask = nil
+    }
+
+    /// 主动 close 所有当前 connections。Connection handler 的 inbound for-await 收到
+    /// close 帧自然退出 → defer unregister 清掉 broadcaster 这边的状态 → client 端
+    /// runLoop catch error → 走 backoff 重连 → 重新做 HMAC upgrade（带最新 secret）
+    ///
+    /// **`onSlowKick` 也调一次**——同 broadcast 慢消费者踢的语义保持一致：让 server 端
+    /// onUpgrade 闭包尽快收尾不卡 inbound iterator
+    func rotateAllConnections() async {
+        guard !connections.isEmpty else { return }
+        let snapshot = connections
+        log("rotating \(snapshot.count) connection(s) for auth refresh")
+        for (id, conn) in snapshot {
+            // close 写帧——失败也无所谓（连接已经死了 client 端走重连），主要是发 close 信号
+            // 让 client 端 inbound 收到 close 立刻退出 for-await 而不是等下次 ping/pong 超时
+            try? await conn.writer.close(.policyViolation, reason: "auth rotation")
+            conn.onSlowKick()
+            // 主动从 set 移除——connection handler 的 defer unregister 也会跑，幂等
+            connections.removeValue(forKey: id)
+        }
     }
 
     /// 注册新连接。`onSlowKick` 在该连接被判定慢消费者踢掉时调用——通常实现为

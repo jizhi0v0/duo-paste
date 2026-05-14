@@ -72,6 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if deps.config.serve {
             startSyncServer()
+            // 启 wsBroadcaster rotation 任务（只 serve 时才有意义——broadcaster 才有 connections
+            // 来 close）。auth 安全 hardening：每 4h 主动 close 所有 ws 连接强制 client 用最新
+            // shared-secret 重新做 HMAC upgrade，secret 被窃取后能监听窗口压到 ≤ rotation interval
+            let broadcaster = deps.wsBroadcaster
+            Task { await broadcaster.start() }
         }
         if deps.config.mesh.enabled && !deps.config.peers.isEmpty {
             startMeshSupervisor()

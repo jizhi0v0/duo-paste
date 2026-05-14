@@ -287,6 +287,10 @@ public struct Config: Codable, Sendable, Equatable {
         /// WS 协议层 autoPing 周期（秒）。客户端跟服务端都用这个值。
         /// 不设 wsServerHeartbeatTimeoutSec 单独项——交给 hbws autoPing 隐式 2x ping 期超时。
         public var wsHeartbeatSec: TimeInterval
+        /// WS server 端定期 close 所有连接的周期（秒）。0 = 不 rotation。
+        /// 默 4h：auth 安全 hardening，secret 被窃取后能监听窗口压到 ≤ 这个值
+        /// （client 走 backoff 重连 + 重 HMAC upgrade 用最新 secret）
+        public var wsRotationSec: TimeInterval
 
         public static let `default` = MeshConfig(
             enabled: true,
@@ -300,7 +304,8 @@ public struct Config: Codable, Sendable, Equatable {
             wsEnabled: true,
             wsReconnectInitialSec: 1,
             wsReconnectMaxSec: 60,
-            wsHeartbeatSec: 30
+            wsHeartbeatSec: 30,
+            wsRotationSec: 4 * 3600
         )
 
         public init(
@@ -315,7 +320,8 @@ public struct Config: Codable, Sendable, Equatable {
             wsEnabled: Bool,
             wsReconnectInitialSec: TimeInterval,
             wsReconnectMaxSec: TimeInterval,
-            wsHeartbeatSec: TimeInterval
+            wsHeartbeatSec: TimeInterval,
+            wsRotationSec: TimeInterval
         ) {
             self.enabled = enabled
             self.pullIntervalSec = pullIntervalSec
@@ -329,6 +335,7 @@ public struct Config: Codable, Sendable, Equatable {
             self.wsReconnectInitialSec = wsReconnectInitialSec
             self.wsReconnectMaxSec = wsReconnectMaxSec
             self.wsHeartbeatSec = wsHeartbeatSec
+            self.wsRotationSec = wsRotationSec
         }
 
         enum CodingKeys: String, CodingKey {
@@ -344,6 +351,7 @@ public struct Config: Codable, Sendable, Equatable {
             case wsReconnectInitialSec = "ws_reconnect_initial_sec"
             case wsReconnectMaxSec = "ws_reconnect_max_sec"
             case wsHeartbeatSec = "ws_heartbeat_sec"
+            case wsRotationSec = "ws_rotation_sec"
         }
 
         public init(from decoder: Decoder) throws {
@@ -361,6 +369,7 @@ public struct Config: Codable, Sendable, Equatable {
             self.wsReconnectInitialSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsReconnectInitialSec) ?? d.wsReconnectInitialSec
             self.wsReconnectMaxSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsReconnectMaxSec) ?? d.wsReconnectMaxSec
             self.wsHeartbeatSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsHeartbeatSec) ?? d.wsHeartbeatSec
+            self.wsRotationSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsRotationSec) ?? d.wsRotationSec
         }
     }
 
@@ -494,6 +503,7 @@ public struct Config: Codable, Sendable, Equatable {
         meshDict["ws_reconnect_initial_sec"] = cfg.mesh.wsReconnectInitialSec
         meshDict["ws_reconnect_max_sec"] = cfg.mesh.wsReconnectMaxSec
         meshDict["ws_heartbeat_sec"] = cfg.mesh.wsHeartbeatSec
+        meshDict["ws_rotation_sec"] = cfg.mesh.wsRotationSec
         dict[CodingKeys.mesh.rawValue] = meshDict
 
         var captureDict = (dict[CodingKeys.capture.rawValue] as? [String: Any]) ?? [:]

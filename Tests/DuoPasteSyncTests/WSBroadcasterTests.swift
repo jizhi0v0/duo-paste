@@ -190,6 +190,66 @@ struct WSBroadcasterTests {
         #expect(await broadcaster.connectionCount == 0)
     }
 
+    @Test func periodicRotationClosesAllConnections() async throws {
+        // broadcaster 配 0.5s rotation interval → 起 server + 1 个 client 连上
+        // → broadcaster 接受 register 后等 rotation 触发 → 验证 connectionCount == 0
+        let secret = Data(repeating: 0xA2, count: 32)
+        let auth = HMACAuth(secret: secret)
+        let port = PortBox()
+        let broadcaster = WSBroadcaster(rotationIntervalSec: 0.5)
+
+        let app = makeBroadcastServer(auth: auth, port: port, broadcaster: broadcaster)
+        let serviceGroup = ServiceGroup(configuration: .init(
+            services: [app], gracefulShutdownSignals: [.sigterm, .sigint], logger: app.logger
+        ))
+        try await withThrowingTaskGroup(of: Void.self) { tg in
+            tg.addTask { try await serviceGroup.run() }
+
+            let p = await port.get()
+            await broadcaster.start()
+
+            // 起 client 长连接（停在 inbound for-await 等 close 帧）
+            tg.addTask {
+                let headers = makeHMACHeaders(auth: auth, path: "/sync/ws")
+                var l = Logger(label: "rotation-test-client")
+                l.logLevel = .critical
+                do {
+                    try await WebSocketClient.connect(
+                        url: "ws://127.0.0.1:\(p)/sync/ws",
+                        configuration: .init(additionalHeaders: headers),
+                        logger: l
+                    ) { inbound, _, _ in
+                        for try await _ in inbound.messages(maxSize: 64 * 1024) {}
+                    }
+                } catch {
+                    // server close → client 抛错合法
+                }
+            }
+
+            // 等 client 注册到 broadcaster
+            await waitUntil { await broadcaster.connectionCount >= 1 }
+            #expect(await broadcaster.connectionCount == 1)
+
+            // 等 rotation 触发 close（rotation 0.5s + 给 close 信号回程一点时间）
+            await waitUntil(timeoutSec: 4.0) { await broadcaster.connectionCount == 0 }
+            #expect(await broadcaster.connectionCount == 0,
+                    "rotation 应当 close 所有 connections")
+
+            await broadcaster.stop()
+            await serviceGroup.triggerGracefulShutdown()
+        }
+    }
+
+    @Test func rotationDisabledWhenIntervalZero() async throws {
+        // rotationIntervalSec=0 → start() no-op，rotation task 永不起。
+        // 主要验证 negative case 不死锁 / 不抛异常
+        let broadcaster = WSBroadcaster(rotationIntervalSec: 0)
+        await broadcaster.start()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await broadcaster.connectionCount == 0)
+        await broadcaster.stop()
+    }
+
     @Test func unregisterIsIdempotent() async throws {
         // 直接构造 ConnectionID 不暴露——通过启动一个简单 server 走 register/unregister 路径
         // 验证：没有 panic、log 一致

@@ -39,7 +39,9 @@ final class AppDependencies {
         self.deviceID = deviceID
         self.database = database
         self.blobs = blobs
-        let wsBroadcaster = WSBroadcaster()
+        let wsBroadcaster = WSBroadcaster(
+            rotationIntervalSec: config.mesh.wsRotationSec
+        )
         self.wsBroadcaster = wsBroadcaster
         // Sendable closure 给 CaptureService.onCursorAdvanced——primary 路径 commit 后触发，
         // 投递到 broadcaster fan-out 给所有连上的 peer。Task wrapper 让 actor 调用脱离
