@@ -417,20 +417,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .singleItem:
             pasteBackSingle(items[0])
 
-        case .fallbackToFirst(let reason):
-            let label: String
-            switch reason {
-            case .crossKind:       label = "跨类型"
-            case .multipleImages:  label = "多图片"
-            }
-            // 走 postNotice 而不是直接赋 recentNotice——后者绕过 3s timer 会让 banner
-            // 永久残留(关 panel 再开仍看见旧提示,踩过)
-            state.postNotice("\(label)多选不可合并，已 paste 第 1 项 (共 \(items.count))")
+        case .fallbackToFirst(.multipleImages):
+            // 多张图片 NSPasteboard 没法合并(单 type 单实例),退到首项。走 postNotice 拿
+            // 3s timer——直接赋 recentNotice 会绕过 timer 让 banner 永久残留(踩过)
+            state.postNotice("多张图片不可合并，已 paste 第 1 项 (共 \(items.count))")
             pasteBackSingle(items[0])
 
         case .mergedText, .mergedFile:
-            // 同 kind 非 image → 同步 merge 写 NSPasteboard。文本 / 文件的内容(textFull / 路径)
-            // 同步可拿,不走 lazy 拉 blob,一次性写完
+            // mergedText 含跨 kind:image/file 用 preview 占位; mergedFile 是全 file 多 URL。
+            // 文本/路径同步可拿,不走 lazy 拉 blob,一次性写完
             watcher.flushPendingIfAny()
             let wrote = Copyback.writeMerged(items: items, blobs: deps.blobs)
             watcher.suppressUpToCurrent()

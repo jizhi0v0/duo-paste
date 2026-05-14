@@ -8,13 +8,15 @@ import Foundation
 private func makeItem(
     id: String,
     kind: ItemKind,
-    textFull: String? = nil
+    textFull: String? = nil,
+    preview: String? = nil
 ) -> Item {
     Item(
         id: id,
         originDevice: "test",
         capturedAtNs: 0,
         kind: kind,
+        preview: preview,
         textFull: textFull
     )
 }
@@ -54,13 +56,14 @@ private func makeItem(
     #expect(PasteMerge.strategy(for: items) == .fallbackToFirst(reason: .multipleImages))
 }
 
-@Test func strategyCrossKindReturnsFallback() {
-    // text + image
+@Test func strategyCrossKindReturnsMergedText() {
+    // 跨 kind(text + image)→ mergedText,image 在 joinTextual 用 preview 兜底。
+    // **设计变更**:原版返回 fallbackToFirst,user 反馈"选了 4 文本+1 图,只粘 1 条"觉得是 bug
     let items = [
         makeItem(id: "1", kind: .text, textFull: "hi"),
-        makeItem(id: "2", kind: .image),
+        makeItem(id: "2", kind: .image, preview: "[image 4.5 MB]"),
     ]
-    #expect(PasteMerge.strategy(for: items) == .fallbackToFirst(reason: .crossKind))
+    #expect(PasteMerge.strategy(for: items) == .mergedText)
 }
 
 @Test func strategyCrossKindFilePlusText() {
@@ -68,19 +71,16 @@ private func makeItem(
         makeItem(id: "1", kind: .file, textFull: "/tmp/a"),
         makeItem(id: "2", kind: .text, textFull: "b"),
     ]
-    #expect(PasteMerge.strategy(for: items) == .fallbackToFirst(reason: .crossKind))
+    #expect(PasteMerge.strategy(for: items) == .mergedText)
 }
 
-@Test func strategyAllTextSubkindsAreMergedText() {
-    // text/url/rtf/html 应该都被当文本类合并。混合 url+text+rtf+html 也走 mergedText
-    // 注:strategy 看的是"全部都是文本系 kind"——按定义 kinds.count > 1 算 crossKind。
-    // 这里钉死:同 kind 才合并,即使都是文本系也不混
+@Test func strategyMixedTextSubkindsAreMergedText() {
+    // text/url/rtf/html 混合也走 mergedText(用 preview 兜底处理 textFull 为 nil 的项)
     let items = [
         makeItem(id: "1", kind: .text, textFull: "a"),
         makeItem(id: "2", kind: .url, textFull: "https://x"),
     ]
-    // text + url 是不同 kind → crossKind fallback
-    #expect(PasteMerge.strategy(for: items) == .fallbackToFirst(reason: .crossKind))
+    #expect(PasteMerge.strategy(for: items) == .mergedText)
 }
 
 @Test func strategyAllUrlReturnsMergedText() {
@@ -129,6 +129,25 @@ private func makeItem(
 
 @Test func joinTextualReturnsNilForEmptyInput() {
     #expect(PasteMerge.joinTextual([]) == nil)
+}
+
+@Test func joinTextualFallsBackToPreviewWhenTextFullNil() {
+    // image kind 通常 textFull = nil(OCR 才填),preview 是人类可读占位。
+    // 跨 kind paste 时 image 必须能用 preview 进入拼接结果
+    let items = [
+        makeItem(id: "1", kind: .text, textFull: "hi"),
+        makeItem(id: "2", kind: .image, textFull: nil, preview: "[image 4.5 MB]"),
+        makeItem(id: "3", kind: .text, textFull: "bye"),
+    ]
+    #expect(PasteMerge.joinTextual(items) == "hi\n[image 4.5 MB]\nbye")
+}
+
+@Test func joinTextualPrefersTextFullOverPreview() {
+    // textFull 非 nil 时不应该退到 preview
+    let items = [
+        makeItem(id: "1", kind: .text, textFull: "full content", preview: "short"),
+    ]
+    #expect(PasteMerge.joinTextual(items) == "full content")
 }
 
 @Test func joinTextualCustomSeparator() {
