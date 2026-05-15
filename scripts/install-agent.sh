@@ -24,6 +24,12 @@ mkdir -p "$INSTALL_DIR" "$LOG_DIR"
 cp "$BINARY" "$INSTALL_DIR/duo-pasted"
 chmod +x "$INSTALL_DIR/duo-pasted"
 
+# macOS 26.x taskgate 拒 SwiftPM incremental linker-signed adhoc 签名（exception=
+# CODESIGNING + "Taskgated Invalid Signature"），exec 时 SIGKILL；force 重签 cdhash
+# 跟 bytes 一致才放行。详见 memory feedback_install_codesign.md
+echo "==> 重签 adhoc"
+codesign --force --sign - "$INSTALL_DIR/duo-pasted"
+
 echo "==> 写 LaunchAgent plist: $PLIST"
 mkdir -p "$(dirname "$PLIST")"
 cat >"$PLIST" <<PLIST_EOF
