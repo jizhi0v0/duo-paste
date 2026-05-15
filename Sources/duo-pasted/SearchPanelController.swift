@@ -101,7 +101,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // MainActor.assumeIsolated 读 state 必须在闭包内,这里只决定 "要不要拦"
             // 不读 state 细节——用一个稍宽的过滤器,真正的分流在下面 switch
             let isSpace = (keyCode == 49)
-            guard interceptCodes.contains(keyCode) || isCmdP || isSpace else { return event }
+            // ⌘1 ~ ⌘9 = 直接粘贴 results[N-1](paste-app 风格快捷键)。macOS 数字键
+            // keyCode 不连续(1=18, 2=19, 3=20, 4=21, 5=23, 6=22, 7=26, 8=28, 9=25),
+            // 用 dict 反查。仅 Cmd 修饰键命中时拦截;不带 Cmd 的数字键透传给 TextField
+            let cmdDigitPos: Int? = isCmd ? Self.digitKeyMap[keyCode] : nil
+            guard interceptCodes.contains(keyCode)
+                    || isCmdP || isSpace || cmdDigitPos != nil else { return event }
             // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
             // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
             if let tv = event.window?.firstResponder as? NSTextView, tv.hasMarkedText() {
@@ -171,7 +176,15 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     if let item = self.state.currentItem {
                         self.state.togglePin(item)
                     }
-                default: break
+                default:
+                    // ⌘1-9 = 直接粘贴 results 前 9 位中第 N 项,不改 selectedIDs。
+                    // 越界 (results 不足 N 条) 透传,UI 上对应 ⌘N 角标也不显示
+                    if let pos = cmdDigitPos {
+                        guard pos - 1 < self.state.results.count else { return false }
+                        self.onPaste([self.state.results[pos - 1]])
+                        return true
+                    }
+                    return false
                 }
                 return true
             }
@@ -188,11 +201,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     private func ensurePanel() -> NSPanel {
         if let p = panel { return p }
-        // Paste.app 风格底部条:全屏宽 + 完全贴底,只保留**顶部**两个圆角。
-        // user 反馈"没有完全贴紧底部和两侧",原版 width-80 + y=minY+30 留 margin 撤掉
+        // Floating island 风格:四周留 margin,四角都圆。早期推过"全宽贴底",但视觉太
+        // 重像 Paste.app 老版底栏;改回 floating 让 panel 像独立悬浮卡片。
+        // hMargin/vMargin 是 panel 外边距(屏幕边到 panel 边),底部相对 Dock 顶留同
+        // 量呼吸。positionBottom 用同一对常量保持单一来源
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // header(~42) + filterBar(~32) + ScrollView(226) + 底 padding(12) = 312
-        let contentRect = NSRect(x: 0, y: 0, width: screenFrame.width, height: 312)
+        let hMargin: CGFloat = Self.panelHMargin
+        // header(~56) + filterBar(~32) + ScrollView(254) + 底 padding(14) = 356
+        let contentRect = NSRect(
+            x: 0, y: 0,
+            width: max(640, screenFrame.width - hMargin * 2),
+            height: 356
+        )
         // borderless 让 window frame 直接 = content rect,setFrameOrigin 设的 y 就是 content
         // 底沿。原 .titled + fullSizeContentView 组合下 window.frame.height = content + 28pt
         // titlebar,setFrameOrigin 让 window 底沿(含 titlebar 下方区)贴 Dock,content 底沿
@@ -253,12 +273,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         let hosting = NSHostingView(rootView: root)
         hosting.frame = contentRect
         hosting.autoresizingMask = [.width, .height]
-        // 全宽贴底布局:只让**顶部**两个角圆,底部直角(贴屏幕底)+左右直角(贴屏幕边)。
-        // CALayer.maskedCorners 在 macOS y-up 坐标系下 MaxY = top → 选 top-left + top-right
+        // Floating island:四角全圆。panel 四周有 margin,不再有任何一边贴屏幕
         hosting.wantsLayer = true
         hosting.layer?.cornerRadius = 22
         hosting.layer?.cornerCurve = .continuous
-        hosting.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
         hosting.layer?.masksToBounds = true
         p.contentView = hosting
         // wantsLayer/cornerRadius 后 invalidate 让 shadow 重新按 mask 计算
@@ -271,9 +289,26 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private func positionBottom(_ p: NSWindow) {
         guard let screen = NSScreen.main else { return }
         let sFrame = screen.visibleFrame
-        // 完全贴左右屏幕边 + 完全贴底(Dock 上沿).visibleFrame 已排除 Dock,所以 minY = Dock 顶
-        p.setFrameOrigin(NSPoint(x: sFrame.minX, y: sFrame.minY))
+        // Floating island:四周留 margin。visibleFrame 已排除 Dock,minY = Dock 顶,
+        // y = minY + vMargin 让 panel 底沿离 Dock 顶 vMargin pt;x 同理
+        p.setFrameOrigin(NSPoint(
+            x: sFrame.minX + Self.panelHMargin,
+            y: sFrame.minY + Self.panelVMargin
+        ))
     }
+
+    /// Panel 外边距(屏幕边/Dock 顶 → panel 边)。ensurePanel 算 contentRect width 和
+    /// positionBottom 设 origin 都用同一对常量,保证 margin 真的对称
+    fileprivate static let panelHMargin: CGFloat = 8
+    fileprivate static let panelVMargin: CGFloat = 6
+
+    /// macOS keyCode → 数字键面值(1-9)反查表。⌘+N 快捷粘贴用。
+    /// 数字键 keyCode 不连续:1=18 2=19 3=20 4=21 5=23 6=22 7=26 8=28 9=25;
+    /// 0=29(不映射,paste-app 风格只到 9)
+    fileprivate static let digitKeyMap: [Int: Int] = [
+        18: 1, 19: 2, 20: 3, 21: 4, 23: 5,
+        22: 6, 26: 7, 28: 8, 25: 9,
+    ]
 
     // MARK: - NSWindowDelegate
 

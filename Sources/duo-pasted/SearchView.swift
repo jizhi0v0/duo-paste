@@ -113,6 +113,30 @@ private struct SelectedCardFramePreference: PreferenceKey {
     }
 }
 
+/// 浮岛 panel 的玻璃背景。macOS 26+ 用 Liquid Glass(`.glassEffect`),
+/// 老系统(deployment target macOS 14)兜底 `.ultraThickMaterial` + clipShape。
+/// 抽成 ViewModifier 让 SearchView body 跟 #available 分支隔离。
+///
+/// `.glassEffect(in:)` 内部已经处理形状 + clip,不需要再加 .clipShape。
+/// 旧路径 ultraThickMaterial 不带形状,所以保留 clipShape。
+@MainActor
+private struct PanelBackgroundModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(
+                    .regular,
+                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                )
+        } else {
+            content
+                .background(.ultraThickMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        }
+    }
+}
+
 struct SearchView: View {
     @Bindable var state: AppState
     /// Enter / 双击触发的 paste 回调。双击行传 `[item]` 单条;Enter 由 SearchPanelController
@@ -151,7 +175,7 @@ struct SearchView: View {
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
-        .frame(minWidth: 800, minHeight: 312, idealHeight: 312, maxHeight: 312)
+        .frame(minWidth: 800, minHeight: 356, idealHeight: 356, maxHeight: 356)
         // 空格预览 = 独立 NSPanel(PreviewPanelController),不在 SearchView 里渲染。
         // 这里只做 trigger 把状态变化抛给 caller,真正 show/hide/reposition 由 controller
         // 完成。三个 onChange 覆盖触发面:
@@ -174,22 +198,12 @@ struct SearchView: View {
                 state.selectedCardWindowRect = rect
             }
         }
-        // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
-        .background(.ultraThickMaterial)
-        .clipShape(
-            UnevenRoundedRectangle(
-                topLeadingRadius: 22, bottomLeadingRadius: 0,
-                bottomTrailingRadius: 0, topTrailingRadius: 22,
-                style: .continuous
-            )
-        )
+        // Floating island:四角圆,panel 四周有 margin 不贴屏幕边。
+        // macOS 26+ 走 Liquid Glass(.glassEffect),老系统兜底 ultraThickMaterial
+        .modifier(PanelBackgroundModifier(cornerRadius: 22))
         .overlay(
-            UnevenRoundedRectangle(
-                topLeadingRadius: 22, bottomLeadingRadius: 0,
-                bottomTrailingRadius: 0, topTrailingRadius: 22,
-                style: .continuous
-            )
-            .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
         )
         // 让内容延伸到 NSPanel titlebar 区域（fullSizeContentView 把 contentView 占位让出来，
         // 但 SwiftUI 默认仍把 titlebar 计入 top safe area，所以 header 上方会留 ~28pt 空白）
@@ -265,14 +279,15 @@ struct SearchView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 14)
+        // maxWidth 800 居中:搜索框 + count 三件一组居中聚焦,跟卡片区横铺解耦
         .frame(maxWidth: 800)
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
     /// 紧凑 filter 行 ~30px。原 filterBar 高 ~46px,缩小 chip 字号 + padding 让它适配 panel。
-    /// chip 行 + 时间窗内容 maxWidth 1000 居中,跟 compactHeader 视觉对齐
+    /// chip 行跟 header 同样 maxWidth 800 居中,跟卡片区横铺解耦
     private var compactFilterBar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
@@ -302,8 +317,8 @@ struct SearchView: View {
                 }
                 timeRangeMenu
             }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 22)
+            .padding(.bottom, 10)
             .frame(maxWidth: 800)
             .frame(maxWidth: .infinity, alignment: .center)
             // 跟卡片区域分隔的 hairline
@@ -328,10 +343,12 @@ struct SearchView: View {
                 // alignment 让 LazyHStack 占满 ScrollView 高度但卡片靠顶——消除 user 反馈
                 // 的"第二次打开 panel 底部还有大空隙"(SwiftUI 默认 vertical centering 让卡片
                 // 在 ScrollView 内居中,下方留空白)
-                LazyHStack(alignment: .top, spacing: 14) {
-                    ForEach(state.results) { item in
+                LazyHStack(alignment: .top, spacing: 22) {
+                    // 前 9 张挂 ⌘1 ~ ⌘9 序号,enumerated 拿 index;之后传 nil 不显示角标
+                    ForEach(Array(state.results.enumerated()), id: \.element.id) { offset, item in
                         ItemCard(
                             item: item,
+                            index: offset < 9 ? offset + 1 : nil,
                             isSelected: state.selectedIDs.contains(item.id),
                             selfDeviceID: state.deps.deviceID,
                             snippet: state.snippets[item.id],
@@ -394,16 +411,16 @@ struct SearchView: View {
                         )
                     }
                 }
-                .padding(.top, 6)  // 卡片顶部跟 filter 行 hairline 留 6pt 间距
+                // 卡片顶部 12pt 间距给 source icon 半溢出留呼吸,不被 filter hairline 顶死
+                .padding(.top, 12)
             }
-            // 横向 padding 在 ScrollView 外让 viewport 离 panel 左右各 18pt。
-            // 精确 frame height 226 = 卡片 220 + top padding 6,让 ScrollView 不 fill remaining
+            // 横向 padding 22 跟 header/filterBar 对齐,panel 左右两侧 padding 统一。
+            // frame height 254 = 卡片 236 + top 12 + bottom 6 余量,ScrollView 不 fill remaining
             // (user 反馈"重复打开 window 下方仍有 padding" = ScrollView fill remaining 时
-            // SwiftUI 让内容 vertical center 留下方空白)。下面 padding(.bottom, 8) 给 panel
-            // 底沿到卡片下沿 8pt 呼吸,符合 user "底部加 padding" 需求
-            .frame(height: 226)
-            .padding(.horizontal, 18)
-            .padding(.bottom, 12)  // 卡片下沿到 panel 下沿 12pt 呼吸,user 反馈"底部需要 padding"
+            // SwiftUI 让内容 vertical center 留下方空白)
+            .frame(height: 254)
+            .padding(.horizontal, 22)
+            .padding(.bottom, 14)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
@@ -815,9 +832,12 @@ private struct KindChip: View {
 
 private struct ItemCard: View {
     let item: Item
+    /// 1-9 = 在 results 数组前 9 位,footer 右下显示 ⌘N 角标对应 ⌘1-9 快捷粘贴;
+    /// nil = 位置超出快捷范围,不显示角标
+    let index: Int?
     let isSelected: Bool
     /// `item.originDevice != selfDeviceID` 表示 PullWorker 从对端镜像过来的远端 item,
-    /// 卡片左上角叠橙色 arrow.down.left 角标
+    /// 卡片右上角大 icon 左下叠橙色 arrow.down.left 角标
     let selfDeviceID: String
     /// 含 STX/ETX 高亮标记的 FTS snippet,query 非空 + 命中时非 nil
     let snippet: String?
@@ -846,20 +866,23 @@ private struct ItemCard: View {
     var body: some View {
         VStack(spacing: 0) {
             contentArea       // 主区 188(image aspectFill / 文本多行 / file 图标)
-            footer            // 32 (app icon + kind + meta + relative time)
+            footer            // 32 (meta + 右下 ⌘N 角标)
         }
-        .frame(width: 200, height: 220)
+        .frame(width: 240, height: 236)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(Color.primary.opacity(isSelected ? 0.07 : 0.035))
         )
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
-            // 选中态 accent 描边 + 加粗;未选中淡灰发丝线
+            // 选中态 accent 描边 + 加粗;未选中按 remote mirror 决定:橙色淡描表示
+            // 对端镜像(替代之前的 remoteOriginBadge 角标——跟右上 source icon 叠加看不清),
+            // 本地 own 走淡灰发丝线。选中态优先于 remote 状态(用户 focus 在卡内容时
+            // 来源信号让位选择反馈)
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(
-                    isSelected ? Color.accentColor : Color.primary.opacity(0.08),
-                    lineWidth: isSelected ? 2 : 0.5
+                    strokeColor,
+                    lineWidth: isSelected ? 2 : (isRemoteMirror ? 1 : 0.5)
                 )
         )
         // 选中卡加微阴影抬升效果
@@ -868,18 +891,19 @@ private struct ItemCard: View {
             radius: isSelected ? 8 : 0,
             x: 0, y: 2
         )
+        // source app icon 钉右上**边框上**——半溢出卡片,中心点贴右上顶点,
+        // 像贴纸/通知 badge 风格。overlay 不被 clipShape 影响,offset 能溢出
         .overlay(alignment: .topTrailing) {
+            topRightSourceIcon
+                .offset(x: 8, y: -8)
+        }
+        // pin 角标内嵌左上(不溢出),克制风格区别于 source icon 的"贴纸"
+        .overlay(alignment: .topLeading) {
             if item.pinned {
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
+                pinBadge
                     .padding(6)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .padding(4)
             }
         }
-        // 远端镜像角标移到 footer icon 右下角(见 footerIcon ZStack),原 topLeading
-        // overlay 在 text/url 卡顶上会遮第一个字符,user 反馈"对端标签遮文字"
         .task(id: item.blobSha256 ?? "") {
             guard shouldShowThumbnail, let sha = item.blobSha256 else {
                 if thumbnail != nil { thumbnail = nil }
@@ -896,6 +920,21 @@ private struct ItemCard: View {
         }
     }
 
+    /// pin 角标——卡片右上角小圆,标记 pinned 状态。
+    /// macOS 26+ 走 Liquid Glass(.glassEffect 圆形),老系统 ultraThinMaterial 兜底
+    @ViewBuilder
+    private var pinBadge: some View {
+        let icon = Image(systemName: "pin.fill")
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(Color.accentColor)
+            .padding(6)
+        if #available(macOS 26.0, *) {
+            icon.glassEffect(.regular, in: Circle())
+        } else {
+            icon.background(.ultraThinMaterial, in: Circle())
+        }
+    }
+
     /// 卡片主区(200×188)。image kind 走原图 aspectFit(显示完整,letterbox 用深色背景填充);
     /// loading 走 placeholder;text 类走多行文字
     @ViewBuilder
@@ -908,7 +947,7 @@ private struct ItemCard: View {
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
             }
-            .frame(width: 200, height: 188)
+            .frame(width: 240, height: 204)
         } else if shouldShowThumbnail {
             // 加载中:placeholder
             ZStack {
@@ -917,7 +956,7 @@ private struct ItemCard: View {
                     .font(.system(size: 32))
                     .foregroundStyle(.secondary.opacity(0.4))
             }
-            .frame(width: 200, height: 188)
+            .frame(width: 240, height: 204)
         } else if item.kind == .file {
             // file 卡(非 image-as-file):大文件 SF Symbol + 文件名
             VStack(spacing: 10) {
@@ -930,7 +969,7 @@ private struct ItemCard: View {
                     .lineLimit(2)
                     .padding(.horizontal, 12)
             }
-            .frame(width: 200, height: 188)
+            .frame(width: 240, height: 204)
         } else {
             // text/url/rtf/html:多行内容。**padding 必须在 frame 之前**——SwiftUI 顺序
             // 决定 padding 加在 frame 内还是外:frame 在 padding 之前会让 padding 加到 frame
@@ -943,24 +982,25 @@ private struct ItemCard: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 12)
-                .frame(width: 200, height: 188)
+                .frame(width: 240, height: 204)
         }
     }
 
-    /// 卡片 footer(200×32):左 app icon + 中 kind/size/time meta + 右 spacer。
-    /// 顶部 0.5pt hairline divider 让 footer 跟内容区视觉分隔
+    /// 卡片 footer(200×32):左 kind/size/time meta + 右 ⌘N 序号角标。
+    /// app icon 移到卡片右上角(topRightSourceIcon),footer 不再有 leading icon
     private var footer: some View {
         HStack(spacing: 6) {
-            footerIcon
-                .frame(width: 16, height: 16)
             Text(footerMeta)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer(minLength: 0)
+            if let idx = index {
+                indexBadge(idx)
+            }
         }
         .padding(.horizontal, 12)
-        .frame(width: 200, height: 32)
+        .frame(width: 240, height: 32)
         .background(Color.primary.opacity(0.05))
         .overlay(alignment: .top) {
             Rectangle()
@@ -969,33 +1009,51 @@ private struct ItemCard: View {
         }
     }
 
-    private var footerIcon: some View {
-        ZStack(alignment: .bottomTrailing) {
-            footerIconCore
-            if isRemoteMirror {
-                remoteOriginBadge
-                    .offset(x: 4, y: 4)
-            }
+    /// 右下 ⌘N 角标——前 9 张卡显示 ⌘1 ~ ⌘9,提示用户可按 ⌘+数字键快速粘贴。
+    /// SearchPanelController.installKeyMonitor 拦 ⌘1-9 keyCode 路由到 onPaste
+    private func indexBadge(_ idx: Int) -> some View {
+        HStack(spacing: 1) {
+            Image(systemName: "command")
+                .font(.system(size: 9, weight: .semibold))
+            Text("\(idx)")
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
         }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .background(
+            Capsule().fill(Color.primary.opacity(0.08))
+        )
     }
 
+    /// 卡片右上角 source app icon——半溢出卡片右上顶点,贴纸风格。
+    /// self capture 走 accent 圆 + 剪贴板图标。远端镜像信号已移到卡片 stroke
+    /// (橙色描边),不再叠 badge 在 icon 上避免跟 app icon 视觉打架
     @ViewBuilder
-    private var footerIconCore: some View {
+    private var topRightSourceIcon: some View {
         if item.isSelfCapture {
             ZStack {
                 Circle().fill(Color.accentColor)
                 Image(systemName: "doc.on.clipboard.fill")
-                    .font(.system(size: 8, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white)
             }
-        } else if let bid = item.sourceApp, let img = AppIconCache.shared.icon(forBundleID: bid) {
+            .frame(width: 20, height: 20)
+        } else if let bid = item.sourceApp,
+                  let img = AppIconCache.shared.icon(forBundleID: bid) {
             Image(nsImage: img)
                 .resizable()
                 .interpolation(.high)
+                .frame(width: 22, height: 22)
         } else {
-            Image(systemName: kindSymbol)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            ZStack {
+                Circle().fill(.ultraThinMaterial)
+                Image(systemName: kindSymbol)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 20, height: 20)
         }
     }
 
@@ -1010,17 +1068,12 @@ private struct ItemCard: View {
         return parts.joined(separator: " · ")
     }
 
-    /// 远端镜像角标——左上角橙色圆 + 白 stroke + arrow.down.left。
-    /// 卡片视觉重心在内容,角标移到左上不抢戏,跟右上 pin 错开
-    private var remoteOriginBadge: some View {
-        ZStack {
-            Circle().fill(Color.orange)
-            Circle().strokeBorder(Color.white, lineWidth: 1)
-            Image(systemName: "arrow.down.left")
-                .font(.system(size: 7, weight: .bold))
-                .foregroundStyle(.white)
-        }
-        .frame(width: 14, height: 14)
+    /// 选中态 accent 描边优先;未选中按 remote mirror 区分:
+    /// 对端镜像橙色淡描;本地 own 原淡灰发丝线
+    private var strokeColor: Color {
+        if isSelected { return Color.accentColor }
+        if isRemoteMirror { return Color.orange.opacity(0.5) }
+        return Color.primary.opacity(0.08)
     }
 
     /// kind 中文标签——meta 行第一列显示。比 bundle name 更立刻能读懂"这是什么"。

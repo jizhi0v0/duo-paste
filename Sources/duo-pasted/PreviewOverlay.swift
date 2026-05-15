@@ -323,8 +323,8 @@ struct PreviewPanelContent: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.ultraThickMaterial)
+            // macOS 26+ Liquid Glass;老系统 ultraThickMaterial 兜底
+            glassBackground
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
 
@@ -350,6 +350,18 @@ struct PreviewPanelContent: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    /// 浮窗玻璃背景。macOS 26+ Liquid Glass;老系统 ultraThickMaterial 兜底。
+    /// glassEffect(in:) 自带 shape + clip,不需要再 fill;旧路径手动 fill 同 shape
+    @ViewBuilder
+    private var glassBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(.regular, in: shape)
+        } else {
+            shape.fill(.ultraThickMaterial)
+        }
     }
 
     private func metaHeader(item: Item) -> some View {
