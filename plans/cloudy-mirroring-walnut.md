@@ -166,6 +166,34 @@
 - 不按 kind 拆分 blob 占用——一行总数够用
 - 不加"立即跑 LRU"按钮——预防档每小时自然跑
 
+### PR 5.1 — 孤儿 blob GC（已落地 2026-05）
+
+**Context**：PR 5 落地后用户报告"软删 1000 张图后 blob 永远不被驱逐"——LRU SQL `oldestEvictableShas` 硬过滤 `deleted_at_ns IS NULL` 把所有 tombstone 排除在外，而 PR 5 没有单独的孤儿清理路径。结果：tombstone 行的 blob 字节永久滞留。
+
+**新增**：
+
+- `Database.tombstoneEvictableShas(limit:)` —— sha 上**所有** ref 行 `deleted_at_ns IS NOT NULL` 才进 candidate。SQL `HAVING SUM(CASE WHEN deleted_at_ns IS NULL THEN 1 ELSE 0 END) = 0` 防止 mesh 跨 origin 同 sha 一边软删一边活着的情况误删
+- `BlobEvictor.evictTombstoneBlobs(batchSize:)` —— 批量 drain，返回 (freed, bytes)
+
+**修改**：
+
+- `BlobEvictor.evictOneOldest` —— 先扫 tombstone candidates，命中即返回；都不在本机字节才 fall back LRU。ENOSPC reactive 路径自动得到孤儿优先
+- `BlobEvictor.evictToWatermark` —— 进入 LRU loop 前先一轮 drain 所有 tombstones；如果 tombstone drain 后已达 highBytes 立即返回不动 LRU
+- `SnapshotScheduler.runOnce` —— **无条件**每 tick 跑 `runOrphanBlobDrain()`，跟磁盘压力解耦（即便磁盘充裕也清理）
+- `Volume.directorySize` —— 加 explicit `fileExists(isDirectory:)` 预检，让"目录不存在"跟"目录空"两种状态在返回值上分开（前者 nil 后者 0）
+
+**核心契约**（不要回退）：
+
+1. **孤儿 = 所有 ref 行都已 tombstone**——任何一行活跃就不算孤儿，blob 保留。mesh 拓扑下同 sha 跨 origin 多行是常态，单 origin 软删不能误清字节
+2. **驱逐不动 DB 行**——跟 PR 5 LRU 路径同契约。tombstone 行连同它的 sha 引用一起留在 DB（pull cursor / `/since` 仍能看到 tombstone 让对端同步软删状态）
+3. **strictly 优于 LRU**——孤儿驱逐没有 UI 副作用（行已软删，搜索看不到），LRU 驱逐会让 CloudBadge 切云端态。所以两条路径都先 drain 孤儿
+
+**测试**：14 个新 case 加进 `BlobEvictionTests.swift`（7 个 SQL 过滤 + 3 个 `evictTombstoneBlobs` + 2 个 `evictOneOldest` 优先级 + 2 个 `evictToWatermark` 集成）+ 6 个 `VolumeTests.swift`
+
+**风险**：
+- 孤儿 drain 跟 LRU 一样不消耗 perTickCap——理论上 100 万个 tombstone 一 tick 卡死。`SnapshotScheduler.runOrphanBlobDrain` 限制 32 round × 256 batch = 8192 / tick，剩下的留下 tick。实测应该 OK（用户软删几千张就够了）
+- 跟 LRU 同样的 `directorySize` 后台运行约束
+
 **风险 / 验证**：
 
 - 阈值 5GB/10GB 对小盘 Mac（128GB）偏紧；对大盘 SSD（2TB）偏松。daily-driver 双 Mac 1TB 场景合适
@@ -179,7 +207,8 @@
 3. **paste 路径行为跟 mode 解耦**：Enter 触发的 lazy fetch 永远走（无论 mode 如何）——full 模式正常不会触发，但兜底；optimized 模式是主路径；**LRU 驱逐过的 sha 也走 lazy 重拉**（PR 5）
 4. **catch-up 不阻塞 daemon**：`mesh-fetch-missing` 是 CLI 子命令独立进程，跟 daemon 同时跑 OK（GRDB DatabasePool 并发安全 + BlobStore.putVerified 原子 rename）
 5. **老 `eager_blobs` 字段**：完成 PR 1 写入新 config 后被 removeValue 洗掉；老代码不存在了
-6. **LRU 驱逐只动 fs 不动 DB 行**（PR 5）：`item.blob_sha256` 保留指向 sha；CloudBadge UI 自动落到"云端"态；lazy paste 路径从 peer 重拉。**pinned / text-only / tombstone 行的 blob 永不驱逐**
+6. **LRU 驱逐只动 fs 不动 DB 行**（PR 5）：`item.blob_sha256` 保留指向 sha；CloudBadge UI 自动落到"云端"态；lazy paste 路径从 peer 重拉。**pinned / text-only 行的 blob 永不驱逐**
+8. **孤儿 blob GC**（PR 5.1）：sha 的**所有**ref 行都已 `deleted_at_ns IS NOT NULL` → "孤儿"，strictly 优于 LRU（无副作用，没活跃行需要它）。`SnapshotScheduler` 每 tick 无条件 drain；`evictOneOldest` / `evictToWatermark` 都先 drain 后 LRU。**软删但仍有活跃 ref（mesh 跨 origin 同 sha）** → 不算孤儿，blob 保留
 7. **磁盘满不丢 capture / paste**（PR 5）：BlobStore.put ENOSPC → 同步驱逐 oldest → retry。三路 put 站点（capture / pull / lazy paste）都走 retry 版本。仿真 ENOSPC 难，靠实机验
 
 ## 测试覆盖

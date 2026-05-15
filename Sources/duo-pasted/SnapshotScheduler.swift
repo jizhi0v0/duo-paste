@@ -55,9 +55,23 @@ final class SnapshotScheduler {
         } catch {
             fputs("snapshot failed: \(error)\n", stderr)
         }
+        // 孤儿 blob 清理：跟磁盘压力无关——所有 ref 行已 tombstone 的 sha，留着没用
+        // 只占空间。无条件每小时 drain，让用户软删后字节按节奏回归
+        runOrphanBlobDrain()
         // 水位预防档：tick 末尾顺路跑一次 blob LRU GC。snapshot 失败不影响这条路径——
         // 反而磁盘满导致 snapshot 失败时这里腾空间是最有用的（下个 tick snapshot 就成功）
         runBlobWatermarkGC()
+    }
+
+    private func runOrphanBlobDrain() {
+        do {
+            let result = try deps.evictor.drainOrphans()
+            if result.freed > 0 {
+                fputs("blob-orphan-drain: freed \(result.freed) blobs \(result.bytes) bytes\n", stderr)
+            }
+        } catch {
+            fputs("blob-orphan-drain failed: \(error)\n", stderr)
+        }
     }
 
     /// blob GC 阈值——可用空间低于 lowBytes 时驱逐 LRU 直到 highBytes。

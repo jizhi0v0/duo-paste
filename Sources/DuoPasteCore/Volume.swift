@@ -19,6 +19,12 @@ public enum Volume {
     /// 主线程同步调用会阻塞 UI。
     public static func directorySize(at root: URL) -> Int64? {
         let fm = FileManager.default
+        // 显式 existence 预检：FileManager.enumerator 对不存在路径返回的是空 enumerator
+        // 不是 nil，会让 caller 分不清"目录空"和"目录没了"两种情况
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
+            return nil
+        }
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],

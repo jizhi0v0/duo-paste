@@ -467,6 +467,317 @@ private func setupWatermarkScenario(
     }
 }
 
+// MARK: - BlobEvictor.drainOrphans 多 round 循环（SnapshotScheduler hourly tick 走这条）
+
+@Test func drainOrphansStopsAtFirstZeroRound() async throws {
+    // 一次性把所有 tombstone drain 完后，第二轮 evictTombstoneBlobs 返回 (0, 0) → 循环退出
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    var shas: [String] = []
+    for i in 0..<3 {
+        let info = try store.put(Data(repeating: UInt8(0x70 + i), count: 100))
+        try insertItem(db, id: "t-\(i)", sha: info.sha256,
+                       capturedAtNs: Int64(i), deletedAtNs: Int64(100 + i))
+        shas.append(info.sha256)
+    }
+    let evictor = BlobEvictor(database: db, blobs: store)
+    let result = try evictor.drainOrphans()
+    #expect(result.freed == 3)
+    #expect(result.bytes == 300)
+    for sha in shas { #expect(!store.exists(sha256: sha)) }
+}
+
+@Test func drainOrphansHonorsMaxRounds() async throws {
+    // 一 round 默认 batchSize=256；造 300 个 tombstone → 第 1 round 清 256，第 2 round 清 44
+    // 总 freed=300, 但 maxRounds=1 时只清 256
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    for i in 0..<300 {
+        // sha 必须唯一——用 i 编码到字节
+        let data = Data([UInt8(i & 0xFF), UInt8((i >> 8) & 0xFF)] + Array(repeating: 0xAA, count: 10))
+        let info = try store.put(data)
+        try insertItem(db, id: "t-\(i)", sha: info.sha256,
+                       capturedAtNs: Int64(i), deletedAtNs: Int64(10_000 + i))
+    }
+    let evictor = BlobEvictor(database: db, blobs: store)
+
+    // maxRounds=1 → 仅一轮 256 个
+    let r1 = try evictor.drainOrphans(maxRounds: 1)
+    #expect(r1.freed == 256)
+
+    // maxRounds=32 → 剩 44 个全清
+    let r2 = try evictor.drainOrphans(maxRounds: 32)
+    #expect(r2.freed == 44)
+
+    // 第三次 — 啥都没了
+    let r3 = try evictor.drainOrphans()
+    #expect(r3.freed == 0)
+    #expect(r3.bytes == 0)
+}
+
+@Test func drainOrphansNoOpWhenNoTombstones() async throws {
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    let info = try store.put(Data(repeating: 0x11, count: 50))
+    try insertItem(db, id: "live", sha: info.sha256, capturedAtNs: 100)
+    let evictor = BlobEvictor(database: db, blobs: store)
+    let result = try evictor.drainOrphans()
+    #expect(result.freed == 0)
+    #expect(result.bytes == 0)
+    #expect(store.exists(sha256: info.sha256))
+}
+
+// MARK: - Database.tombstoneEvictableShas
+
+@Test func tombstoneEvictableEmptyWhenNoTombstones() async throws {
+    let db = try makeDB(at: tempDir())
+    let sha = String(repeating: "aa", count: 32)
+    try insertItem(db, id: "live", sha: sha, capturedAtNs: 100)
+    let rows = try db.tombstoneEvictableShas(limit: 10)
+    #expect(rows.isEmpty)
+}
+
+@Test func tombstoneEvictableReturnsAllDeletedSha() async throws {
+    let db = try makeDB(at: tempDir())
+    let sha = String(repeating: "bb", count: 32)
+    try insertItem(db, id: "deleted", sha: sha, capturedAtNs: 100, deletedAtNs: 500)
+    let rows = try db.tombstoneEvictableShas(limit: 10)
+    #expect(rows.map { $0.sha } == [sha])
+}
+
+@Test func tombstoneEvictableExcludesShaWithAnyLiveRow() async throws {
+    // 同 sha 跨 origin 多行：一边软删一边活着 → 不算孤儿，不该 evict
+    let db = try makeDB(at: tempDir())
+    let mixedSha = String(repeating: "cc", count: 32)
+    try insertItem(db, id: "tomb-row", sha: mixedSha, capturedAtNs: 100, deletedAtNs: 500, origin: "self")
+    try insertItem(db, id: "live-row", sha: mixedSha, capturedAtNs: 200, origin: "peer-A")
+    let rows = try db.tombstoneEvictableShas(limit: 10)
+    // 仍有活跃 ref，必须排除
+    #expect(rows.isEmpty)
+}
+
+@Test func tombstoneEvictableIncludesShaWhereAllRowsTombstoned() async throws {
+    // 同 sha 多行**全**软删 → 孤儿，可 evict
+    let db = try makeDB(at: tempDir())
+    let sha = String(repeating: "dd", count: 32)
+    try insertItem(db, id: "a", sha: sha, capturedAtNs: 100, deletedAtNs: 500, origin: "self")
+    try insertItem(db, id: "b", sha: sha, capturedAtNs: 200, deletedAtNs: 600, origin: "peer-A")
+    let rows = try db.tombstoneEvictableShas(limit: 10)
+    #expect(rows.map { $0.sha } == [sha])
+}
+
+@Test func tombstoneEvictableOrdersByMinDeletedAtAsc() async throws {
+    let db = try makeDB(at: tempDir())
+    let shaX = String(repeating: "11", count: 32)
+    let shaY = String(repeating: "22", count: 32)
+    let shaZ = String(repeating: "33", count: 32)
+    // shaY 最早删；shaZ 中间；shaX 最晚
+    try insertItem(db, id: "x", sha: shaX, capturedAtNs: 100, deletedAtNs: 900)
+    try insertItem(db, id: "y", sha: shaY, capturedAtNs: 100, deletedAtNs: 100)
+    try insertItem(db, id: "z", sha: shaZ, capturedAtNs: 100, deletedAtNs: 500)
+    let rows = try db.tombstoneEvictableShas(limit: 10)
+    #expect(rows.map { $0.sha } == [shaY, shaZ, shaX])
+}
+
+@Test func tombstoneEvictableExcludesTextOnlyRows() async throws {
+    let db = try makeDB(at: tempDir())
+    // 软删的 text 行没 blob，不该出现在 candidate list（防 SQL 误把 NULL sha 折成一组）
+    try insertItem(db, id: "text-tomb", sha: nil, capturedAtNs: 100,
+                   deletedAtNs: 200, kind: "text")
+    let rows = try db.tombstoneEvictableShas(limit: 10)
+    #expect(rows.isEmpty)
+}
+
+@Test func tombstoneEvictableHonorsLimit() async throws {
+    let db = try makeDB(at: tempDir())
+    for i in 0..<5 {
+        let sha = String(repeating: String(format: "%02x", i + 0x40), count: 32)
+        try insertItem(db, id: "row-\(i)", sha: sha,
+                       capturedAtNs: Int64(i), deletedAtNs: Int64(100 + i))
+    }
+    let rows = try db.tombstoneEvictableShas(limit: 2)
+    #expect(rows.count == 2)
+}
+
+// MARK: - BlobEvictor.evictTombstoneBlobs
+
+@Test func evictTombstoneDrainsAllOrphanBlobs() async throws {
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    // 3 个软删 blob + 1 个活跃 blob
+    let tombs = try (0..<3).map { i -> (String, Int64) in
+        let info = try store.put(Data(repeating: UInt8(0x80 + i), count: 100))
+        try insertItem(db, id: "tomb-\(i)", sha: info.sha256,
+                       capturedAtNs: Int64(i * 100), deletedAtNs: Int64(500 + i))
+        return (info.sha256, 100)
+    }
+    let live = try store.put(Data(repeating: 0xEE, count: 100))
+    try insertItem(db, id: "live", sha: live.sha256, capturedAtNs: 2_000)
+
+    let evictor = BlobEvictor(database: db, blobs: store)
+    let result = try evictor.evictTombstoneBlobs()
+    #expect(result.freed == 3)
+    #expect(result.bytes == 300)
+    // 3 个 orphan 字节全没了
+    for (sha, _) in tombs {
+        #expect(!store.exists(sha256: sha))
+    }
+    // 活跃 blob 没动
+    #expect(store.exists(sha256: live.sha256))
+    // DB 行**全**保留（包括 tombstone 行——驱逐不动 DB）
+    let count = try await db.pool.read { d in
+        try Int.fetchOne(d, sql: "SELECT COUNT(*) FROM item") ?? 0
+    }
+    #expect(count == 4)
+}
+
+@Test func evictTombstoneReturnsZeroWhenNoOrphans() async throws {
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    let info = try store.put(Data(repeating: 0x33, count: 50))
+    try insertItem(db, id: "live", sha: info.sha256, capturedAtNs: 100)
+
+    let evictor = BlobEvictor(database: db, blobs: store)
+    let result = try evictor.evictTombstoneBlobs()
+    #expect(result.freed == 0)
+    #expect(result.bytes == 0)
+    #expect(store.exists(sha256: info.sha256))
+}
+
+@Test func evictTombstoneSkipsShaNotInBlobStore() async throws {
+    // 软删 + 本机已经没字节（optimized mode + 老 sha）：跳过，freed 不计
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    let phantomSha = String(repeating: "ee", count: 32)
+    let realInfo = try store.put(Data(repeating: 0xAA, count: 200))
+    try insertItem(db, id: "phantom-tomb", sha: phantomSha, capturedAtNs: 100, deletedAtNs: 500)
+    try insertItem(db, id: "real-tomb", sha: realInfo.sha256, capturedAtNs: 200, deletedAtNs: 600)
+
+    let evictor = BlobEvictor(database: db, blobs: store)
+    let result = try evictor.evictTombstoneBlobs()
+    // phantom 跳过、real 释放
+    #expect(result.freed == 1)
+    #expect(result.bytes == 200)
+    #expect(!store.exists(sha256: realInfo.sha256))
+}
+
+// MARK: - evictOneOldest: tombstone 先行于 LRU
+
+@Test func evictOneOldestPrefersTombstoneOverLRU() async throws {
+    // tombstone blob captured 比 LRU blob 更**新**——按 LRU 顺序它本应排后面；
+    // 但 tombstone 优先策略让它先被驱逐（免费 win，无 UI 副作用）
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    let oldestLive = try store.put(Data(repeating: 0x01, count: 100))
+    let newerTomb = try store.put(Data(repeating: 0x02, count: 100))
+    try insertItem(db, id: "oldest-live", sha: oldestLive.sha256, capturedAtNs: 100)
+    try insertItem(db, id: "newer-tomb", sha: newerTomb.sha256,
+                   capturedAtNs: 999, deletedAtNs: 1_500)
+
+    let evictor = BlobEvictor(database: db, blobs: store)
+    let freed = try evictor.evictOneOldest()
+    #expect(freed == true)
+    // 较新的 tombstone 被驱逐，较老但活跃的保留
+    #expect(!store.exists(sha256: newerTomb.sha256))
+    #expect(store.exists(sha256: oldestLive.sha256))
+}
+
+@Test func evictOneOldestFallsBackToLRUWhenNoTombstones() async throws {
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    let oldInfo = try store.put(Data(repeating: 0x11, count: 100))
+    let newInfo = try store.put(Data(repeating: 0x22, count: 100))
+    try insertItem(db, id: "old", sha: oldInfo.sha256, capturedAtNs: 100)
+    try insertItem(db, id: "new", sha: newInfo.sha256, capturedAtNs: 999)
+
+    let evictor = BlobEvictor(database: db, blobs: store)
+    #expect(try evictor.evictOneOldest() == true)
+    // 没 tombstone → 走 LRU → 删 old
+    #expect(!store.exists(sha256: oldInfo.sha256))
+    #expect(store.exists(sha256: newInfo.sha256))
+}
+
+// MARK: - evictToWatermark drains tombstones first
+
+@Test func watermarkDrainsTombstonesBeforeLRU() async throws {
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    // 3 个 tombstone + 3 个活跃
+    var tombShas: [String] = []
+    for i in 0..<3 {
+        let info = try store.put(Data(repeating: UInt8(0xA0 + i), count: 100))
+        try insertItem(db, id: "tomb-\(i)", sha: info.sha256,
+                       capturedAtNs: Int64(2_000 + i), deletedAtNs: Int64(3_000 + i))
+        tombShas.append(info.sha256)
+    }
+    var liveShas: [String] = []
+    for i in 0..<3 {
+        let info = try store.put(Data(repeating: UInt8(0xC0 + i), count: 100))
+        try insertItem(db, id: "live-\(i)", sha: info.sha256, capturedAtNs: Int64(1_000 + i))
+        liveShas.append(info.sha256)
+    }
+
+    let evictor = BlobEvictor(database: db, blobs: store)
+    // mock 可用空间永远低于 low → 一直驱逐到 candidates 用光
+    let result = try evictor.evictToWatermark(
+        lowBytes: 100_000,
+        highBytes: 200_000,
+        availableBytes: { 0 }
+    )
+    // 3 个 tombstone + 3 个 LRU 全被驱
+    #expect(result.freed == 6)
+    for sha in tombShas { #expect(!store.exists(sha256: sha)) }
+    for sha in liveShas { #expect(!store.exists(sha256: sha)) }
+}
+
+@Test func watermarkStopsAfterTombstoneDrainWhenAboveHigh() async throws {
+    let dir = tempDir()
+    let store = makeStore(at: dir)
+    let db = try makeDB(at: dir)
+    // 2 个 tombstone + 3 个活跃
+    var tombShas: [String] = []
+    for i in 0..<2 {
+        let info = try store.put(Data(repeating: UInt8(0xE0 + i), count: 100))
+        try insertItem(db, id: "tomb-\(i)", sha: info.sha256,
+                       capturedAtNs: Int64(100 + i), deletedAtNs: Int64(500 + i))
+        tombShas.append(info.sha256)
+    }
+    var liveShas: [String] = []
+    for i in 0..<3 {
+        let info = try store.put(Data(repeating: UInt8(0xF0 + i), count: 100))
+        try insertItem(db, id: "live-\(i)", sha: info.sha256, capturedAtNs: Int64(1_000 + i))
+        liveShas.append(info.sha256)
+    }
+
+    // 模拟可用空间随每次 evict 增长 1000 bytes：drain 2 个 tombstone 后到 high，停手
+    let evictor = BlobEvictor(database: db, blobs: store)
+    var callCount = 0
+    let result = try evictor.evictToWatermark(
+        lowBytes: 1_000,
+        highBytes: 3_000,
+        availableBytes: {
+            defer { callCount += 1 }
+            // 第 0 次（initial）读 0；之后每读一次涨 5000，足以早退
+            return callCount == 0 ? 0 : 10_000
+        }
+    )
+    // tombstone 一批清完后读 availableBytes=10000 >= high 立即返回
+    #expect(result.freed == 2)
+    // tombstone 全清
+    for sha in tombShas { #expect(!store.exists(sha256: sha)) }
+    // 活跃没动（tombstone drain 已经够腾水位）
+    for sha in liveShas { #expect(store.exists(sha256: sha)) }
+}
+
 @Test func watermarkHonorsPerTickCap() async throws {
     let (store, db, _) = try setupWatermarkScenario(blobCount: 100)
     let evictor = BlobEvictor(database: db, blobs: store)

@@ -605,11 +605,45 @@ public struct Database: Sendable {
         }
     }
 
+    /// 按 `MIN(deleted_at_ns) ASC` 列出"孤儿 blob"—— 所有引用行都已 tombstone
+    /// 的 sha。空间压力下应**优先**驱逐这些（strictly 优于 LRU），因为：
+    /// - 没有任何活跃行需要这些字节
+    /// - 用户搜索 / UI 永远看不到对应行（已软删）
+    /// - 不触发 CloudBadge 云端态切换（没行可显示）
+    ///
+    /// 过滤：sha 上的**所有**ref 行 `deleted_at_ns IS NOT NULL`。换言之只要有一行还活
+    /// 着，这个 sha 就不在候选——它仍是 [[oldest-evictable-shas]] 路径的目标。
+    ///
+    /// 排序：`MIN(deleted_at_ns) ASC`——最早被软删的最先驱逐。语义"过期墓碑先清"。
+    ///
+    /// 返回 `(sha, blobSize)` 让 caller 累计字节量；blob_size 是 capture 时记的逻辑值。
+    public func tombstoneEvictableShas(
+        limit: Int, offset: Int = 0
+    ) throws -> [(sha: String, blobSize: Int64)] {
+        precondition(limit > 0, "limit must be > 0")
+        precondition(offset >= 0, "offset must be >= 0")
+        return try pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT blob_sha256 AS sha,
+                       COALESCE(MAX(blob_size), 0) AS sz,
+                       MIN(deleted_at_ns) AS oldest_tomb
+                FROM item
+                WHERE blob_sha256 IS NOT NULL
+                GROUP BY blob_sha256
+                HAVING SUM(CASE WHEN deleted_at_ns IS NULL THEN 1 ELSE 0 END) = 0
+                ORDER BY oldest_tomb ASC
+                LIMIT ? OFFSET ?
+            """, arguments: [limit, offset]).map {
+                (sha: $0["sha"] as String, blobSize: $0["sz"] as Int64)
+            }
+        }
+    }
+
     /// 按 `captured_at_ns ASC` 列出可驱逐的 blob sha——最老优先。
     ///
     /// 过滤契约（缺一不可，少了任何一条都会出事）：
     /// - `blob_sha256 IS NOT NULL` —— text-kind 行没 blob 可驱逐
-    /// - `deleted_at_ns IS NULL` —— tombstone 走单独 GC 路径
+    /// - `deleted_at_ns IS NULL` —— tombstone 走 [[tombstone-evictable-shas]] 单独路径
     /// - `pinned = 0` —— **用户钉的永不驱逐**（硬不变量，不要回退）
     ///
     /// 同 sha 多行只算一次（`MIN(captured_at_ns)` 决定排序键）——驱逐删的是 sha 字节，
