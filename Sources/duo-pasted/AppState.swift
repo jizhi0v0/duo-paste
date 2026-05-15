@@ -105,6 +105,18 @@ final class AppState {
     /// `.failed` 时 banner 显示错误文案 + 用户 Esc 或 Enter 重试
     var pasteProgress: PasteProgress = .idle
 
+    /// Quick Look 风格的空格预览开关。true 时由 SearchPanelController 创建/显示独立
+    /// 浮窗(PreviewPanelController)挂在搜索 panel 上方;内容跟随 currentItem 实时
+    /// 刷新(箭头导航能切换被预览的项)。
+    /// 由 SearchPanelController 的 NSEvent monitor 在空格键路径上 toggle;panel
+    /// hide / 复用打开都会复位成 false 避免下次打开还残留预览态。
+    var previewShown: Bool = false
+
+    /// SearchView 上报的当前选中卡片在 SwiftUI .global 坐标空间(top-left)的 frame。
+    /// PreviewPanelController 用它换算屏幕坐标决定浮窗水平居中位置 + 跟随箭头切换。
+    /// 用结构体而非 Optional——选中态保证有 currentItem,frame=.zero 用作 "还没测量" 哨兵
+    var selectedCardWindowRect: CGRect = .zero
+
     enum PasteProgress: Equatable, Sendable {
         case idle
         case fetching(itemID: String, sizeHint: Int64?)  // sizeHint=blobSize 可知时让 UI 显示进度

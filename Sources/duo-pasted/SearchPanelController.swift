@@ -21,6 +21,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private let onDismiss: () -> Void
     private var panel: NSPanel?
     private var localKeyMonitor: Any?
+    /// 空格预览的独立浮窗 controller。lazy 跟搜索 panel 同生命周期——首次 ensurePanel
+    /// 时一并创建,setAnchor 绑搜索 panel 作为屏幕坐标换算锚点。
+    /// 浮窗不抢 key,因此搜索 panel 的 NSEvent monitor 仍然能截到空格/箭头/Esc 路由预览
+    private var previewController: PreviewPanelController?
 
     init(state: AppState, onPaste: @escaping ([Item]) -> Void,
          onReveal: ((Item) -> Void)? = nil,
@@ -58,6 +62,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     func hide() {
         panel?.orderOut(nil)
         removeKeyMonitor()
+        // preview overlay 永远不跨 panel 生命周期保留——hide 时强制复位,
+        // 下次 show 看到的是干净状态。windowDidResignKey 也走这里,所以 panel
+        // 失焦自动隐藏的路径同样覆盖。state.previewShown 复位还会触发 SearchView
+        // 的 onChange → previewController.hide();这里直接再调一次兜底,避免 SwiftUI
+        // 在 panel 已 orderOut 后 onChange 不触发的边界情况
+        state.previewShown = false
+        previewController?.hide()
         // 调用方负责 cancel 进行中的 lazy paste task + 重置 pasteProgress 状态。
         // 不放在 hide 内部直接操作 state，让 controller 跟 paste 业务解耦
         onDismiss()
@@ -82,20 +93,51 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // ⌘P (keyCode=35) = 切换选中行的 pinned。仅 Cmd 修饰键命中时截走；
             // 不带修饰键的 P 透传给 TextField 当作正常字符输入
             let isCmdP = (keyCode == 35 && isCmd)
-            guard interceptCodes.contains(keyCode) || isCmdP else { return event }
+            // 空格键(49)的拦截条件比较微妙——只在以下两种情况下吞掉:
+            //   1) preview 已经打开 → 空格关闭 preview(Quick Look 风格 toggle)
+            //   2) preview 关闭 + 搜索框为空 + 有选中项 → 空格打开 preview
+            // 搜索框非空(用户正在输入)时,空格必须透传给 TextField 当作正常字符,
+            // 否则 "hello world" 这种带空格的搜索就完全没法输入了。
+            // MainActor.assumeIsolated 读 state 必须在闭包内,这里只决定 "要不要拦"
+            // 不读 state 细节——用一个稍宽的过滤器,真正的分流在下面 switch
+            let isSpace = (keyCode == 49)
+            guard interceptCodes.contains(keyCode) || isCmdP || isSpace else { return event }
             // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
             // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
             if let tv = event.window?.firstResponder as? NSTextView, tv.hasMarkedText() {
                 return event
             }
-            MainActor.assumeIsolated {
-                guard let self, let panel = self.panel, panel.isKeyWindow else { return }
+            // 空格的拦截/透传决定要读 state.previewShown / state.query,因此推到
+                // MainActor 闭包内做。其他键统一吞掉(返回 nil),空格走 shouldConsume 分流
+            let shouldConsume = MainActor.assumeIsolated { () -> Bool in
+                guard let self, let panel = self.panel, panel.isKeyWindow else {
+                    return false
+                }
                 switch keyCode {
+                case 49:                                        // Space — Quick Look 风格预览
+                    if self.state.previewShown {
+                        // preview 已开,空格关闭(同时也响应 Esc 路径,但这里更明确)
+                        self.state.previewShown = false
+                        return true
+                    }
+                    // preview 未开:只要有选中项就开预览。这里**故意不**判 query.isEmpty——
+                    // user 反馈:搜 "pdf" 拿到结果后按空格,期望是预览不是往输入框塞空格。
+                    // 代价是搜索框输不进字面空格(FTS5 多词查询比如 "ipados news" 无法直输),
+                    // 但剪贴板搜索基本是单关键词,权衡可接受。Esc 清空 query 后空格仍能开预览,
+                    // ✕ 按钮可清 query
+                    if self.state.currentItem != nil {
+                        self.state.previewShown = true
+                        return true
+                    }
+                    return false                               // 无选中项(结果空) → 透传
                 case 123: self.state.navigate(by: -1)           // ← 上一项
                 case 124: self.state.navigate(by: 1)            // → 下一项
                 case 126: self.state.navigate(by: -1)           // ↑ alias
                 case 125: self.state.navigate(by: 1)            // ↓ alias
                 case 36, 76:                                    // Return / Enter
+                    // preview 打开时 Enter 仍粘贴——Quick Look 心智里 Return = 选择/确认
+                    // (像 Finder Quick Look: 选中再 Return 打开)。粘贴流程会自然关 panel,
+                    // panel.hide() 路径会复位 previewShown,不需要单独清
                     // 多选时按 selectedIDs 顺序传整个数组;没显式多选 → 取 currentItem 兜底
                     let items: [Item]
                     if !self.state.selectedItems.isEmpty {
@@ -116,15 +158,24 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                         // spinner overlay；同步路径由 AppDelegate.pasteBack 拿 panel 引用自己关
                         self.onPaste(items)
                     }
-                case 53: self.hide()                            // Esc
+                case 53:                                        // Esc
+                    // Esc 优先关 preview(不关 panel)——Finder Quick Look 的标准心智:
+                    // QL 开着时 Esc 收回 QL;再按 Esc 才退出选择。这里 preview 关后用户
+                    // 可以继续在 panel 内操作,再按 Esc 才真正关 panel
+                    if self.state.previewShown {
+                        self.state.previewShown = false
+                    } else {
+                        self.hide()
+                    }
                 case 35 where isCmd:                            // ⌘P = toggle pin
                     if let item = self.state.currentItem {
                         self.state.togglePin(item)
                     }
                 default: break
                 }
+                return true
             }
-            return nil
+            return shouldConsume ? nil : event
         }
     }
 
@@ -169,6 +220,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         p.backgroundColor = .clear
         p.hasShadow = true
 
+        // 预览浮窗 controller——跟搜索 panel 同时创建,锚点指向搜索 panel 自己。
+        // SearchView 的 onPreviewChange 闭包驱动它 show/hide;箭头切换 / 滚动让卡片
+        // frame 变化时 SwiftUI .onChange 也会回调一次让浮窗 reposition
+        let preview = PreviewPanelController(state: state, blobs: state.deps.blobs)
+        preview.setAnchor(p)
+        self.previewController = preview
+
         let root = SearchView(
             state: state,
             onPaste: { [weak self] items in
@@ -180,6 +238,16 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             },
             onClose: { [weak self] in
                 self?.hide()
+            },
+            onPreviewChange: { [weak self] shown in
+                guard let self else { return }
+                if shown,
+                   let item = self.state.currentItem,
+                   self.state.selectedCardWindowRect != .zero {
+                    preview.show(item: item, cardRectInGlobal: self.state.selectedCardWindowRect)
+                } else {
+                    preview.hide()
+                }
             }
         )
         let hosting = NSHostingView(rootView: root)

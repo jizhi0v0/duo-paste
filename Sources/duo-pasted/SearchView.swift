@@ -102,12 +102,27 @@ final class AppIconCache {
     }
 }
 
+/// SwiftUI PreferenceKey:把 currentItem 卡片的 .global frame 上报给 AppState/Controller。
+/// .global 是 SwiftUI 在 hosting view(NSPanel 的 contentView)内的 top-left 坐标空间,
+/// PreviewPanelController 拿到后再换算屏幕坐标(bottom-left)
+private struct SelectedCardFramePreference: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
+}
+
 struct SearchView: View {
     @Bindable var state: AppState
     /// Enter / 双击触发的 paste 回调。双击行传 `[item]` 单条;Enter 由 SearchPanelController
     /// 走 selectedItems 传多条。AppDelegate.pasteBack 根据数量决定单项 / 合并 / 降级路径
     var onPaste: ([Item]) -> Void
     var onClose: () -> Void
+    /// 预览状态变化时通知 caller (SearchPanelController) 驱动 PreviewPanelController。
+    /// `shown=true` 表示 show/update 浮窗(controller 自己 read state.currentItem + 卡片
+    /// frame);false 表示 hide。在 panel hide 时 controller 也会兜底再 hide 一次
+    var onPreviewChange: (Bool) -> Void = { _ in }
 
     @FocusState private var searchFieldFocused: Bool
 
@@ -137,6 +152,28 @@ struct SearchView: View {
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
         .frame(minWidth: 800, minHeight: 312, idealHeight: 312, maxHeight: 312)
+        // 空格预览 = 独立 NSPanel(PreviewPanelController),不在 SearchView 里渲染。
+        // 这里只做 trigger 把状态变化抛给 caller,真正 show/hide/reposition 由 controller
+        // 完成。三个 onChange 覆盖触发面:
+        //   1) previewShown true/false toggle
+        //   2) selectedIDs 变化(箭头切换 currentItem) → 内容跟随
+        //   3) selectedCardWindowRect 变化(滚动 / 布局更新) → 浮窗 reposition
+        .onChange(of: state.previewShown) { _, shown in
+            onPreviewChange(shown)
+        }
+        .onChange(of: state.selectedIDs) { _, _ in
+            if state.previewShown { onPreviewChange(true) }
+        }
+        .onChange(of: state.selectedCardWindowRect) { _, _ in
+            if state.previewShown { onPreviewChange(true) }
+        }
+        .onPreferenceChange(SelectedCardFramePreference.self) { rect in
+            // PreferenceKey 在 layout 过程里多次 fire,只在值真正变化时写回,避免
+            // 触发上面 onChange 死循环
+            if rect != state.selectedCardWindowRect {
+                state.selectedCardWindowRect = rect
+            }
+        }
         // Paste.app 风格底部条:全宽贴底,只顶部两个角圆。底部+左右贴屏边没必要圆角
         .background(.ultraThickMaterial)
         .clipShape(
@@ -276,6 +313,12 @@ struct SearchView: View {
         }
     }
 
+    /// 当前预览锚点的 item id——跟 AppState.currentItem 同口径(selectedIDs.last ?? 第一个)。
+    /// 用 String? 而不是 Item? 让 ForEach 内的 `==` 比较廉价(不重比整个 Item struct)
+    private var previewAnchorID: String? {
+        state.selectedIDs.last ?? state.results.first?.id
+    }
+
     /// Paste.app 风格横向卡片滚动。LazyHStack 让千条 item 不卡——出视口的卡 unload。
     /// ScrollViewReader.scrollTo 配 selectedIDs.last + scrollPulse 让箭头导航能滚到选中卡
     private var cardScroller: some View {
@@ -295,6 +338,20 @@ struct SearchView: View {
                             blobs: state.deps.blobs
                         )
                         .id(item.id)
+                        // 仅 currentItem 那张卡上挂 GeometryReader 发布 frame——currentItem
+                        // = selectedIDs.last,跟 PreviewPanelController 锚定逻辑一致。
+                        // 多选时不发布其他选中卡的 frame(预览只有一个浮窗,跟最后选中的卡走)
+                        .background {
+                            if item.id == previewAnchorID {
+                                GeometryReader { geo in
+                                    Color.clear
+                                        .preference(
+                                            key: SelectedCardFramePreference.self,
+                                            value: geo.frame(in: .global)
+                                        )
+                                }
+                            }
+                        }
                         // user 反馈不要点击放大动画 + 首卡 scale 会让左边框超出 viewport 被裁,
                         // scaleEffect 全撤掉,选中态靠 accent border + shadow 高亮即可
                         // 双击粘贴(无视 selectedIDs)

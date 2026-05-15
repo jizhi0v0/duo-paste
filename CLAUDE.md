@@ -295,6 +295,25 @@ Swift 6 strict concurrency 拒绝把同一个 iterator 实例 capture 进多个 
 
 `@main DuoPasteApp.init()` 里第一行调 `CLI.dispatchAndExitIfApplicable()`。命中 `init-secret` / `retry-failed` / `--help` 则跑完直接 `exit(0|1)`，根本不让 SwiftUI 拉起 NSApp。无参 / 未识别参数返回，daemon 流程照常。子命令实现住在 `DuoPasteCore.Admin`（纯函数，便于单测），CLI 只做 argv 解析 + exit。
 
+### 空格预览浮窗：SwiftUI 子树 + `.id(kindKey)` 切换，不要换 NSViewRepresentable Coordinator
+
+`PreviewPanelController` 是独立 `NonKeyHUDPanel`，hostingView 里 SwiftUI 子树按 `media` 路由到 `PDFPreviewBody` / `Image` / `TextPreviewBody` / `FilePreviewBody`。kind 切换靠 `contentBody().id(kindKey)` 强制 SwiftUI clean swap 子树。代价：切回同一 PDF 时 PDFView 重建 + 首页重渲，肉眼"封面闪一下"。**接受这个 trade-off**，user 已确认。
+
+**不要回退到**: "把所有 kind 的 NSView (PDFView / NSImageView / NSScrollView+NSTextView / NSHostingView) 全 lazy 挂在一个 container 里只 toggle isHidden" 的方案。本意是切回同 PDF 不重渲，但是 `NSImageView` / `PDFView` 的 `intrinsicContentSize`（图片像素 / PDF 页尺寸）会通过 macOS 14+ `NSHostingView.updateAnimatedWindowSize`（私有 `windowDidLayout` notification 路径）**推回 NSWindow 触发 auto-grow**——panel 从 497×706 涨到 1440×906 / 1276×2112（恰好是图片像素值）。
+
+试过且**全部无效**的拦截方案：
+
+| 方案 | 结果 |
+|---|---|
+| `NSPanel.contentMinSize = contentMaxSize = contentSize` | 私有路径无视 min/max |
+| `NSHostingView.sizingOptions = []` | 默认就是 `[]`，显式写也不管用 |
+| Subclass `NSHostingView` override `intrinsicContentSize = noIntrinsicMetric` | `updateAnimatedWindowSize` 不经过 intrinsicContentSize |
+| Subclass `NSPanel` override `setFrame(_:display:animate:)` | private 路径不走 public `setFrame`，override 从未 fire |
+| `didResizeNotification` observer + setContentSize revert | 跟 `windowDidLayout` 同步 layout pass 死循环，NSException `more Update Constraints in Window passes than there are views` 直接崩 daemon |
+| 上面 + DispatchQueue.main.async 延迟 revert | 用户能看到 panel 一帧涨一帧缩，体感很糟 |
+
+唯一守得住 panel 尺寸的路径就是**不让 NSImageView / PDFView 持续挂在 hosting view 的 SwiftUI 子树里**——`.id(kindKey)` 切 kind 时 SwiftUI 整体 tear down 这些 NSViewRepresentable，AppKit 没东西可推就不 auto-resize 了。位置：`PreviewOverlay.swift` 的 `PreviewPanelContent.contentBody` + `kindKey`。
+
 ## 已知环境坑
 
 ### SwiftPM 克隆 GRDB.swift 弱网必断
