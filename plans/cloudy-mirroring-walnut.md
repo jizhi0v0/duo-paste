@@ -208,8 +208,8 @@
 4. **catch-up 不阻塞 daemon**：`mesh-fetch-missing` 是 CLI 子命令独立进程，跟 daemon 同时跑 OK（GRDB DatabasePool 并发安全 + BlobStore.putVerified 原子 rename）
 5. **老 `eager_blobs` 字段**：完成 PR 1 写入新 config 后被 removeValue 洗掉；老代码不存在了
 6. **LRU 驱逐只动 fs 不动 DB 行**（PR 5）：`item.blob_sha256` 保留指向 sha；CloudBadge UI 自动落到"云端"态；lazy paste 路径从 peer 重拉。**pinned / text-only 行的 blob 永不驱逐**
-8. **孤儿 blob GC**（PR 5.1）：sha 的**所有**ref 行都已 `deleted_at_ns IS NOT NULL` → "孤儿"，strictly 优于 LRU（无副作用，没活跃行需要它）。`SnapshotScheduler` 每 tick 无条件 drain；`evictOneOldest` / `evictToWatermark` 都先 drain 后 LRU。**软删但仍有活跃 ref（mesh 跨 origin 同 sha）** → 不算孤儿，blob 保留
-7. **磁盘满不丢 capture / paste**（PR 5）：BlobStore.put ENOSPC → 同步驱逐 oldest → retry。三路 put 站点（capture / pull / lazy paste）都走 retry 版本。仿真 ENOSPC 难，靠实机验
+7. **孤儿 blob GC**（PR 5.1）：sha 的**所有**ref 行都已 `deleted_at_ns IS NOT NULL` → "孤儿"，strictly 优于 LRU（无副作用，没活跃行需要它）。`SnapshotScheduler` 每 tick 无条件 drain；`evictOneOldest` / `evictToWatermark` 都先 drain 后 LRU。**软删但仍有活跃 ref（mesh 跨 origin 同 sha）** → 不算孤儿，blob 保留
+8. **磁盘满不丢 capture / paste**（PR 5）：BlobStore.put ENOSPC → 同步驱逐 oldest → retry。三路 put 站点（capture / pull / lazy paste）都走 retry 版本。仿真 ENOSPC 难，靠实机验
 
 ## 测试覆盖
 
