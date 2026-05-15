@@ -317,18 +317,27 @@ private struct SelectedCardFramePreference: PreferenceKey {
     }
 }
 
-/// 浮岛 panel 的玻璃背景。统一走 `.ultraThickMaterial` (NSVisualEffectView)——
-/// macOS 26 Liquid Glass `.glassEffect` 虽然视觉更精致,但 `isOpaque=false + bg=.clear`
-/// 让屏幕截图(CleanShotX 等抓帧)时 panel 完全透明,跟系统 Spotlight 行为一致但
-/// 跟 Paste.app 不同。本项目优先要"截图正常显示"心智,牺牲 Liquid Glass 换稳定材质。
-/// 想恢复 Liquid Glass:把这里改成 `.glassEffect(.regular, in: shape)` 即可
+/// 浮岛 panel 的玻璃背景。macOS 26+ 走 Liquid Glass (`.glassEffect`)——视觉更通透有
+/// 折射感;老系统兜底 `.ultraThickMaterial` (NSVisualEffectView)。
+///
+/// **截图 tradeoff**:`.glassEffect` 配 `isOpaque=false + bg=.clear` 会让 CleanShotX 等
+/// 截图工具抓到的 panel 透明(跟系统 Spotlight 同行为)。用户接受这个 trade-off 换 Liquid
+/// Glass 视觉——本质上是"录屏 / 截图 vs 实时视觉"两选一。要回到 ultraThickMaterial 把
+/// `if #available` 分支去掉即可
 @MainActor
 private struct PanelBackgroundModifier: ViewModifier {
     let cornerRadius: CGFloat
     func body(content: Content) -> some View {
-        content
-            .background(.ultraThickMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if #available(macOS 26.0, *) {
+            content
+                .background(Color.clear.glassEffect(.regular, in: shape))
+                .clipShape(shape)
+        } else {
+            content
+                .background(.ultraThickMaterial)
+                .clipShape(shape)
+        }
     }
 }
 
@@ -464,11 +473,23 @@ struct SearchView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(
-                Capsule().fill(Color.primary.opacity(0.05))
+                Capsule().fill(Color.primary.opacity(searchFieldFocused ? 0.08 : 0.05))
             )
             .overlay(
-                Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                Capsule().strokeBorder(
+                    searchFieldFocused
+                        ? Color.accentColor.opacity(0.55)
+                        : Color.primary.opacity(0.12),
+                    lineWidth: searchFieldFocused ? 1.2 : 0.5
+                )
             )
+            // focus 态加 accent 色辉光环——SwiftUI shadow 不被 Capsule clip,自然外溢
+            .shadow(
+                color: searchFieldFocused ? Color.accentColor.opacity(0.22) : .clear,
+                radius: searchFieldFocused ? 8 : 0,
+                y: 1
+            )
+            .animation(.smooth(duration: 0.18), value: searchFieldFocused)
             Text("\(state.totalCount) 条")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
@@ -1032,6 +1053,12 @@ private struct FileSubKindChip: View {
                 Capsule()
                     .fill(isSelected ? Color.accentColor : Color.primary.opacity(0.06))
             )
+            .shadow(
+                color: isSelected ? Color.accentColor.opacity(0.35) : .clear,
+                radius: isSelected ? 6 : 0,
+                y: 1
+            )
+            .animation(.smooth(duration: 0.18), value: isSelected)
         }
         .buttonStyle(.plain)
         .fixedSize()
@@ -1083,6 +1110,12 @@ private struct KindChip: View {
                 Capsule()
                     .fill(isSelected ? Color.accentColor : Color.primary.opacity(0.06))
             )
+            .shadow(
+                color: isSelected ? Color.accentColor.opacity(0.35) : .clear,
+                radius: isSelected ? 6 : 0,
+                y: 1
+            )
+            .animation(.smooth(duration: 0.18), value: isSelected)
         }
         .buttonStyle(.plain)
         // 不加这个，父 HStack 收窄时会把 "文本" 压成 "文 / 本" 垂直堆叠（Text 默认允许多行换行）。
@@ -1140,6 +1173,10 @@ private struct ItemCard: View {
     /// 自动 lazy fetch 不显 spinner（缩略图占位本身已是提示）；用户主动点 ☁️ 才显
     @State private var cloudDownloading: Bool = false
     @State private var cloudLastError: String?
+    /// 鼠标悬停态——驱动 hover ring overlay + shadow boost。**不**驱动 scaleEffect:
+    /// 首卡 scaleEffect 会让左边框超出 cardScroller viewport 被裁(见 cardScroller 注释),
+    /// hover 效果靠 glow ring + shadow 实现
+    @State private var isHovered: Bool = false
 
     private var isRemoteMirror: Bool {
         item.originDevice != selfDeviceID
@@ -1173,12 +1210,27 @@ private struct ItemCard: View {
                     lineWidth: isSelected ? 2 : (isRemoteMirror ? 1 : 0.5)
                 )
         )
-        // 选中卡加微阴影抬升效果
-        .shadow(
-            color: isSelected ? Color.accentColor.opacity(0.25) : .clear,
-            radius: isSelected ? 8 : 0,
-            x: 0, y: 2
+        // hover ring——选中前 hint 这张卡可点击。白色细描 + 模糊给"高亮"感不抢
+        // accent 选中态。isSelected 时不显示(避免跟 accent 描边打架)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(
+                    Color.white.opacity(isHovered && !isSelected ? 0.22 : 0),
+                    lineWidth: 1
+                )
+                .blur(radius: 0.5)
         )
+        // 选中卡 accent 辉光;hover 卡黑色 ambient shadow——两态独立动画,切换平滑
+        .shadow(
+            color: isSelected
+                ? Color.accentColor.opacity(0.4)
+                : (isHovered ? Color.black.opacity(0.18) : .clear),
+            radius: isSelected ? 14 : (isHovered ? 10 : 0),
+            x: 0, y: isSelected ? 4 : (isHovered ? 3 : 0)
+        )
+        .animation(.smooth(duration: 0.22), value: isSelected)
+        .animation(.smooth(duration: 0.18), value: isHovered)
+        .onHover { isHovered = $0 }
         // source app icon 钉右上**边框上**——半溢出卡片让 icon "贴"在边沿,
         // 避免内嵌方案遮挡卡内文字。cardScroller 给每张卡 .padding(.trailing, 12) 留
         // slack,scrollTo 最右卡时含 slack 的 padded frame 全可见 → icon 不被 clip

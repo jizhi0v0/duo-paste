@@ -172,7 +172,8 @@ private struct GeneralSettingsTab: View {
         }
     }
 
-    /// 单个修饰键 toggle——pill 样式跟 hotkey 心智一致，比一行一个 Toggle 紧凑
+    /// 单个修饰键 toggle——pill 样式跟 hotkey 心智一致，比一行一个 Toggle 紧凑。
+    /// on/off 切换走 smooth 动画 + 选中态加 accent glow,跟 SearchView 的 chip 一致
     private func modifierToggle(_ glyph: String, name: String) -> some View {
         let isOn = modifierBinding(name)
         return Button {
@@ -188,6 +189,12 @@ private struct GeneralSettingsTab: View {
                               : Color.primary.opacity(0.08))
                 )
                 .foregroundStyle(isOn.wrappedValue ? Color.white : Color.primary)
+                .shadow(
+                    color: isOn.wrappedValue ? Color.accentColor.opacity(0.35) : .clear,
+                    radius: isOn.wrappedValue ? 5 : 0,
+                    y: 1
+                )
+                .animation(.smooth(duration: 0.18), value: isOn.wrappedValue)
         }
         .buttonStyle(.plain)
     }
@@ -328,7 +335,21 @@ private struct ApplyBar: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
-        .background(.bar)
+        .background(applyBarBackground)
+        // tab 切换时 ApplyBar 状态文本变化平滑过渡;dirty / clean 切换的按钮 enable
+        // 也走系统默认 fade
+        .animation(.smooth(duration: 0.18), value: model.isDirty)
+        .animation(.smooth(duration: 0.18), value: model.statusMessage)
+    }
+
+    /// macOS 26+ Liquid Glass;老系统兜底 `.bar` 材质
+    @ViewBuilder
+    private var applyBarBackground: some View {
+        if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(.regular, in: Rectangle())
+        } else {
+            Rectangle().fill(.bar)
+        }
     }
 
     /// statusMessage 含「重启」时才显示重启按钮——简单文本探测，避免引入新字段

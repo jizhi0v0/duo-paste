@@ -49,19 +49,60 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     func show() {
         let p = ensurePanel()
-        positionBottom(p)
-        // 临时切到 regular 让 panel 能拿到 key 状态，显示完再切回去
-        // 但因为我们已经是 .accessory 且 panel 是 nonactivating，需要手动 makeKey
+        let targetOrigin = bottomOrigin()
+        // 开场动画:从 targetOrigin.y - 14 处淡入上浮。alphaValue=0 + 偏移 14pt 起,
+        // NSAnimationContext 走 0.22s ease-out 到 targetOrigin + alphaValue=1。
+        // panel hide 时复位的 alpha + origin 在这里被重新设回起点
+        let startOrigin = NSPoint(x: targetOrigin.x, y: targetOrigin.y - 14)
+        p.setFrameOrigin(startOrigin)
+        p.alphaValue = 0
         NSApp.activate(ignoringOtherApps: true)
         p.makeKeyAndOrderFront(nil)
         installKeyMonitor()
         // 触发 SearchView 重新抢焦点 + kick refresh（panel 被复用，onAppear 不再 fire）
         state.openPulse &+= 1
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.85, 0.3, 1.0)
+            ctx.allowsImplicitAnimation = true
+            p.animator().setFrameOrigin(targetOrigin)
+            p.animator().alphaValue = 1
+        }
     }
 
     func hide() {
-        panel?.orderOut(nil)
-        removeKeyMonitor()
+        // 收场动画:0.14s 快速淡出 + 微下沉,完成后 orderOut。比 show 短一拍——
+        // 用户主动关闭希望立即响应,长动画会拖沓
+        guard let p = panel, p.isVisible else {
+            panel?.orderOut(nil)
+            removeKeyMonitor()
+            finalizeHide()
+            return
+        }
+        let currentOrigin = p.frame.origin
+        let exitOrigin = NSPoint(x: currentOrigin.x, y: currentOrigin.y - 8)
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.14
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            p.animator().setFrameOrigin(exitOrigin)
+            p.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            // NSAnimationContext 的 completionHandler 不带 isolation——回到 main 后
+            // 才能访问 @MainActor 隔离的 panel / removeKeyMonitor / finalizeHide
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.panel?.orderOut(nil)
+                // alpha 复位让下次 show 不会因为残留 alpha=0 被中断
+                self.panel?.alphaValue = 1
+                self.removeKeyMonitor()
+                self.finalizeHide()
+            }
+        })
+    }
+
+    /// hide 路径共用收尾——orderOut 之后必须复位 preview + 通知 caller cancel paste task。
+    /// show/hide 动画走两条 codepath,把这部分抽出来避免漏调
+    private func finalizeHide() {
         // preview overlay 永远不跨 panel 生命周期保留——hide 时强制复位,
         // 下次 show 看到的是干净状态。windowDidResignKey 也走这里,所以 panel
         // 失焦自动隐藏的路径同样覆盖。state.previewShown 复位还会触发 SearchView
@@ -287,14 +328,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     }
 
     private func positionBottom(_ p: NSWindow) {
-        guard let screen = NSScreen.main else { return }
+        p.setFrameOrigin(bottomOrigin())
+    }
+
+    /// 计算 panel 贴底浮岛的目标 origin。show 动画起点从 `targetY - 14` 开始上浮到这里;
+    /// hide 动画从这里下沉 8pt 同时淡出。`visibleFrame` 已排除 Dock
+    private func bottomOrigin() -> NSPoint {
+        guard let screen = NSScreen.main else { return .zero }
         let sFrame = screen.visibleFrame
-        // Floating island:四周留 margin。visibleFrame 已排除 Dock,minY = Dock 顶,
-        // y = minY + vMargin 让 panel 底沿离 Dock 顶 vMargin pt;x 同理
-        p.setFrameOrigin(NSPoint(
+        return NSPoint(
             x: sFrame.minX + Self.panelHMargin,
             y: sFrame.minY + Self.panelVMargin
-        ))
+        )
     }
 
     /// Panel 外边距(屏幕边/Dock 顶 → panel 边)。ensurePanel 算 contentRect width 和
