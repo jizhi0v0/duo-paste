@@ -42,6 +42,10 @@ public actor CaptureService {
     /// **闭包必须 Sendable + 不能 throw**——CaptureService 是 actor，writer tx 已 commit
     /// 后再调；闭包出错应该 log 不影响业务路径。
     private let onCursorAdvanced: @Sendable (Int64) -> Void
+    /// ENOSPC 时调本回调释放空间 + 重试 BlobStore.put。nil = 不做重试（行为退化到
+    /// PR cloudy-mirroring-walnut 前的"capture 失败丢弃这条"）。生产路径 AppDelegate
+    /// 注入 `BlobEvictor.evictOneOldest`；测试可注入静态 false/true 验证 retry 骨架
+    private let evictOnFull: (@Sendable () throws -> Bool)?
 
     public init(
         database: Database,
@@ -50,11 +54,13 @@ public actor CaptureService {
         mergeWindowNs: Int64? = nil,
         textMergeWindowNs: Int64?? = nil,
         limits: Config.CaptureLimits = .default,
-        onCursorAdvanced: @escaping @Sendable (Int64) -> Void = { _ in }
+        onCursorAdvanced: @escaping @Sendable (Int64) -> Void = { _ in },
+        evictOnFull: (@Sendable () throws -> Bool)? = nil
     ) {
         self.database = database
         self.blobs = blobs
         self.deviceID = deviceID
+        self.evictOnFull = evictOnFull
         // 显式 mergeWindowNs 用于测试；生产从 limits.mergeWindowSec 推导。
         self.mergeWindowNs = mergeWindowNs ?? Int64(limits.mergeWindowSec) * 1_000_000_000
         // textMergeWindowNs 是 Int64?? —— 外层 nil 表示"用 limits 推导"，外层非 nil 表示
@@ -168,8 +174,14 @@ public actor CaptureService {
     }
 
     private func ingestBlob(_ c: CapturedPasteboard, blob: Data) throws -> CaptureResult {
-        // 先内容寻址写盘，得到 sha256
-        let info = try blobs.put(blob, ext: c.blobExt)
+        // 先内容寻址写盘，得到 sha256。注入了 evictOnFull 时 ENOSPC 自动 LRU 驱逐 +
+        // 重试，腾不出空间才 throw；nil 时直接走原 put 路径
+        let info: BlobInfo
+        if let evictor = evictOnFull {
+            info = try blobs.putRetryingOnFull(blob, ext: c.blobExt, evictor: evictor)
+        } else {
+            info = try blobs.put(blob, ext: c.blobExt)
+        }
         let preview = c.fileName ?? "[\(c.kind.rawValue) \(humanSize(info.size))]"
         let now = c.capturedAtNs
         let mergeFloor = now - mergeWindowNs

@@ -26,7 +26,8 @@ private func tmpConfig(_ json: String) throws -> URL {
 }
 
 @Test func configMeshSinglePeer() throws {
-    // 单 peer 部署：本机 serve + 配一个 peer URL
+    // 单 peer 部署：本机 serve + 配一个 peer URL。
+    // 老 shared_secret_keychain_account 键残留也允许（unknown key 被 decoder 忽略）
     let url = try tmpConfig("""
     {
         "serve": true,
@@ -73,24 +74,26 @@ private func tmpConfig(_ json: String) throws -> URL {
 }
 
 @Test func configMeshSegmentDefaults() throws {
-    // mesh 段没写 → 全默认值
+    // mesh 段没写 → 全默认值。
+    // plan settings-cleanup：内部 tuning 字段从 Config.MeshConfig 撤掉，
+    // 这里只验 user-facing 4 个字段
     let url = try tmpConfig("{}")
     let cfg = try Config.load(from: url)
     #expect(cfg.mesh.enabled == true)
     #expect(cfg.mesh.pullIntervalSec == 30)
     #expect(cfg.mesh.wsEnabled == true)
-    #expect(cfg.mesh.eagerBlobs == false)
-    #expect(cfg.mesh.crossDeviceDedupWindowNs == 5_000_000_000)
+    #expect(cfg.mesh.storageMode == .full)
 }
 
 @Test func configMeshSegmentRoundtrip() throws {
+    // ws_heartbeat_sec 是老 tuning 键 → unknown key 被 decoder 忽略不报错
     let url = try tmpConfig("""
     {
         "mesh": {
             "enabled": true,
             "pull_interval_sec": 60,
             "ws_enabled": false,
-            "eager_blobs": true,
+            "storage_mode": "optimized",
             "ws_heartbeat_sec": 45
         }
     }
@@ -98,8 +101,147 @@ private func tmpConfig(_ json: String) throws -> URL {
     let cfg = try Config.load(from: url)
     #expect(cfg.mesh.pullIntervalSec == 60)
     #expect(cfg.mesh.wsEnabled == false)
-    #expect(cfg.mesh.eagerBlobs == true)
-    #expect(cfg.mesh.wsHeartbeatSec == 45)
+    #expect(cfg.mesh.storageMode == .optimized)
+}
+
+/// plan settings-cleanup：老 mesh tuning 字段（pull_batch_limit / *_backoff_sec /
+/// cross_device_dedup_window_ns / clock_skew_warn_ms / ws_reconnect_*_sec /
+/// ws_heartbeat_sec / ws_rotation_sec）从 Config.MeshConfig 撤掉。老 config 残留这些
+/// 键时 decoder 必须容忍（unknown key 忽略），不能报错让 daemon 启动挂
+@Test func configIgnoresLegacyMeshTuningKeys() throws {
+    let url = try tmpConfig("""
+    {
+        "mesh": {
+            "enabled": true,
+            "pull_interval_sec": 30,
+            "pull_batch_limit": 500,
+            "pull_initial_backoff_sec": 2,
+            "pull_max_backoff_sec": 120,
+            "cross_device_dedup_window_ns": 5000000000,
+            "clock_skew_warn_ms": 30000,
+            "ws_enabled": true,
+            "ws_reconnect_initial_sec": 1,
+            "ws_reconnect_max_sec": 60,
+            "ws_heartbeat_sec": 30,
+            "ws_rotation_sec": 14400
+        }
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.enabled == true)
+    #expect(cfg.mesh.pullIntervalSec == 30)
+    #expect(cfg.mesh.wsEnabled == true)
+}
+
+/// 写入路径必须 removeValue 老 tuning 键——升级后 config.json 不残留
+@Test func configWriteRemovesLegacyMeshTuningKeys() throws {
+    let url = try tmpConfig("""
+    {
+        "mesh": {
+            "pull_interval_sec": 30,
+            "pull_batch_limit": 500,
+            "ws_heartbeat_sec": 30,
+            "ws_rotation_sec": 14400,
+            "cross_device_dedup_window_ns": 5000000000
+        }
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    try Config.write(cfg, to: url)
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    let mesh = dict["mesh"] as! [String: Any]
+    for legacy in [
+        "pull_batch_limit", "pull_initial_backoff_sec", "pull_max_backoff_sec",
+        "cross_device_dedup_window_ns", "clock_skew_warn_ms",
+        "ws_reconnect_initial_sec", "ws_reconnect_max_sec",
+        "ws_heartbeat_sec", "ws_rotation_sec",
+    ] {
+        #expect(mesh[legacy] == nil, "legacy key \(legacy) 应已被洗掉")
+    }
+    // 用户可见字段仍在
+    #expect(mesh["pull_interval_sec"] as? Int == 30)
+}
+
+/// 老 shared_secret_keychain_account 字段同款撤掉（实际从未在启动路径上读，
+/// shared-secret 走文件路径）
+@Test func configWriteRemovesSharedSecretKeychainAccount() throws {
+    let url = try tmpConfig("""
+    { "shared_secret_keychain_account": "io.duopaste.secret" }
+    """)
+    let cfg = try Config.load(from: url)
+    try Config.write(cfg, to: url)
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    #expect(dict["shared_secret_keychain_account"] == nil)
+}
+
+// MARK: - storage_mode 兼容（plan cloudy-mirroring-walnut §设计决策 老 config 兼容）
+
+@Test func storageModeDefaultsToFull() throws {
+    // 既没 storage_mode 也没老 eager_blobs → 默认 .full（mesh 字面语义）
+    let url = try tmpConfig("{}")
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.storageMode == .full)
+}
+
+@Test func storageModeExplicitOptimized() throws {
+    let url = try tmpConfig("""
+    { "mesh": { "storage_mode": "optimized" } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.storageMode == .optimized)
+}
+
+@Test func storageModeExplicitFull() throws {
+    let url = try tmpConfig("""
+    { "mesh": { "storage_mode": "full" } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.storageMode == .full)
+}
+
+@Test func storageModeLegacyEagerBlobsTrueMapsToFull() throws {
+    // 老 config 显式 eager_blobs=true → 升级后映射 .full（语义一致）
+    let url = try tmpConfig("""
+    { "mesh": { "eager_blobs": true } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.storageMode == .full)
+}
+
+@Test func storageModeLegacyEagerBlobsFalseMapsToFull() throws {
+    // 老 config 显式 eager_blobs=false（PR cloudy-mirroring-walnut 之前默认）
+    // → 升级后映射 .full（默认翻新——「修复后的正确语义」）
+    let url = try tmpConfig("""
+    { "mesh": { "eager_blobs": false } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.storageMode == .full)
+}
+
+@Test func storageModeNewKeyWinsOverLegacy() throws {
+    // 同时存在两个键 → 新键 storage_mode 优先
+    let url = try tmpConfig("""
+    { "mesh": { "storage_mode": "optimized", "eager_blobs": true } }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.mesh.storageMode == .optimized)
+}
+
+@Test func storageModeWriteRemovesLegacyEagerBlobs() throws {
+    // 写新 config 时洗掉老 eager_blobs 字段
+    let url = try tmpConfig("""
+    { "mesh": { "eager_blobs": true, "pull_interval_sec": 30 } }
+    """)
+    var cfg = try Config.load(from: url)
+    cfg.mesh.storageMode = .optimized
+    try Config.write(cfg, to: url)
+    let raw = try Data(contentsOf: url)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    let mesh = dict["mesh"] as! [String: Any]
+    #expect(mesh["eager_blobs"] == nil)
+    #expect((mesh["storage_mode"] as? String) == "optimized")
 }
 
 @Test func configRejectsDuplicatePeerURLs() throws {

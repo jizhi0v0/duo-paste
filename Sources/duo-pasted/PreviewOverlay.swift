@@ -4,6 +4,7 @@ import PDFKit
 import AVFoundation
 import AVKit
 import DuoPasteCore
+import DuoPasteSync
 
 /// 空格预览的独立浮窗。
 ///
@@ -41,6 +42,12 @@ final class PreviewPanelController {
         self.state = state
         self.blobs = blobs
     }
+
+    /// PR cloudy-mirroring-walnut PR 3：optimized storage_mode 下预览图缺 blob 走这个
+    /// fetcher 按需拉。nil = 没配 peer / 加载失败，缺 blob 显占位即可。
+    /// 从 state.pasteBlobFetcher / state.deps.config.mesh.storageMode 读，不另存一份引用
+    private var fetcher: (any BlobFetcher)? { state.pasteBlobFetcher }
+    private var storageMode: StorageMode { state.deps.config.mesh.storageMode }
 
     /// 由 SearchPanelController 在搜索 panel 创建后调用,提供屏幕坐标换算的锚点。
     /// 不在 init 里传是因为 search panel 是 lazy 创建的(ensurePanel)
@@ -95,8 +102,13 @@ final class PreviewPanelController {
         let targetID = item.id
         let capturedItem = item
         let capturedBlobs = blobs
+        let capturedFetcher = fetcher
+        let capturedMode = storageMode
         loadTask = Task { [weak self] in
-            let decoded = await Self.decodeMedia(item: capturedItem, blobs: capturedBlobs)
+            let decoded = await Self.decodeMedia(
+                item: capturedItem, blobs: capturedBlobs,
+                fetcher: capturedFetcher, storageMode: capturedMode
+            )
             guard let self else { return }
             self.mediaCache[targetID] = decoded
             guard self.currentItemID == targetID,
@@ -208,7 +220,31 @@ final class PreviewPanelController {
     /// `PreviewMedia` 用 `@unchecked Sendable` 标记(NSImage/PDFDocument 单写多读,这里
     /// 只在 detached task 里构造一次就交出,后续 main actor 上只读不变)。
     /// 优先级 `.userInitiated` 让用户能感知到这是交互响应路径而非后台 batch
-    nonisolated private static func decodeMedia(item: Item, blobs: BlobStore) async -> PreviewMedia {
+    nonisolated private static func decodeMedia(
+        item: Item,
+        blobs: BlobStore,
+        fetcher: (any BlobFetcher)? = nil,
+        storageMode: StorageMode = .full
+    ) async -> PreviewMedia {
+        // PR cloudy-mirroring-walnut PR 3：optimized 模式 + image kind + 本机缺 blob →
+        // 先 lazy GET /blob 拉字节 + putVerified 写盘，再走下面的同步 decode 路径。
+        // 视频走 BlobStore.locate 解 URL，所以视频路径也需要先拉。PDF 走本机文件路径，不影响
+        if storageMode == .optimized,
+           let fetcher,
+           let sha = item.blobSha256,
+           (Self.isImageLikeStatic(item) || Self.isVideoLikeStatic(item)),
+           !blobs.exists(sha256: sha)
+        {
+            do {
+                let outcome = try await fetcher.getBlob(sha256: sha)
+                if case .found(let data) = outcome {
+                    _ = try? blobs.putVerified(data, expectedSha256: sha)
+                }
+            } catch {
+                // 透传——下面 decode 走 fallback（路径 / 退化 .none）
+            }
+        }
+
         let detached: Task<PreviewMedia, Never> = Task.detached(priority: .userInitiated) {
             if Self.isImageLikeStatic(item), let sha = item.blobSha256,
                let data = try? blobs.read(sha256: sha) ?? nil,
@@ -671,7 +707,10 @@ private struct VideoPreviewBody: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = .inline
-        view.showsFullScreenToggleButton = true
+        // **关键**：禁掉 fullscreen 按钮。AVPlayerView 进 fullscreen 会创建独立的
+        // fullscreen NSWindow，跟 NonKeyHUDPanel 的 nonactivating panel 层级冲突——
+        // ESC 不传给视频控件、点击也退不出来，屏幕上半部黑底下半部漏出搜索 panel
+        view.showsFullScreenToggleButton = false
         view.allowsPictureInPicturePlayback = false
         view.videoGravity = .resizeAspect
         let asset = AVURLAsset(url: url)

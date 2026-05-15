@@ -96,6 +96,10 @@ final class AppState {
     /// 原因：NSPanel 被复用（orderOut 不销毁 hosting view），onAppear / .task(id:query)
     /// 在 reshow 时不会再 fire，焦点会丢、stale results 不会刷新。
     var openPulse: Int = 0
+    /// mesh-fetch-missing / 「补齐缺失 blob」拉回字节后 bump，让 SearchView 卡片 .task
+    /// 重 fire 走 decode 路径（光清 ImageThumbnailCache.invalidateAll 不够——
+    /// .task(id: cacheKey) 因为 sha 不变不会自动 re-fire，要把 pulse 拼进 id）
+    var blobInventoryPulse: Int = 0
     /// PullWorker 上一轮探测到的 primary 时钟偏移（毫秒，signed）。
     /// nil = 还没探测过 / 未启用 pull。banner 阈值由 `clockSkewWarnMs` 决定，
     /// AppState 不做阈值判断，只透传给 SearchView 显示。
@@ -131,6 +135,13 @@ final class AppState {
     }
 
     let deps: AppDependencies
+
+    /// PR cloudy-mirroring-walnut PR 3：optimized storage_mode 下 UI 路径（缩略图 /
+    /// 空格预览）触发按需 lazy GET /blob/<sha>。由 AppDelegate.setupPasteBlobFetcher 设置；
+    /// nil = 没配 peer / shared-secret 加载失败，UI 缺 blob 时显占位即可。
+    /// 跟 AppDelegate.pasteBlobFetcher 同一份引用——paste 路径 + UI 路径共用一个 fetcher
+    /// 让 keep-alive 连接池命中率高
+    var pasteBlobFetcher: (any BlobFetcher)?
 
     /// 单次跳过的提示。`bytes` / `limit` 单位字节，UI 端 humanize。`kind` 决定文案。
     struct SkipNotice: Equatable, Sendable {
@@ -226,7 +237,12 @@ final class AppState {
         // 后台预热 image thumbnail——daemon 重启后 ImageThumbnailCache 空,首次打开 panel
         // 时每张 image 卡 .task 命中 miss 会先显占位再异步 replace。这里 fire-and-forget
         // 让 decode 提前跑,常规场景(daemon 启动后秒级以上才开 panel)cache 已 hot
-        ImageThumbnailCache.shared.prefetch(items: initial, blobs: deps.blobs)
+        ImageThumbnailCache.shared.prefetch(
+            items: initial,
+            blobs: deps.blobs,
+            fetcher: pasteBlobFetcher,
+            storageMode: deps.config.mesh.storageMode
+        )
     }
 
     /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断，无业务语义——稀疏类型
@@ -276,7 +292,12 @@ final class AppState {
             self.results = outcome.items
             // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
             // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
-            ImageThumbnailCache.shared.prefetch(items: outcome.items, blobs: deps.blobs)
+            ImageThumbnailCache.shared.prefetch(
+                items: outcome.items,
+                blobs: deps.blobs,
+                fetcher: pasteBlobFetcher,
+                storageMode: deps.config.mesh.storageMode
+            )
             self.snippets = outcome.snippets
             self.searchMode = outcome.mode
             self.totalCount = outcome.totalCount

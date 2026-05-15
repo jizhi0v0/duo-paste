@@ -592,6 +592,52 @@ public struct Database: Sendable {
         return try base.filter(Column("text_full") == text).fetchOne(db)
     }
 
+    /// 数 blob_sha256 = sha 且未软删的 item 行。磁盘水位驱逐前用：refCount > 1 时
+    /// 删盘也只清一个 sha 的字节（同 sha 多行共用），所以这里只关心 sha 是否仍被任何
+    /// 活跃行引用。tombstone (`deleted_at_ns IS NOT NULL`) 不算 ref——那些行本来就
+    /// 可以 blob GC。
+    public func refCountForBlob(sha256: String) throws -> Int {
+        try pool.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM item
+                WHERE blob_sha256 = ? AND deleted_at_ns IS NULL
+            """, arguments: [sha256]) ?? 0
+        }
+    }
+
+    /// 按 `captured_at_ns ASC` 列出可驱逐的 blob sha——最老优先。
+    ///
+    /// 过滤契约（缺一不可，少了任何一条都会出事）：
+    /// - `blob_sha256 IS NOT NULL` —— text-kind 行没 blob 可驱逐
+    /// - `deleted_at_ns IS NULL` —— tombstone 走单独 GC 路径
+    /// - `pinned = 0` —— **用户钉的永不驱逐**（硬不变量，不要回退）
+    ///
+    /// 同 sha 多行只算一次（`MIN(captured_at_ns)` 决定排序键）——驱逐删的是 sha 字节，
+    /// 重复返回同 sha 浪费循环。
+    ///
+    /// 返回 `(sha, blobSize)` 让 caller 累计驱逐字节量决定是否够腾水位，不用每次都
+    /// 读 fs。**blob_size 是 DB 里 capture 时记的逻辑大小**，不代表 BlobStore fs 上的
+    /// 物理大小（极端情况下可能小几个 byte），但水位决策不需要那么精确。
+    public func oldestEvictableShas(limit: Int) throws -> [(sha: String, blobSize: Int64)] {
+        precondition(limit > 0, "limit must be > 0")
+        return try pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT blob_sha256 AS sha,
+                       COALESCE(MAX(blob_size), 0) AS sz,
+                       MIN(captured_at_ns) AS oldest
+                FROM item
+                WHERE blob_sha256 IS NOT NULL
+                  AND deleted_at_ns IS NULL
+                  AND pinned = 0
+                GROUP BY blob_sha256
+                ORDER BY oldest ASC
+                LIMIT ?
+            """, arguments: [limit]).map {
+                (sha: $0["sha"] as String, blobSize: $0["sz"] as Int64)
+            }
+        }
+    }
+
     /// 一键 WAL checkpoint，用于 snapshot 前刷盘
     public func checkpoint() throws {
         _ = try pool.writeWithoutTransaction { db in

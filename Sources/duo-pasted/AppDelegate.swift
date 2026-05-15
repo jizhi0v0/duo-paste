@@ -1,12 +1,20 @@
 import AppKit
+import SwiftUI
 import DuoPasteCore
 import DuoPasteCapture
 import DuoPasteSync
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// SwiftUI Settings scene 不能直接访问 AppDelegate 实例字段。这里挂一个 weak 弱引用，
+    /// 让 SettingsView 能拿到当前 AppState（含 deps.config / deps.deviceID / pasteBlobFetcher
+    /// / meshStatus）。单 daemon 进程内永远只有 1 个 AppDelegate
+    static weak var shared: AppDelegate?
+
     private var deps: AppDependencies!
-    private var state: AppState!
+    var state: AppState!  // SwiftUI Settings 读
+    /// SwiftUI Settings 读 config / paths / device-id / blobs 路径
+    var dependencies: AppDependencies? { deps }
     private var panel: SearchPanelController!
     private var statusBar: StatusBarController!
     private var watcher: PasteboardWatcher!
@@ -30,12 +38,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// nonisolated 让 TaskGroup 的 sleeper task 能 capture（详 fetchBlobLazy）
     nonisolated static let lazyBlobTimeoutSec: TimeInterval = 30
 
+    /// 自管的 Settings 窗口。第一次点状态栏「设置…」时 lazy 创建；
+    /// 后续点击 makeKeyAndOrderFront 复用同一个 window，关掉时 orderOut 不销毁
+    /// 让 SwiftUI 状态（SettingsModel 的 working copy）保留
+    private var settingsWindow: NSWindow?
+
+    /// StatusBarController 触发的「设置…」入口。accessory app 没 Dock + 无主菜单，
+    /// SwiftUI Settings scene 不响应 `showSettingsWindow:` —— 自管 NSWindow 绕开整个机制
+    /// SettingsView apply 后调用——重读 config.hotkey 把 GlobalHotKey 重 register 到新组合。
+    /// 零成本（register API 幂等：先 unregister 旧 + remove 旧 handler，再 register 新）。
+    /// **关键**：必须重新 load 一次 config 拿最新值；deps.config 是 daemon 启动时快照不会变
+    func reloadHotkey() {
+        guard hotkey != nil else { return }
+        let cfg: Config
+        do {
+            cfg = try Config.load(from: deps.paths.configFile)
+        } catch {
+            fputs("reloadHotkey: 读 config 失败：\(error)\n", stderr)
+            return
+        }
+        do {
+            let translated = try HotkeyTranslation.translate(cfg.hotkey)
+            try hotkey.register(
+                keyCode: translated.keyCode,
+                carbonModifiers: translated.modifiers
+            ) { [weak self] in
+                self?.panel.toggle()
+            }
+            fputs("hotkey re-registered: \(cfg.hotkey.modifiers.joined(separator: "+"))+\(cfg.hotkey.key)\n", stderr)
+        } catch {
+            fputs("reloadHotkey: register 失败：\(error)\n", stderr)
+        }
+    }
+
+    /// SettingsView「立即重启 daemon」按钮调用——`exit(0)` 让 launchd KeepAlive
+    /// 自动 respawn 新进程（plist 有 KeepAlive=true）。daemon 进程级重启比手动
+    /// `launchctl kickstart` 直接，且新进程会重读 config 让所有非热重载字段生效
+    func restartDaemon() {
+        fputs("restart requested via settings — exiting for launchd respawn\n", stderr)
+        exit(0)
+    }
+
+    func showSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let win = settingsWindow {
+            win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: SettingsView())
+        let win = NSWindow(contentViewController: host)
+        win.title = "duo-paste 设置"
+        win.styleMask = [.titled, .closable, .miniaturizable]
+        win.setContentSize(NSSize(width: 600, height: 500))
+        win.isReleasedWhenClosed = false   // close 走 orderOut，下次直接复用
+        win.center()
+        self.settingsWindow = win
+        win.makeKeyAndOrderFront(nil)
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
         NSApp.setActivationPolicy(.accessory)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.shared = self
         do {
             deps = try AppDependencies()
         } catch {
@@ -95,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startOCRWorker()
         }
 
-        fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · db=\(deps.paths.mainDB.path)\n", stderr)
+        fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · storage_mode=\(deps.config.mesh.storageMode.rawValue) · db=\(deps.paths.mainDB.path)\n", stderr)
     }
 
     /// 用 config.hotkey 注册 Carbon 全局快捷键；失败时回退到默认 ⌥⌘V 再试一次。
@@ -153,6 +220,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 // 严格模式：peer.deviceID 显式给了 → 严格校验对端 /health 返回 device_id
                 // 不匹配立即 transient skip。学习模式：deviceID=nil → 首次 /health 学到
+                // plan settings-cleanup：PullWorker / WSNotificationClient 内部 tuning
+                // 字段（batch limit / backoff / dedup window / clock skew / ws timing）
+                // 不再从 config 读，全用 worker default。pullIntervalSec / storageMode 仍
+                // 用户可见所以仍透传
                 let worker = PullWorker(
                     database: deps.database,
                     transport: client,
@@ -162,14 +233,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     pasteSuppressions: deps.pasteSuppressions,
                     blobFetcher: client,
                     blobs: deps.blobs,
+                    evictOnFull: deps.evictOnFull,
                     config: PullWorker.Config(
                         intervalSec: TimeInterval(intervalSec),
-                        batchLimit: cfg.mesh.pullBatchLimit,
-                        initialBackoffSec: cfg.mesh.pullInitialBackoffSec,
-                        maxBackoffSec: cfg.mesh.pullMaxBackoffSec,
-                        crossDeviceDedupWindowNs: cfg.mesh.crossDeviceDedupWindowNs,
-                        clockSkewWarnMs: cfg.mesh.clockSkewWarnMs,
-                        eagerBlobs: cfg.mesh.eagerBlobs
+                        storageMode: cfg.mesh.storageMode
                     )
                 )
                 let wsClient: WSNotificationClient?
@@ -189,12 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 "ws-client: catastrophic — exiting to let launchd restart\n".utf8
                             ))
                             exit(1)
-                        },
-                        config: WSNotificationClient.Config(
-                            heartbeatSec: cfg.mesh.wsHeartbeatSec,
-                            reconnectInitialSec: cfg.mesh.wsReconnectInitialSec,
-                            reconnectMaxSec: cfg.mesh.wsReconnectMaxSec
-                        )
+                        }
                     )
                 } else {
                     wsClient = nil  // mesh.ws_enabled=false 退化为周期 pull
@@ -223,11 +285,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
-            self.pasteBlobFetcher = HTTPPeerClient(
+            let fetcher = HTTPPeerClient(
                 baseURL: firstPeer.url,
                 auth: auth,
                 session: AppDependencies.syncURLSession
             )
+            self.pasteBlobFetcher = fetcher
+            // PR cloudy-mirroring-walnut PR 3：UI 路径（缩略图 / 空格预览）optimized 模式
+            // 下也走这个 fetcher 按需拉 blob。同 instance 让连接池跨场景复用
+            self.state.pasteBlobFetcher = fetcher
             fputs("paste blob fetcher → \(firstPeer.url.absoluteString)\n", stderr)
         } catch {
             fputs("paste blob fetcher NOT initialized: \(error)\n", stderr)
@@ -679,7 +745,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch r {
                 case .found(let data):
                     do {
-                        _ = try deps.blobs.putVerified(data, expectedSha256: sha)
+                        // ENOSPC 时走 LRU 驱逐重试：用户正在 paste，先腾出空间再写
+                        _ = try deps.blobs.putVerifiedRetryingOnFull(
+                            data, expectedSha256: sha, evictor: deps.evictOnFull
+                        )
                         return .success
                     } catch {
                         return .failure(reason: "落盘失败: \(error)")

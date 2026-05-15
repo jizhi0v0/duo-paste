@@ -305,7 +305,9 @@ private func makeEmptyDB(at dir: URL) throws -> URL {
 }
 
 @Test func meshInitPreservesUnrelatedConfigFields() throws {
-    // hotkey / capture / ocr / shared_secret_keychain_account 不动
+    // hotkey / capture / ocr 不动。
+    // plan settings-cleanup：shared_secret_keychain_account 已撤掉，老 key 在 Config.write
+    // 时被显式 removeValue 洗掉——这里改成验证它消失而非保留
     let dir = tempDir()
     let cfg = try writeConfig("""
     {
@@ -330,5 +332,8 @@ private func makeEmptyDB(at dir: URL) throws -> URL {
     #expect(after.capture.maxTextBytes == 1024 * 1024)
     #expect(after.ocr.enabled == false)
     #expect(after.ocr.languages == ["zh-Hans"])
-    #expect(after.sharedSecretKeychainAccount == "io.duopaste.secret")
+    // 老 keychain account 字段被洗掉
+    let raw = try Data(contentsOf: cfg)
+    let dict = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+    #expect(dict["shared_secret_keychain_account"] == nil)
 }

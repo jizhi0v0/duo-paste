@@ -128,7 +128,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
     await runBriefly(worker)
 
@@ -162,7 +162,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: false)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .optimized)
     )
     await runBriefly(worker)
 
@@ -196,7 +196,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
     await runBriefly(worker)
     #expect(await fetcher.totalCalls() == 0)
@@ -221,7 +221,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
     await runBriefly(worker)
     #expect(await fetcher.totalCalls() == 0)
@@ -243,7 +243,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
     await runBriefly(worker)
     #expect(await fetcher.totalCalls() == 0)
@@ -266,7 +266,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
     await runBriefly(worker)
 
@@ -305,7 +305,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         database: db, transport: transport,
         selfDeviceID: "client", meshStatus: MeshStatus(),
         blobFetcher: fetcher, blobs: blobs,
-        config: PullWorker.Config(intervalSec: 60, eagerBlobs: true)
+        config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
     await runBriefly(worker)
 

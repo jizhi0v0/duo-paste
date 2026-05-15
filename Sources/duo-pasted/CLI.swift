@@ -23,6 +23,8 @@ enum CLI {
             runMeshInit(args: rest)
         case "mesh-doctor":
             runMeshDoctor(args: rest)
+        case "mesh-fetch-missing":
+            runMeshFetchMissing(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -69,6 +71,14 @@ enum CLI {
                                   缺字节统计。**只读**，不动 DB / config / blobs。
                                   退出码 0=都健康；1=任一 peer unreachable / device_id 不匹配 /
                                   blob 缺失 → 给脚本接管。
+
+          mesh-fetch-missing [--dry-run] [--concurrency N] [--peer URL]
+                                  一次性 catch-up：扫本机所有 peer-origin 缺字节的
+                                  image/file blob sha → 并发 GET /blob/<sha> 拉回本机
+                                  BlobStore。用户从老 storage_mode=optimized（或老
+                                  eager_blobs=false）升到新默认 full 后跑一次补历史。
+                                  默认 concurrency=4。--peer 限定单个 peer URL（默认按
+                                  config peers 顺序尝试每个）。--dry-run 只列缺失不拉。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -440,6 +450,176 @@ enum CLI {
         } else {
             lines.append("")
             lines.append("blobs: ✓ 本机 image/file 行的 sha 全部在 BlobStore")
+        }
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    private static func runMeshFetchMissing(args: [String]) {
+        var dryRun = false
+        var concurrency = 4
+        var peerOverride: URL? = nil
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--dry-run":
+                dryRun = true
+                i += 1
+            case "--concurrency":
+                if i + 1 < args.count, let n = Int(args[i + 1]), n >= 1, n <= 64 {
+                    concurrency = n
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-fetch-missing: --concurrency 缺值或越界 (1-64)\n".utf8))
+                    exit(1)
+                }
+            case "--peer":
+                if i + 1 < args.count,
+                   let u = URL(string: args[i + 1]),
+                   let scheme = u.scheme?.lowercased(),
+                   ["http", "https"].contains(scheme),
+                   u.host != nil
+                {
+                    peerOverride = u
+                    i += 2
+                } else {
+                    FileHandle.standardError.write(Data("mesh-fetch-missing: --peer URL 非法\n".utf8))
+                    exit(1)
+                }
+            default:
+                FileHandle.standardError.write(Data("mesh-fetch-missing: 未知参数 \(args[i])\n".utf8))
+                exit(1)
+            }
+        }
+
+        let paths = Paths.makeDefault()
+        paths.ensureExists()
+        let cfg: Config
+        do {
+            cfg = try Config.load(from: paths.configFile)
+        } catch {
+            FileHandle.standardError.write(Data("mesh-fetch-missing: 读 config 失败：\(error)\n".utf8))
+            exit(1)
+        }
+        let deviceID: String
+        do {
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("mesh-fetch-missing: 读 device-id 失败：\(error)\n".utf8))
+            exit(1)
+        }
+        let blobs = BlobStore(root: paths.blobsDir)
+
+        // peer 候选列表：--peer 显式给 → 单峰；否则用 config.peers 全部按序尝试
+        let peerURLs: [URL]
+        if let p = peerOverride {
+            peerURLs = [p]
+        } else {
+            peerURLs = cfg.peers.map { $0.url }
+        }
+        if peerURLs.isEmpty && !dryRun {
+            FileHandle.standardError.write(Data("mesh-fetch-missing: 没有配置 peer（config peers 空 + 未给 --peer）\n".utf8))
+            exit(1)
+        }
+
+        // dry-run 路径不需要 fetcher——闭包永远 unreachable
+        let fetcher: @Sendable (String) async -> Admin.BlobFetchOutcome
+        if dryRun {
+            fetcher = { _ in .notFound }
+        } else {
+            let secret: Data
+            do {
+                secret = try SharedSecret.load(from: paths.sharedSecretFile)
+            } catch {
+                FileHandle.standardError.write(Data("mesh-fetch-missing: 加载 shared-secret 失败：\(error)\n".utf8))
+                exit(1)
+            }
+            let auth = HMACAuth(secret: secret)
+            // 每个 peer 一个 HTTPPeerClient，按 peerURLs 顺序对每个 sha 尝试
+            let clients: [HTTPPeerClient] = peerURLs.map {
+                HTTPPeerClient(baseURL: $0, auth: auth)
+            }
+            fetcher = { sha in
+                var lastErr: Admin.BlobFetchOutcome = .notFound
+                for client in clients {
+                    do {
+                        let r = try await client.getBlob(sha256: sha)
+                        switch r {
+                        case .found(let data): return .found(data)
+                        case .notFound:
+                            lastErr = .notFound
+                            continue
+                        }
+                    } catch let err as GetBlobError {
+                        switch err {
+                        case .rejected(let reason):
+                            lastErr = .rejected(reason: reason)
+                            continue
+                        case .shaMismatch(let exp, let act):
+                            lastErr = .shaMismatch(expected: exp, actual: act)
+                            continue
+                        case .transient(let reason):
+                            lastErr = .transient(reason: reason)
+                            continue
+                        }
+                    } catch {
+                        lastErr = .transient(reason: "\(error)")
+                        continue
+                    }
+                }
+                return lastErr
+            }
+        }
+
+        let report: Admin.FetchMissingReport
+        let finalConcurrency = concurrency
+        let finalDryRun = dryRun
+        let finalPaths = paths
+        let finalDeviceID = deviceID
+        let finalBlobs = blobs
+        let finalFetcher = fetcher
+        do {
+            report = try runBlocking { @Sendable in
+                try await Admin.fetchMissingBlobs(
+                    dbPath: finalPaths.mainDB,
+                    selfDeviceID: finalDeviceID,
+                    blobs: finalBlobs,
+                    fetcher: finalFetcher,
+                    concurrency: finalConcurrency,
+                    dryRun: finalDryRun,
+                    log: { msg in
+                        FileHandle.standardError.write(Data("mesh-fetch-missing: \(msg)\n".utf8))
+                    }
+                )
+            }
+        } catch {
+            FileHandle.standardError.write(Data("mesh-fetch-missing failed: \(error)\n".utf8))
+            exit(1)
+        }
+        printFetchMissingReport(report, peerURLs: peerURLs, concurrency: concurrency)
+        exit(report.failed > 0 ? 1 : 0)
+    }
+
+    private static func printFetchMissingReport(_ r: Admin.FetchMissingReport, peerURLs: [URL], concurrency: Int) {
+        var lines: [String] = []
+        if r.dryRun {
+            lines.append("mesh-fetch-missing dry-run · 未拉取")
+        } else {
+            lines.append("mesh-fetch-missing done")
+        }
+        lines.append("  peers: \(peerURLs.count) · concurrency=\(concurrency)")
+        for u in peerURLs { lines.append("    - \(u.absoluteString)") }
+        lines.append("  total missing: \(r.totalMissing)")
+        if r.dryRun {
+            lines.append("  （加 --concurrency / 去掉 --dry-run 真跑）")
+        } else {
+            lines.append("  fetched=\(r.fetched) failed=\(r.failed)")
+            if !r.failures.isEmpty {
+                lines.append("")
+                lines.append("⚠ 失败样本（前 \(r.failures.count) 条）：")
+                for f in r.failures {
+                    lines.append("    - \(f.sha.prefix(12))... · \(f.reason)")
+                }
+            }
         }
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
     }

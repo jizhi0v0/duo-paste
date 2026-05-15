@@ -34,11 +34,14 @@ public actor PullWorker {
         /// 立刻 401，但快到边界就该提醒了。
         public var clockSkewWarnMs: Int64
 
-        /// `pull.eager_blobs=true` 时 PullWorker 拉完一页 metadata 后顺路 GET 这一页里
-        /// 本机 BlobStore 没字节的 blob_sha256（去重）。失败不抛、不阻塞 cursor 推进——
-        /// 下次 tick 拉同样的 sha 再试。**默认 false**（lazy 路径覆盖 paste-back 即可，
-        /// eager 是图片密集 + 大盘场景的可选优化）
-        public var eagerBlobs: Bool
+        /// `.full`（默认）= PullWorker 拉完一页 metadata 顺路 GET 这一页里本机 BlobStore
+        /// 没字节的 blob_sha256（去重）做完整 mirror。`.optimized` = 不拉字节，UI 按需走
+        /// lazy 路径（缩略图 / 预览 / paste）。失败不抛、不阻塞 cursor 推进——下次 tick
+        /// 拉同样的 sha 再试。
+        ///
+        /// 替代老 `eagerBlobs: Bool` 字段（plan cloudy-mirroring-walnut）——默认翻成
+        /// 「完整 mirror」对齐 mesh 字面语义；想节省存储的设备显式配 .optimized opt-in
+        public var storageMode: StorageMode
 
         public init(
             intervalSec: TimeInterval = 30,
@@ -47,7 +50,7 @@ public actor PullWorker {
             maxBackoffSec: TimeInterval = 120,
             crossDeviceDedupWindowNs: Int64 = 5_000_000_000,
             clockSkewWarnMs: Int64 = 30_000,
-            eagerBlobs: Bool = false
+            storageMode: StorageMode = .default
         ) {
             self.intervalSec = intervalSec
             self.batchLimit = batchLimit
@@ -55,7 +58,7 @@ public actor PullWorker {
             self.maxBackoffSec = maxBackoffSec
             self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
             self.clockSkewWarnMs = clockSkewWarnMs
-            self.eagerBlobs = eagerBlobs
+            self.storageMode = storageMode
         }
 
         public static let `default` = Config()
@@ -74,11 +77,14 @@ public actor PullWorker {
     /// 又被对端 watcher capture 推回来时，PullWorker 在 applyPage 里查这个 set，命中 skip。
     /// nil = 抑制功能未启用（standalone / 测试不传）。
     private let pasteSuppressions: PasteSuppressionSet?
-    /// eager_blobs=true 时用于拉 blob 字节。nil → 即使 config.eagerBlobs=true 也 no-op
+    /// `storage_mode=.full` 时用于拉 blob 字节。nil → 即使 config.storageMode=.full 也 no-op
     /// （让测试可以独立控制；生产 AppDelegate 始终注入 HTTPPeerClient）
     private let blobFetcher: BlobFetcher?
-    /// eager_blobs=true 时把拉回的字节写入这里。nil → 同 blobFetcher
+    /// `storage_mode=.full` 时把拉回的字节写入这里。nil → 同 blobFetcher
     private let blobs: BlobStore?
+    /// ENOSPC 时调本回调释放空间。nil = 不做 LRU 驱逐，fetchBlobsFull 失败只 log
+    /// （行为不变）。生产路径 AppDelegate 注入 `BlobEvictor.evictOneOldest`
+    private let evictOnFull: (@Sendable () throws -> Bool)?
     private let config: Config
     private let nowNs: @Sendable () -> Int64
     private let log: @Sendable (String) -> Void
@@ -99,6 +105,7 @@ public actor PullWorker {
         pasteSuppressions: PasteSuppressionSet? = nil,
         blobFetcher: BlobFetcher? = nil,
         blobs: BlobStore? = nil,
+        evictOnFull: (@Sendable () throws -> Bool)? = nil,
         config: Config = .default,
         nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() },
         log: @escaping @Sendable (String) -> Void = { msg in
@@ -113,6 +120,7 @@ public actor PullWorker {
         self.pasteSuppressions = pasteSuppressions
         self.blobFetcher = blobFetcher
         self.blobs = blobs
+        self.evictOnFull = evictOnFull
         self.config = config
         self.nowNs = nowNs
         self.log = log
@@ -296,9 +304,10 @@ public actor PullWorker {
                 result.skippedDedup = applied.dedupSkipped
                 result.skippedPasteEcho = applied.pasteEchoSkipped
                 result.hasMore = page.hasMore
-                // eager_blobs 路径：tx 已提交、cursor 已推进，eager 失败不回滚 mirror。
-                // 顺序故意——blob 字节是"用户体验加速"，不是 mirror 正确性的一部分
-                await fetchBlobsEager(applied.mirroredShas)
+                // storage_mode=.full 路径：tx 已提交、cursor 已推进，full 失败不回滚 mirror。
+                // 顺序故意——blob 字节是"用户体验加速"，不是 mirror 正确性的一部分。
+                // .optimized 模式 fetchBlobsFull 内部 guard short-circuit return no-op
+                await fetchBlobsFull(applied.mirroredShas)
             } catch {
                 log("apply page failed: \(error)")
                 result.hadTransient = true
@@ -508,12 +517,13 @@ public actor PullWorker {
         }
     }
 
-    /// eager_blobs 路径：拉这一页 mirror 行涉及的 blob 字节到本机 BlobStore。
+    /// `storage_mode=.full` 路径：拉这一页 mirror 行涉及的 blob 字节到本机 BlobStore。
     /// **best-effort**：任何 sha 失败 only log，不 throw、不影响 cursor 推进（cursor 已经
     /// 在 applyPage tx 内 commit）。下次 tick 这些 sha 仍 missing 会再次尝试——指数 backoff
-    /// 由整体 tick 层接管（transient 失败时整体 tick 标 hadTransient），eager 阶段不自己重试
-    private func fetchBlobsEager(_ shas: Set<String>) async {
-        guard config.eagerBlobs,
+    /// 由整体 tick 层接管（transient 失败时整体 tick 标 hadTransient），full 阶段不自己重试。
+    /// `.optimized` 模式 short-circuit return——UI 按需走 lazy 路径
+    private func fetchBlobsFull(_ shas: Set<String>) async {
+        guard config.storageMode == .full,
               let fetcher = blobFetcher,
               let store = blobs,
               !shas.isEmpty else {
@@ -534,24 +544,30 @@ public actor PullWorker {
                 switch outcome {
                 case .found(let data):
                     do {
-                        _ = try store.putVerified(data, expectedSha256: sha)
+                        if let evictor = evictOnFull {
+                            _ = try store.putVerifiedRetryingOnFull(
+                                data, expectedSha256: sha, evictor: evictor
+                            )
+                        } else {
+                            _ = try store.putVerified(data, expectedSha256: sha)
+                        }
                         fetched += 1
                     } catch {
-                        log("eager blob put failed sha=\(sha): \(error)")
+                        log("full mirror blob put failed sha=\(sha): \(error)")
                         failed += 1
                     }
                 case .notFound:
-                    // primary 也没字节——promote-to-primary 缺 blob 场景下的合法情况
-                    log("eager blob notFound on primary sha=\(sha)")
+                    // peer 也没字节——promote-to-primary 缺 blob 场景下的合法情况
+                    log("full mirror blob notFound on peer sha=\(sha)")
                     failed += 1
                 }
             } catch {
-                log("eager blob fetch failed sha=\(sha): \(error)")
+                log("full mirror blob fetch failed sha=\(sha): \(error)")
                 failed += 1
             }
         }
         if fetched + failed > 0 {
-            log("eager blobs fetched=\(fetched) skipped=\(skipped) failed=\(failed)")
+            log("full mirror blobs fetched=\(fetched) skipped=\(skipped) failed=\(failed)")
         }
     }
 }

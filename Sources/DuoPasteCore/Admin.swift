@@ -321,8 +321,7 @@ public enum Admin {
             mesh: oldConfig.mesh,
             ocr: oldConfig.ocr,
             capture: oldConfig.capture,
-            hotkey: oldConfig.hotkey,
-            sharedSecretKeychainAccount: oldConfig.sharedSecretKeychainAccount
+            hotkey: oldConfig.hotkey
         )
 
         // dry-run：跑完所有预检 + 组好 newConfig 但**不**真写
@@ -352,6 +351,177 @@ public enum Admin {
             dryRun: false,
             removedLegacyKeys: removedLegacy
         )
+    }
+
+    // MARK: - mesh-fetch-missing （PR cloudy-mirroring-walnut PR 2）
+
+    /// 一次性 catch-up 入口：扫本机所有缺字节的 peer-origin blob sha → 并发拉回。
+    /// 用户从老 lazy 模式 / `eager_blobs=false` 升级到新 `storage_mode=full` 默认后，
+    /// 历史 peer 行可能仍缺 blob（PR 1 之后的新行 PullWorker eager 路径自动处理）。
+    public struct FetchMissingReport: Sendable, Equatable {
+        /// 总共需要拉的 sha 数（dedup 后；含 fetched + failed + skipped）
+        public let totalMissing: Int
+        /// 成功 GET + putVerified 写盘的 sha 数
+        public let fetched: Int
+        /// 失败（404 / shaMismatch / transient 重试耗尽 / put 失败）的 sha 数
+        public let failed: Int
+        /// dryRun=true 时全部入 skipped；非 dryRun 路径目前不进 skipped（保留字段
+        /// 给未来 "blob 太大跳过" 等场景）
+        public let skipped: Int
+        /// 失败的 sha + reason，最多保留前 N 条。给用户日志看哪些 peer 上也没字节
+        public let failures: [FetchFailure]
+        public let dryRun: Bool
+
+        public struct FetchFailure: Sendable, Equatable {
+            public let sha: String
+            public let reason: String
+        }
+    }
+
+    /// Admin 不能依赖 DuoPasteSync 模块的 BlobFetcher 协议——用闭包接口。
+    /// CLI 包装层把 HTTPPeerClient.getBlob 翻成这个 enum
+    public enum BlobFetchOutcome: Sendable {
+        case found(Data)
+        case notFound
+        case shaMismatch(expected: String, actual: String)
+        case rejected(reason: String)
+        case transient(reason: String)
+    }
+
+    public static let fetchMissingFailureSampleLimit = 20
+
+    /// 一次性 catch-up：把本机缺字节的 peer-origin sha 全部拉回来。
+    ///
+    /// 设计要点：
+    /// - **只扫 peer-origin**（origin_device != selfDeviceID）：own-origin 缺 blob 是
+    ///   本地 BlobStore 被清的问题，拉对端也没有；mesh-fetch-missing 是补对端镜像
+    /// - **并发 sha 而非并发 peer**：每个 sha 内部由 fetcher 闭包决定要打哪个 peer
+    ///   （CLI 包装层按 peer 顺序尝试）；this 函数只控总并发数
+    /// - **dryRun=true**：只扫描列出 missing，不真发 GET、不写盘；返回 total + 全入
+    ///   skipped。给用户决定要不要真跑
+    /// - **失败不抛**：单条 sha 失败 only log + 进 failures 列表；整个函数永远成功返回。
+    ///   `Sources/DuoPasteSync/PullWorker.fetchBlobsFull` 路径同款契约
+    /// - **putVerified**：拉回字节走 BlobStore.putVerified 二次校验 sha（防 MITM /
+    ///   server bug 给错字节污染本机）
+    public static func fetchMissingBlobs(
+        dbPath: URL,
+        selfDeviceID: String,
+        blobs: BlobStore,
+        fetcher: @escaping @Sendable (String) async -> BlobFetchOutcome,
+        concurrency: Int = 4,
+        dryRun: Bool = false,
+        log: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws -> FetchMissingReport {
+        precondition(concurrency >= 1, "concurrency 必须 >= 1")
+        let missing = try scanMissingPeerBlobs(dbPath: dbPath, selfDeviceID: selfDeviceID, blobs: blobs)
+        let total = missing.count
+
+        if dryRun || total == 0 {
+            return FetchMissingReport(
+                totalMissing: total,
+                fetched: 0, failed: 0,
+                skipped: dryRun ? total : 0,
+                failures: [],
+                dryRun: dryRun
+            )
+        }
+
+        // 并发桶：semaphore 模式控总并发 = concurrency。每个 sha 一个 child task，
+        // 各自申请 semaphore 后才发 GET。简单 actor 计数即可
+        let counter = FetchMissingCounter(sampleLimit: fetchMissingFailureSampleLimit)
+        let oneSha: @Sendable (String) async -> Void = { sha in
+            // BlobStore.exists 二次 check：扫描后到拉取间可能并发的 PullWorker eager 路径
+            // 已经拉过；幂等防重
+            if blobs.exists(sha256: sha) { return }
+            let outcome = await fetcher(sha)
+            switch outcome {
+            case .found(let data):
+                do {
+                    _ = try blobs.putVerified(data, expectedSha256: sha)
+                    await counter.recordSuccess()
+                    log("fetched sha=\(sha)")
+                } catch {
+                    await counter.recordFailure(sha: sha, reason: "put failed: \(error)")
+                }
+            case .notFound:
+                await counter.recordFailure(sha: sha, reason: "peer 上无此 blob（404）")
+            case .shaMismatch(let expected, let actual):
+                await counter.recordFailure(
+                    sha: sha,
+                    reason: "peer 返回字节 sha 不一致 (expected \(expected.prefix(8))... got \(actual.prefix(8))...)"
+                )
+            case .rejected(let reason):
+                await counter.recordFailure(sha: sha, reason: "鉴权拒绝: \(reason)")
+            case .transient(let reason):
+                await counter.recordFailure(sha: sha, reason: "transient: \(reason)")
+            }
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            var running = 0
+            var iter = missing.makeIterator()
+            // 启动初始 batch
+            while running < concurrency, let sha = iter.next() {
+                running += 1
+                group.addTask { await oneSha(sha) }
+            }
+            // 滚动入队剩余
+            while await group.next() != nil {
+                if let sha = iter.next() {
+                    group.addTask { await oneSha(sha) }
+                }
+            }
+        }
+
+        let (fetched, failed, failures) = await counter.snapshot()
+        return FetchMissingReport(
+            totalMissing: total,
+            fetched: fetched,
+            failed: failed,
+            skipped: 0,
+            failures: failures,
+            dryRun: false
+        )
+    }
+
+    /// fetchMissingBlobs 的内部并发计数器
+    private actor FetchMissingCounter {
+        var fetched = 0
+        var failed = 0
+        var failures: [FetchMissingReport.FetchFailure] = []
+        let sampleLimit: Int
+        init(sampleLimit: Int) { self.sampleLimit = sampleLimit }
+        func recordSuccess() { fetched += 1 }
+        func recordFailure(sha: String, reason: String) {
+            failed += 1
+            if failures.count < sampleLimit {
+                failures.append(.init(sha: sha, reason: reason))
+            }
+        }
+        func snapshot() -> (Int, Int, [FetchMissingReport.FetchFailure]) {
+            (fetched, failed, failures)
+        }
+    }
+
+    /// 扫所有 peer-origin（origin != selfDeviceID）blob_sha256 非空 + image/file kind +
+    /// 未删的去重 sha 集，跟 BlobStore 比对找出缺字节的。返回完整 sha 列表（catch-up
+    /// 时要拉，不只是采样）
+    public static func scanMissingPeerBlobs(
+        dbPath: URL,
+        selfDeviceID: String,
+        blobs: BlobStore
+    ) throws -> [String] {
+        let db = try Database(path: dbPath)
+        let allShas: [String] = try db.pool.read { conn -> [String] in
+            try String.fetchAll(conn, sql: """
+                SELECT DISTINCT blob_sha256 FROM item
+                WHERE blob_sha256 IS NOT NULL
+                  AND deleted_at_ns IS NULL
+                  AND kind IN ('image', 'file')
+                  AND origin_device != ?
+            """, arguments: [selfDeviceID])
+        }
+        return allShas.filter { !blobs.exists(sha256: $0) }
     }
 
     /// 扫 item 表里 blob_sha256 非空 + image/file kind + 未删的去重 sha 集合，

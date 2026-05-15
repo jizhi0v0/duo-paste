@@ -9,7 +9,7 @@ import DuoPasteCore
 /// 不把这逻辑放在 DuoPasteCore：Config 模块不依赖 Carbon，跨设备配置同步将来如果做
 /// iOS 客户端也能复用。daemon 进程才需要 Carbon 桥接
 enum HotkeyTranslation {
-    /// `HotkeyConfig.key`（A-Z / 0-9）→ kVK_ANSI_* 常量。
+    /// `HotkeyConfig.key`（A-Z / 0-9 / 标点）→ kVK_ANSI_* 常量。
     /// 表必须跟 `HotkeyConfig.supportedKeys` 覆盖一致，否则会出现 "config 校验通过但
     /// 翻译失败" 的诡异 case
     static let keyToCode: [String: Int] = [
@@ -23,6 +23,18 @@ enum HotkeyTranslation {
         "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3,
         "4": kVK_ANSI_4, "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7,
         "8": kVK_ANSI_8, "9": kVK_ANSI_9,
+        // ANSI 标点。Paste.app 风格的 `⌘\` / `⌘;` 这类组合常见，扩进白名单
+        "\\": kVK_ANSI_Backslash,
+        "/": kVK_ANSI_Slash,
+        ";": kVK_ANSI_Semicolon,
+        "'": kVK_ANSI_Quote,
+        ",": kVK_ANSI_Comma,
+        ".": kVK_ANSI_Period,
+        "[": kVK_ANSI_LeftBracket,
+        "]": kVK_ANSI_RightBracket,
+        "=": kVK_ANSI_Equal,
+        "-": kVK_ANSI_Minus,
+        "`": kVK_ANSI_Grave,
     ]
 
     struct TranslationError: Error, CustomStringConvertible {

@@ -55,5 +55,29 @@ final class SnapshotScheduler {
         } catch {
             fputs("snapshot failed: \(error)\n", stderr)
         }
+        // 水位预防档：tick 末尾顺路跑一次 blob LRU GC。snapshot 失败不影响这条路径——
+        // 反而磁盘满导致 snapshot 失败时这里腾空间是最有用的（下个 tick snapshot 就成功）
+        runBlobWatermarkGC()
+    }
+
+    /// blob GC 阈值——可用空间低于 lowBytes 时驱逐 LRU 直到 highBytes。
+    /// 双水位 hysteresis 避免阈值上下抖动反复触发
+    private static let lowWatermarkBytes: Int64 = 5 * 1024 * 1024 * 1024   // 5 GB
+    private static let highWatermarkBytes: Int64 = 10 * 1024 * 1024 * 1024 // 10 GB
+
+    private func runBlobWatermarkGC() {
+        do {
+            let blobsDir = deps.paths.blobsDir
+            let result = try deps.evictor.evictToWatermark(
+                lowBytes: Self.lowWatermarkBytes,
+                highBytes: Self.highWatermarkBytes,
+                availableBytes: { Volume.availableBytes(at: blobsDir) }
+            )
+            if result.freed > 0 {
+                fputs("blob-evict: freed \(result.freed) blobs capHit=\(result.capHit)\n", stderr)
+            }
+        } catch {
+            fputs("blob-evict failed: \(error)\n", stderr)
+        }
     }
 }

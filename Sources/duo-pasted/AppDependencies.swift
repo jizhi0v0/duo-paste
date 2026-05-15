@@ -10,6 +10,10 @@ final class AppDependencies {
     let database: Database
     let blobs: BlobStore
     let deviceID: String
+    /// LRU blob 驱逐器。ENOSPC 时 capture / paste / pull 路径走它腾空间。
+    /// **生产路径所有 BlobStore.put 都应走 retryingOnFull 变体** + 注入这个回调
+    let evictor: BlobEvictor
+    let evictOnFull: @Sendable () throws -> Bool
     let captureService: CaptureService
     let searchAPI: SearchAPI
     /// 搜索选择层。Mesh 拓扑下永远走本机 fold-aware 路径——item 表本身就是单表混存
@@ -39,8 +43,20 @@ final class AppDependencies {
         self.deviceID = deviceID
         self.database = database
         self.blobs = blobs
+        let evictor = BlobEvictor(
+            database: database,
+            blobs: blobs,
+            log: { msg in
+                FileHandle.standardError.write(Data("blob-evict: \(msg)\n".utf8))
+            }
+        )
+        self.evictor = evictor
+        let evictOnFull: @Sendable () throws -> Bool = { try evictor.evictOneOldest() }
+        self.evictOnFull = evictOnFull
+        // plan settings-cleanup：ws_rotation_sec 不再从 config 读，用 default 4h。
+        // Auth rotation 是安全 hardening 不是用户调参点，硬编码合适
         let wsBroadcaster = WSBroadcaster(
-            rotationIntervalSec: config.mesh.wsRotationSec
+            rotationIntervalSec: 4 * 3600
         )
         self.wsBroadcaster = wsBroadcaster
         // Sendable closure 给 CaptureService.onCursorAdvanced——primary 路径 commit 后触发，
@@ -58,7 +74,8 @@ final class AppDependencies {
                         latestIngestedAtNs: ns
                     )
                 }
-            }
+            },
+            evictOnFull: evictOnFull
         )
         let searchAPI = SearchAPI(database: database)
         self.searchAPI = searchAPI

@@ -47,9 +47,6 @@ public struct Config: Codable, Sendable, Equatable {
     /// 全局快捷键。默认 ⌥⌘V（跟硬编码历史值一致）。改了 config.json 后要重启 daemon
     public var hotkey: HotkeyConfig
 
-    /// Keychain 里 shared secret 的 account 名。HMAC 签名用。primary_url 为空时不需要。
-    public var sharedSecretKeychainAccount: String?
-
     /// 捕获字节守门。意外 Cmd+C 巨型对象（4K 长截图 / Cmd+A 大日志）→ 跳过入库，
     /// macOS 剪贴板自身正常工作（Cmd+V 立刻粘贴），只是不进 duo-paste 历史。
     ///
@@ -149,11 +146,19 @@ public struct Config: Codable, Sendable, Equatable {
         }
 
         /// `key` 必须落在受支持字符集里。Carbon keyCode 转换不在这里——保持 Config
-        /// 模块不依赖 Carbon。GlobalHotKey 调用方负责字符串 → keyCode 映射 + 报错
+        /// 模块不依赖 Carbon。GlobalHotKey 调用方负责字符串 → keyCode 映射 + 报错。
+        ///
+        /// 覆盖范围：A-Z + 0-9 + 常用 ANSI 标点符号（Paste.app 风格的 `⌘\` / `⌘;`
+        /// 这类组合）。**必须**跟 GlobalHotKey.HotkeyTranslation.keyToCode 表保持同步——
+        /// Config.validate 通过但 translate 失败 = 程序员错误
         public static let supportedKeys: Set<String> = {
             var set: Set<String> = []
             for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" { set.insert(String(c)) }
             for c in "0123456789" { set.insert(String(c)) }
+            // ANSI 标点（按 Carbon kVK_ANSI_* 常量覆盖范围）
+            for s in ["\\", "/", ";", "'", ",", ".", "[", "]", "=", "-", "`"] {
+                set.insert(s)
+            }
             return set
         }()
 
@@ -264,94 +269,56 @@ public struct Config: Codable, Sendable, Equatable {
         }
     }
 
-    /// Mesh 全局参数。各 peer 共享，不分 per-peer 配置。详 plan §"Config schema"。
+    /// Mesh 全局参数。各 peer 共享，不分 per-peer 配置。
+    ///
+    /// **用户可见字段**（settings window / config.json 都暴露）：
+    /// - `enabled` / `pullIntervalSec` / `wsEnabled` / `storageMode`
+    ///
+    /// **历史 tuning 字段已撤掉**（plan §settings-cleanup）：内部 backoff / dedup window /
+    /// WS timing / clock skew threshold 都不再从 config 读，统一走 worker / broadcaster
+    /// 的硬编码 default。老 config.json 里残留 `pull_batch_limit / pull_initial_backoff_sec /
+    /// pull_max_backoff_sec / cross_device_dedup_window_ns / clock_skew_warn_ms /
+    /// ws_reconnect_initial_sec / ws_reconnect_max_sec / ws_heartbeat_sec / ws_rotation_sec`
+    /// 键会被 decoder 忽略不报错；Config.write 不再序列化这些键，保留升级用户的 config
+    /// 干净（nested merge 会保留任何未知键，但因为这些键不在 write 列表里，下次写回会被
+    /// 自动洗掉）
     public struct MeshConfig: Codable, Sendable, Equatable {
         /// false → 退化为 standalone（peers 字段也应为空；validate 强制）。
         public var enabled: Bool
         /// PullWorker 周期 floor。WS cursor_advanced 通了仍每 N 秒拉一次兜底（防 WS 漏推）。
         public var pullIntervalSec: Int
-        public var pullBatchLimit: Int
-        public var pullInitialBackoffSec: TimeInterval
-        public var pullMaxBackoffSec: TimeInterval
-        /// 跨设备 Continuity dedup 窗口（纳秒）。0 = 关。默认 5e9 (5s) 兜 Universal Clipboard 副本。
-        public var crossDeviceDedupWindowNs: Int64
-        /// 时钟偏移告警阈值（毫秒）。HMAC 容忍 ±5min skew，30s 是早期预警。
-        public var clockSkewWarnMs: Int64
-        /// true → PullWorker 拉完一页 metadata 顺路 GET 缺的 blob 字节。
-        /// 默认 false，走 lazy paste-back 路径即可。
-        public var eagerBlobs: Bool
-        /// false → 关 WS 通知层退化为 30s 周期 pull。
+        /// blob 存储模式。`.full`（默认）= PullWorker 每 tick 顺路拉新行的 blob 字节做完整
+        /// mirror；`.optimized` = 不拉字节，UI 需要看到时按需走 lazy GET /blob/<sha>。
+        /// 老 `eager_blobs` 键的兼容：见 MeshConfig.init(from:) decode 路径。
+        public var storageMode: StorageMode
+        /// false → 关 WS 通知层退化为周期 pull（按 pullIntervalSec）。
         public var wsEnabled: Bool
-        public var wsReconnectInitialSec: TimeInterval
-        public var wsReconnectMaxSec: TimeInterval
-        /// WS 协议层 autoPing 周期（秒）。客户端跟服务端都用这个值。
-        /// 不设 wsServerHeartbeatTimeoutSec 单独项——交给 hbws autoPing 隐式 2x ping 期超时。
-        public var wsHeartbeatSec: TimeInterval
-        /// WS server 端定期 close 所有连接的周期（秒）。0 = 不 rotation。
-        /// 默 4h：auth 安全 hardening，secret 被窃取后能监听窗口压到 ≤ 这个值
-        /// （client 走 backoff 重连 + 重 HMAC upgrade 用最新 secret）
-        public var wsRotationSec: TimeInterval
 
         public static let `default` = MeshConfig(
             enabled: true,
             pullIntervalSec: 30,
-            pullBatchLimit: 500,
-            pullInitialBackoffSec: 2,
-            pullMaxBackoffSec: 120,
-            crossDeviceDedupWindowNs: 5_000_000_000,
-            clockSkewWarnMs: 30_000,
-            eagerBlobs: false,
-            wsEnabled: true,
-            wsReconnectInitialSec: 1,
-            wsReconnectMaxSec: 60,
-            wsHeartbeatSec: 30,
-            wsRotationSec: 4 * 3600
+            storageMode: .default,
+            wsEnabled: true
         )
 
         public init(
             enabled: Bool,
             pullIntervalSec: Int,
-            pullBatchLimit: Int,
-            pullInitialBackoffSec: TimeInterval,
-            pullMaxBackoffSec: TimeInterval,
-            crossDeviceDedupWindowNs: Int64,
-            clockSkewWarnMs: Int64,
-            eagerBlobs: Bool,
-            wsEnabled: Bool,
-            wsReconnectInitialSec: TimeInterval,
-            wsReconnectMaxSec: TimeInterval,
-            wsHeartbeatSec: TimeInterval,
-            wsRotationSec: TimeInterval
+            storageMode: StorageMode,
+            wsEnabled: Bool
         ) {
             self.enabled = enabled
             self.pullIntervalSec = pullIntervalSec
-            self.pullBatchLimit = pullBatchLimit
-            self.pullInitialBackoffSec = pullInitialBackoffSec
-            self.pullMaxBackoffSec = pullMaxBackoffSec
-            self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
-            self.clockSkewWarnMs = clockSkewWarnMs
-            self.eagerBlobs = eagerBlobs
+            self.storageMode = storageMode
             self.wsEnabled = wsEnabled
-            self.wsReconnectInitialSec = wsReconnectInitialSec
-            self.wsReconnectMaxSec = wsReconnectMaxSec
-            self.wsHeartbeatSec = wsHeartbeatSec
-            self.wsRotationSec = wsRotationSec
         }
 
         enum CodingKeys: String, CodingKey {
             case enabled
             case pullIntervalSec = "pull_interval_sec"
-            case pullBatchLimit = "pull_batch_limit"
-            case pullInitialBackoffSec = "pull_initial_backoff_sec"
-            case pullMaxBackoffSec = "pull_max_backoff_sec"
-            case crossDeviceDedupWindowNs = "cross_device_dedup_window_ns"
-            case clockSkewWarnMs = "clock_skew_warn_ms"
-            case eagerBlobs = "eager_blobs"
+            case storageMode = "storage_mode"
+            case eagerBlobs = "eager_blobs"   // 老键，decode-only 兼容；encode 走 storageMode
             case wsEnabled = "ws_enabled"
-            case wsReconnectInitialSec = "ws_reconnect_initial_sec"
-            case wsReconnectMaxSec = "ws_reconnect_max_sec"
-            case wsHeartbeatSec = "ws_heartbeat_sec"
-            case wsRotationSec = "ws_rotation_sec"
         }
 
         public init(from decoder: Decoder) throws {
@@ -359,17 +326,29 @@ public struct Config: Codable, Sendable, Equatable {
             let d = MeshConfig.default
             self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
             self.pullIntervalSec = try c.decodeIfPresent(Int.self, forKey: .pullIntervalSec) ?? d.pullIntervalSec
-            self.pullBatchLimit = try c.decodeIfPresent(Int.self, forKey: .pullBatchLimit) ?? d.pullBatchLimit
-            self.pullInitialBackoffSec = try c.decodeIfPresent(TimeInterval.self, forKey: .pullInitialBackoffSec) ?? d.pullInitialBackoffSec
-            self.pullMaxBackoffSec = try c.decodeIfPresent(TimeInterval.self, forKey: .pullMaxBackoffSec) ?? d.pullMaxBackoffSec
-            self.crossDeviceDedupWindowNs = try c.decodeIfPresent(Int64.self, forKey: .crossDeviceDedupWindowNs) ?? d.crossDeviceDedupWindowNs
-            self.clockSkewWarnMs = try c.decodeIfPresent(Int64.self, forKey: .clockSkewWarnMs) ?? d.clockSkewWarnMs
-            self.eagerBlobs = try c.decodeIfPresent(Bool.self, forKey: .eagerBlobs) ?? d.eagerBlobs
+            // storage_mode 解码顺序（plan cloudy-mirroring-walnut 老 config 兼容）：
+            //   1. 新键 storage_mode 显式给 → 用它
+            //   2. 否则尝老键 eager_blobs：true/false 都映射 .full
+            //   3. 都缺则用 default (.full)
+            if let mode = try c.decodeIfPresent(StorageMode.self, forKey: .storageMode) {
+                self.storageMode = mode
+            } else if (try c.decodeIfPresent(Bool.self, forKey: .eagerBlobs)) != nil {
+                self.storageMode = .full
+            } else {
+                self.storageMode = d.storageMode
+            }
             self.wsEnabled = try c.decodeIfPresent(Bool.self, forKey: .wsEnabled) ?? d.wsEnabled
-            self.wsReconnectInitialSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsReconnectInitialSec) ?? d.wsReconnectInitialSec
-            self.wsReconnectMaxSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsReconnectMaxSec) ?? d.wsReconnectMaxSec
-            self.wsHeartbeatSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsHeartbeatSec) ?? d.wsHeartbeatSec
-            self.wsRotationSec = try c.decodeIfPresent(TimeInterval.self, forKey: .wsRotationSec) ?? d.wsRotationSec
+        }
+
+        // 显式 encode：`eagerBlobs` CodingKey 是 decode-only 兼容键，没有匹配 property，
+        // Swift 不能自动 synthesize Encodable。Config.write 走 JSON dict 路径不依赖这个
+        // encode，但 Codable 协议契约要求覆盖
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(enabled, forKey: .enabled)
+            try c.encode(pullIntervalSec, forKey: .pullIntervalSec)
+            try c.encode(storageMode, forKey: .storageMode)
+            try c.encode(wsEnabled, forKey: .wsEnabled)
         }
     }
 
@@ -384,8 +363,7 @@ public struct Config: Codable, Sendable, Equatable {
         mesh: .default,
         ocr: .default,
         capture: .default,
-        hotkey: .default,
-        sharedSecretKeychainAccount: nil
+        hotkey: .default
     )
 
     public init(
@@ -399,8 +377,7 @@ public struct Config: Codable, Sendable, Equatable {
         mesh: MeshConfig = .default,
         ocr: OCRSettings = .default,
         capture: CaptureLimits = .default,
-        hotkey: HotkeyConfig = .default,
-        sharedSecretKeychainAccount: String?
+        hotkey: HotkeyConfig = .default
     ) {
         self.serve = serve
         self.serveHost = serveHost
@@ -413,7 +390,6 @@ public struct Config: Codable, Sendable, Equatable {
         self.ocr = ocr
         self.capture = capture
         self.hotkey = hotkey
-        self.sharedSecretKeychainAccount = sharedSecretKeychainAccount
     }
 
     enum CodingKeys: String, CodingKey {
@@ -428,7 +404,6 @@ public struct Config: Codable, Sendable, Equatable {
         case ocr
         case capture
         case hotkey
-        case sharedSecretKeychainAccount = "shared_secret_keychain_account"
     }
 
     public init(from decoder: Decoder) throws {
@@ -444,9 +419,6 @@ public struct Config: Codable, Sendable, Equatable {
         self.ocr = try c.decodeIfPresent(OCRSettings.self, forKey: .ocr) ?? .default
         self.capture = try c.decodeIfPresent(CaptureLimits.self, forKey: .capture) ?? .default
         self.hotkey = try c.decodeIfPresent(HotkeyConfig.self, forKey: .hotkey) ?? .default
-        self.sharedSecretKeychainAccount = try c.decodeIfPresent(
-            String.self, forKey: .sharedSecretKeychainAccount
-        )
     }
 
     /// 把 cfg 序列化写到 `path`（atomic + 0600 权限）。
@@ -489,21 +461,29 @@ public struct Config: Codable, Sendable, Equatable {
         let peersJSON = try JSONEncoder().encode(cfg.peers)
         dict[CodingKeys.peers.rawValue] = (try? JSONSerialization.jsonObject(with: peersJSON)) ?? []
 
-        // mesh 段 nested merge——读原 sub-dict 做 base，只覆盖 cfg 内字段，保留未来字段
+        // mesh 段 nested merge——读原 sub-dict 做 base，只覆盖 cfg 内字段，保留未来字段。
+        // **plan settings-cleanup**：老 tuning 键（pull_batch_limit / pull_initial_backoff_sec /
+        // pull_max_backoff_sec / cross_device_dedup_window_ns / clock_skew_warn_ms /
+        // ws_reconnect_initial_sec / ws_reconnect_max_sec / ws_heartbeat_sec / ws_rotation_sec）
+        // 显式 removeValue 洗掉——之前 config.json 可能写过这些；升级路径上 Config.write
+        // 一次后老字段从磁盘消失
         var meshDict = (dict[CodingKeys.mesh.rawValue] as? [String: Any]) ?? [:]
         meshDict["enabled"] = cfg.mesh.enabled
         meshDict["pull_interval_sec"] = cfg.mesh.pullIntervalSec
-        meshDict["pull_batch_limit"] = cfg.mesh.pullBatchLimit
-        meshDict["pull_initial_backoff_sec"] = cfg.mesh.pullInitialBackoffSec
-        meshDict["pull_max_backoff_sec"] = cfg.mesh.pullMaxBackoffSec
-        meshDict["cross_device_dedup_window_ns"] = cfg.mesh.crossDeviceDedupWindowNs
-        meshDict["clock_skew_warn_ms"] = cfg.mesh.clockSkewWarnMs
-        meshDict["eager_blobs"] = cfg.mesh.eagerBlobs
+        meshDict["storage_mode"] = cfg.mesh.storageMode.rawValue
         meshDict["ws_enabled"] = cfg.mesh.wsEnabled
-        meshDict["ws_reconnect_initial_sec"] = cfg.mesh.wsReconnectInitialSec
-        meshDict["ws_reconnect_max_sec"] = cfg.mesh.wsReconnectMaxSec
-        meshDict["ws_heartbeat_sec"] = cfg.mesh.wsHeartbeatSec
-        meshDict["ws_rotation_sec"] = cfg.mesh.wsRotationSec
+        // 老 eager_blobs 键洗掉——升级后 config.json 不再含 PR cloudy-mirroring-walnut
+        // 之前的 schema 字段，避免用户读 config 时看到两套语义冲突的字段
+        meshDict.removeValue(forKey: "eager_blobs")
+        // 老内部 tuning 字段——下沉到 worker / broadcaster default 后从 config 移除
+        for legacy in [
+            "pull_batch_limit", "pull_initial_backoff_sec", "pull_max_backoff_sec",
+            "cross_device_dedup_window_ns", "clock_skew_warn_ms",
+            "ws_reconnect_initial_sec", "ws_reconnect_max_sec",
+            "ws_heartbeat_sec", "ws_rotation_sec",
+        ] {
+            meshDict.removeValue(forKey: legacy)
+        }
         dict[CodingKeys.mesh.rawValue] = meshDict
 
         var captureDict = (dict[CodingKeys.capture.rawValue] as? [String: Any]) ?? [:]
@@ -533,8 +513,9 @@ public struct Config: Codable, Sendable, Equatable {
         ocrDict["per_item_pause_ms"] = cfg.ocr.perItemPauseMs
         dict[CodingKeys.ocr.rawValue] = ocrDict
 
-        Self.setOrRemove(&dict, CodingKeys.sharedSecretKeychainAccount.rawValue,
-                         cfg.sharedSecretKeychainAccount)
+        // plan settings-cleanup：撤掉 shared_secret_keychain_account（从未在启动路径上读，
+        // shared-secret 始终走文件路径）。老 config 里残留的键 → 这里显式洗掉
+        dict.removeValue(forKey: "shared_secret_keychain_account")
 
         let out = try JSONSerialization.data(
             withJSONObject: dict,
@@ -587,15 +568,6 @@ public struct Config: Codable, Sendable, Equatable {
         if mesh.pullIntervalSec < 1 {
             throw ConfigError.invalidCombination("mesh.pull_interval_sec 必须 >= 1")
         }
-        if mesh.pullBatchLimit < 1 {
-            throw ConfigError.invalidCombination("mesh.pull_batch_limit 必须 >= 1")
-        }
-        if mesh.crossDeviceDedupWindowNs < 0 {
-            throw ConfigError.invalidCombination("mesh.cross_device_dedup_window_ns 必须 >= 0")
-        }
-        if mesh.wsHeartbeatSec < 1 {
-            throw ConfigError.invalidCombination("mesh.ws_heartbeat_sec 必须 >= 1")
-        }
         // peers 内 url 重复 / device_id 重复检查——启动时撞了立刻报，免得运行时
         // 两个 PullWorker 抢同一行 cursor / 同一份 mirror
         var seenURLs = Set<String>()
@@ -644,7 +616,7 @@ public struct Config: Codable, Sendable, Equatable {
         let keyNorm = hotkey.key.uppercased()
         if !HotkeyConfig.supportedKeys.contains(keyNorm) {
             throw ConfigError.invalidCombination(
-                "hotkey.key 不支持：\(hotkey.key)。当前只支持 A-Z 和 0-9"
+                "hotkey.key 不支持：\(hotkey.key)。当前支持 A-Z / 0-9 / 标点 \\/;',.[]=-`"
             )
         }
         if hotkey.modifiers.isEmpty {

@@ -141,6 +141,93 @@ public struct BlobStore: Sendable {
         guard let url = locate(sha256: sha256) else { return nil }
         return try Data(contentsOf: url)
     }
+
+    /// 读 blob 文件字节数。不存在返回 nil（区别于 0 字节文件）。
+    public func size(sha256: String) -> Int64? {
+        guard let url = locate(sha256: sha256) else { return nil }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attrs?[.size] as? NSNumber)?.int64Value
+    }
+
+    /// 物理删 blob 文件。**只删 fs，不动 DB 行**——`item.blob_sha256` 保留指向该 sha，
+    /// `BlobStore.exists()` 之后返回 false → UI 落到 CloudBadge（"云端"）状态 → Enter 走
+    /// lazy 路径从 peer 重拉。这是磁盘水位驱逐 / tombstone GC 的底层原语。
+    ///
+    /// Returns: `.deleted(size)` 删成功 + 字节数；`.notFound` 文件不在；`.failed(err)` 删失败。
+    /// 不抛错：caller 通常在循环里跑（驱逐到水位达标），单文件失败不该中断整轮
+    @discardableResult
+    public func evict(sha256: String) -> EvictOutcome {
+        guard let url = locate(sha256: sha256) else { return .notFound }
+        let fm = FileManager.default
+        let attrs = try? fm.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        do {
+            try fm.removeItem(at: url)
+            return .deleted(size: size)
+        } catch {
+            return .failed(error)
+        }
+    }
+
+    public enum EvictOutcome: Sendable {
+        case deleted(size: Int64)
+        case notFound
+        case failed(Error)
+    }
+
+    /// `put` 的 ENOSPC 重试包装：磁盘满时调 `evictor()` 释放一个 LRU blob 后重试，
+    /// 循环直到成功 / evictor 返回 false / 达到 maxRetries。
+    /// 非 ENOSPC 错误立即重抛——不要把其它写盘问题（权限 / I/O 错误）当成空间问题
+    /// 反复 evict
+    @discardableResult
+    public func putRetryingOnFull(
+        _ data: Data,
+        ext: String? = nil,
+        maxRetries: Int = 64,
+        evictor: () throws -> Bool
+    ) throws -> BlobInfo {
+        try Self.retryOnFull(maxRetries: maxRetries, evictor: evictor) {
+            try self.put(data, ext: ext)
+        }
+    }
+
+    /// `putVerified` 的 ENOSPC 重试包装——同 putRetryingOnFull 行为
+    @discardableResult
+    public func putVerifiedRetryingOnFull(
+        _ data: Data,
+        expectedSha256: String,
+        ext: String? = nil,
+        maxRetries: Int = 64,
+        evictor: () throws -> Bool
+    ) throws -> BlobInfo {
+        try Self.retryOnFull(maxRetries: maxRetries, evictor: evictor) {
+            try self.putVerified(data, expectedSha256: expectedSha256, ext: ext)
+        }
+    }
+
+    /// 内部 retry loop。**internal access** 让单测注入 mock put 闭包验证循环骨架——
+    /// 真做 ENOSPC 仿真要 dd if=/dev/zero 占满 tmp 卷，CI 不可控
+    @discardableResult
+    static func retryOnFull(
+        maxRetries: Int,
+        evictor: () throws -> Bool,
+        put: () throws -> BlobInfo
+    ) throws -> BlobInfo {
+        var retries = 0
+        while true {
+            do {
+                return try put()
+            } catch {
+                guard DiskFull.isOutOfSpace(error) else {
+                    throw error
+                }
+                guard retries < maxRetries, try evictor() else {
+                    throw error
+                }
+                retries += 1
+            }
+        }
+    }
 }
 
 public enum BlobStoreError: Error, CustomStringConvertible, Sendable {

@@ -67,7 +67,28 @@ final class ImageThumbnailCache {
         return cache[key]
     }
 
-    func thumbnail(for item: Item, blobs: BlobStore) async -> NSImage? {
+    /// 清空所有缓存 + decode 黑名单。
+    ///
+    /// 用途：mesh-fetch-missing / 「补齐缺失 blob」按钮拉回字节后，原本进了 notDecodable
+    /// 黑名单的 sha（首次卡片出现时本机没字节，decode 失败）现在能正常 decode 了。
+    /// 调一次让所有卡片下次 .task fire 时重新走 decode 路径。
+    /// 配合 AppState.blobInventoryPulse bump 触发 .task 重 fire（光清缓存不够——卡片
+    /// .task(id: cacheKey) 因为 sha 不变不会自动 re-fire）
+    func invalidateAll() {
+        cache.removeAll()
+        notDecodable.removeAll()
+    }
+
+    /// PR cloudy-mirroring-walnut PR 3：加 `fetcher` + `storageMode` 参数让 optimized 模式
+    /// 在本机缺 blob 时按需 GET /blob/<sha> 拉回。`.full` 模式 + 缺 blob 直接 return nil
+    /// （理论上 PullWorker eager 路径已拉，缺失说明 catch-up 没跑过——`mesh-fetch-missing`
+    /// CLI 补一次即可）。fetcher=nil 时退化跟老行为一致（没 peer / shared-secret 失败）
+    func thumbnail(
+        for item: Item,
+        blobs: BlobStore,
+        fetcher: (any BlobFetcher)? = nil,
+        storageMode: StorageMode = .full
+    ) async -> NSImage? {
         guard let key = Self.cacheKey(for: item) else { return nil }
         if let img = cache[key] { return img }
         if notDecodable.contains(key) { return nil }
@@ -75,6 +96,28 @@ final class ImageThumbnailCache {
         let sha = item.blobSha256
         let pathStr = item.textFull
         let maxPx = Self.maxPx
+
+        // optimized 模式 + 缺 blob → 先 lazy fetch + putVerified 进 BlobStore，再走下面的
+        // decode 路径（BlobStore.read 这下能命中）。fetch 失败 fallthrough decode（路径
+        // fallback 仍可能命中本机文件 URL）。注意：跟 paste 路径不同——这里不显示 spinner，
+        // 缩略图不到位 UI 就是占位图，缺图不阻塞用户操作
+        if storageMode == .optimized,
+           let sha,
+           let fetcher,
+           (try? blobs.read(sha256: sha) ?? nil) == nil,
+           !blobs.exists(sha256: sha)
+        {
+            do {
+                let outcome = try await fetcher.getBlob(sha256: sha)
+                if case .found(let data) = outcome {
+                    _ = try? blobs.putVerified(data, expectedSha256: sha)
+                }
+            } catch {
+                // transient / rejected / shaMismatch 都吞掉走下面 fallback——
+                // 用户看到的是占位图，不影响其他卡片
+            }
+        }
+
         // 提交到专用 OperationQueue 隔离 thread budget(详 `decodeQueue` 注释)。
         // Task.detached 旧实现走 cooperative pool .userInitiated 会把 OCR 饿死
         let img: NSImage? = await withCheckedContinuation { cont in
@@ -120,14 +163,28 @@ final class ImageThumbnailCache {
     /// **关键**:实际 decode 工作进 `decodeQueue`(max=4 并发)而**不是**裸 `Task`。N=100+
     /// 张时旧实现 fire 100 个并发 Task 抢协作池 → OCR 饿死(2026-05-15 bug)。本函数只是
     /// 入队 + 解 continuation,for-loop body 是廉价 `addOperation` 调用,N 张大循环也无害
-    func prefetch(items: [Item], blobs: BlobStore) {
+    ///
+    /// **storage_mode=.optimized 跳过缺 blob 的预热**：用户没主动看就别 GET，避免后台流量
+    /// 把对端打满。用户真切到那张卡 .task 会主动 fetch（thumbnail 函数走 lazy 路径）
+    func prefetch(
+        items: [Item],
+        blobs: BlobStore,
+        fetcher: (any BlobFetcher)? = nil,
+        storageMode: StorageMode = .full
+    ) {
         for item in items {
             guard let key = Self.cacheKey(for: item),
                   cache[key] == nil,
                   !notDecodable.contains(key),
                   Self.isThumbnailable(item) else { continue }
+            // optimized 模式 + 缺本机 blob → 跳过预热（避免后台拉一堆字节，等用户真看再拉）
+            if storageMode == .optimized,
+               let sha = item.blobSha256,
+               !blobs.exists(sha256: sha) {
+                continue
+            }
             Task { [weak self] in
-                _ = await self?.thumbnail(for: item, blobs: blobs)
+                _ = await self?.thumbnail(for: item, blobs: blobs, fetcher: fetcher, storageMode: storageMode)
             }
         }
     }
@@ -177,6 +234,17 @@ final class ImageThumbnailCache {
     /// 视频缩略图——AVAssetImageGenerator 抽帧。优先取 0.5s 帧避开开头黑场/淡入,失败
     /// 兜底 0s。maximumSize 让 AVF 自己 downscale 不传整张 4K decode 进内存
     nonisolated private static func decodeVideoThumbnail(url: URL, maxPx: Int) -> NSImage? {
+        // 先做文件 readability sanity check——`FileManager.fileExists` 在 iCloud Documents /
+        // ~/Documents 等 TCC 受保护目录上会返 true 但实际 daemon read 0 字节（macOS 14+
+        // 默认 LaunchAgent 没"完整磁盘访问"权限）。短 read 探测失败时打 log 让用户知道
+        // 真因
+        let fm = FileManager.default
+        if !fm.isReadableFile(atPath: url.path) {
+            FileHandle.standardError.write(Data(
+                "video-thumb: not readable (TCC?) path=\(url.path)\n".utf8
+            ))
+            return nil
+        }
         let asset = AVURLAsset(url: url)
         let gen = AVAssetImageGenerator(asset: asset)
         gen.appliesPreferredTrackTransform = true   // 应用 metadata 旋转(竖拍视频别躺着)
@@ -185,12 +253,19 @@ final class ImageThumbnailCache {
             CMTime(seconds: 0.5, preferredTimescale: 600),
             .zero,
         ]
+        var lastErr: Error?
         for t in attempts {
-            if let cgImg = try? gen.copyCGImage(at: t, actualTime: nil) {
+            do {
+                let cgImg = try gen.copyCGImage(at: t, actualTime: nil)
                 let size = NSSize(width: CGFloat(cgImg.width) / 2, height: CGFloat(cgImg.height) / 2)
                 return NSImage(cgImage: cgImg, size: size)
+            } catch {
+                lastErr = error
             }
         }
+        FileHandle.standardError.write(Data(
+            "video-thumb: copyCGImage failed url=\(url.lastPathComponent) err=\(lastErr.map { "\($0)" } ?? "nil")\n".utf8
+        ))
         return nil
     }
 }
@@ -487,7 +562,10 @@ struct SearchView: View {
                             isSelected: state.selectedIDs.contains(item.id),
                             selfDeviceID: state.deps.deviceID,
                             snippet: state.snippets[item.id],
-                            blobs: state.deps.blobs
+                            blobs: state.deps.blobs,
+                            fetcher: state.pasteBlobFetcher,
+                            storageMode: state.deps.config.mesh.storageMode,
+                            blobInventoryPulse: state.blobInventoryPulse
                         )
                         // 仅 currentItem 那张卡上挂 GeometryReader 发布 frame——currentItem
                         // = selectedIDs.last,跟 PreviewPanelController 锚定逻辑一致。
@@ -1048,9 +1126,20 @@ private struct ItemCard: View {
     let snippet: String?
     /// BlobStore reference 让 contentArea 异步加载 image kind / file-as-image 缩略图
     let blobs: BlobStore
+    /// PR cloudy-mirroring-walnut PR 3：optimized storage_mode 下缩略图缺 blob 走这个
+    /// fetcher 按需拉。nil = 没配 peer / shared-secret 失败，缺 blob 直接占位
+    let fetcher: (any BlobFetcher)?
+    let storageMode: StorageMode
+    /// AppState.blobInventoryPulse 透传——补齐缺失 blob 后 bump 让本卡 .task 重 fire 走
+    /// decode 路径。光靠 ImageThumbnailCache.invalidateAll 不够（.task id 不变不会 re-fire）
+    let blobInventoryPulse: Int
 
     /// 缩略图状态。.task 异步加载完 set;LazyHStack 卡滚出视野 unload 时 cancel + 重置
     @State private var thumbnail: NSImage?
+    /// PR cloudy-mirroring-walnut PR 4：手动点 ☁️ 触发下载时的进度态。thumbnail 路径
+    /// 自动 lazy fetch 不显 spinner（缩略图占位本身已是提示）；用户主动点 ☁️ 才显
+    @State private var cloudDownloading: Bool = false
+    @State private var cloudLastError: String?
 
     private var isRemoteMirror: Bool {
         item.originDevice != selfDeviceID
@@ -1097,6 +1186,22 @@ private struct ItemCard: View {
             topRightSourceIcon
                 .offset(x: 8, y: -8)
         }
+        // PR cloudy-mirroring-walnut PR 4：☁️ cloud badge——optimized 模式 + 本机缺 blob 显示。
+        // 钉到右下角避免跟右上的 source app icon 打架；点击主动触发 lazy fetch
+        .overlay(alignment: .topLeading) {
+            CloudBadgeView(
+                state: CloudBadgeStateCalculator.state(
+                    storageMode: storageMode,
+                    item: item,
+                    blobs: blobs,
+                    isDownloading: cloudDownloading,
+                    lastError: cloudLastError
+                ),
+                onTap: { triggerCloudDownload() }
+            )
+            .padding(6)
+            .offset(x: item.pinned ? 30 : 0, y: 0)
+        }
         // pin 角标内嵌左上(不溢出),克制风格区别于 source icon 的"贴纸"
         .overlay(alignment: .topLeading) {
             if item.pinned {
@@ -1104,7 +1209,7 @@ private struct ItemCard: View {
                     .padding(6)
             }
         }
-        .task(id: ImageThumbnailCache.cacheKey(for: item) ?? "") {
+        .task(id: "\(ImageThumbnailCache.cacheKey(for: item) ?? "")|\(blobInventoryPulse)") {
             guard shouldShowThumbnail else {
                 if thumbnail != nil { thumbnail = nil }
                 return
@@ -1113,9 +1218,45 @@ private struct ItemCard: View {
                 if thumbnail !== cached { thumbnail = cached }
                 return
             }
-            let img = await ImageThumbnailCache.shared.thumbnail(for: item, blobs: blobs)
+            let img = await ImageThumbnailCache.shared.thumbnail(
+                for: item, blobs: blobs,
+                fetcher: fetcher, storageMode: storageMode
+            )
             if !Task.isCancelled, thumbnail !== img {
                 thumbnail = img
+            }
+        }
+    }
+
+    /// PR cloudy-mirroring-walnut PR 4：用户点 ☁️ 主动触发 lazy GET /blob。
+    /// fetcher nil（standalone / shared-secret 失败）→ 立即标 failed 显红色 !
+    /// 成功 → BlobStore.putVerified 写盘 + 清掉 cache key 让 thumbnail .task 重渲
+    private func triggerCloudDownload() {
+        guard !cloudDownloading,
+              let sha = item.blobSha256,
+              let fetcher else {
+            if fetcher == nil { cloudLastError = "未配置 peer / shared-secret 加载失败" }
+            return
+        }
+        cloudDownloading = true
+        cloudLastError = nil
+        Task {
+            defer { cloudDownloading = false }
+            do {
+                let outcome = try await fetcher.getBlob(sha256: sha)
+                if case .found(let data) = outcome {
+                    _ = try blobs.putVerified(data, expectedSha256: sha)
+                    // 触发 .task 重 decode 缩略图——cache key 由 sha 决定，put 后下次
+                    // task fires 自然命中 BlobStore.read。强制 thumbnail=nil 让 SwiftUI
+                    // re-evaluate placeholder→image 切换
+                    thumbnail = nil
+                } else {
+                    cloudLastError = "peer 上无此 blob (404)"
+                }
+            } catch let err as GetBlobError {
+                cloudLastError = "\(err)"
+            } catch {
+                cloudLastError = "\(error)"
             }
         }
     }
