@@ -313,7 +313,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     // MARK: - NSWindowDelegate
 
     func windowDidResignKey(_ notification: Notification) {
-        // 用户切走了，自动隐藏
+        // preview 打开时**不**自动 hide:空格预览触发的 AVAsset 访问 iCloud / 受限目录
+        // 会让 macOS 弹 TCC "允许访问"系统 alert,这个 alert 抢走 panel 的 key 焦点 →
+        // windowDidResignKey 立即 hide() 会让 panel + preview 跟 alert 一起消失,用户
+        // 还没来得及点"允许"就以为 daemon crash。preview 打开就保留 panel,让 user
+        // 主动 Esc 或 space 关。普通 panel(非 preview)时仍按原逻辑——切走自动隐藏
+        FileHandle.standardError.write(Data("resign-key: previewShown=\(state.previewShown)\n".utf8))
+        if state.previewShown { return }
         hide()
     }
 }

@@ -6,6 +6,9 @@ public struct SearchQuery: Sendable, Equatable {
     public var fromNs: Int64?
     public var toNs: Int64?
     public var kinds: [ItemKind]
+    /// `.file` kind 的虚拟 sub-kind 过滤(视频/PDF/音频/图片文件)。语义上跟 `kinds`
+    /// **OR 关系**——`kinds=[.text]` + `fileSubKinds=[.video]` 命中文本 OR 视频文件
+    public var fileSubKinds: [FileSubKind]
     public var pinnedOnly: Bool
     public var includeDeleted: Bool
     public var limit: Int
@@ -16,6 +19,7 @@ public struct SearchQuery: Sendable, Equatable {
         fromNs: Int64? = nil,
         toNs: Int64? = nil,
         kinds: [ItemKind] = [],
+        fileSubKinds: [FileSubKind] = [],
         pinnedOnly: Bool = false,
         includeDeleted: Bool = false,
         limit: Int = 200,
@@ -25,6 +29,7 @@ public struct SearchQuery: Sendable, Equatable {
         self.fromNs = fromNs
         self.toNs = toNs
         self.kinds = kinds
+        self.fileSubKinds = fileSubKinds
         self.pinnedOnly = pinnedOnly
         self.includeDeleted = includeDeleted
         self.limit = limit
@@ -76,12 +81,12 @@ public struct SearchAPI: Sendable {
         // pinnedOnly=true 或 q.kinds 非空时 oversample 必须无界——否则按时间倒序取 limit+offset
         // 行可能全是不该出现在结果里的类型/未 pin 状态，filter 后凑不齐 q.limit。剪贴板量级
         // 万级，Swift 端 fold 几毫秒，可接受。
-        let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty
+        let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty || !q.fileSubKinds.isEmpty
         let oversampleLimit = needsPostFilter ? Int.max : (q.limit + q.offset)
         let oversample = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
-            kinds: [], pinnedOnly: false,
+            kinds: [], fileSubKinds: [], pinnedOnly: false,
             includeDeleted: q.includeDeleted,
             limit: oversampleLimit,
             offset: 0
@@ -117,9 +122,20 @@ public struct SearchAPI: Sendable {
 
         // 按 winner 行的字段过滤——不可前置到子查询。countByKindUnion / countUnion 走同源
         // 不变量保证 chip 数字、count、list 三者口径一致。
-        if !q.kinds.isEmpty {
-            let allowed = Set(q.kinds)
-            deduped = deduped.filter { allowed.contains($0.0.kind) }
+        // kinds + fileSubKinds 走 **OR** 关系——任一命中即保留(empty + empty = 全保留)
+        if !q.kinds.isEmpty || !q.fileSubKinds.isEmpty {
+            let allowedKinds = Set(q.kinds)
+            let subSet = Set(q.fileSubKinds)
+            deduped = deduped.filter { hit in
+                let item = hit.0
+                if allowedKinds.contains(item.kind) { return true }
+                if !subSet.isEmpty, item.kind == .file,
+                   let sub = ItemClassifier.fileSubKind(item),
+                   subSet.contains(sub) {
+                    return true
+                }
+                return false
+            }
         }
         if q.pinnedOnly {
             deduped = deduped.filter { $0.0.pinned }
@@ -160,10 +176,8 @@ public struct SearchAPI: Sendable {
         if !q.includeDeleted { wheres.append("item.deleted_at_ns IS NULL") }
         if let from = q.fromNs { wheres.append("item.captured_at_ns >= ?"); args.append(from) }
         if let to = q.toNs { wheres.append("item.captured_at_ns <= ?"); args.append(to) }
-        if !q.kinds.isEmpty {
-            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
-            wheres.append("item.kind IN (\(p))")
-            args.append(contentsOf: q.kinds.map { $0.rawValue })
+        if let kindPred = buildKindPredicate(q, args: &args) {
+            wheres.append(kindPred)
         }
         if q.pinnedOnly { wheres.append("item.pinned = 1") }
 
@@ -229,6 +243,7 @@ public struct SearchAPI: Sendable {
                 text: q.text,
                 fromNs: q.fromNs, toNs: q.toNs,
                 kinds: q.kinds,
+                fileSubKinds: q.fileSubKinds,
                 pinnedOnly: q.pinnedOnly,
                 includeDeleted: q.includeDeleted,
                 limit: Int.max,
@@ -239,14 +254,15 @@ public struct SearchAPI: Sendable {
     }
 
     /// 当前 (query / timeRange / pinnedOnly) 维度下，按 kind 分桶的 fold 后命中数。
-    /// **忽略**输入 `q.kinds`——chip count 显示的是"如果我只点这个 kind 会得到多少"，
-    /// 跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法判断稀疏类型。
-    /// 跟 `searchHits` / `count` 同源走 fold 路径，保证 chip / total / list 口径一致。
+    /// **忽略**输入 `q.kinds` + `q.fileSubKinds`——chip count 显示的是"如果我只点这个
+    /// chip 会得到多少"，跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法
+    /// 判断稀疏类型。跟 `searchHits` / `count` 同源走 fold 路径，保证 chip / total / list 口径一致。
     public func countByKind(_ q: SearchQuery) throws -> [ItemKind: Int] {
         let stripped = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
             kinds: [],
+            fileSubKinds: [],
             pinnedOnly: q.pinnedOnly,
             includeDeleted: q.includeDeleted,
             limit: Int.max, offset: 0
@@ -259,6 +275,80 @@ public struct SearchAPI: Sendable {
             }
             return out
         }
+    }
+
+    /// 按 file sub-kind 分桶的 fold 后命中数。同 `countByKind` 的语义——chip "视频 N"
+    /// 显示假如**只**选视频会有多少条,忽略当前已选 chip。返回所有 FileSubKind 的 entry
+    /// (缺的填 0),让 chip "0" 状态可见
+    public func countByFileSubKind(_ q: SearchQuery) throws -> [FileSubKind: Int] {
+        let stripped = SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs, toNs: q.toNs,
+            kinds: [],
+            fileSubKinds: [],
+            pinnedOnly: q.pinnedOnly,
+            includeDeleted: q.includeDeleted,
+            limit: Int.max, offset: 0
+        )
+        return try database.pool.read { db in
+            let hits = try Self.fetchHitsFolded(db, query: stripped)
+            var out: [FileSubKind: Int] = [:]
+            for k in FileSubKind.allCases { out[k] = 0 }
+            for hit in hits where hit.0.kind == .file {
+                if let sub = ItemClassifier.fileSubKind(hit.0) {
+                    out[sub, default: 0] += 1
+                }
+            }
+            return out
+        }
+    }
+
+    /// 构造 kind + fileSubKinds 的 OR'd WHERE 谓词。返回 nil 表示无 kind 过滤。
+    /// args 通过 inout 追加占位符值,调用方拼到自己的 args 序列里。
+    /// 注意:占位符顺序必须跟 args 追加顺序严格对齐
+    private static func buildKindPredicate(_ q: SearchQuery, args: inout [DatabaseValueConvertible]) -> String? {
+        var clauses: [String] = []
+        if !q.kinds.isEmpty {
+            let p = q.kinds.map { _ in "?" }.joined(separator: ",")
+            clauses.append("item.kind IN (\(p))")
+            args.append(contentsOf: q.kinds.map { $0.rawValue })
+        }
+        for sub in q.fileSubKinds {
+            let pred = subKindSQL(sub, args: &args)
+            clauses.append("(item.kind = 'file' AND \(pred))")
+        }
+        guard !clauses.isEmpty else { return nil }
+        return clauses.count == 1 ? clauses[0] : "(" + clauses.joined(separator: " OR ") + ")"
+    }
+
+    /// 单个 FileSubKind 的 SQL 谓词:mime OR 路径后缀 LIKE。多 ext 用 OR 串联,
+    /// LIKE 用 `LOWER(IFNULL(text_full,''))` 兼容空字段 + 大小写
+    private static func subKindSQL(_ sub: FileSubKind, args: inout [DatabaseValueConvertible]) -> String {
+        let mimeClause: String
+        let exts: [String]
+        switch sub {
+        case .video:
+            args.append("video/%")
+            mimeClause = "item.blob_mime LIKE ?"
+            exts = [".mp4", ".m4v", ".mov"]
+        case .pdf:
+            args.append("application/pdf")
+            mimeClause = "item.blob_mime = ?"
+            exts = [".pdf"]
+        case .audio:
+            args.append("audio/%")
+            mimeClause = "item.blob_mime LIKE ?"
+            exts = [".mp3", ".m4a", ".aac", ".wav", ".flac", ".aiff", ".aif", ".ogg", ".opus"]
+        case .imageFile:
+            args.append("image/%")
+            mimeClause = "item.blob_mime LIKE ?"
+            exts = [".png", ".jpg", ".jpeg", ".heic", ".heif", ".gif", ".webp", ".tiff", ".tif", ".bmp", ".svg"]
+        }
+        let likeClauses = exts.map { ext -> String in
+            args.append("%" + ext)
+            return "LOWER(IFNULL(item.text_full,'')) LIKE ?"
+        }
+        return "(" + ([mimeClause] + likeClauses).joined(separator: " OR ") + ")"
     }
 
     /// 把用户输入的自由文本转成 FTS5 MATCH 表达式。
@@ -291,10 +381,8 @@ public struct SearchAPI: Sendable {
             wheres.append("item.captured_at_ns <= ?")
             args.append(to)
         }
-        if !q.kinds.isEmpty {
-            let placeholders = q.kinds.map { _ in "?" }.joined(separator: ",")
-            wheres.append("item.kind IN (\(placeholders))")
-            args.append(contentsOf: q.kinds.map { $0.rawValue })
+        if let kindPred = buildKindPredicate(q, args: &args) {
+            wheres.append(kindPred)
         }
         if q.pinnedOnly {
             wheres.append("item.pinned = 1")

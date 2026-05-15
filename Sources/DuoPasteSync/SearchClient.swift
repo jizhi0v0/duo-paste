@@ -31,19 +31,24 @@ public struct SearchProvider: Sendable {
         /// 按 kind 分桶的 fold 后命中数。**忽略** `query.kinds`——chip 上挂 "图片 19" 时
         /// 显示的是"如果只选这个 kind 会有多少"，跟当前已选 chip 集合无关。
         public let kindCounts: [ItemKind: Int]
+        /// 按 FileSubKind 分桶的 fold 后命中数(file kind 的细分:视频/PDF/音频/图片文件)。
+        /// 同样忽略输入 chip 选择,语义跟 kindCounts 平行
+        public let fileSubKindCounts: [FileSubKind: Int]
 
         public init(
             items: [Item],
             mode: Mode,
             snippets: [String: String] = [:],
             totalCount: Int = 0,
-            kindCounts: [ItemKind: Int] = [:]
+            kindCounts: [ItemKind: Int] = [:],
+            fileSubKindCounts: [FileSubKind: Int] = [:]
         ) {
             self.items = items
             self.mode = mode
             self.snippets = snippets
             self.totalCount = totalCount
             self.kindCounts = kindCounts
+            self.fileSubKindCounts = fileSubKindCounts
         }
     }
 
@@ -83,12 +88,14 @@ public struct SearchProvider: Sendable {
         })
         let total = (try? local.count(query)) ?? hits.count
         let raw = (try? local.countByKind(query)) ?? [:]
+        let subRaw = (try? local.countByFileSubKind(query)) ?? [:]
         return Outcome(
             items: hits.map(\.0),
             mode: mode,
             snippets: snippets,
             totalCount: total,
-            kindCounts: Self.normalizeKindCounts(raw)
+            kindCounts: Self.normalizeKindCounts(raw),
+            fileSubKindCounts: Self.normalizeFileSubKindCounts(subRaw)
         )
     }
 
@@ -98,6 +105,15 @@ public struct SearchProvider: Sendable {
     static func normalizeKindCounts(_ raw: [ItemKind: Int]) -> [ItemKind: Int] {
         var out = raw
         for k in ItemKind.allCases where out[k] == nil {
+            out[k] = 0
+        }
+        return out
+    }
+
+    /// 同上,对 FileSubKind 平铺所有 case
+    static func normalizeFileSubKindCounts(_ raw: [FileSubKind: Int]) -> [FileSubKind: Int] {
+        var out = raw
+        for k in FileSubKind.allCases where out[k] == nil {
             out[k] = 0
         }
         return out

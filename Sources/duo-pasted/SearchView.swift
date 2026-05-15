@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import AVFoundation
 import DuoPasteCore
 import DuoPasteSync
 
@@ -18,10 +19,13 @@ import DuoPasteSync
 /// 改卡片布局后调高让缩略图不糊。1000 image 缓存 ~10-30MB 内存,可接受
 ///
 /// 加载策略:
-/// - `cached(sha:)` 同步查 dict,命中直接返回(SwiftUI body 内可直接调,不卡)
-/// - `thumbnail(sha:blobs:)` async,miss 时 Task.detached 跑 background CPU decode +
-///   downscale(用 CGImageSourceCreateThumbnailAtIndex 是 Core Graphics 最快路径,~毫秒级)
-/// - decode 失败的 sha 进 `notDecodable` 黑名单,LazyVStack 重渲不再反复重试
+/// - `cached(for:)` 同步查 dict,命中直接返回(SwiftUI body 内可直接调,不卡)
+/// - `thumbnail(for:blobs:)` async,miss 时 Task.detached 跑 background CPU decode
+/// - decode 失败的 key 进 `notDecodable` 黑名单,LazyHStack 重渲不再反复重试
+///
+/// **cache key**:blob-backed 项用 `sha:<sha256>`;file kind 走 Finder 复制(无 blob,只
+/// 有路径)的视频/图片用 `path:<本机绝对路径>`——后者跨设备 mirror 在对端文件不存在
+/// 时 decode fail 一次后进黑名单,UI fallback SF Symbol
 @MainActor
 final class ImageThumbnailCache {
     static let shared = ImageThumbnailCache()
@@ -29,27 +33,102 @@ final class ImageThumbnailCache {
     private var notDecodable: Set<String> = []
     private static let maxPx: Int = 400
 
-    func cached(sha256: String) -> NSImage? { cache[sha256] }
+    /// blob-backed 优先用 sha;file kind 无 blob 时退化到路径(本机文件 URL 解析)
+    nonisolated static func cacheKey(for item: Item) -> String? {
+        if let sha = item.blobSha256 { return "sha:" + sha }
+        if let p = item.textFull, !p.isEmpty, !p.contains("\n") {
+            return "path:" + p
+        }
+        return nil
+    }
 
-    func thumbnail(sha256: String, blobs: BlobStore) async -> NSImage? {
-        if let img = cache[sha256] { return img }
-        if notDecodable.contains(sha256) { return nil }
+    func cached(for item: Item) -> NSImage? {
+        guard let key = Self.cacheKey(for: item) else { return nil }
+        return cache[key]
+    }
+
+    func thumbnail(for item: Item, blobs: BlobStore) async -> NSImage? {
+        guard let key = Self.cacheKey(for: item) else { return nil }
+        if let img = cache[key] { return img }
+        if notDecodable.contains(key) { return nil }
+        let isVideo = Self.isVideoLike(item)
+        let sha = item.blobSha256
+        let pathStr = item.textFull
         let maxPx = Self.maxPx
         let img = await Task.detached(priority: .userInitiated) { () -> NSImage? in
-            guard let data = try? blobs.read(sha256: sha256) ?? nil else { return nil }
-            return Self.decodeThumbnail(data: data, maxPx: maxPx)
+            // 选源 URL:优先 BlobStore(content-addressed 稳),没 blob 退化到本机文件路径
+            let sourceURL: URL? = {
+                if let sha, let blobURL = blobs.locate(sha256: sha) { return blobURL }
+                if let pathStr, !pathStr.isEmpty {
+                    let u = URL(fileURLWithPath: pathStr)
+                    if FileManager.default.fileExists(atPath: u.path) { return u }
+                }
+                return nil
+            }()
+            if isVideo {
+                guard let sourceURL else { return nil }
+                return Self.decodeVideoThumbnail(url: sourceURL, maxPx: maxPx)
+            }
+            // image 路径:优先 BlobStore.read(零拷贝走 Data),没 blob 时直读文件 URL
+            if let sha, let data = try? blobs.read(sha256: sha) ?? nil {
+                return Self.decodeImageThumbnail(data: data, maxPx: maxPx)
+            }
+            if let sourceURL, let data = try? Data(contentsOf: sourceURL) {
+                return Self.decodeImageThumbnail(data: data, maxPx: maxPx)
+            }
+            return nil
         }.value
         if let img {
-            cache[sha256] = img
+            cache[key] = img
         } else {
-            notDecodable.insert(sha256)
+            notDecodable.insert(key)
         }
         return img
     }
 
+    /// 后台预热——AppState.init / refresh 后调,把 results 里 thumbnailable 项(image +
+    /// video)的 thumbnail 提前 decode 进 cache。每张卡 .task 命中 cached(sha:) 直接拿,
+    /// 不闪 placeholder。每条 sha 单独起 Task → thumbnail() 内部 Task.detached → 并发
+    /// decode;已 cached / 黑名单的 sha 跳过,重复 prefetch (init + refresh) 廉价
+    func prefetch(items: [Item], blobs: BlobStore) {
+        for item in items {
+            guard let key = Self.cacheKey(for: item),
+                  cache[key] == nil,
+                  !notDecodable.contains(key),
+                  Self.isThumbnailable(item) else { continue }
+            Task { [weak self] in
+                _ = await self?.thumbnail(for: item, blobs: blobs)
+            }
+        }
+    }
+
+    /// 静图判别:image kind 必须有 blob;file kind 走 mime / 路径后缀(可能无 blob)
+    nonisolated static func isImageLike(_ item: Item) -> Bool {
+        if item.kind == .image { return item.blobSha256 != nil }
+        if item.kind == .file {
+            if let mime = item.blobMime, mime.hasPrefix("image/") { return true }
+            if let p = item.textFull, fileLooksLikeImage(path: p) { return true }
+        }
+        return false
+    }
+
+    /// 视频判别——AVFoundation 能解码的 mp4/m4v/mov。file kind Finder 复制无 blob,
+    /// thumbnail() 解析时退化到本机文件 URL,所以这里不能 require blob 存在
+    nonisolated static func isVideoLike(_ item: Item) -> Bool {
+        if let mime = item.blobMime, mime.hasPrefix("video/") { return true }
+        if item.kind == .file, let p = item.textFull, fileLooksLikeVideo(path: p) { return true }
+        return false
+    }
+
+    /// 卡片缩略图能渲染的所有类型——image + video。kind=.file 的视频/图片走文件路径
+    /// 后缀启发,kind=.image 直走 image
+    nonisolated static func isThumbnailable(_ item: Item) -> Bool {
+        isImageLike(item) || isVideoLike(item)
+    }
+
     /// `nonisolated` 让 Task.detached 闭包能直接调——本函数纯 CG 调用 + 局部变量,无
     /// MainActor 状态访问,跑 background CPU 安全
-    nonisolated private static func decodeThumbnail(data: Data, maxPx: Int) -> NSImage? {
+    nonisolated private static func decodeImageThumbnail(data: Data, maxPx: Int) -> NSImage? {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -63,6 +142,26 @@ final class ImageThumbnailCache {
         // point size = pixel / 2(2x retina) 让 SwiftUI 用 point 摆放跟 32pt frame 对齐
         let size = NSSize(width: CGFloat(cgImg.width) / 2, height: CGFloat(cgImg.height) / 2)
         return NSImage(cgImage: cgImg, size: size)
+    }
+
+    /// 视频缩略图——AVAssetImageGenerator 抽帧。优先取 0.5s 帧避开开头黑场/淡入,失败
+    /// 兜底 0s。maximumSize 让 AVF 自己 downscale 不传整张 4K decode 进内存
+    nonisolated private static func decodeVideoThumbnail(url: URL, maxPx: Int) -> NSImage? {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true   // 应用 metadata 旋转(竖拍视频别躺着)
+        gen.maximumSize = CGSize(width: CGFloat(maxPx), height: CGFloat(maxPx))
+        let attempts: [CMTime] = [
+            CMTime(seconds: 0.5, preferredTimescale: 600),
+            .zero,
+        ]
+        for t in attempts {
+            if let cgImg = try? gen.copyCGImage(at: t, actualTime: nil) {
+                let size = NSSize(width: CGFloat(cgImg.width) / 2, height: CGFloat(cgImg.height) / 2)
+                return NSImage(cgImage: cgImg, size: size)
+            }
+        }
+        return nil
     }
 }
 
@@ -113,27 +212,18 @@ private struct SelectedCardFramePreference: PreferenceKey {
     }
 }
 
-/// 浮岛 panel 的玻璃背景。macOS 26+ 用 Liquid Glass(`.glassEffect`),
-/// 老系统(deployment target macOS 14)兜底 `.ultraThickMaterial` + clipShape。
-/// 抽成 ViewModifier 让 SearchView body 跟 #available 分支隔离。
-///
-/// `.glassEffect(in:)` 内部已经处理形状 + clip,不需要再加 .clipShape。
-/// 旧路径 ultraThickMaterial 不带形状,所以保留 clipShape。
+/// 浮岛 panel 的玻璃背景。统一走 `.ultraThickMaterial` (NSVisualEffectView)——
+/// macOS 26 Liquid Glass `.glassEffect` 虽然视觉更精致,但 `isOpaque=false + bg=.clear`
+/// 让屏幕截图(CleanShotX 等抓帧)时 panel 完全透明,跟系统 Spotlight 行为一致但
+/// 跟 Paste.app 不同。本项目优先要"截图正常显示"心智,牺牲 Liquid Glass 换稳定材质。
+/// 想恢复 Liquid Glass:把这里改成 `.glassEffect(.regular, in: shape)` 即可
 @MainActor
 private struct PanelBackgroundModifier: ViewModifier {
     let cornerRadius: CGFloat
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content
-                .glassEffect(
-                    .regular,
-                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                )
-        } else {
-            content
-                .background(.ultraThickMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        }
+        content
+            .background(.ultraThickMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
 
@@ -301,9 +391,20 @@ struct SearchView: View {
                                 onTap: { toggleKind(kind) }
                             )
                         }
-                        if !state.selectedKinds.isEmpty {
+                        // .file kind 细分 chip——视频/PDF/音频/图片文件。视觉上跟基础 chip 同款,
+                        // 语义上 OR(选了 "视频" + 不选 "文件" → 只视频;选了 "文件" → 全部文件)
+                        ForEach(filterChipFileSubKinds, id: \.self) { sub in
+                            FileSubKindChip(
+                                sub: sub,
+                                isSelected: state.selectedFileSubKinds.contains(sub),
+                                count: state.fileSubKindCounts.isEmpty ? nil : (state.fileSubKindCounts[sub] ?? 0),
+                                onTap: { toggleFileSubKind(sub) }
+                            )
+                        }
+                        if !state.selectedKinds.isEmpty || !state.selectedFileSubKinds.isEmpty {
                             Button {
                                 state.selectedKinds.removeAll()
+                                state.selectedFileSubKinds.removeAll()
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .font(.system(size: 11))
@@ -343,7 +444,11 @@ struct SearchView: View {
                 // alignment 让 LazyHStack 占满 ScrollView 高度但卡片靠顶——消除 user 反馈
                 // 的"第二次打开 panel 底部还有大空隙"(SwiftUI 默认 vertical centering 让卡片
                 // 在 ScrollView 内居中,下方留空白)
-                LazyHStack(alignment: .top, spacing: 22) {
+                // spacing=10 + 每张卡 .padding(.trailing, 12) → 视觉间距 22pt 跟之前一致。
+                // trailing padding 让 card 的 frame(被 .id 标识 + 被 scrollTo 锚定的那个)
+                // 含 12pt slack,topRight icon 的 8pt 溢出落在 slack 内,scrollTo 最右卡时
+                // 不会被 ScrollView clip 切掉 icon
+                LazyHStack(alignment: .top, spacing: 10) {
                     // 前 9 张挂 ⌘1 ~ ⌘9 序号,enumerated 拿 index;之后传 nil 不显示角标
                     ForEach(Array(state.results.enumerated()), id: \.element.id) { offset, item in
                         ItemCard(
@@ -354,10 +459,10 @@ struct SearchView: View {
                             snippet: state.snippets[item.id],
                             blobs: state.deps.blobs
                         )
-                        .id(item.id)
                         // 仅 currentItem 那张卡上挂 GeometryReader 发布 frame——currentItem
                         // = selectedIDs.last,跟 PreviewPanelController 锚定逻辑一致。
-                        // 多选时不发布其他选中卡的 frame(预览只有一个浮窗,跟最后选中的卡走)
+                        // GeometryReader 必须在 .padding 前,读到的是 240pt 卡本身的 frame
+                        // 而不是 252pt 含 slack 的 padded frame(影响 preview 浮窗锚点)
                         .background {
                             if item.id == previewAnchorID {
                                 GeometryReader { geo in
@@ -369,6 +474,11 @@ struct SearchView: View {
                                 }
                             }
                         }
+                        // 右侧 12pt slack 给 topRight icon 的 8pt 溢出留位置;.id 在 padding
+                        // 后挂,scrollTo 锚定 252pt 含 slack 的 padded frame,最右卡 scrollTo
+                        // 后 icon 仍在 viewport 内
+                        .padding(.trailing, 12)
+                        .id(item.id)
                         // user 反馈不要点击放大动画 + 首卡 scale 会让左边框超出 viewport 被裁,
                         // scaleEffect 全撤掉,选中态靠 accent border + shadow 高亮即可
                         // 双击粘贴(无视 selectedIDs)
@@ -411,7 +521,7 @@ struct SearchView: View {
                         )
                     }
                 }
-                // 卡片顶部 12pt 间距给 source icon 半溢出留呼吸,不被 filter hairline 顶死
+                // 顶部 12pt 给 icon offset(y:-8) 上溢出留 buffer + 跟 filter hairline 间距
                 .padding(.top, 12)
             }
             // 横向 padding 22 跟 header/filterBar 对齐,panel 左右两侧 padding 统一。
@@ -537,11 +647,24 @@ struct SearchView: View {
         [.text, .image, .url, .file, .rtf, .html]
     }
 
+    /// `.file` 细分 chip 顺序——视频 / PDF / 音频 / 图片文件,按出现频次
+    private var filterChipFileSubKinds: [FileSubKind] {
+        [.video, .pdf, .audio, .imageFile]
+    }
+
     private func toggleKind(_ kind: ItemKind) {
         if state.selectedKinds.contains(kind) {
             state.selectedKinds.remove(kind)
         } else {
             state.selectedKinds.insert(kind)
+        }
+    }
+
+    private func toggleFileSubKind(_ sub: FileSubKind) {
+        if state.selectedFileSubKinds.contains(sub) {
+            state.selectedFileSubKinds.remove(sub)
+        } else {
+            state.selectedFileSubKinds.insert(sub)
         }
     }
 
@@ -773,6 +896,58 @@ struct SearchView: View {
 /// 0 也显示（"图片 0"），避免用户误以为 filter 失效；nil = 出错降级时隐藏。
 /// nil/0 的区分发生在 caller：空 kindCounts dict（出错降级）→ nil；非空 dict
 /// （fold-aware 路径有命中）→ 缺 key 默认 0。
+/// `.file` 细分 chip——风格跟 KindChip 一致,kind 换成 FileSubKind
+private struct FileSubKindChip: View {
+    let sub: FileSubKind
+    let isSelected: Bool
+    let count: Int?
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.system(size: 11))
+                Text(label)
+                    .font(.system(size: 12))
+                if let count {
+                    Text("\(count)")
+                        .font(.system(size: 11))
+                        .monospacedDigit()
+                        .foregroundStyle(isSelected ? Color.white.opacity(0.75) : .secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(isSelected ? Color.white : .primary)
+            .background(
+                Capsule()
+                    .fill(isSelected ? Color.accentColor : Color.primary.opacity(0.06))
+            )
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+    }
+
+    private var label: String {
+        switch sub {
+        case .video: "视频"
+        case .pdf: "PDF"
+        case .audio: "音频"
+        case .imageFile: "图片文件"
+        }
+    }
+
+    private var symbol: String {
+        switch sub {
+        case .video: "play.rectangle"
+        case .pdf: "doc.richtext"
+        case .audio: "waveform"
+        case .imageFile: "photo.on.rectangle"
+        }
+    }
+}
+
 private struct KindChip: View {
     let kind: ItemKind
     let isSelected: Bool
@@ -851,16 +1026,10 @@ private struct ItemCard: View {
         item.originDevice != selfDeviceID
     }
 
-    /// 是否应该显示缩略图。命中三路:image kind / file kind+blob mime=image/ / file kind+
-    /// 路径后缀像 image。前提是有 blob sha
+    /// 是否应该显示缩略图——直接复用 ImageThumbnailCache.isThumbnailable
+    /// (image kind / image-like file / video-like file 都接)
     private var shouldShowThumbnail: Bool {
-        guard item.blobSha256 != nil else { return false }
-        if item.kind == .image { return true }
-        if item.kind == .file {
-            if let mime = item.blobMime, mime.hasPrefix("image/") { return true }
-            if let p = item.textFull, fileLooksLikeImage(path: p) { return true }
-        }
-        return false
+        ImageThumbnailCache.isThumbnailable(item)
     }
 
     var body: some View {
@@ -891,8 +1060,9 @@ private struct ItemCard: View {
             radius: isSelected ? 8 : 0,
             x: 0, y: 2
         )
-        // source app icon 钉右上**边框上**——半溢出卡片,中心点贴右上顶点,
-        // 像贴纸/通知 badge 风格。overlay 不被 clipShape 影响,offset 能溢出
+        // source app icon 钉右上**边框上**——半溢出卡片让 icon "贴"在边沿,
+        // 避免内嵌方案遮挡卡内文字。cardScroller 给每张卡 .padding(.trailing, 12) 留
+        // slack,scrollTo 最右卡时含 slack 的 padded frame 全可见 → icon 不被 clip
         .overlay(alignment: .topTrailing) {
             topRightSourceIcon
                 .offset(x: 8, y: -8)
@@ -904,16 +1074,16 @@ private struct ItemCard: View {
                     .padding(6)
             }
         }
-        .task(id: item.blobSha256 ?? "") {
-            guard shouldShowThumbnail, let sha = item.blobSha256 else {
+        .task(id: ImageThumbnailCache.cacheKey(for: item) ?? "") {
+            guard shouldShowThumbnail else {
                 if thumbnail != nil { thumbnail = nil }
                 return
             }
-            if let cached = ImageThumbnailCache.shared.cached(sha256: sha) {
+            if let cached = ImageThumbnailCache.shared.cached(for: item) {
                 if thumbnail !== cached { thumbnail = cached }
                 return
             }
-            let img = await ImageThumbnailCache.shared.thumbnail(sha256: sha, blobs: blobs)
+            let img = await ImageThumbnailCache.shared.thumbnail(for: item, blobs: blobs)
             if !Task.isCancelled, thumbnail !== img {
                 thumbnail = img
             }
@@ -935,8 +1105,22 @@ private struct ItemCard: View {
         }
     }
 
+    /// 视频卡左下 ▶ 角标——hint 这是视频不是静图,跟图片缩略图视觉区分
+    @ViewBuilder
+    private var videoPlayBadge: some View {
+        let icon = Image(systemName: "play.fill")
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(Color.white)
+            .padding(6)
+        if #available(macOS 26.0, *) {
+            icon.glassEffect(.regular.tint(Color.black.opacity(0.55)), in: Circle())
+        } else {
+            icon.background(Color.black.opacity(0.55), in: Circle())
+        }
+    }
+
     /// 卡片主区(200×188)。image kind 走原图 aspectFit(显示完整,letterbox 用深色背景填充);
-    /// loading 走 placeholder;text 类走多行文字
+    /// loading 走 placeholder;text 类走多行文字。视频缩略图叠 ▶ 角标区分静图
     @ViewBuilder
     private var contentArea: some View {
         if shouldShowThumbnail, let thumb = thumbnail {
@@ -948,6 +1132,11 @@ private struct ItemCard: View {
                     .aspectRatio(contentMode: .fit)
             }
             .frame(width: 240, height: 204)
+            .overlay(alignment: .bottomLeading) {
+                if ItemClassifier.isVideo(item) {
+                    videoPlayBadge.padding(8)
+                }
+            }
         } else if shouldShowThumbnail {
             // 加载中:placeholder
             ZStack {
@@ -1076,27 +1265,42 @@ private struct ItemCard: View {
         return Color.primary.opacity(0.08)
     }
 
-    /// kind 中文标签——meta 行第一列显示。比 bundle name 更立刻能读懂"这是什么"。
+    /// kind 中文标签——meta 行第一列显示。`.file` 按 ItemClassifier 细分到
+    /// 视频/PDF/音频/图片文件,普通文件继续 "文件"
     private var kindLabel: String {
         switch item.kind {
-        case .text: "文本"
-        case .rtf: "富文本"
-        case .html: "HTML"
-        case .url: "链接"
-        case .image: "图片"
-        case .file: "文件"
+        case .text: return "文本"
+        case .rtf: return "富文本"
+        case .html: return "HTML"
+        case .url: return "链接"
+        case .image: return "图片"
+        case .file:
+            switch ItemClassifier.fileSubKind(item) {
+            case .video: return "视频"
+            case .pdf: return "PDF"
+            case .audio: return "音频"
+            case .imageFile: return "图片文件"
+            case .none: return "文件"
+            }
         }
     }
 
-    /// app icon 不可用时的 fallback symbol。
+    /// app icon 不可用时的 fallback symbol。`.file` 同样按 sub-kind 细分
     private var kindSymbol: String {
         switch item.kind {
-        case .text: "text.alignleft"
-        case .rtf: "doc.richtext"
-        case .html: "chevron.left.forwardslash.chevron.right"
-        case .url: "link"
-        case .image: "photo"
-        case .file: "doc"
+        case .text: return "text.alignleft"
+        case .rtf: return "doc.richtext"
+        case .html: return "chevron.left.forwardslash.chevron.right"
+        case .url: return "link"
+        case .image: return "photo"
+        case .file:
+            switch ItemClassifier.fileSubKind(item) {
+            case .video: return "play.rectangle"
+            case .pdf: return "doc.richtext"
+            case .audio: return "waveform"
+            case .imageFile: return "photo.on.rectangle"
+            case .none: return "doc"
+            }
         }
     }
 

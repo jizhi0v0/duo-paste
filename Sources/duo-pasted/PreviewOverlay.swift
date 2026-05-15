@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 import PDFKit
+import AVFoundation
+import AVKit
 import DuoPasteCore
 
 /// 空格预览的独立浮窗。
@@ -116,7 +118,7 @@ final class PreviewPanelController {
     }
 
     private func needsAsyncDecode(_ item: Item) -> Bool {
-        isImageLike(item) || isPDFLike(item)
+        isImageLike(item) || isPDFLike(item) || Self.isVideoLikeStatic(item)
     }
 
     /// 把"算尺寸 + 写 SwiftUI rootView + 移动/显示 panel"封装一起。同步路径(缓存命中)
@@ -192,6 +194,11 @@ final class PreviewPanelController {
                 return NSSize(width: max(380, pdfW * scale), height: pdfH * scale + chromeH)
             }
             return NSSize(width: 720, height: 420)
+        case .video(_, let size):
+            let pixelW = max(size.width, 1); let pixelH = max(size.height, 1)
+            let contentMaxH = maxH - chromeH
+            let scale = min(maxW / pixelW, contentMaxH / pixelH, 1.0)
+            return NSSize(width: max(380, pixelW * scale), height: pixelH * scale + chromeH)
         case .none, .loading:
             return NSSize(width: 720, height: 420)
         }
@@ -202,7 +209,7 @@ final class PreviewPanelController {
     /// 只在 detached task 里构造一次就交出,后续 main actor 上只读不变)。
     /// 优先级 `.userInitiated` 让用户能感知到这是交互响应路径而非后台 batch
     nonisolated private static func decodeMedia(item: Item, blobs: BlobStore) async -> PreviewMedia {
-        await Task.detached(priority: .userInitiated) { () -> PreviewMedia in
+        let detached: Task<PreviewMedia, Never> = Task.detached(priority: .userInitiated) {
             if Self.isImageLikeStatic(item), let sha = item.blobSha256,
                let data = try? blobs.read(sha256: sha) ?? nil,
                let img = NSImage(data: data) {
@@ -220,8 +227,38 @@ final class PreviewPanelController {
                     return .pdf(doc)
                 }
             }
+            if Self.isVideoLikeStatic(item) {
+                // 视频源 URL:优先 BlobStore(blob 备份的小视频),退化本机文件路径
+                let url: URL? = {
+                    if let sha = item.blobSha256, let u = blobs.locate(sha256: sha) { return u }
+                    if let raw = item.textFull,
+                       let first = raw.split(separator: "\n", omittingEmptySubsequences: true).first {
+                        let path = String(first)
+                        if FileManager.default.fileExists(atPath: path) {
+                            return URL(fileURLWithPath: path)
+                        }
+                    }
+                    return nil
+                }()
+                if let url {
+                    let asset = AVURLAsset(url: url)
+                    do {
+                        let tracks = try await asset.loadTracks(withMediaType: .video)
+                        if let track = tracks.first {
+                            let natural = try await track.load(.naturalSize)
+                            let transform = try await track.load(.preferredTransform)
+                            let displayed = natural.applying(transform)
+                            let size = CGSize(width: abs(displayed.width), height: abs(displayed.height))
+                            return .video(url, size)
+                        }
+                    } catch {
+                        // decode 失败 fallthrough .none → 显示通用 file body
+                    }
+                }
+            }
             return .none
-        }.value
+        }
+        return await detached.value
     }
 
     /// 给同步路径用的 @MainActor wrapper——直接 forward 到 nonisolated static 实现,
@@ -249,6 +286,17 @@ final class PreviewPanelController {
             return false
         }
         return String(first).lowercased().hasSuffix(".pdf")
+    }
+
+    /// 视频判别——AVFoundation 能解码的格式(mp4/m4v/mov),跟 ImageThumbnailCache.isVideoLike
+    /// 同口径但接受 multi-line(虽然 fileLooksLikeVideo 自己拒)
+    nonisolated static func isVideoLikeStatic(_ item: Item) -> Bool {
+        if let mime = item.blobMime, mime.hasPrefix("video/") { return true }
+        guard item.kind == .file, let raw = item.textFull,
+              let first = raw.split(separator: "\n", omittingEmptySubsequences: true).first else {
+            return false
+        }
+        return fileLooksLikeVideo(path: String(first))
     }
 
     private func ensurePanel() -> NSPanel {
@@ -312,6 +360,9 @@ enum PreviewMedia: @unchecked Sendable {
     case loading
     case image(NSImage)
     case pdf(PDFDocument)
+    /// 视频:URL 给 AVPlayer 播放,displaySize 是已应用 preferredTransform 的展示尺寸,
+    /// sizeFor 用它算 panel 比例(竖拍视频要 H>W,naturalSize 不带 transform 会反)
+    case video(URL, CGSize)
 }
 
 /// 浮窗内容视图。圆角卡片自身是 panel 全幅;header(36) + body(剩余) + footer(28)
@@ -385,7 +436,9 @@ struct PreviewPanelContent: View {
         .frame(height: 36)
     }
 
-    /// 当前 media 对应的稳定身份 key——给 contentBody .id() 用,kind 切换强制干净 swap
+    /// 当前 media 对应的稳定身份 key——给 contentBody .id() 用,kind 切换强制干净 swap。
+    /// video 把 URL 编进 key,确保切到不同视频时 SwiftUI 整体重建 VideoPreviewBody
+    /// (否则 same .id 复用,@State player 不会重置 → 还在播旧视频)
     private var kindKey: String {
         switch media {
         case .none:
@@ -397,6 +450,7 @@ struct PreviewPanelContent: View {
         case .loading: return "loading"
         case .image: return "image"
         case .pdf: return "pdf"
+        case .video(let url, _): return "video:" + url.absoluteString
         }
     }
 
@@ -417,6 +471,8 @@ struct PreviewPanelContent: View {
                 .background(Color.black.opacity(0.04))
         case .pdf(let doc):
             PDFPreviewBody(document: doc)
+        case .video(let url, _):
+            VideoPreviewBody(url: url)
         case .none:
             if isImageLike(item) {
                 ZStack {
@@ -597,6 +653,74 @@ private struct PDFKitView: NSViewRepresentable {
 }
 
 @MainActor
+/// 视频预览——AVPlayerView 走原生控件(play/pause/scrubber/音量/全屏)。
+///
+/// **历史**:第一版用 SwiftUI `VideoPlayer`,它内部 Swift class `VideoPlayerView` 继承
+/// ObjC `AVPlayerView`,macOS 26.5 上 Swift runtime 初始化该 class metadata 时
+/// `getSuperclassMetadata` demangle 失败 → SIGABRT。`failed to demangle superclass
+/// of VideoPlayerView from mangled name 'So12AVPlayerViewC'`
+///
+/// **现版本**:直接 `NSViewRepresentable` 挂 AVPlayerView(纯 ObjC 类,Swift runtime
+/// 不需要初始化它的 Swift class metadata,绕开 demangle 路径)。controlsStyle=.inline
+/// 走底部贴边的 scrubber + 播放控件。autoplay 静音,user 想出声手动点音量
+private struct VideoPreviewBody: NSViewRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .inline
+        view.showsFullScreenToggleButton = true
+        view.allowsPictureInPicturePlayback = false
+        view.videoGravity = .resizeAspect
+        let asset = AVURLAsset(url: url)
+        let item = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true                                // 预览静音,不在用户搜索时突然出声
+        player.automaticallyWaitsToMinimizeStalling = false  // 本地文件不要等 buffer
+        view.player = player
+        context.coordinator.player = player
+        player.play()
+        context.coordinator.statusObservation = item.observe(
+            \.status, options: [.new]
+        ) { item, _ in
+            if item.status == .readyToPlay {
+                Task { @MainActor in player.play() }
+            }
+        }
+        context.coordinator.loopObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { _ in
+            player.seek(to: .zero)
+            player.play()
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        // no-op;parent .id(kindKey) 带 URL,切到不同视频走 makeNSView 重建
+    }
+
+    static func dismantleNSView(_ nsView: AVPlayerView, coordinator: Coordinator) {
+        coordinator.player?.pause()
+        coordinator.statusObservation?.invalidate()
+        coordinator.statusObservation = nil
+        if let obs = coordinator.loopObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        nsView.player = nil
+    }
+
+    final class Coordinator {
+        var player: AVPlayer?
+        var loopObserver: NSObjectProtocol?
+        var statusObservation: NSKeyValueObservation?
+    }
+}
+
 private struct FilePreviewBody: View {
     let item: Item
     var body: some View {

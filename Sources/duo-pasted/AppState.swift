@@ -30,9 +30,15 @@ final class AppState {
     /// 按 kind 分桶的命中数（忽略 selectedKinds 自身——chip 上的数字含义是"如果只选这个
     /// kind 会有多少"，跟当前已勾选 chip 集合无关）。UI 端 KindChip 用来挂 "图片 (19)"。
     var kindCounts: [ItemKind: Int] = [:]
-    /// 类型筛选。空集 = 全部（不带 WHERE 过滤）；非空 = SearchQuery.kinds IN (...)
-    /// chip 行 UI 多选 toggle，状态变化触发 refresh
+    /// 按 FileSubKind 分桶的命中数(.file kind 细分:视频/PDF/音频/图片文件)。
+    /// 跟 kindCounts 同语义忽略 selectedFileSubKinds 自身,给 chip 数字用
+    var fileSubKindCounts: [FileSubKind: Int] = [:]
+    /// 类型筛选(base kind)。空集 = 全部不过滤;非空 + selectedFileSubKinds 走 OR 关系
+    /// (SearchQuery.kinds OR SearchQuery.fileSubKinds)
     var selectedKinds: Set<ItemKind> = []
+    /// `.file` kind 的虚拟 sub-kind 筛选(视频/PDF/音频/图片文件)。空集 = 不带 sub
+    /// 过滤;非空跟 selectedKinds OR 起作用
+    var selectedFileSubKinds: Set<FileSubKind> = []
     /// 时间窗筛选。`.all` = 不带 fromNs；其他换算成 SearchQuery.fromNs
     var timeRange: TimeRange = .all
     /// 仅显示已置顶。SearchQuery.pinnedOnly → SQL `pinned = 1`
@@ -79,7 +85,8 @@ final class AppState {
     /// 约束链（其实都已经满足，但用 String 也省去 SwiftUI Equatable 比较的实例化）
     var filterID: String {
         let kindsStr = selectedKinds.map { $0.rawValue }.sorted().joined(separator: ",")
-        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
+        let subsStr = selectedFileSubKinds.map { $0.rawValue }.sorted().joined(separator: ",")
+        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
     }
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedIDs 不动这个，避免不必要的滚动。
@@ -215,6 +222,11 @@ final class AppState {
         // panel 打开后第一次 refresh() 会替换成正确的 union/mirror 总数。
         self.totalCount = (try? deps.searchAPI.count(SearchQuery())) ?? initial.count
         self.kindCounts = (try? deps.searchAPI.countByKind(SearchQuery())) ?? [:]
+        self.fileSubKindCounts = (try? deps.searchAPI.countByFileSubKind(SearchQuery())) ?? [:]
+        // 后台预热 image thumbnail——daemon 重启后 ImageThumbnailCache 空,首次打开 panel
+        // 时每张 image 卡 .task 命中 miss 会先显占位再异步 replace。这里 fire-and-forget
+        // 让 decode 提前跑,常规场景(daemon 启动后秒级以上才开 panel)cache 已 hot
+        ImageThumbnailCache.shared.prefetch(items: initial, blobs: deps.blobs)
     }
 
     /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断，无业务语义——稀疏类型
@@ -255,16 +267,21 @@ final class AppState {
             text: trimmed.isEmpty ? nil : trimmed,
             fromNs: timeRange.fromNs(),
             kinds: Array(selectedKinds),
+            fileSubKinds: Array(selectedFileSubKinds),
             pinnedOnly: pinnedOnly,
             limit: Self.listLimit
         )
         do {
             let outcome = try await deps.searchProvider.search(q)
             self.results = outcome.items
+            // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
+            // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
+            ImageThumbnailCache.shared.prefetch(items: outcome.items, blobs: deps.blobs)
             self.snippets = outcome.snippets
             self.searchMode = outcome.mode
             self.totalCount = outcome.totalCount
             self.kindCounts = outcome.kindCounts
+            self.fileSubKindCounts = outcome.fileSubKindCounts
             // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
             // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）
             self.clockSkewMs = deps.meshStatus.worstClockSkewMs()
