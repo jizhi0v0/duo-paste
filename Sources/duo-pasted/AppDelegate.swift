@@ -179,6 +179,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         auth: auth,
                         expectedPeerDeviceID: peer.deviceID,
                         onCursorAdvanced: { [weak worker] _ in worker?.wake() },
+                        // 连续失败到 budget 触发 catastrophic:打日志 + exit(1) 让
+                        // launchd KeepAlive 重启 daemon。SwiftNIO 内部 resolver
+                        // 在进程启动时 snapshot,长期 DNS / 网络故障旧进程往往拉不回,
+                        // 进程级重启是兜底——SCDynamicStore 监听 + WS wake 是主修路径,
+                        // 这里只为兜底场景(SwiftNIO bug / 接口 stale state)兜底
+                        onCatastrophicFailure: {
+                            FileHandle.standardError.write(Data(
+                                "ws-client: catastrophic — exiting to let launchd restart\n".utf8
+                            ))
+                            exit(1)
+                        },
                         config: WSNotificationClient.Config(
                             heartbeatSec: cfg.mesh.wsHeartbeatSec,
                             reconnectInitialSec: cfg.mesh.wsReconnectInitialSec,

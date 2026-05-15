@@ -29,26 +29,46 @@ public final class MeshSupervisor: @unchecked Sendable {
     /// @unchecked Sendable 因为 Swift 不能从 final class 自动推出"不可变 array of actor 对是 Sendable"。
     public let peers: [Peer]
     private let log: @Sendable (String) -> Void
+    /// 系统 DNS / 网络接口变化时让所有 WS client 立即重连(绕过 backoff sleep)。
+    /// supervisor.start() 时启动,stop() 时停。nil = 禁用自动恢复(测试场景)
+    private var dnsMonitor: DNSChangeMonitor?
 
     public init(
         peers: [Peer],
+        autoRecoverOnDNSChange: Bool = true,
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("mesh: \(msg)\n".utf8))
         }
     ) {
         self.peers = peers
         self.log = log
+        if autoRecoverOnDNSChange {
+            // WakeBox 桥接:闭包不能直接 capture self(初始化未完),用一个 box 占位
+            let wakeBox = WakeBox()
+            self.dnsMonitor = DNSChangeMonitor(
+                onChange: { wakeBox.invoke() }
+            )
+            wakeBox.target = { [weak self] in self?.wakeAllWS() }
+        }
+    }
+
+    /// 闭包持有的 box,把 supervisor 弱引用桥进 DNSChangeMonitor 的 @Sendable 回调
+    private final class WakeBox: @unchecked Sendable {
+        var target: (() -> Void)?
+        func invoke() { target?() }
     }
 
     /// PR 2 兼容入口：只有 PullWorker 列表 → 自动包成 Peer 对（wsClient = nil）。
     /// 旧调用点（如 PR 2 时期 AppDelegate）和单 peer 测试可以继续 work。
+    /// 这条路径**默认禁用** DNS monitor——纯 PullWorker 不需要,测试不希望
+    /// supervisor.start() 走系统 SCDynamicStore 交互
     public convenience init(
         workers: [PullWorker],
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("mesh: \(msg)\n".utf8))
         }
     ) {
-        self.init(peers: workers.map { Peer(worker: $0) }, log: log)
+        self.init(peers: workers.map { Peer(worker: $0) }, autoRecoverOnDNSChange: false, log: log)
     }
 
     /// 暴露 worker 列表的别名——很多旧测试 / 上层代码用 `supervisor.workers`，保留兼容。
@@ -66,11 +86,15 @@ public final class MeshSupervisor: @unchecked Sendable {
                 await ws.start()
             }
         }
+        // DNS / 网络接口 SCDynamicStore 监听放在 ws 启动后:Tailscale up/down 时立即
+        // 让所有 WS client 跳过 backoff 重连
+        dnsMonitor?.start()
     }
 
     /// 停所有 peer。WS client 先停（cancel 长连接 task），PullWorker 后停——避免
     /// WS 在停 worker 期间还触发 wake()。
     public func stop() async {
+        dnsMonitor?.stop()
         for p in peers {
             if let ws = p.wsClient {
                 await ws.stop()
@@ -84,6 +108,14 @@ public final class MeshSupervisor: @unchecked Sendable {
     public func wakeAll() {
         for p in peers {
             p.worker.wake()
+        }
+    }
+
+    /// SCDynamicStore DNS / 网络接口变化时调:让所有 WS client cancel 当前 backoff
+    /// sleep 立即重连。WSClient.wake() 是 nonisolated 无 await
+    public func wakeAllWS() {
+        for p in peers {
+            p.wsClient?.wake()
         }
     }
 

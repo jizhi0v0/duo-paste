@@ -30,16 +30,23 @@ public actor WSNotificationClient {
         /// 设小是 DoS 防御——peer 篡改后塞 64 MB JSON 让 client OOM。
         public var maxInboundMessageBytes: Int
 
+        /// 连续失败到此阈值后调 onCatastrophicFailure。0 = 禁用(永远不主动 exit)。
+        /// 默认 15:initial 1s + 指数 backoff 到 max 60s 约 11 分钟,经验上够过滤短暂
+        /// 网络抖动 + 给 SCDynamicStore DNS recovery 机会,持续故障才进 launchd 重启路径
+        public var failureBudgetForCatastrophic: Int
+
         public init(
             heartbeatSec: TimeInterval = 30,
             reconnectInitialSec: TimeInterval = 1,
             reconnectMaxSec: TimeInterval = 60,
-            maxInboundMessageBytes: Int = 64 * 1024
+            maxInboundMessageBytes: Int = 64 * 1024,
+            failureBudgetForCatastrophic: Int = 15
         ) {
             self.heartbeatSec = heartbeatSec
             self.reconnectInitialSec = reconnectInitialSec
             self.reconnectMaxSec = reconnectMaxSec
             self.maxInboundMessageBytes = maxInboundMessageBytes
+            self.failureBudgetForCatastrophic = failureBudgetForCatastrophic
         }
 
         public static let `default` = Config()
@@ -53,11 +60,18 @@ public actor WSNotificationClient {
     private let expectedPeerDeviceID: String?
     private let onCursorAdvanced: @Sendable (Int64) -> Void
     private let onConnectStateChange: @Sendable (Bool) -> Void
+    /// 连续失败超过 config.failureBudgetForCatastrophic 触发——AppDelegate 注入 exit(1)
+    /// 让 launchd KeepAlive 重启 daemon。SwiftNIO 内部 resolver 在 client 创建时 snapshot,
+    /// 长期 fail 通常意味 DNS / 接口状态 stale,进程重启是最稳的最后兜底
+    private let onCatastrophicFailure: @Sendable () -> Void
     private let config: Config
     private let now: @Sendable () -> Int64
     private let log: @Sendable (String) -> Void
 
     private var runTask: Task<Void, Never>?
+    /// 当前 backoff sleep task。wake() 取消它让 retry 立即触发——
+    /// SCDynamicStore DNS 变化路径用这条让 DNS 恢复后秒级重连而不是等满 backoff(可能 60s)
+    private var currentSleep: Task<Void, Error>?
 
     public init(
         peerURL: URL,
@@ -65,6 +79,7 @@ public actor WSNotificationClient {
         expectedPeerDeviceID: String?,
         onCursorAdvanced: @escaping @Sendable (Int64) -> Void = { _ in },
         onConnectStateChange: @escaping @Sendable (Bool) -> Void = { _ in },
+        onCatastrophicFailure: @escaping @Sendable () -> Void = {},
         config: Config = .default,
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
         log: @escaping @Sendable (String) -> Void = { msg in
@@ -76,6 +91,7 @@ public actor WSNotificationClient {
         self.expectedPeerDeviceID = expectedPeerDeviceID
         self.onCursorAdvanced = onCursorAdvanced
         self.onConnectStateChange = onConnectStateChange
+        self.onCatastrophicFailure = onCatastrophicFailure
         self.config = config
         self.now = now
         self.log = log
@@ -91,6 +107,21 @@ public actor WSNotificationClient {
     public func stop() {
         runTask?.cancel()
         runTask = nil
+        currentSleep?.cancel()
+        currentSleep = nil
+    }
+
+    /// 外部触发立即重连——DNSChangeMonitor 在系统 DNS / 网络接口状态变化时调本方法,
+    /// cancel 当前 backoff sleep 让 runLoop 跳出 sleep 立即进下一轮 connect。
+    /// nonisolated 让 callsite(SCDynamicStore GCD callback)不用 await 直接调
+    public nonisolated func wake() {
+        Task { [weak self] in
+            await self?.cancelCurrentSleep()
+        }
+    }
+
+    private func cancelCurrentSleep() {
+        currentSleep?.cancel()
     }
 
     /// 连接当前是否活跃——由 onConnectStateChange 回调外部 MeshStatus 之后再读，这里内部
@@ -122,16 +153,34 @@ public actor WSNotificationClient {
                 log("connect error: \(error)")
             }
             if Task.isCancelled { return }
+            // 连续失败到 budget → 视为 daemon 进程层故障,触发 catastrophic 回调
+            // (生产路径 = exit(1) → launchd KeepAlive 重启)。SwiftNIO 内部 resolver
+            // snapshot 在进程启动时缓存,DNS 变化后旧进程往往拉不回来,重启是兜底
+            if config.failureBudgetForCatastrophic > 0
+                && consecutiveFailures >= config.failureBudgetForCatastrophic {
+                log("connect failed \(consecutiveFailures) times consecutively · signaling catastrophic")
+                onCatastrophicFailure()
+                return
+            }
             let backoff = min(
                 config.reconnectInitialSec * pow(2.0, Double(consecutiveFailures - 1)),
                 config.reconnectMaxSec
             )
             log("retry in \(Int(backoff))s (failures=\(consecutiveFailures))")
-            do {
+            // sleep 用 stored task,wake() 可 cancel 让 DNS 变化时跳过剩余 backoff
+            let sleepTask = Task<Void, Error> {
                 try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+            }
+            currentSleep = sleepTask
+            do {
+                try await sleepTask.value
+            } catch is CancellationError {
+                // wake() 取消 sleep → 立即下一轮 retry。打 log 让外部能看到
+                log("backoff cancelled by wake(), retrying immediately")
             } catch {
                 return
             }
+            currentSleep = nil
         }
         log("stopped")
     }
