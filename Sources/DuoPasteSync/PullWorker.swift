@@ -453,15 +453,16 @@ public actor PullWorker {
                     dedupSkipped += 1
                     continue
                 }
-                // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump）回放。
-                // PR 4 已删 push_state / push_attempts / last_push_error 列。
+                // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump /
+                // OCR done 回放 extracted_text）。PR 4 已删 push_state / push_attempts /
+                // last_push_error 列。v9 加 extracted_text + extracted_text_source 两列。
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO item
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                        source_app, source_app_name, preview, text_full,
                        blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
-                       ocr_state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ocr_state, extracted_text, extracted_text_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, arguments: [
                     item.id,
                     item.originDevice,
@@ -478,6 +479,8 @@ public actor PullWorker {
                     item.pinned ? 1 : 0,
                     item.deletedAtNs,
                     item.ocrState?.rawValue,
+                    item.extractedText,
+                    item.extractedTextSource?.rawValue,
                 ])
                 written += 1
                 // 收集本页 blob 需求集合（eager 阶段后处理）。kind=image/file 才有意义；

@@ -3,9 +3,16 @@ import GRDB
 
 /// 本地 OCR 调度器。仿 PushWorker 单 actor 串行 tick + `wake()` 缩短延迟。
 ///
-/// **职责**：扫本机 `origin = self` + `kind = 'image'` + `ocr_state = 'pending'` 的行，
-/// 调 OCRRecognizer 拿文本写回 `text_full` + `ocr_state = 'done'`，FTS5 trigger 自动
-/// 刷新索引让图里中英文进搜索。
+/// **职责**：扫本机 `origin = self` + `ocr_state = 'pending'` 且 kind 满足 (image OR
+/// file+image-blob) 的行，调 OCRRecognizer 拿文本写回 `extracted_text` +
+/// `extracted_text_source='ocr'` + `ocr_state = 'done'`，FTS5 trigger 自动刷新索引让
+/// 图里中英文进搜索。
+///
+/// **扫描条件扩 file kind**（v9 之后）：用户从 Finder / IDE / Slack 复制 .png 文件路径
+/// 走 PasteboardWatcher "文件 URL" 分支落 kind=.file，但单文件 image-like 路径会**额外**
+/// 把字节读进 BlobStore 做 mirror。这类行 blob_mime='image/*' + blob_sha256 非空，
+/// OCR 可见的字节就绪——所以 OCR 也应该扫这些行。判别用 blob_mime（不用路径后缀）
+/// 因为 mime 是 CaptureService 读字节成功才设置的，等价于"OCR 必需的字节就绪"。
 ///
 /// **不变量**（详 plan vivid-scanning-vellum.md §关键不变量）：
 /// 1. 只扫 origin=self，不跨 origin（破"PullWorker 跳过 own-origin"前提；Phase 2 加
@@ -259,32 +266,44 @@ public actor OCRWorker {
         }
     }
 
-    /// SQL：`origin_device = self AND kind = 'image' AND ocr_state = 'pending'
-    /// AND deleted_at_ns IS NULL` 按 captured_at_ns ASC 取 batchSize 条。
+    /// SQL：`origin_device = self AND ocr_state = 'pending' AND deleted_at_ns IS NULL`
+    /// AND (`kind = 'image'` **OR** `kind = 'file' AND blob_mime LIKE 'image/%' AND
+    /// blob_sha256 IS NOT NULL`) 按 captured_at_ns ASC 取 batchSize 条。
     /// ASC 让 backfill 老历史按时间顺序清，新捕获走 wake 进 batch 顺序无所谓。
     ///
-    /// **不过滤 blob_sha256 IS NOT NULL**：legacy/corrupt/backfill 出来的 image 行
-    /// 可能 sha 缺失。让它们进 batch，processOne 第一行 `guard let sha` 把它们
-    /// 标 skipped 收敛——否则永远卡 pending，"no blob sha" 这条 markSkipped 分支也不可达
+    /// **不过滤 image kind 的 blob_sha256 IS NOT NULL**：legacy/corrupt/backfill 出来的
+    /// image 行可能 sha 缺失。让它们进 batch，processOne 第一行 `guard let sha` 把它们
+    /// 标 skipped 收敛——否则永远卡 pending，"no blob sha" 这条 markSkipped 分支也不可达。
+    /// file 分支要求 blob_sha256 IS NOT NULL 是因为：file kind 多数行（path-only）没 blob,
+    /// 进 batch 也只能立刻 skipped 空跑——不如在 SQL 层就过滤。
+    ///
+    /// 用 GRDB SQLLiteral 而非 QueryInterface 是因为 file 分支的 OR + blob_mime LIKE
+    /// 复合谓词 query builder 表达起来不如手写 SQL 清楚
     private func fetchPending() throws -> [Item] {
         let limit = config.batchSize
         let device = originDevice
         return try database.pool.read { db in
-            try Item
-                .filter(Column("origin_device") == device)
-                .filter(Column("kind") == ItemKind.image.rawValue)
-                .filter(Column("ocr_state") == OCRState.pending.rawValue)
-                .filter(Column("deleted_at_ns") == nil)
-                .order(Column("captured_at_ns").asc)
-                .limit(limit)
-                .fetchAll(db)
+            try Item.fetchAll(db, sql: """
+                SELECT * FROM item
+                WHERE origin_device = ?
+                  AND ocr_state = ?
+                  AND deleted_at_ns IS NULL
+                  AND (
+                        kind = 'image'
+                     OR (kind = 'file' AND blob_mime LIKE 'image/%' AND blob_sha256 IS NOT NULL)
+                  )
+                ORDER BY captured_at_ns ASC
+                LIMIT ?
+            """, arguments: [device, OCRState.pending.rawValue, limit])
         }
     }
 
     /// 写回成功 OCR 结果。**关键**：
+    /// - 写 `extracted_text` + `extracted_text_source = 'ocr'`（v9 之后）。**不**动 `text_full`
+    ///   ——它装的是"原始可粘贴文本"，OCR 不属于这一类。两列语义切干净
     /// - bump `ingested_at_ns` 让 audit-push / 未来同步看到更新（plan §不变量 #2）
     /// - text 空字符串 → nil（plan §不变量 #3）
-    /// - 不动 preview / captured_at_ns / push_state（OCR 不是新 capture，也不影响推送）
+    /// - 不动 preview / captured_at_ns（OCR 不是新 capture，也不影响推送）
     /// - `AND deleted_at_ns IS NULL` 守护：fetchPending → processOne 之间用户可能软删
     ///   该 item。把 OCR 结果写进 tombstone 不破坏 search（已 exclude），但会通过 /since
     ///   把"软删 image 又被 OCR 了"无谓下发给 mirror clients
@@ -297,7 +316,8 @@ public actor OCRWorker {
                 let stamp = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 try db.execute(sql: """
                     UPDATE item
-                    SET text_full = ?,
+                    SET extracted_text = ?,
+                        extracted_text_source = 'ocr',
                         ocr_state = 'done',
                         ingested_at_ns = ?
                     WHERE id = ?

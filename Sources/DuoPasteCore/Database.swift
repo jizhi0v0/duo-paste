@@ -401,6 +401,125 @@ public struct Database: Sendable {
             try db.execute(sql: "ALTER TABLE item DROP COLUMN last_push_error;")
         }
 
+        // v9: 把"从 blob 内容派生出来的辅助索引文本"从 text_full 拆出来成独立列
+        // `extracted_text`，并加 `extracted_text_source` 标这段文本是 OCR / 字幕 / PDF 文字层
+        // 哪种 extractor 产出的（当前只有 'ocr'，未来加字幕/PDF text/ASR 时复用本列）。
+        //
+        // **核心动机**：v6 当年决定让 image kind 的 `text_full` 装 OCR 文本（FTS5 trigger
+        // 复用零成本）。但 text_full 的契约本来是"原始可粘贴文本"——
+        //   - text/url/rtf/html → 原文
+        //   - file → 路径列表（Cmd+V 时写回 NSPasteboard 当 file URL）
+        //   - image → 字节才是可粘贴主体，textFull 闲着 → 当时塞了 OCR 文本
+        // 副作用是 image kind 的 textFull 语义跟其他 kind 不一致；PasteMerge.joinTextual
+        // 加了 image-kind-special-cased 走 preview 兜底分支。
+        //
+        // v9 之后语义重新干净：
+        //   - text_full   ：原始可粘贴文本（image kind 永远 NULL；其他 kind 不变）
+        //   - extracted_text ：从 blob 派生的辅助索引文本（OCR/字幕/PDF text/ASR/...）
+        //   - FTS5 索引列 = text_full + preview + source_app_name + extracted_text
+        //
+        // 顺手解锁 **file kind + image-blob 也能 OCR**（解决"用户从 Finder 复制 .png 文件，
+        // 搜索框搜图里的字搜不出"的 gap）—— OCRWorker 之后会扩 fetchPending 谓词，本
+        // migration 把存量 71 行本机 file+image-blob 标 ocr_state='pending' 让 worker 重扫。
+        //
+        // **不变量**：
+        // 1. text_full 搬迁是单向的——v8 daemon 读不到 OCR 文本。预检 snapshot 备份后执行
+        // 2. FTS5 contentless-external 表的列签名 schema-time 固定，加列必须整表 DROP+CREATE+
+        //    重建索引。本机库 <2K 行秒级完成；trigger 同步重写让后续 INSERT/UPDATE 同步索引
+        //    extracted_text
+        // 3. 跨设备升级窗口：新 daemon 通过 /since 推 extracted_text 字段给老 v8 daemon
+        //    （Codable 默认 ignore unknown），老 daemon 静默丢弃。**需要双 Mac 同时升 v9**
+        //    才能让 OCR 搜索结果跨设备生效；过渡期老 daemon 看到的对端 image kind 是
+        //    text_full=nil 的"空白 OCR"，但 chip 数 / list 不影响
+        m.registerMigration("v9_extracted_text") { db in
+            // step 1: 加两个新列
+            try db.execute(sql: "ALTER TABLE item ADD COLUMN extracted_text TEXT;")
+            try db.execute(sql: "ALTER TABLE item ADD COLUMN extracted_text_source TEXT;")
+
+            // step 2: 历史 image kind 数据搬迁——把 text_full 里装的 OCR 文本搬到
+            // extracted_text，source 标 'ocr'。条件：kind='image' AND ocr_state='done' AND
+            // text_full 非空 AND 非空字符串。`done` 状态保证那段文本确实是 OCR 写入的（
+            // pending/skipped/failed 的 image 行 text_full 应该是 nil；不应该有但兜底过滤）
+            try db.execute(sql: """
+                UPDATE item
+                SET extracted_text = text_full,
+                    extracted_text_source = 'ocr'
+                WHERE kind = 'image'
+                  AND ocr_state = 'done'
+                  AND text_full IS NOT NULL
+                  AND text_full != '';
+            """)
+
+            // step 3: image kind 的 text_full 一律清 NULL——新契约"text_full=原始可粘贴文本，
+            // image 没有"。这一步也把 step 2 的 done 行清掉，让 image kind 跟其他 kind 在
+            // text_full 语义上对齐
+            try db.execute(sql: """
+                UPDATE item SET text_full = NULL WHERE kind = 'image';
+            """)
+
+            // step 4: file kind + image-blob backfill。让 OCRWorker 之后能扫到本机已有的
+            // 71 张图片文件（用户从 Finder 复制 .png 进库的）。
+            // 条件：本机 own-origin（OCR Phase 1 不变量）AND kind=file AND blob_mime 是
+            // image/* AND blob 字节就绪（blob_sha256 非空）AND 未软删 AND 当前 ocr_state 是
+            // 老语义下的"未处理"（NULL = capture 时没标 pending 因为不是 image kind）
+            try db.execute(sql: """
+                UPDATE item
+                SET ocr_state = 'pending'
+                WHERE kind = 'file'
+                  AND blob_mime LIKE 'image/%'
+                  AND blob_sha256 IS NOT NULL
+                  AND deleted_at_ns IS NULL
+                  AND ocr_state IS NULL;
+            """)
+
+            // step 5: 整表重建 FTS5 索引——加 extracted_text 进索引列。
+            // contentless-external 的列签名 schema-time 固定，没法 ALTER。
+            //
+            // 顺序：drop 3 个 trigger → drop fts 表 → create 新 fts 表 → rebuild 索引
+            // 数据 → 建 3 个新 trigger。这段必须在事务内执行（migration 默认在 tx 内）
+            try db.execute(sql: "DROP TRIGGER IF EXISTS item_au;")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS item_ad;")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS item_ai;")
+            try db.execute(sql: "DROP TABLE IF EXISTS item_fts;")
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE item_fts USING fts5(
+                    text_full,
+                    preview,
+                    source_app_name,
+                    extracted_text,
+                    content='item',
+                    content_rowid='rowid',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+            """)
+            // 用 `INSERT INTO item_fts(item_fts) VALUES('rebuild')` 触发 contentless-external
+            // 模式的全量重建：FTS5 自动从 item 表按 content_rowid 拉每行做 tokenize。
+            // 比手动 `INSERT INTO item_fts(rowid, col1, col2...) SELECT ...` 省 SQL 也避免漏列
+            try db.execute(sql: "INSERT INTO item_fts(item_fts) VALUES('rebuild');")
+
+            // 3 个 trigger 重建：在 v1 基础上加 extracted_text 这一列
+            try db.execute(sql: """
+                CREATE TRIGGER item_ai AFTER INSERT ON item BEGIN
+                    INSERT INTO item_fts(rowid, text_full, preview, source_app_name, extracted_text)
+                    VALUES (new.rowid, new.text_full, new.preview, new.source_app_name, new.extracted_text);
+                END;
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER item_ad AFTER DELETE ON item BEGIN
+                    INSERT INTO item_fts(item_fts, rowid, text_full, preview, source_app_name, extracted_text)
+                    VALUES ('delete', old.rowid, old.text_full, old.preview, old.source_app_name, old.extracted_text);
+                END;
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER item_au AFTER UPDATE ON item BEGIN
+                    INSERT INTO item_fts(item_fts, rowid, text_full, preview, source_app_name, extracted_text)
+                    VALUES ('delete', old.rowid, old.text_full, old.preview, old.source_app_name, old.extracted_text);
+                    INSERT INTO item_fts(rowid, text_full, preview, source_app_name, extracted_text)
+                    VALUES (new.rowid, new.text_full, new.preview, new.source_app_name, new.extracted_text);
+                END;
+            """)
+        }
+
         return m
     }
 

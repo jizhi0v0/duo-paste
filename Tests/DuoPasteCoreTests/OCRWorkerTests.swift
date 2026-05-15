@@ -94,7 +94,9 @@ private func fastConfig(maxAttempts: Int = 3, maxBlobMB: Int = 16) -> OCRWorker.
     #expect(result.done == 1)
     let after = try fetchItem(env, id: "img-1")
     #expect(after?.ocrState == .done)
-    #expect(after?.textFull == "hello world")
+    #expect(after?.extractedText == "hello world")
+    #expect(after?.extractedTextSource == .ocr)
+    #expect(after?.textFull == nil)              // image kind text_full 永远 nil（v9 契约）
     #expect(after?.ingestedAtNs != nil)
     #expect(await recorder.count() == 1)
 }
@@ -149,7 +151,7 @@ private actor OCRCursorAdvancedRecorder {
     #expect(r.processed == 0)
     let after = try fetchItem(env, id: "other-img")
     #expect(after?.ocrState == .pending)  // 状态不变
-    #expect(after?.textFull == nil)
+    #expect(after?.extractedText == nil)
     #expect(await recorder.count() == 0)
 }
 
@@ -204,7 +206,7 @@ private actor OCRCursorAdvancedRecorder {
     #expect(r.done == 1)
     let after = try fetchItem(env, id: "blank-img")
     #expect(after?.ocrState == .done)
-    #expect(after?.textFull == nil)  // 空字符串归一化为 nil（不变量 #3）
+    #expect(after?.extractedText == nil)  // 空字符串归一化为 nil（不变量 #3）
 }
 
 @Test func ocrWorkerSkipsWhenBlobMissing() async throws {
@@ -396,7 +398,7 @@ private actor OCRCursorAdvancedRecorder {
     #expect(await recorder.count() >= 1)
     let after = try fetchItem(env, id: "fresh")
     #expect(after?.ocrState == .done)
-    #expect(after?.textFull == "woke")
+    #expect(after?.extractedText == "woke")
 }
 
 /// 在 recognize() 内部触发软删的 recognizer，用来精准模拟 markDone 时 row 已是 tombstone。
@@ -436,12 +438,107 @@ private struct SoftDeleteOnRecognize: OCRRecognizer {
     let after = try fetchItem(env, id: "tombstone-race")
     // 已被软删
     #expect(after?.deletedAtNs == 999)
-    // markDone 的 guard 让 UPDATE 命中 0 行 —— text_full 没被写入
-    #expect(after?.textFull == nil)
+    // markDone 的 guard 让 UPDATE 命中 0 行 —— extracted_text 没被写入
+    #expect(after?.extractedText == nil)
 }
 
 // PR 4 删了 push_state / last_push_error 列，原 ocrWorkerMarkSkippedDoesNotClobberPushFailedLastError
 // 测试不再适用——OCR worker 现在只动 ocr_state 列，reason 走 stderr log。
+
+@Test func ocrWorkerProcessesFileKindWithImageBlob() async throws {
+    // v9 之后：用户从 Finder 复制 .png 文件路径 → kind=.file + blob_mime='image/png'
+    // + blob_sha256 非空（PasteboardWatcher 给单 image-like 文件 URL 额外读字节）。
+    // OCRWorker 应该扫这类行，OCR 文本进 extracted_text 让搜索能命中图里的字
+    let env = try makeEnv()
+    let sha = try seedBlob(env)
+    let it = Item(
+        id: "file-img-1",
+        originDevice: env.deviceID,
+        capturedAtNs: 1_700_000_000_000_000_000,
+        kind: .file,
+        preview: "screenshot.png",
+        textFull: "/Users/bobby/Downloads/screenshot.png",  // file kind text_full = path
+        blobSha256: sha,
+        blobSize: 16,
+        blobMime: "image/png",
+        ocrState: .pending
+    )
+    try await env.db.pool.write { try it.insert($0) }
+    let recognizer = StubOCRRecognizer(
+        table: [sha: .success(OCRResult(text: "文本 折线图 柱状图"))]
+    )
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig()
+    )
+    let result = await w.tick()
+    #expect(result.processed == 1)
+    #expect(result.done == 1)
+    let after = try fetchItem(env, id: "file-img-1")
+    #expect(after?.ocrState == .done)
+    #expect(after?.extractedText == "文本 折线图 柱状图")
+    #expect(after?.extractedTextSource == .ocr)
+    // 关键：file kind text_full 不被 markDone 动 —— path 必须保留供 Finder reveal + paste-back
+    #expect(after?.textFull == "/Users/bobby/Downloads/screenshot.png")
+}
+
+@Test func ocrWorkerSkipsFileKindWithNonImageBlob() async throws {
+    // file kind 但 blob_mime 不是 image/*（比如 video/mp4 / application/pdf）应被
+    // fetchPending 谓词过滤，不进 batch
+    let env = try makeEnv()
+    let sha = try seedBlob(env)
+    let it = Item(
+        id: "file-mp4",
+        originDevice: env.deviceID,
+        capturedAtNs: 1_700_000_000_000_000_000,
+        kind: .file,
+        preview: "video.mp4",
+        textFull: "/tmp/video.mp4",
+        blobSha256: sha,
+        blobMime: "video/mp4",
+        ocrState: .pending             // 即便 state=pending,谓词过滤掉 mp4 不走 OCR
+    )
+    try await env.db.pool.write { try it.insert($0) }
+    let recorder = OCRCallRecorder()
+    let recognizer = StubOCRRecognizer(recorder: recorder)
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig()
+    )
+    let r = await w.tick()
+    #expect(r.processed == 0)
+    #expect(await recorder.count() == 0)
+    let after = try fetchItem(env, id: "file-mp4")
+    #expect(after?.ocrState == .pending)   // 状态不变
+}
+
+@Test func ocrWorkerSkipsFileKindWithoutBlobSha() async throws {
+    // file kind 路径串行(c.blob=nil 走 ingestText) → blob_mime 跟 blob_sha256 都 nil
+    // 即使有 image 路径后缀,fetchPending 谓词 `blob_sha256 IS NOT NULL` 兜底过滤
+    let env = try makeEnv()
+    let it = Item(
+        id: "file-path-only",
+        originDevice: env.deviceID,
+        capturedAtNs: 1_700_000_000_000_000_000,
+        kind: .file,
+        preview: "screenshot.png",
+        textFull: "/some/path/screenshot.png",
+        ocrState: .pending             // 历史数据可能误标 pending 也不应被扫
+    )
+    try await env.db.pool.write { try it.insert($0) }
+    let recorder = OCRCallRecorder()
+    let recognizer = StubOCRRecognizer(recorder: recorder)
+    let w = OCRWorker(
+        database: env.db, blobs: env.blobs,
+        recognizer: recognizer, originDevice: env.deviceID,
+        config: fastConfig()
+    )
+    let r = await w.tick()
+    #expect(r.processed == 0)
+    #expect(await recorder.count() == 0)
+}
 
 @Test func ocrWorkerBumpsIngestedAtNsOnMarkDone() async throws {
     let env = try makeEnv()

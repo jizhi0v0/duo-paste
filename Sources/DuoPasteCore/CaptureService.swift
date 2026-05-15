@@ -195,9 +195,32 @@ public actor CaptureService {
             }
 
             let ingestNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
-            // image kind 入库即标 ocr_state=pending，让 OCR worker 扫到。
-            // file kind 也是 blob 但不走 OCR（文件路径是字符串，BlobStore 里没字节）。
-            let ocrState: OCRState? = c.kind == .image ? .pending : nil
+            // 入库即标 ocr_state=pending 让 OCR worker 扫到。范围：
+            //   - kind=image：所有 image kind 行（一向如此）
+            //   - kind=file + blob_mime=image/*：PasteboardWatcher 给单 .png 文件路径
+            //     额外读了字节进 BlobStore 做 mirror（c.blob 非 nil 走到本路径 →
+            //     blob_mime 已被设成 image/<ext>）。这类行 OCRWorker 也能扫
+            // 其它 kind（file path-only / non-image blob）不标。判别用 blob_mime 不用
+            // 路径后缀启发（mime 是 capture 时读字节成功才设的，等价于"OCR 可用字节就绪"）
+            let isImageBlob = (c.kind == .image)
+                || (c.kind == .file && (c.blobMime?.hasPrefix("image/") == true))
+            let ocrState: OCRState? = isImageBlob ? .pending : nil
+            // text_full 契约（v9 之后）：
+            //   - file kind：路径列表（Cmd+V 时写回 NSPasteboard 当 file URL）。c.text 是
+            //     PasteboardWatcher \n-join 的多路径串；单文件无 c.text 时用 fileName 兜底
+            //   - image kind：永远 nil。image 的"可粘贴主体"是字节，fileName 不参与 paste
+            //     路径（Copyback.copy .image 直接 setData），装 textFull 只污染 FTS5 索引
+            //   - 其他 blob kind：暂用 fileName（沿用旧行为）
+            // v9 migration step 3 已把历史 image kind text_full 清 NULL，新数据按此契约统一
+            let resolvedTextFull: String?
+            switch c.kind {
+            case .file:
+                resolvedTextFull = c.text ?? c.fileName
+            case .image:
+                resolvedTextFull = nil
+            default:
+                resolvedTextFull = c.fileName
+            }
             let item = Item(
                 id: UUIDv7.generateString(),
                 originDevice: deviceID,
@@ -207,8 +230,7 @@ public actor CaptureService {
                 sourceApp: c.sourceAppBundleID,
                 sourceAppName: c.sourceAppName,
                 preview: preview,
-                // file kind 保留完整路径供 Finder reveal + FTS 搜索；image/其他 kind 用 fileName
-                textFull: c.kind == .file ? (c.text ?? c.fileName) : c.fileName,
+                textFull: resolvedTextFull,
                 blobSha256: info.sha256,
                 blobSize: info.size,
                 blobMime: c.blobMime,

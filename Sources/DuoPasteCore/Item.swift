@@ -21,6 +21,13 @@ public enum OCRState: String, Codable, Sendable {
     case skipped
 }
 
+/// `extracted_text` 来源标记——这段辅助索引文本是从什么 extractor 提取出来的。
+/// 当前只有 OCR；未来加视频字幕提取/PDF 文字层抽取/语音转写时复用同一列、加 case。
+/// 用 String raw + Codable 让 wire 上是 plain string；老 peer 不发字段时 decode 成 nil
+public enum ExtractedTextSource: String, Codable, Sendable {
+    case ocr
+}
+
 public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "item"
 
@@ -39,6 +46,13 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
     public var pinned: Bool
     public var deletedAtNs: Int64?
     public var ocrState: OCRState?
+    /// 从 blob 内容派生的辅助索引文本——OCR/字幕/PDF 文字层/未来 ASR。FTS5 索引列之一。
+    /// `text_full` 永远装"原始可粘贴文本"，本列装"从二进制提取出来的可搜文本"——
+    /// 两列语义切干净，不再 kind-dependent 混用（v9 migration 拆出来）
+    public var extractedText: String?
+    /// `extracted_text` 是哪种 extractor 写入的。nil 表示该行没有 extracted text
+    /// （或老 peer 没发字段）；非 nil 时 `.ocr` 是当前唯一来源
+    public var extractedTextSource: ExtractedTextSource?
 
     public init(
         id: String,
@@ -55,7 +69,9 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         blobMime: String? = nil,
         pinned: Bool = false,
         deletedAtNs: Int64? = nil,
-        ocrState: OCRState? = nil
+        ocrState: OCRState? = nil,
+        extractedText: String? = nil,
+        extractedTextSource: ExtractedTextSource? = nil
     ) {
         self.id = id
         self.originDevice = originDevice
@@ -72,6 +88,8 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         self.pinned = pinned
         self.deletedAtNs = deletedAtNs
         self.ocrState = ocrState
+        self.extractedText = extractedText
+        self.extractedTextSource = extractedTextSource
     }
 
     /// sourceApp 用的 sentinel：表示"本机 duo-paste 内 Cmd+C"。watcher 在 self
@@ -98,5 +116,7 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         case pinned
         case deletedAtNs = "deleted_at_ns"
         case ocrState = "ocr_state"
+        case extractedText = "extracted_text"
+        case extractedTextSource = "extracted_text_source"
     }
 }

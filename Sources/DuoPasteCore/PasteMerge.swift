@@ -57,10 +57,10 @@ public enum PasteMerge {
 
     /// 把 items 内容按顺序拼成单字符串(separator 分隔)。
     /// 取值优先级:
-    /// - image kind:**强制走 preview**("[image NNN KB]" / 文件名)。image 的 textFull
-    ///   被 OCR worker 填进的是 OCR 文本(常含识别噪声,如 "R\n臻选美式..."),
-    ///   跨 kind 合并 paste 用户期望的是占位/文件名而非 OCR 文本——image 的"可粘贴形式"
-    ///   是字节(走 mergedImages 路径),不是 OCR 出的字
+    /// - image kind:**强制走 preview**("[image NNN KB]" / 文件名)。image 没有"原始可
+    ///   粘贴文本"——可粘贴主体是字节(走 mergedImages 路径),v9 之后 textFull 永远 nil。
+    ///   OCR 文本现在装在 extracted_text 列(从 v6 历史的 textFull 搬出),不再参与
+    ///   跨 kind 合并 paste(语义上 OCR 是"搜索辅助索引"不是"用户复制的内容")
     /// - 其他 kind:`textFull ?? preview`——textFull 不空时直接用,nil 时退 preview 兜底
     /// 全空 → 返回 nil(调用方据此判定"无可写入内容")
     public static func joinTextual(_ items: [Item], separator: String = "\n") -> String? {
