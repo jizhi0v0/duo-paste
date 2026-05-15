@@ -67,7 +67,8 @@ final class SnapshotScheduler {
         do {
             let result = try deps.evictor.drainOrphans()
             if result.freed > 0 {
-                fputs("blob-orphan-drain: freed \(result.freed) blobs \(result.bytes) bytes\n", stderr)
+                let suffix = result.capHit ? " (cap hit，剩余孤儿留下个 tick)" : ""
+                fputs("blob-orphan-drain: freed \(result.freed) blobs \(result.bytes) bytes\(suffix)\n", stderr)
             }
         } catch {
             fputs("blob-orphan-drain failed: \(error)\n", stderr)

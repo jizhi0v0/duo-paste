@@ -18,6 +18,12 @@ public struct BlobEvictor: Sendable {
     public let blobs: BlobStore
     public let log: @Sendable (String) -> Void
 
+    /// `drainOrphans` 默认外层 round 上限 + `evictToWatermark` 内嵌孤儿 drain 上限共享。
+    /// 单次调用最多清 `orphanDrainMaxRounds * 256` 个孤儿 blob (默 8192)。
+    /// 超过的留下个调用窗口慢慢消化——SnapshotScheduler hourly tick + cap hit 日志会让
+    /// 用户看到"还没清完"
+    public static let orphanDrainMaxRounds: Int = 32
+
     public init(
         database: Database,
         blobs: BlobStore,
@@ -129,20 +135,30 @@ public struct BlobEvictor: Sendable {
     /// `maxRounds`。语义"尽量清，但单次调用不无限阻塞 caller"。SnapshotScheduler 每小时
     /// tick 走这条路径，默 32 round × 256 batch = 8192 孤儿/tick；超过的留下个 tick 慢慢消化。
     ///
+    /// `capHit == true` 表示走完 `maxRounds` 时最后一轮仍 freed > 0——大概率还有未清的
+    /// 孤儿。caller (SnapshotScheduler) 看到这个 flag 写日志提示"剩余孤儿留下个 tick 清"，
+    /// 不立即重跑——hourly 节奏下 user 软删几千张图自然消化，真撞到 cap 也只是 12h 后清完
+    ///
     /// 抛出：内部 `evictTombstoneBlobs` throw（SQL / fs 异常）会冒泡——caller 决定要不要
     /// 吞错误（hourly scheduler 选吞 + 写日志）
     @discardableResult
-    public func drainOrphans(maxRounds: Int = 32) throws -> (freed: Int, bytes: Int64) {
+    public func drainOrphans(
+        maxRounds: Int = orphanDrainMaxRounds
+    ) throws -> (freed: Int, bytes: Int64, capHit: Bool) {
         precondition(maxRounds > 0, "maxRounds must be > 0")
         var totalFreed = 0
         var totalBytes: Int64 = 0
-        for _ in 0..<maxRounds {
+        var capHit = false
+        for round in 0..<maxRounds {
             let (freed, bytes) = try evictTombstoneBlobs()
             if freed == 0 { break }
             totalFreed += freed
             totalBytes += bytes
+            if round == maxRounds - 1 {
+                capHit = true
+            }
         }
-        return (totalFreed, totalBytes)
+        return (totalFreed, totalBytes, capHit)
     }
 
     /// 水位预防档：可用空间 < `lowBytes` → 循环 evictOneOldest 直到可用空间 ≥
@@ -175,7 +191,7 @@ public struct BlobEvictor: Sendable {
         // 先一次性 drain 所有孤儿 blob —— 免费 win，不消耗 perTickCap
         var freed = 0
         var tombRounds = 0
-        while tombRounds < 32 {
+        while tombRounds < Self.orphanDrainMaxRounds {
             let (tFreed, _) = try evictTombstoneBlobs()
             if tFreed == 0 { break }
             freed += tFreed

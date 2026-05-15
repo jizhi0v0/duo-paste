@@ -485,6 +485,7 @@ private func setupWatermarkScenario(
     let result = try evictor.drainOrphans()
     #expect(result.freed == 3)
     #expect(result.bytes == 300)
+    #expect(result.capHit == false)
     for sha in shas { #expect(!store.exists(sha256: sha)) }
 }
 
@@ -503,18 +504,21 @@ private func setupWatermarkScenario(
     }
     let evictor = BlobEvictor(database: db, blobs: store)
 
-    // maxRounds=1 → 仅一轮 256 个
+    // maxRounds=1 → 仅一轮 256 个，最后一轮 freed > 0 → capHit
     let r1 = try evictor.drainOrphans(maxRounds: 1)
     #expect(r1.freed == 256)
+    #expect(r1.capHit == true)
 
-    // maxRounds=32 → 剩 44 个全清
+    // maxRounds=32 → 剩 44 个全清，第二轮 freed=0 早退 → 非 capHit
     let r2 = try evictor.drainOrphans(maxRounds: 32)
     #expect(r2.freed == 44)
+    #expect(r2.capHit == false)
 
     // 第三次 — 啥都没了
     let r3 = try evictor.drainOrphans()
     #expect(r3.freed == 0)
     #expect(r3.bytes == 0)
+    #expect(r3.capHit == false)
 }
 
 @Test func drainOrphansNoOpWhenNoTombstones() async throws {
@@ -527,6 +531,7 @@ private func setupWatermarkScenario(
     let result = try evictor.drainOrphans()
     #expect(result.freed == 0)
     #expect(result.bytes == 0)
+    #expect(result.capHit == false)
     #expect(store.exists(sha256: info.sha256))
 }
 
