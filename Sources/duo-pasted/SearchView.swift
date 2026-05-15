@@ -33,6 +33,26 @@ final class ImageThumbnailCache {
     private var notDecodable: Set<String> = []
     private static let maxPx: Int = 400
 
+    /// thumbnail decode 专用执行队列。**核心目的**：限流 + 跟其它进程内工作隔离 thread budget。
+    ///
+    /// 历史 bug（2026-05-15 v9 OCR backfill 卡死）：原实现 `prefetch` for-loop fire 100+ 张
+    /// `Task { thumbnail() }`，每个 thumbnail 内部又 `Task.detached(priority: .userInitiated)`，
+    /// 协作池被 .userInitiated 持续占满 → 同进程内 VisionOCRRecognizer 的 `.utility`
+    /// `DispatchQueue.global` 永久饥饿,`handler.perform` 永不返。详 plans 里 OCR 卡死分析。
+    ///
+    /// 修法（Nuke / Kingfisher 同款）：专用 `OperationQueue` 限并发 + qos=.utility。
+    /// - `maxConcurrentOperationCount=4`：每张 decode 100-300ms（4K JPG），4 并发刚好
+    ///   填满后台 CPU 不挤压;数字大了对单图延迟没帮助,反而吃光 thread。
+    /// - `qos=.utility`：thumbnail prefetch 是"提前准备 UI 资源"，比 OCR（用户感知索引）
+    ///   优先级低一档。两者各自有 budget,不再互相抢
+    private static let decodeQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "io.duopaste.thumbnail.decode"
+        q.maxConcurrentOperationCount = 4
+        q.qualityOfService = .utility
+        return q
+    }()
+
     /// blob-backed 优先用 sha;file kind 无 blob 时退化到路径(本机文件 URL 解析)
     nonisolated static func cacheKey(for item: Item) -> String? {
         if let sha = item.blobSha256 { return "sha:" + sha }
@@ -55,29 +75,36 @@ final class ImageThumbnailCache {
         let sha = item.blobSha256
         let pathStr = item.textFull
         let maxPx = Self.maxPx
-        let img = await Task.detached(priority: .userInitiated) { () -> NSImage? in
-            // 选源 URL:优先 BlobStore(content-addressed 稳),没 blob 退化到本机文件路径
-            let sourceURL: URL? = {
-                if let sha, let blobURL = blobs.locate(sha256: sha) { return blobURL }
-                if let pathStr, !pathStr.isEmpty {
-                    let u = URL(fileURLWithPath: pathStr)
-                    if FileManager.default.fileExists(atPath: u.path) { return u }
+        // 提交到专用 OperationQueue 隔离 thread budget(详 `decodeQueue` 注释)。
+        // Task.detached 旧实现走 cooperative pool .userInitiated 会把 OCR 饿死
+        let img: NSImage? = await withCheckedContinuation { cont in
+            Self.decodeQueue.addOperation {
+                // 选源 URL:优先 BlobStore(content-addressed 稳),没 blob 退化到本机文件路径
+                let sourceURL: URL? = {
+                    if let sha, let blobURL = blobs.locate(sha256: sha) { return blobURL }
+                    if let pathStr, !pathStr.isEmpty {
+                        let u = URL(fileURLWithPath: pathStr)
+                        if FileManager.default.fileExists(atPath: u.path) { return u }
+                    }
+                    return nil
+                }()
+                if isVideo {
+                    guard let sourceURL else { cont.resume(returning: nil); return }
+                    cont.resume(returning: Self.decodeVideoThumbnail(url: sourceURL, maxPx: maxPx))
+                    return
                 }
-                return nil
-            }()
-            if isVideo {
-                guard let sourceURL else { return nil }
-                return Self.decodeVideoThumbnail(url: sourceURL, maxPx: maxPx)
+                // image 路径:优先 BlobStore.read(零拷贝走 Data),没 blob 时直读文件 URL
+                if let sha, let data = try? blobs.read(sha256: sha) ?? nil {
+                    cont.resume(returning: Self.decodeImageThumbnail(data: data, maxPx: maxPx))
+                    return
+                }
+                if let sourceURL, let data = try? Data(contentsOf: sourceURL) {
+                    cont.resume(returning: Self.decodeImageThumbnail(data: data, maxPx: maxPx))
+                    return
+                }
+                cont.resume(returning: nil)
             }
-            // image 路径:优先 BlobStore.read(零拷贝走 Data),没 blob 时直读文件 URL
-            if let sha, let data = try? blobs.read(sha256: sha) ?? nil {
-                return Self.decodeImageThumbnail(data: data, maxPx: maxPx)
-            }
-            if let sourceURL, let data = try? Data(contentsOf: sourceURL) {
-                return Self.decodeImageThumbnail(data: data, maxPx: maxPx)
-            }
-            return nil
-        }.value
+        }
         if let img {
             cache[key] = img
         } else {
@@ -88,8 +115,11 @@ final class ImageThumbnailCache {
 
     /// 后台预热——AppState.init / refresh 后调,把 results 里 thumbnailable 项(image +
     /// video)的 thumbnail 提前 decode 进 cache。每张卡 .task 命中 cached(sha:) 直接拿,
-    /// 不闪 placeholder。每条 sha 单独起 Task → thumbnail() 内部 Task.detached → 并发
-    /// decode;已 cached / 黑名单的 sha 跳过,重复 prefetch (init + refresh) 廉价
+    /// 不闪 placeholder。已 cached / 黑名单的 sha 跳过,重复 prefetch 廉价。
+    ///
+    /// **关键**:实际 decode 工作进 `decodeQueue`(max=4 并发)而**不是**裸 `Task`。N=100+
+    /// 张时旧实现 fire 100 个并发 Task 抢协作池 → OCR 饿死(2026-05-15 bug)。本函数只是
+    /// 入队 + 解 continuation,for-loop body 是廉价 `addOperation` 调用,N 张大循环也无害
     func prefetch(items: [Item], blobs: BlobStore) {
         for item in items {
             guard let key = Self.cacheKey(for: item),
