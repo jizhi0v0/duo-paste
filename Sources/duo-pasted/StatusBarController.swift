@@ -1,16 +1,24 @@
 import AppKit
+import DuoPasteCore
 
 @MainActor
 final class StatusBarController: NSObject {
     private let item: NSStatusItem
     private let onOpenSearch: () -> Void
+    private var openMenuItem: NSMenuItem!
 
-    init(onOpenSearch: @escaping () -> Void) {
+    init(hotkey: Config.HotkeyConfig, onOpenSearch: @escaping () -> Void) {
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.onOpenSearch = onOpenSearch
         super.init()
         setupButton()
-        setupMenu()
+        setupMenu(hotkey: hotkey)
+    }
+
+    /// reloadHotkey 把 GlobalHotKey 重 register 之后调来同步状态栏菜单上"打开搜索"
+    /// 那行的 ⌘⌥V 标记。仅刷 keyEquivalent / modifierMask，不重建 menu
+    func updateOpenSearchHotkey(_ hotkey: Config.HotkeyConfig) {
+        applyHotkey(hotkey, to: openMenuItem)
     }
 
     private func setupButton() {
@@ -23,16 +31,17 @@ final class StatusBarController: NSObject {
         }
     }
 
-    private func setupMenu() {
+    private func setupMenu(hotkey: Config.HotkeyConfig) {
         let menu = NSMenu()
         let open = NSMenuItem(
             title: "打开搜索",
             action: #selector(openSearch),
-            keyEquivalent: "v"
+            keyEquivalent: ""
         )
-        open.keyEquivalentModifierMask = [.command, .option]
         open.target = self
+        applyHotkey(hotkey, to: open)
         menu.addItem(open)
+        openMenuItem = open
 
         menu.addItem(NSMenuItem.separator())
 
@@ -58,6 +67,25 @@ final class StatusBarController: NSObject {
         menu.addItem(quit)
 
         item.menu = menu
+    }
+
+    private func applyHotkey(_ hotkey: Config.HotkeyConfig, to menuItem: NSMenuItem) {
+        menuItem.keyEquivalent = hotkey.key.lowercased()
+        menuItem.keyEquivalentModifierMask = Self.modifierFlags(from: hotkey.modifiers)
+    }
+
+    private static func modifierFlags(from modifiers: [String]) -> NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        for m in modifiers {
+            switch m.lowercased() {
+            case "cmd", "command":  flags.insert(.command)
+            case "option", "alt":   flags.insert(.option)
+            case "control", "ctrl": flags.insert(.control)
+            case "shift":           flags.insert(.shift)
+            default: break
+            }
+        }
+        return flags
     }
 
     @objc private func openSettings() {
