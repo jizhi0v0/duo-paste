@@ -77,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ) { [weak self] in
                 self?.panel.toggle()
             }
+            statusBar?.updateOpenSearchHotkey(cfg.hotkey)
             fputs("hotkey re-registered: \(cfg.hotkey.modifiers.joined(separator: "+"))+\(cfg.hotkey.key)\n", stderr)
         } catch {
             fputs("reloadHotkey: register 失败：\(error)\n", stderr)
@@ -207,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onOpenWith: { [weak self] item, app in self?.openWith(item, app: app) },
             onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() }
         )
-        statusBar = StatusBarController { [weak self] in
+        statusBar = StatusBarController(hotkey: deps.config.hotkey) { [weak self] in
             self?.panel.toggle()
         }
 
@@ -241,14 +242,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let broadcaster = deps.wsBroadcaster
             Task { await broadcaster.start() }
         }
-        if deps.config.mesh.enabled && !deps.config.peers.isEmpty {
-            startMeshSupervisor()
+        // PR 3 smart transport：mesh + paste-fetcher 都先 discover 学到对端 ponte_host，
+        // 再按决定建 worker / fetcher。两者共享同一 discover 结果走同一 Task 串行启动避免
+        // 重复 /health 探测（per peer 2 个 candidate × 3s timeout）
+        let needMesh = deps.config.mesh.enabled && !deps.config.peers.isEmpty
+        let needPasteFetcher = !deps.config.peers.isEmpty
+        if needMesh || needPasteFetcher {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.startWithSmartTransport(startMesh: needMesh, startPasteFetcher: needPasteFetcher)
+            }
         }
-        // lazy paste-back blob fetcher 跟 PullWorker 独立——只要配了 peers + shared-secret，
-        // 即使 mesh.enabled=false 也能在 paste 时按需拉单个 blob。
-        // 多 peer 部署下 fetcher 当前只指 peers[0]——image 通常一台主力机产，找到的概率最高。
-        // 若 peers[0] 缺字节会 404，PR 6 之后 lazy 路径不再有 fallback chain（plan 留作未来）
-        setupPasteBlobFetcher()
+
+        // Blob 仓库 baseline 扫盘：detached 后台一次 directorySize → setBaseline。
+        // Settings 关于页订阅 blobStats.stream() 在 baseline 落盘前看到 nil = "计算中…"。
+        let blobsDir = deps.paths.blobsDir
+        let blobStats = deps.blobStats
+        Task.detached(priority: .utility) {
+            let total = Volume.directorySize(at: blobsDir) ?? 0
+            await blobStats.setBaseline(total)
+        }
 
         // OCR worker：本机 own-origin image 跑 Vision OCR 把图里文字写 text_full 进 FTS5。
         // 启动条件 = config.ocr.enabled，跟 push/pull/serve 解耦——任何 role 都跑自家
@@ -301,115 +314,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
 
-    /// Mesh supervisor：每个 peer 起一对 (PullWorker, WSNotificationClient)，supervisor 统一
-    /// 启停。PR 5 后从 `config.peers` + `config.mesh` 读，多 peer 自然 fan-out。
+    /// PR 3：mesh supervisor + paste-fetcher 一起 discover-first 启动。每个 peer 探一次
+    /// `/health` 学对端 `ponte_host` 自动 fill ponte URL（替代用户手抄 `pull_url`）。
+    /// 决策优先级：手抄 `pull_url` > 学到 ponte_host > tailscale `peer.url`（见 SmartTransport
+    /// docstring）。
     ///
-    /// 启用条件：`config.mesh.enabled=true` 且 `peers` 非空（applicationDidFinishLaunching guard）。
-    /// 启动失败（shared-secret / 单个 peer URL 解析）非致命，daemon 仍然能用本机捕获 + 本地搜索。
-    private func startMeshSupervisor() {
+    /// 决策好之后 PeerBuilder 按 host 选 NIO 还是 URLSession transport——ponte 路径下 WS 走
+    /// URLSession + PonteSession proxy；tailscale 路径仍走 NIO 直连
+    private func startWithSmartTransport(startMesh: Bool, startPasteFetcher: Bool) async {
         let cfg = deps.config
+        let auth: HMACAuth
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
-            let auth = HMACAuth(secret: secret)
+            auth = HMACAuth(secret: secret)
+        } catch {
+            fputs("smart transport NOT started: 加载 shared-secret 失败：\(error)\n", stderr)
+            return
+        }
+        let smart = SmartTransport()
+        let decisions = await smart.discover(
+            peers: cfg.peers,
+            auth: auth,
+            tailscaleSession: AppDependencies.syncURLSession
+        )
+        for d in decisions {
+            fputs(
+                "smart-transport: peer \(d.peerIndex) → \(d.transportLabel)" +
+                (d.learnedPonteHost.map { " (learned ponte_host=\($0))" } ?? "") +
+                "\n",
+                stderr
+            )
+        }
+
+        // 起 mesh supervisor（如果该起）
+        if startMesh {
             let intervalSec = max(1, cfg.mesh.pullIntervalSec)
-            var supervisorPeers: [MeshSupervisor.Peer] = []
-            for peer in cfg.peers {
-                // PullWorker 走 peer.effectivePullURL（ponte 快路径优先），WSNotificationClient
-                // 仍用 peer.url（NIO WS 不读系统 proxy，跑不了 ponte）
-                let pullURL = peer.effectivePullURL
-                let client = HTTPPeerClient(
-                    baseURL: pullURL,
-                    auth: auth,
-                    session: PonteSession.session(
-                        for: pullURL,
-                        fallback: AppDependencies.syncURLSession
-                    )
-                )
-                // 严格模式：peer.deviceID 显式给了 → 严格校验对端 /health 返回 device_id
-                // 不匹配立即 transient skip。学习模式：deviceID=nil → 首次 /health 学到
-                // plan settings-cleanup：PullWorker / WSNotificationClient 内部 tuning
-                // 字段（batch limit / backoff / dedup window / clock skew / ws timing）
-                // 不再从 config 读，全用 worker default。pullIntervalSec / storageMode 仍
-                // 用户可见所以仍透传
-                let worker = PullWorker(
-                    database: deps.database,
-                    transport: client,
-                    selfDeviceID: deps.deviceID,
-                    expectedPeerDeviceID: peer.deviceID,
-                    meshStatus: deps.meshStatus,
-                    pasteSuppressions: deps.pasteSuppressions,
-                    blobFetcher: client,
-                    blobs: deps.blobs,
-                    evictOnFull: deps.evictOnFull,
-                    config: PullWorker.Config(
-                        intervalSec: TimeInterval(intervalSec),
-                        storageMode: cfg.mesh.storageMode
-                    )
-                )
-                let wsClient: WSNotificationClient?
-                if cfg.mesh.wsEnabled {
-                    wsClient = WSNotificationClient(
-                        peerURL: peer.url,
-                        auth: auth,
-                        expectedPeerDeviceID: peer.deviceID,
-                        onCursorAdvanced: { [weak worker] _ in worker?.wake() },
-                        // 连续失败到 budget 触发 catastrophic:打日志 + exit(1) 让
-                        // launchd KeepAlive 重启 daemon。SwiftNIO 内部 resolver
-                        // 在进程启动时 snapshot,长期 DNS / 网络故障旧进程往往拉不回,
-                        // 进程级重启是兜底——SCDynamicStore 监听 + WS wake 是主修路径,
-                        // 这里只为兜底场景(SwiftNIO bug / 接口 stale state)兜底
-                        onCatastrophicFailure: {
-                            FileHandle.standardError.write(Data(
-                                "ws-client: catastrophic — exiting to let launchd restart\n".utf8
-                            ))
-                            exit(1)
-                        }
-                    )
-                } else {
-                    wsClient = nil  // mesh.ws_enabled=false 退化为周期 pull
-                }
-                supervisorPeers.append(MeshSupervisor.Peer(worker: worker, wsClient: wsClient))
-            }
+            let builder = SmartTransport.PeerBuilder(
+                database: deps.database,
+                blobs: deps.blobs,
+                meshStatus: deps.meshStatus,
+                pasteSuppressions: deps.pasteSuppressions,
+                selfDeviceID: deps.deviceID,
+                evictOnFull: deps.evictOnFull,
+                pullWorkerConfig: PullWorker.Config(
+                    intervalSec: TimeInterval(intervalSec),
+                    storageMode: cfg.mesh.storageMode
+                ),
+                wsEnabled: cfg.mesh.wsEnabled,
+                auth: auth,
+                tailscaleSession: AppDependencies.syncURLSession,
+                onCatastrophicFailure: {
+                    FileHandle.standardError.write(Data(
+                        "ws-client: catastrophic — exiting to let launchd restart\n".utf8
+                    ))
+                    exit(1)
+                },
+                expectedPeerDeviceIDs: cfg.peers.map { $0.deviceID }
+            )
+            let supervisorPeers = decisions.map { builder.build(decision: $0) }
             let supervisor = MeshSupervisor(peers: supervisorPeers)
             self.meshSupervisor = supervisor
-            Task { await supervisor.start() }
+            await supervisor.start()
             fputs("mesh supervisor → \(supervisorPeers.count) peer(s) (interval=\(intervalSec)s, ws=\(cfg.mesh.wsEnabled ? "on" : "off"))\n", stderr)
-            for peer in cfg.peers {
-                fputs("  · \(peer.url.absoluteString)\(peer.deviceID.map { " device_id=\($0)" } ?? " (learn mode)")\n", stderr)
-            }
-        } catch {
-            fputs("mesh supervisor NOT started: \(error)\n", stderr)
         }
-    }
 
-    /// lazy paste-back blob fetcher 初始化——跟 PullWorker 独立。
-    /// 只要 config 配了至少 1 个 peer + shared-secret 可加载就建一个 HTTPPeerClient
-    /// 给 pasteBack 用，**不依赖** mesh.enabled / serve 配置。**这是 paste-back
-    /// 不可降级的最低要求**：用户已经选中图片按 Enter 了，没 fetcher 等于挂掉。
-    /// 多 peer 部署当前只用 peers[0]——通常 image 在某一台主力机产，命中率最高
-    private func setupPasteBlobFetcher() {
-        guard let firstPeer = deps.config.peers.first else { return }
-        do {
-            let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
-            let auth = HMACAuth(secret: secret)
-            // 同 PullWorker：paste / 缩略图 / 预览的 blob 拉取走 effectivePullURL
-            // （ponte 快路径优先），fallback URL = tailscale URL（让 syncURLSession 处理）
-            let pullURL = firstPeer.effectivePullURL
-            let fetcher = HTTPPeerClient(
-                baseURL: pullURL,
-                auth: auth,
-                session: PonteSession.session(
-                    for: pullURL,
-                    fallback: AppDependencies.syncURLSession
-                )
-            )
+        // paste-back blob fetcher 用 peers[0] 的决策——多 peer 部署下 image 通常在主力机产，
+        // 缺字节会 404 由 lazy 路径自然降级（PR 6 之后 fallback chain 不在这里做）
+        if startPasteFetcher, let d0 = decisions.first {
+            let session = PonteSession.session(for: d0.chosenPullURL, fallback: AppDependencies.syncURLSession)
+            let fetcher = HTTPPeerClient(baseURL: d0.chosenPullURL, auth: auth, session: session)
             self.pasteBlobFetcher = fetcher
-            // PR cloudy-mirroring-walnut PR 3：UI 路径（缩略图 / 空格预览）optimized 模式
-            // 下也走这个 fetcher 按需拉 blob。同 instance 让连接池跨场景复用
             self.state.pasteBlobFetcher = fetcher
-            fputs("paste blob fetcher → \(pullURL.absoluteString)\n", stderr)
-        } catch {
-            fputs("paste blob fetcher NOT initialized: \(error)\n", stderr)
+            fputs("paste blob fetcher → \(d0.chosenPullURL.absoluteString)\n", stderr)
         }
     }
 
