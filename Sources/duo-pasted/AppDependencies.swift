@@ -9,6 +9,9 @@ final class AppDependencies {
     let config: Config
     let database: Database
     let blobs: BlobStore
+    /// BlobStore 字节占用增量计数器。Settings 关于页订阅，put/evict 时 BlobStore 内部
+    /// 自动喂数。baseline 由 AppDelegate 启动后 detached 扫盘任务建立
+    let blobStats: BlobStorageStats
     let deviceID: String
     /// LRU blob 驱逐器。ENOSPC 时 capture / paste / pull 路径走它腾空间。
     /// **生产路径所有 BlobStore.put 都应走 retryingOnFull 变体** + 注入这个回调
@@ -37,12 +40,14 @@ final class AppDependencies {
         let deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
         let config = try Config.load(from: paths.configFile)
         let database = try Database(path: paths.mainDB)
-        let blobs = BlobStore(root: paths.blobsDir)
+        let blobStats = BlobStorageStats()
+        let blobs = BlobStore(root: paths.blobsDir, stats: blobStats)
         self.paths = paths
         self.config = config
         self.deviceID = deviceID
         self.database = database
         self.blobs = blobs
+        self.blobStats = blobStats
         let evictor = BlobEvictor(
             database: database,
             blobs: blobs,

@@ -304,6 +304,32 @@ Swift 6 strict concurrency 拒绝把同一个 iterator 实例 capture 进多个 
 
 唯一守得住 panel 尺寸的路径就是**不让 NSImageView / PDFView 持续挂在 hosting view 的 SwiftUI 子树里**——`.id(kindKey)` 切 kind 时 SwiftUI 整体 tear down 这些 NSViewRepresentable，AppKit 没东西可推就不 auto-resize 了。位置：`PreviewOverlay.swift` 的 `PreviewPanelContent.contentBody` + `kindKey`。
 
+### Settings 窗口 traffic lights 自管 placement（macOS 26 不要回到 ignoresSafeArea 那条路）
+
+Paste 风格 Settings：sidebar 卡片视觉上**包住** traffic lights（红绿灯漂在 sidebar 卡片内部 ~14px 处）。macOS 26 上**不要**试图通过 SwiftUI 让卡片扩到 titlebar 区——这条路被验证完全走不通。
+
+**正确姿态**（位置：`AppDelegate.showSettings` + `positionSettingsTrafficLights`）：
+- NSWindow styleMask 含 `.fullSizeContentView`，`titlebarAppearsTransparent = true`，`titleVisibility = .hidden`，**不含** `.resizable`（用 `maxSize = win.frame.size` 锁尺寸，避免 traffic lights placement 在 resize 时漂移）
+- contentView = `FullBleedHostingView`（NSHostingView 子类 override `safeAreaInsets` 为 0；macOS 26 上这个 override 只让 SwiftUI 的 `GeometryReader` **报告**全 0 safe area，**渲染像素**仍然 clip 到 contentLayoutRect——所以单靠它**还不够**，但它仍然要保留让 SwiftUI 内部布局正确）
+- **关键步骤**：拿 `window.standardWindowButton(.closeButton / .miniaturizeButton / .zoomButton)` 三个按钮，`contentView.addSubview(button, positioned: .above, relativeTo: nil)` 把它们从 frameView 重新挂到 contentView，再 `setFrameOrigin` 手动定位（当前实现 topInset=40 / leftInset=34 / spacing=25 落在 sidebar 卡片内部）
+- 补一层 `TrafficLightGlyphOverlay` 自定义 NSView，覆盖在三个按钮上方，hover 时自己画 ×/-/+ glyph（按钮被 reparent 后系统的 hover-glyph 路径断了，必须手画）。`hitTest` 返回 nil 让点击穿透到底下的真按钮
+- `windowDidResize` hook 重 position（即便 resize 被锁，写了无害）
+
+**试过且全部无效的方向**（macOS 26 NSHostingView 真的会无视所有 SwiftUI 层 safe area 控制）：
+
+| 方案 | 结果 |
+|---|---|
+| `NSHostingView.safeAreaInsets` override 为 0 | GeometryReader 报告 size=(W, contentView.h) safeArea=0，但渲染像素仍在 titlebar 下方开始 |
+| `NSHostingView.safeAreaRegions = []`（macOS 14+ 标准 API） | 同上 |
+| SwiftUI `.ignoresSafeArea()` / `.ignoresSafeArea(.all)` | 同上 |
+| NSWindow 创建时一次传完整 styleMask（避免后追加 .fullSizeContentView） | window/contentView frame 正常变 680，但渲染区不变 |
+| 套 wrapper NSView 作 contentView + hostingView `topAnchor = wrapper.top - 32`（让 host frame 712 高，向上突出窗口顶 32px） | hostingView 内部 inset 不按 host frame 算而按 NSWindow.contentLayoutRect 绝对算，hack 没生效 |
+| SwiftUI root `.padding(.top, -32)` 把所有内容上移 | 视觉上 sidebar 卡片是贴顶了，但 SwiftUI 内容画到 hostingView 边界外被 frameView 的 traffic lights 整体遮住，红绿灯反而完全看不见 |
+
+**根本原因**：macOS 26 上 NSHostingView 在 `fullSizeContentView` 窗口里把 SwiftUI **渲染**硬剪到 `window.contentLayoutRect`（=contentView.frame 减 titlebar 32px），跟 hostingView 自身 frame 没关系，跟 SwiftUI 报告的 safeArea 也没关系。SwiftUI 的 logical layout 是 680 高，但实际像素只画 648 高（top 32px 是 titlebar 区，hostingView 自己跳过）。
+
+**不要回退**：下次看到 `positionSettingsTrafficLights(in:)` 这个看起来 hacky 的 ~30 行函数觉得"是不是能用 SwiftUI 干净方案替代"——**不能**。从 `.padding(.top, -32)` 起所有 SwiftUI 层 hack 都验证过失败。Codex 接手 3 轮就用这个 AppKit 姿态修好了，方向正确。
+
 ## 已知环境坑
 
 ### SwiftPM 克隆 GRDB.swift 弱网必断

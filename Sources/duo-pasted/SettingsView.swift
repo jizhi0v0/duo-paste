@@ -148,6 +148,9 @@ private struct SettingsDetail: View {
         }
         .animation(.smooth(duration: 0.18), value: model.isDirty)
         .animation(.smooth(duration: 0.18), value: model.statusMessage)
+        .onChange(of: model.isDirty) { _, newValue in
+            if newValue { model.notifyConfigEdited() }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -160,6 +163,7 @@ final class SettingsModel {
     private(set) var initial: Config
     var statusMessage: String?
     var statusIsError = false
+    @ObservationIgnored private var dismissTask: Task<Void, Never>?
 
     init() {
         let paths = Paths.makeDefault()
@@ -189,19 +193,52 @@ final class SettingsModel {
             }
             statusMessage = restartNeeded ? "已应用 · 部分字段需重启 daemon 生效" : "已应用 · 立即生效"
             statusIsError = false
+            // 需重启的提示 / 错误都让"重启"按钮 / 错误信息一直可见,不自动消失
+            scheduleStatusDismiss(skip: restartNeeded)
         } catch {
             statusMessage = "写盘失败：\(error)"
             statusIsError = true
+            cancelStatusDismiss()
         }
     }
 
     func discard() {
+        cancelStatusDismiss()
         config = initial
         statusMessage = nil
+        statusIsError = false
+    }
+
+    /// SettingsDetail 在 isDirty 由 false 变 true 那一刻调——用户开始新一轮编辑,
+    /// 上次的"已应用"提示立刻收起 + cancel 还没触发的清除 timer。否则 timer 后续
+    /// fire 会把用户新编辑期间的 statusMessage(若有)误清
+    func notifyConfigEdited() {
+        cancelStatusDismiss()
+        if statusMessage != nil {
+            statusMessage = nil
+            statusIsError = false
+        }
     }
 
     func restartDaemon() {
         AppDelegate.shared?.restartDaemon()
+    }
+
+    private func scheduleStatusDismiss(skip: Bool) {
+        cancelStatusDismiss()
+        guard !skip else { return }
+        dismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard let self, !Task.isCancelled else { return }
+            self.statusMessage = nil
+            self.statusIsError = false
+            self.dismissTask = nil
+        }
+    }
+
+    private func cancelStatusDismiss() {
+        dismissTask?.cancel()
+        dismissTask = nil
     }
 }
 
@@ -818,7 +855,7 @@ private struct AboutPane: View {
                 pathRow("Blob 仓库", path: paths.blobsDir.path)
             }
         }
-        .task { await refreshStorageStats() }
+        .task { await subscribeStorageStats() }
     }
 
     private func pathRow(_ title: String, path: String, isFirst: Bool = false) -> some View {
@@ -828,13 +865,24 @@ private struct AboutPane: View {
         }
     }
 
-    private func refreshStorageStats() async {
+    /// 订阅 BlobStorageStats 推送 —— 任何 put/evict 都即时更新 `blobsTotalBytes`，
+    /// 不再扫盘。`diskAvailableBytes` 只取首次（卷容量变化慢，且没有事件源）。view 消失
+    /// 时 `.task` 自动 cancel → stream 的 onTermination 清理 continuation
+    private func subscribeStorageStats() async {
         let blobsDir = Paths.makeDefault().blobsDir
-        let (total, avail) = await Task.detached {
-            (Volume.directorySize(at: blobsDir), Volume.availableBytes(at: blobsDir))
+        diskAvailableBytes = await Task.detached {
+            Volume.availableBytes(at: blobsDir)
         }.value
-        blobsTotalBytes = total
-        diskAvailableBytes = avail
+        guard let stats = AppDelegate.shared?.dependencies?.blobStats else {
+            // daemon 未启动 —— 兜底跑一次扫盘，UI 仍能看到数字
+            blobsTotalBytes = await Task.detached {
+                Volume.directorySize(at: blobsDir)
+            }.value
+            return
+        }
+        for await bytes in await stats.stream() {
+            blobsTotalBytes = bytes
+        }
     }
 
     private static func formatBytes(_ bytes: Int64) -> String {
@@ -960,7 +1008,8 @@ private struct AboutPane: View {
                 if report.fetched > 0 {
                     ImageThumbnailCache.shared.invalidateAll()
                     AppDelegate.shared?.state.blobInventoryPulse &+= 1
-                    await refreshStorageStats()
+                    // blobsTotalBytes 由 BlobStorageStats.stream 自动推 —— putVerified 经
+                    // BlobStore.notifyAdded 喂 actor，订阅的 .task 会收到新值
                 }
             } catch {
                 fetchReport = "执行失败：\(error)"

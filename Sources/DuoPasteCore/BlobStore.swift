@@ -10,9 +10,13 @@ public struct BlobInfo: Sendable, Hashable {
 
 public struct BlobStore: Sendable {
     public let root: URL
+    /// 字节占用增量计数器。Settings 关于页订阅这个 actor 推送，put/evict 写盘事件直接喂入。
+    /// nil = 不维护计数器（CLI 一次性命令、单测路径），生产 daemon 路径必须注入。
+    public let stats: BlobStorageStats?
 
-    public init(root: URL) {
+    public init(root: URL, stats: BlobStorageStats? = nil) {
         self.root = root
+        self.stats = stats
     }
 
     public func path(for sha256: String, ext: String? = nil) -> URL {
@@ -80,12 +84,14 @@ public struct BlobStore: Sendable {
                 throw error
             }
         }
-        return BlobInfo(
+        let written = BlobInfo(
             sha256: hex,
             size: Int64(data.count),
             path: target,
             wasExisting: false
         )
+        notifyAdded(written.size)
+        return written
     }
 
     /// `put` 的防御版本：在算 sha 之前先比对 `expectedSha`，不匹配直接 throw。
@@ -129,12 +135,14 @@ public struct BlobStore: Sendable {
                 throw error
             }
         }
-        return BlobInfo(
+        let written = BlobInfo(
             sha256: hex,
             size: Int64(data.count),
             path: target,
             wasExisting: false
         )
+        notifyAdded(written.size)
+        return written
     }
 
     public func read(sha256: String) throws -> Data? {
@@ -163,6 +171,7 @@ public struct BlobStore: Sendable {
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
         do {
             try fm.removeItem(at: url)
+            notifyRemoved(size)
             return .deleted(size: size)
         } catch {
             return .failed(error)
@@ -203,6 +212,20 @@ public struct BlobStore: Sendable {
         try Self.retryOnFull(maxRetries: maxRetries, evictor: evictor) {
             try self.putVerified(data, expectedSha256: expectedSha256, ext: ext)
         }
+    }
+
+    /// 写盘成功钩子 —— 起 detached Task 喂 BlobStorageStats actor，让 Settings 关于页
+    /// 不用扫盘就能即时刷新"Blob 仓库占用"。stats=nil（CLI / 单测路径）时 no-op。
+    /// 起 Task 而非改方法 async：BlobStore.put 在生产路径都被 sync caller 调用（包括
+    /// retryOnFull 闭包内嵌），改 async 会污染整条调用链
+    private func notifyAdded(_ size: Int64) {
+        guard let stats else { return }
+        Task { await stats.add(size) }
+    }
+
+    private func notifyRemoved(_ size: Int64) {
+        guard let stats else { return }
+        Task { await stats.sub(size) }
     }
 
     /// 内部 retry loop。**internal access** 让单测注入 mock put 闭包验证循环骨架——
