@@ -353,7 +353,7 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
         config: PullWorker.Config(intervalSec: 60)
     )
     let supervisor = MeshSupervisor(workers: [w1, w2])
-    #expect(supervisor.peerCount == 2)
+    #expect(await supervisor.peerCount == 2)
     await supervisor.start()
     try? await Task.sleep(nanoseconds: 200_000_000)
     // 两 peer 都被 /health + /since 调过 → mesh 注册两 peer
