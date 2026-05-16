@@ -351,12 +351,21 @@ struct SearchView: View {
     /// `shown=true` 表示 show/update 浮窗(controller 自己 read state.currentItem + 卡片
     /// frame);false 表示 hide。在 panel hide 时 controller 也会兜底再 hide 一次
     var onPreviewChange: (Bool) -> Void = { _ in }
+    /// 右键 contextMenu "在 Finder 显示" 触发,跟键盘 ⌘Return 走同一 handler。
+    /// 仅 file/image kind 才在菜单里出现;nil = caller 不接菜单项不显示
+    var onReveal: ((Item) -> Void)? = nil
+    /// 右键 contextMenu "打开方式" 子菜单选中某 app 后触发。(item, app bundleURL)。
+    /// nil = caller 不接子菜单不显示
+    var onOpenWith: ((Item, URL) -> Void)? = nil
 
     @FocusState private var searchFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
-            compactHeader              // 搜索框 + count(单行 ~42px)
+            // compactHeader 加 zIndex 让 slash 补全 overlay 浮在 chip 行之上——SwiftUI
+            // VStack 默认 z 按声明顺序 ascending,compactHeader 在前 → z 比 compactFilterBar
+            // 低 → overlay 会被 chip 行遮(用户反馈过)
+            compactHeader.zIndex(10)   // 搜索框 + count(单行 ~42px)
             compactFilterBar           // chip 行 + 时间窗 + 仅置顶(~30px)
             // 主体卡片区域,横向 LazyHStack 滚动
             if state.results.isEmpty {
@@ -364,6 +373,14 @@ struct SearchView: View {
             } else {
                 cardScroller
             }
+        }
+        // panel 内点空白(非 card / 非 TextField / 非 chip)关 preview——SwiftUI hit-test
+        // 是 child-first,有 onTapGesture 的子视图(card / chip)优先吃 tap,父这层只在
+        // 真正空白处 fire。配合 SearchPanelController 的 global click monitor(app 外
+        // 点击退整个 panel)形成完整 "click outside to dismiss preview" 路径
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if state.previewShown { state.previewShown = false }
         }
         .overlay(alignment: .top) {
             // banner 用 overlay 浮在 header 上方,不占主体高度。
@@ -379,7 +396,7 @@ struct SearchView: View {
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
         }
-        .frame(minWidth: 800, minHeight: 356, idealHeight: 356, maxHeight: 356)
+        .frame(minWidth: 800, minHeight: 358, idealHeight: 358, maxHeight: 358)
         // 空格预览 = 独立 NSPanel(PreviewPanelController),不在 SearchView 里渲染。
         // 这里只做 trigger 把状态变化抛给 caller,真正 show/hide/reposition 由 controller
         // 完成。三个 onChange 覆盖触发面:
@@ -451,11 +468,19 @@ struct SearchView: View {
     private var compactHeader: some View {
         HStack(spacing: 10) {
             // search 加 capsule bg + border,像标准 macOS 搜索 input
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(.secondary)
-                TextField("搜索剪贴板历史", text: $state.query)
+                // 已激活的 slash qualifier 渲染成 pill chip,排在 TextField 左侧。每个 chip
+                // 自带 ✕ 一键删,Backspace 在 TextField 为空时弹最后一个(SearchPanelController
+                // 装的 keyMonitor 拦 keyCode=51)
+                ForEach(state.activeQualifiers, id: \.self) { qual in
+                    QualifierChipPill(qualifier: qual) {
+                        state.removeQualifier(qual)
+                    }
+                }
+                TextField("搜索剪贴板历史 (输 / 触发筛选)", text: $state.query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14, weight: .regular))
                     .focused($searchFieldFocused)
@@ -490,6 +515,15 @@ struct SearchView: View {
                 y: 1
             )
             .animation(.smooth(duration: 0.18), value: searchFieldFocused)
+            // slash 补全候选浮层——绑在搜索框下方,跟搜索框 capsule 同宽
+            .overlay(alignment: .bottomLeading) {
+                if state.completionMenuVisible && !state.completionCandidates.isEmpty {
+                    completionOverlay
+                        .offset(y: 36)  // 36pt = capsule 高度 + 4pt 间距
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+            .zIndex(1)  // 让 overlay 浮在 chip 行之上
             Text("\(state.totalCount) 条")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
@@ -500,37 +534,159 @@ struct SearchView: View {
         // maxWidth 800 居中:搜索框 + count 三件一组居中聚焦,跟卡片区横铺解耦
         .frame(maxWidth: 800)
         .frame(maxWidth: .infinity, alignment: .center)
+        .onChange(of: state.query) { _, _ in
+            extractQualifierChips()
+            updateCompletion()
+        }
+    }
+
+    /// query 里出现已闭合（后跟空格）的合法 /xxx token → 自动抽到 activeQualifiers,
+    /// query 字符串里只保留搜索文本 + 末尾未闭合的 /xxx(让补全菜单继续)。
+    /// 用户输 `/image ocr` 时:输到 "/image " 那一刻 "/image" 立即变 chip,query 变 "ocr"
+    private func extractQualifierChips() {
+        let (extracted, remaining) = QueryParser.extractCompleted(state.query)
+        guard !extracted.isEmpty else { return }
+        for q in extracted where !state.activeQualifiers.contains(q) {
+            state.activeQualifiers.append(q)
+        }
+        // 抽完后 query 字符串只剩搜索文本 + 末尾未闭合 /xxx
+        if remaining != state.query {
+            state.query = remaining
+        }
+    }
+
+    /// slash 补全候选浮层——VStack 列出 QueryParser.suggestions 候选,高亮项 accent 背景
+    private var completionOverlay: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(state.completionCandidates.enumerated()), id: \.offset) { idx, candidate in
+                let isHighlighted = idx == state.completionHighlight
+                Button {
+                    acceptCompletion(at: idx)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(candidate.display)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(isHighlighted ? Color.white : .primary)
+                        Spacer()
+                        Text(qualifierHint(candidate.qualifier))
+                            .font(.system(size: 11))
+                            .foregroundStyle(isHighlighted ? Color.white.opacity(0.75) : .secondary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(isHighlighted ? Color.accentColor : Color.clear)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 4)
+        .frame(width: 320)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.ultraThinMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
+    }
+
+    /// qualifier 显示对应的中文提示文本（候选行右侧）
+    private func qualifierHint(_ q: QueryQualifier) -> String {
+        switch q {
+        case .kind(let k):
+            switch k {
+            case .text: return "文本"
+            case .rtf: return "富文本"
+            case .html: return "HTML"
+            case .url: return "链接"
+            case .image: return "图片"
+            case .file: return "文件"
+            }
+        case .fileSubKind(let s):
+            switch s {
+            case .video: return "视频"
+            case .pdf: return "PDF"
+            case .audio: return "音频"
+            case .imageFile: return "图片文件"
+            }
+        case .imageMerged: return "图片(合并)"
+        case .textSuffix(let s): return "文件名 *\(s)"
+        }
+    }
+
+    /// 监听 query 变化：当前 token（按空白拆，取最后一个）以 `/` 开头时弹补全菜单
+    private func updateCompletion() {
+        let lastToken = state.query.split(separator: " ", omittingEmptySubsequences: false).last.map(String.init) ?? ""
+        if lastToken.hasPrefix("/"), lastToken.count >= 1 {
+            let suggestions = QueryParser.suggestions(prefix: lastToken)
+            state.completionCandidates = suggestions
+            state.completionMenuVisible = !suggestions.isEmpty
+            // highlight 跟随候选数量 clamp
+            if state.completionHighlight >= suggestions.count {
+                state.completionHighlight = 0
+            }
+        } else {
+            state.completionMenuVisible = false
+            state.completionCandidates = []
+            state.completionHighlight = 0
+        }
+    }
+
+    /// 鼠标点候选行 → 接受补全。键盘 Enter 路径走 SearchPanelController 直接调
+    /// state.acceptCompletion()（同样 binding 到 AppState 上的实现）
+    private func acceptCompletion(at index: Int) {
+        state.acceptCompletion(at: index)
     }
 
     /// 紧凑 filter 行 ~30px。原 filterBar 高 ~46px,缩小 chip 字号 + padding 让它适配 panel。
     /// chip 行跟 header 同样 maxWidth 800 居中,跟卡片区横铺解耦
+    ///
+    /// **chip 折叠策略**：primary = [文本] [图片合并] [链接] [PDF]，secondary 的
+    /// [富文本] [HTML] [视频] [音频] [图片文件] [文件] 折进 "更多 ▾" Menu。
+    /// 心智：覆盖 90% 高频，secondary 用得少不该一直占空间。
+    /// [图片] chip 合并语义——同时响应 .image kind（原生剪贴板截图）+ .imageFile sub-kind
+    /// (Finder 复制的 .png 文件)，用户视角"图片就是一种东西"
     private var compactFilterBar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(filterChipKinds, id: \.self) { kind in
-                            KindChip(
-                                kind: kind,
-                                isSelected: state.selectedKinds.contains(kind),
-                                count: state.kindCounts.isEmpty ? nil : (state.kindCounts[kind] ?? 0),
-                                onTap: { toggleKind(kind) }
-                            )
-                        }
-                        // .file kind 细分 chip——视频/PDF/音频/图片文件。视觉上跟基础 chip 同款,
-                        // 语义上 OR(选了 "视频" + 不选 "文件" → 只视频;选了 "文件" → 全部文件)
-                        ForEach(filterChipFileSubKinds, id: \.self) { sub in
-                            FileSubKindChip(
-                                sub: sub,
-                                isSelected: state.selectedFileSubKinds.contains(sub),
-                                count: state.fileSubKindCounts.isEmpty ? nil : (state.fileSubKindCounts[sub] ?? 0),
-                                onTap: { toggleFileSubKind(sub) }
-                            )
-                        }
-                        if !state.selectedKinds.isEmpty || !state.selectedFileSubKinds.isEmpty {
+                        // 文本 chip
+                        KindChip(
+                            kind: .text,
+                            isSelected: state.isKindActive(.text),
+                            count: state.kindCounts.isEmpty ? nil : (state.kindCounts[.text] ?? 0),
+                            onTap: { toggleKind(.text) }
+                        )
+                        // 图片 chip——合并 .image + .imageFile 计数 / toggle
+                        KindChip(
+                            kind: .image,
+                            isSelected: state.isKindActive(.image) || state.isFileSubKindActive(.imageFile),
+                            count: (state.kindCounts.isEmpty && state.fileSubKindCounts.isEmpty) ? nil : state.imageMergedCount,
+                            onTap: { state.toggleImageChip() }
+                        )
+                        // 链接 chip
+                        KindChip(
+                            kind: .url,
+                            isSelected: state.isKindActive(.url),
+                            count: state.kindCounts.isEmpty ? nil : (state.kindCounts[.url] ?? 0),
+                            onTap: { toggleKind(.url) }
+                        )
+                        // PDF chip
+                        FileSubKindChip(
+                            sub: .pdf,
+                            isSelected: state.isFileSubKindActive(.pdf),
+                            count: state.fileSubKindCounts.isEmpty ? nil : (state.fileSubKindCounts[.pdf] ?? 0),
+                            onTap: { toggleFileSubKind(.pdf) }
+                        )
+                        // 更多 ▾ Menu——折叠 secondary chip
+                        moreChipMenu
+                        if !state.selectedKinds.isEmpty || !state.selectedFileSubKinds.isEmpty || !state.activeQualifiers.isEmpty {
                             Button {
-                                state.selectedKinds.removeAll()
-                                state.selectedFileSubKinds.removeAll()
+                                state.clearAllFilters()
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .font(.system(size: 11))
@@ -552,6 +708,84 @@ struct SearchView: View {
             Rectangle()
                 .fill(Color.primary.opacity(0.06))
                 .frame(height: 0.5)
+        }
+    }
+
+    /// secondary chip 折叠菜单——[富文本] [HTML] [视频] [音频] [图片文件] [文件]。
+    /// 任一 secondary 选中时按钮加 `•` accent dot 提示
+    private var moreChipMenu: some View {
+        let secondaryKinds: [ItemKind] = [.rtf, .html, .file]
+        let secondarySubs: [FileSubKind] = [.video, .audio, .imageFile]
+        let anySelected = secondaryKinds.contains { state.isKindActive($0) }
+            || secondarySubs.contains { state.isFileSubKindActive($0) }
+        return Menu {
+            ForEach(secondaryKinds, id: \.self) { kind in
+                Button {
+                    toggleKind(kind)
+                } label: {
+                    Label {
+                        let n = state.kindCounts[kind] ?? 0
+                        Text("\(kindMenuLabel(kind)) (\(n))")
+                    } icon: {
+                        Image(systemName: state.isKindActive(kind) ? "checkmark" : "")
+                    }
+                }
+            }
+            Divider()
+            ForEach(secondarySubs, id: \.self) { sub in
+                Button {
+                    toggleFileSubKind(sub)
+                } label: {
+                    Label {
+                        let n = state.fileSubKindCounts[sub] ?? 0
+                        Text("\(subMenuLabel(sub)) (\(n))")
+                    } icon: {
+                        Image(systemName: state.isFileSubKindActive(sub) ? "checkmark" : "")
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text("更多")
+                    .font(.system(size: 12))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                if anySelected {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: 5, height: 5)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(.primary)
+            .background(
+                Capsule()
+                    .fill(Color.primary.opacity(0.06))
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    private func kindMenuLabel(_ k: ItemKind) -> String {
+        switch k {
+        case .text: "文本"
+        case .rtf: "富文本"
+        case .html: "HTML"
+        case .url: "链接"
+        case .image: "图片"
+        case .file: "文件"
+        }
+    }
+
+    private func subMenuLabel(_ s: FileSubKind) -> String {
+        switch s {
+        case .video: "视频"
+        case .pdf: "PDF"
+        case .audio: "音频"
+        case .imageFile: "图片文件"
         }
     }
 
@@ -648,6 +882,25 @@ struct SearchView: View {
                                 }
                             }
                         )
+                        // 右键 contextMenu —— "粘贴 / 在 Finder 显示 / 打开方式 / 置顶"。
+                        // 注意:点击 contextMenu 项不走单击/双击 gesture 路径,所以右键时
+                        // selectedIDs 不被改;菜单永远只操作 `item`(被右键点中的那张卡),
+                        // 不是 selectedItems。这跟 Finder 行为对齐:右键单张文件不改多选
+                        .contextMenu {
+                            Button("粘贴") { onPaste([item]) }
+                            if let onReveal,
+                               item.kind == .file || item.kind == .image {
+                                Button("在 Finder 显示") { onReveal(item) }
+                            }
+                            Divider()
+                            if let onOpenWith {
+                                OpenWithMenu(item: item, onOpenWith: onOpenWith)
+                            }
+                            Divider()
+                            Button(item.pinned ? "取消置顶" : "置顶") {
+                                state.togglePin(item)
+                            }
+                        }
                     }
                 }
                 // 顶部 12pt 给 icon offset(y:-8) 上溢出留 buffer + 跟 filter hairline 间距
@@ -659,7 +912,7 @@ struct SearchView: View {
             // SwiftUI 让内容 vertical center 留下方空白)
             .frame(height: 254)
             .padding(.horizontal, 22)
-            .padding(.bottom, 14)
+            .padding(.bottom, 16)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
@@ -1026,6 +1279,60 @@ struct SearchView: View {
 /// nil/0 的区分发生在 caller：空 kindCounts dict（出错降级）→ nil；非空 dict
 /// （fold-aware 路径有命中）→ 缺 key 默认 0。
 /// `.file` 细分 chip——风格跟 KindChip 一致,kind 换成 FileSubKind
+/// 搜索框内已激活的 slash qualifier pill —— `/image` `/pdf` `/java` 等。pill 风格,
+/// 自带 ✕ 按钮一键删,Backspace 在 TextField 空时弹最后一个。颜色弱于 KindChip 的
+/// selected 态(不抢搜索焦点),但跟普通 .ultraThinMaterial 区分,让 chip 边界清晰
+private struct QualifierChipPill: View {
+    let qualifier: QueryQualifier
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(displayText)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.primary)
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(
+            Capsule().fill(Color.accentColor.opacity(0.18))
+        )
+        .overlay(
+            Capsule().strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 0.5)
+        )
+        .fixedSize()
+    }
+
+    private var displayText: String {
+        switch qualifier {
+        case .kind(let k):
+            switch k {
+            case .text: return "/text"
+            case .rtf: return "/rtf"
+            case .html: return "/html"
+            case .url: return "/url"
+            case .image: return "/image"
+            case .file: return "/file"
+            }
+        case .fileSubKind(let s):
+            switch s {
+            case .video: return "/video"
+            case .pdf: return "/pdf"
+            case .audio: return "/audio"
+            case .imageFile: return "/imagefile"
+            }
+        case .imageMerged: return "/image"
+        case .textSuffix(let s): return s.hasPrefix(".") ? "/" + String(s.dropFirst()) : "/" + s
+        }
+    }
+}
+
 private struct FileSubKindChip: View {
     let sub: FileSubKind
     let isSelected: Bool
@@ -1469,15 +1776,48 @@ private struct ItemCard: View {
         }
     }
 
-    /// "文本 · 34s" / "图片 · 4.5 MB · 41m" 之类
+    /// 卡片底部 meta 行。规则按 kind/sub-kind 分支:
+    /// - 图片 (kind=image / .file+.imageFile / .file+.video) 卡 **省略 kind 字**——
+    ///   缩略图本身已是视觉提示,再写"图片"是冗余
+    ///   - .image: "尺寸 · 时间"（原生剪贴板无文件名）
+    ///   - .file+.imageFile / .file+.video: "文件名 · 尺寸 · 时间"
+    /// - PDF / 音频 / 普通文件 / 其他 kind 保留 kindLabel(视觉提示弱或无缩略图)
     private var footerMeta: String {
-        var parts: [String] = [kindLabel]
-        if item.kind == .image, let size = item.blobSize {
-            parts.append(humanSize(size))
-        }
         let rel = relativeFormatter.localizedString(for: capturedDate, relativeTo: Date())
+        let size = item.blobSize.map { humanSize($0) }
+        var parts: [String] = []
+
+        if item.kind == .image {
+            // 原生剪贴板图片：尺寸 · 时间
+            if let s = size { parts.append(s) }
+        } else if item.kind == .file {
+            switch ItemClassifier.fileSubKind(item) {
+            case .imageFile, .video:
+                // Finder 复制的图片/视频文件：文件名 · 尺寸 · 时间
+                if let name = firstFileName { parts.append(name) }
+                if let s = size { parts.append(s) }
+            case .pdf, .audio, .none:
+                // PDF / 音频 / 普通文件：保留 kindLabel
+                parts.append(kindLabel)
+            }
+        } else {
+            // text/rtf/html/url：保留 kindLabel
+            parts.append(kindLabel)
+        }
+
         parts.append(rel)
         return parts.joined(separator: " · ")
+    }
+
+    /// `.file` kind 第一行路径的文件名。textFull 是 `\n`-join 路径串(CaptureService 写入),
+    /// 取首行 → URL.lastPathComponent。跟 `previewText` 的文件名解析口径一致
+    private var firstFileName: String? {
+        guard let raw = item.textFull,
+              let first = raw.split(separator: "\n", omittingEmptySubsequences: true).first else {
+            return nil
+        }
+        let name = URL(fileURLWithPath: String(first)).lastPathComponent
+        return name.isEmpty ? nil : name
     }
 
     /// 选中态 accent 描边优先;未选中按 remote mirror 区分:

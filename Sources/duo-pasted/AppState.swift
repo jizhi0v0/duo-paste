@@ -47,6 +47,28 @@ final class AppState {
     /// 不持久化；SearchView 顶部以 caption 形态短暂显示
     var recentNotice: String?
 
+    // MARK: - slash 补全菜单状态
+    /// 搜索框输入 `/xxx` 时弹的补全菜单是否显示。SearchView 监听 query 变化时按当前 token
+    /// 是否以 `/` 开头来 set，SearchPanelController.installKeyMonitor 据此把 ↑↓/Enter/Esc
+    /// 路由到补全菜单而非卡片导航
+    var completionMenuVisible: Bool = false
+    /// 补全菜单高亮项的 index。↑↓ 改它
+    var completionHighlight: Int = 0
+    /// 补全候选列表。SearchView .onChange(query) 时刷
+    var completionCandidates: [(display: String, qualifier: QueryQualifier)] = []
+
+    /// 已激活的 slash qualifier —— 搜索框左侧以 pill chip 形态渲染(QualifierChip),
+    /// 每个带 ✕ 按钮可点删。SearchView onChange(query) 监听到空格后的合法 /xxx token
+    /// 时自动抽进来；用户 Enter 选补全候选也是 append 到这里。
+    ///
+    /// 跟 query: String 是两条独立 state ——
+    /// - query 装搜索文本 + 末尾未闭合的 /xxx(让补全菜单匹配)
+    /// - activeQualifiers 装已成型的 chip qualifier
+    /// refresh() 时两者取并集传给 SearchQuery。
+    /// chip selectedKinds / selectedFileSubKinds 跟 activeQualifiers 也是 OR 并集——
+    /// 用户点 PDF chip 跟 /pdf 选补全是等价的两条入口
+    var activeQualifiers: [QueryQualifier] = []
+
     /// 时间窗选项。换算成 SearchQuery.fromNs（toNs 始终 nil = 不卡上界）。
     /// 注：用 wall-clock 算窗口起点，时钟偏移大时窗口范围会跟实际感受偏离——
     /// 但 mirror 端 ingested_at_ns 已对齐 primary，主要影响是 own-origin item 在
@@ -86,7 +108,126 @@ final class AppState {
     var filterID: String {
         let kindsStr = selectedKinds.map { $0.rawValue }.sorted().joined(separator: ",")
         let subsStr = selectedFileSubKinds.map { $0.rawValue }.sorted().joined(separator: ",")
-        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
+        // activeQualifiers 进 filterID:string 化保留顺序,变化触发 .task(id:) 重 fetch
+        let qualsStr = activeQualifiers.map { qualifierKey($0) }.joined(separator: ",")
+        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(qualsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
+    }
+
+    /// QueryQualifier 的 string key,filterID 用
+    private func qualifierKey(_ q: QueryQualifier) -> String {
+        switch q {
+        case .kind(let k): return "k:\(k.rawValue)"
+        case .fileSubKind(let s): return "s:\(s.rawValue)"
+        case .textSuffix(let s): return "x:\(s)"
+        case .imageMerged: return "im"
+        }
+    }
+
+    /// chip kind 高亮判定：chip 自身 selectedKinds 选中，**或** activeQualifiers 里出现
+    /// 该 kind 的 slash qualifier 都算高亮（[图片] chip 同时响应 `.imageMerged`）
+    func isKindActive(_ k: ItemKind) -> Bool {
+        if selectedKinds.contains(k) { return true }
+        for q in activeQualifiers {
+            if case .kind(let kk) = q, kk == k { return true }
+            if k == .image, case .imageMerged = q { return true }
+        }
+        return false
+    }
+
+    /// chip sub-kind 高亮判定。imageFile sub-kind 同时响应 `.imageMerged`（用户想精准筛
+    /// 文件路径图片仍然要显式 `/imagefile`）
+    func isFileSubKindActive(_ sub: FileSubKind) -> Bool {
+        if selectedFileSubKinds.contains(sub) { return true }
+        for q in activeQualifiers {
+            if case .fileSubKind(let ss) = q, ss == sub { return true }
+            if sub == .imageFile, case .imageMerged = q { return true }
+        }
+        return false
+    }
+
+    /// [图片] chip toggle：合并语义同时操作 .image + .imageFile 两个 Set，让 SQL 端通过
+    /// kinds OR fileSubKinds 拿到两种存储路径
+    func toggleImageChip() {
+        let active = selectedKinds.contains(.image) || selectedFileSubKinds.contains(.imageFile)
+        if active {
+            selectedKinds.remove(.image)
+            selectedFileSubKinds.remove(.imageFile)
+        } else {
+            selectedKinds.insert(.image)
+            selectedFileSubKinds.insert(.imageFile)
+        }
+    }
+
+    /// [图片] chip 计数 = 原生剪贴板图片 + 文件路径图片之和
+    var imageMergedCount: Int {
+        (kindCounts[.image] ?? 0) + (fileSubKindCounts[.imageFile] ?? 0)
+    }
+
+    /// ✕ 清除按钮调用：同时清 chip selection + activeQualifiers + 剥 query 里 slash token,
+    /// 让"清除筛选"一键到位
+    func clearAllFilters() {
+        selectedKinds.removeAll()
+        selectedFileSubKinds.removeAll()
+        activeQualifiers.removeAll()
+        // query 里末尾未闭合的 / token 也清掉（用户输了 "/pd" 没选补全就点 ✕，残留没意义）
+        // 先 extract 然后 remaining 就是清干净后的状态
+        let (_, remaining) = QueryParser.extractCompleted(query)
+        // remaining 可能还含未闭合的 /xxx,继续 split 把开头 / 的 token 都剔
+        let cleaned = remaining
+            .split(separator: " ", omittingEmptySubsequences: true)
+            .filter { !$0.hasPrefix("/") }
+            .joined(separator: " ")
+        if cleaned != query {
+            query = cleaned
+        }
+    }
+
+    /// 接受补全 —— 把 query 末尾未闭合的 /xxx token 剥掉,候选 qualifier 加进 activeQualifiers。
+    /// 不再往 query 字符串里塞 alias 字面量(老姿态),让搜索框只装"搜索文本",chip 体现 qualifier。
+    /// SearchPanelController 在 completionMenuVisible 时把 Enter 路由到这里
+    func acceptCompletion(at index: Int? = nil) {
+        let idx = index ?? completionHighlight
+        guard idx < completionCandidates.count else { return }
+        let candidate = completionCandidates[idx]
+        // 剥掉末尾 /xxx token —— 找最后一个空格,后面那段就是末尾 token
+        if let lastSpace = query.lastIndex(of: " ") {
+            query = String(query[...lastSpace])
+        } else {
+            query = ""
+        }
+        // 加进 activeQualifiers(去重)
+        if !activeQualifiers.contains(candidate.qualifier) {
+            activeQualifiers.append(candidate.qualifier)
+        }
+        completionMenuVisible = false
+        completionCandidates = []
+        completionHighlight = 0
+    }
+
+    /// 补全菜单 ↑↓ 移动高亮项
+    func moveCompletionHighlight(by delta: Int) {
+        guard !completionCandidates.isEmpty else { return }
+        let n = completionCandidates.count
+        completionHighlight = ((completionHighlight + delta) % n + n) % n
+    }
+
+    /// 关闭补全菜单（Esc 路径）
+    func dismissCompletion() {
+        completionMenuVisible = false
+        completionCandidates = []
+        completionHighlight = 0
+    }
+
+    /// Backspace 在 query 为空 + activeQualifiers 非空时,弹掉最后一个 chip。
+    /// SearchPanelController 在 keyCode=51 拦截路由
+    func popLastQualifier() {
+        guard !activeQualifiers.isEmpty else { return }
+        activeQualifiers.removeLast()
+    }
+
+    /// 点 chip ✕ 删特定 qualifier
+    func removeQualifier(_ q: QueryQualifier) {
+        activeQualifiers.removeAll { $0 == q }
     }
     /// 键盘导航触发滚动用的脉冲计数；每次箭头导航 +1，触发 SearchView 滚动到选中项。
     /// 鼠标点击只改 selectedIDs 不动这个，避免不必要的滚动。
@@ -278,12 +419,43 @@ final class AppState {
     }
 
     func refresh() async {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 把 chip selection 跟 activeQualifiers 取并集落到 SearchQuery —— 用户点 PDF chip
+        // 跟选 /pdf 补全必须等价。imageMerged 同时贡献到 kinds(.image) + fileSubKinds(.imageFile)
+        var kindsUnion = selectedKinds
+        var subsUnion = selectedFileSubKinds
+        var suffixes: [String] = []
+        for qual in activeQualifiers {
+            switch qual {
+            case .kind(let k):
+                kindsUnion.insert(k)
+            case .fileSubKind(let s):
+                subsUnion.insert(s)
+            case .imageMerged:
+                kindsUnion.insert(.image)
+                subsUnion.insert(.imageFile)
+            case .textSuffix(let s):
+                suffixes.append(s)
+            }
+        }
+        // query 里可能还有用户尚未确认的末尾 /xxx token（补全菜单显示但未 Enter）—— 走
+        // QueryParser.extractCompleted 兜底:把已闭合的 /xxx 也算上,让用户即使不走补全
+        // 直接输 "/pdf hello" 也能正确筛
+        let (extraQuals, remaining) = QueryParser.extractCompleted(query)
+        for qual in extraQuals {
+            switch qual {
+            case .kind(let k): kindsUnion.insert(k)
+            case .fileSubKind(let s): subsUnion.insert(s)
+            case .imageMerged: kindsUnion.insert(.image); subsUnion.insert(.imageFile)
+            case .textSuffix(let s): suffixes.append(s)
+            }
+        }
+        let trimmed = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
         let q = SearchQuery(
             text: trimmed.isEmpty ? nil : trimmed,
             fromNs: timeRange.fromNs(),
-            kinds: Array(selectedKinds),
-            fileSubKinds: Array(selectedFileSubKinds),
+            kinds: Array(kindsUnion),
+            fileSubKinds: Array(subsUnion),
+            textFullSuffixes: suffixes,
             pinnedOnly: pinnedOnly,
             limit: Self.listLimit
         )

@@ -9,6 +9,10 @@ public struct SearchQuery: Sendable, Equatable {
     /// `.file` kind 的虚拟 sub-kind 过滤(视频/PDF/音频/图片文件)。语义上跟 `kinds`
     /// **OR 关系**——`kinds=[.text]` + `fileSubKinds=[.video]` 命中文本 OR 视频文件
     public var fileSubKinds: [FileSubKind]
+    /// 文件扩展名后缀过滤（如 [".java", ".py"]）。跟 kinds / fileSubKinds **OR 关系**。
+    /// 走 `LOWER(text_full) LIKE '%.java'`——FTS5 unicode61 tokenizer 对 `.` 不可靠，
+    /// 用 LIKE 后缀匹配跟 sub-kind ext 路径同构。给 slash qualifier `/java /c /py` 用
+    public var textFullSuffixes: [String]
     public var pinnedOnly: Bool
     public var includeDeleted: Bool
     public var limit: Int
@@ -20,6 +24,7 @@ public struct SearchQuery: Sendable, Equatable {
         toNs: Int64? = nil,
         kinds: [ItemKind] = [],
         fileSubKinds: [FileSubKind] = [],
+        textFullSuffixes: [String] = [],
         pinnedOnly: Bool = false,
         includeDeleted: Bool = false,
         limit: Int = 200,
@@ -30,6 +35,7 @@ public struct SearchQuery: Sendable, Equatable {
         self.toNs = toNs
         self.kinds = kinds
         self.fileSubKinds = fileSubKinds
+        self.textFullSuffixes = textFullSuffixes
         self.pinnedOnly = pinnedOnly
         self.includeDeleted = includeDeleted
         self.limit = limit
@@ -81,12 +87,12 @@ public struct SearchAPI: Sendable {
         // pinnedOnly=true 或 q.kinds 非空时 oversample 必须无界——否则按时间倒序取 limit+offset
         // 行可能全是不该出现在结果里的类型/未 pin 状态，filter 后凑不齐 q.limit。剪贴板量级
         // 万级，Swift 端 fold 几毫秒，可接受。
-        let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty || !q.fileSubKinds.isEmpty
+        let needsPostFilter = q.pinnedOnly || !q.kinds.isEmpty || !q.fileSubKinds.isEmpty || !q.textFullSuffixes.isEmpty
         let oversampleLimit = needsPostFilter ? Int.max : (q.limit + q.offset)
         let oversample = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
-            kinds: [], fileSubKinds: [], pinnedOnly: false,
+            kinds: [], fileSubKinds: [], textFullSuffixes: [], pinnedOnly: false,
             includeDeleted: q.includeDeleted,
             limit: oversampleLimit,
             offset: 0
@@ -122,16 +128,21 @@ public struct SearchAPI: Sendable {
 
         // 按 winner 行的字段过滤——不可前置到子查询。countByKindUnion / countUnion 走同源
         // 不变量保证 chip 数字、count、list 三者口径一致。
-        // kinds + fileSubKinds 走 **OR** 关系——任一命中即保留(empty + empty = 全保留)
-        if !q.kinds.isEmpty || !q.fileSubKinds.isEmpty {
+        // kinds + fileSubKinds + textFullSuffixes 走 **OR** 关系——任一命中即保留(空 = 全保留)
+        if !q.kinds.isEmpty || !q.fileSubKinds.isEmpty || !q.textFullSuffixes.isEmpty {
             let allowedKinds = Set(q.kinds)
             let subSet = Set(q.fileSubKinds)
+            let suffixes = q.textFullSuffixes.map { $0.lowercased() }
             deduped = deduped.filter { hit in
                 let item = hit.0
                 if allowedKinds.contains(item.kind) { return true }
                 if !subSet.isEmpty, item.kind == .file,
                    let sub = ItemClassifier.fileSubKind(item),
                    subSet.contains(sub) {
+                    return true
+                }
+                if !suffixes.isEmpty, let tf = item.textFull?.lowercased(),
+                   suffixes.contains(where: { tf.hasSuffix($0) }) {
                     return true
                 }
                 return false
@@ -244,6 +255,7 @@ public struct SearchAPI: Sendable {
                 fromNs: q.fromNs, toNs: q.toNs,
                 kinds: q.kinds,
                 fileSubKinds: q.fileSubKinds,
+                textFullSuffixes: q.textFullSuffixes,
                 pinnedOnly: q.pinnedOnly,
                 includeDeleted: q.includeDeleted,
                 limit: Int.max,
@@ -258,11 +270,15 @@ public struct SearchAPI: Sendable {
     /// chip 会得到多少"，跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法
     /// 判断稀疏类型。跟 `searchHits` / `count` 同源走 fold 路径，保证 chip / total / list 口径一致。
     public func countByKind(_ q: SearchQuery) throws -> [ItemKind: Int] {
+        // textFullSuffixes 是搜索维度（用户输 /java 想看 java 文件），不是 chip 维度，
+        // 跟 kinds/fileSubKinds 不同——保留进 stripped 让 chip count 反映"如果只选这个
+        // chip + 当前搜索范围有多少"，而不是"忽略整个搜索范围"
         let stripped = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
             kinds: [],
             fileSubKinds: [],
+            textFullSuffixes: q.textFullSuffixes,
             pinnedOnly: q.pinnedOnly,
             includeDeleted: q.includeDeleted,
             limit: Int.max, offset: 0
@@ -286,6 +302,7 @@ public struct SearchAPI: Sendable {
             fromNs: q.fromNs, toNs: q.toNs,
             kinds: [],
             fileSubKinds: [],
+            textFullSuffixes: q.textFullSuffixes,
             pinnedOnly: q.pinnedOnly,
             includeDeleted: q.includeDeleted,
             limit: Int.max, offset: 0
@@ -316,6 +333,10 @@ public struct SearchAPI: Sendable {
         for sub in q.fileSubKinds {
             let pred = subKindSQL(sub, args: &args)
             clauses.append("(item.kind = 'file' AND \(pred))")
+        }
+        for suffix in q.textFullSuffixes {
+            args.append("%" + suffix.lowercased())
+            clauses.append("LOWER(IFNULL(item.text_full,'')) LIKE ?")
         }
         guard !clauses.isEmpty else { return nil }
         return clauses.count == 1 ? clauses[0] : "(" + clauses.joined(separator: " OR ") + ")"

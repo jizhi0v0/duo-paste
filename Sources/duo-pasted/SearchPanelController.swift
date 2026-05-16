@@ -13,14 +13,29 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// 多选合并 vs 降级首项的语义由 AppDelegate.pasteBack 决定
     private let onPaste: ([Item]) -> Void
     /// ⌘Return 时触发——file/image kind 且**单选**。AppDelegate 用它调 NSWorkspace reveal/open。
-    /// 多选 reveal 语义不清,仅单选生效
+    /// 多选 reveal 语义不清,仅单选生效。SearchView 右键 contextMenu "在 Finder 显示" 也走这里
     private let onReveal: ((Item) -> Void)?
+    /// 右键 contextMenu "打开方式" 子菜单选中某 app 后触发。(item, app bundleURL)。
+    /// AppDelegate 用 OpenWithStaging 物化 item → NSWorkspace 调起目标 app。
+    /// nil 时 SearchView 不显示子菜单
+    private let onOpenWith: ((Item, URL) -> Void)?
     /// panel hide / dismiss 路径调用——AppDelegate 用它 cancel 进行中的 lazy paste
     /// task + 重置 state.pasteProgress。覆盖三条触发点：Esc 键 / windowDidResignKey
     /// （焦点切走）/ 主动调 hide() 的其它入口
     private let onDismiss: () -> Void
     private var panel: NSPanel?
+    /// 标记 ensurePanel 是否刚创建了新 panel(冷启动首次 show)。show() 路径用它决定是否
+    /// defer 一个 runloop tick 让 SwiftUI 完成 .glassEffect / .ultraThickMaterial 首帧渲染,
+    /// 否则黑影会出现在 alpha fadein 期间。复用 panel 时这个标记是 false 直接动画
+    private var freshlyCreated: Bool = false
     private var localKeyMonitor: Any?
+    /// 全局鼠标监听器——抓"用户点了我们 app 之外区域"的事件,触发自动 hide。
+    /// 解决 preview 打开时 windowDidResignKey 被守卫(防 TCC alert)的副作用:
+    /// 单纯 resign-key 不区分键盘切走/系统 alert/鼠标点外面,无法只关心后者;
+    /// 改成 global mouse monitor 专门捕获鼠标点外区域 → 主动 hide。
+    /// global monitor 永远收不到自家 app 内事件(包括 search panel + preview panel),
+    /// 所以点 panel 自身不会误触发,TCC alert 是系统弹无鼠标 down 也不会触发
+    private var globalClickMonitor: Any?
     /// 空格预览的独立浮窗 controller。lazy 跟搜索 panel 同生命周期——首次 ensurePanel
     /// 时一并创建,setAnchor 绑搜索 panel 作为屏幕坐标换算锚点。
     /// 浮窗不抢 key,因此搜索 panel 的 NSEvent monitor 仍然能截到空格/箭头/Esc 路由预览
@@ -28,10 +43,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 
     init(state: AppState, onPaste: @escaping ([Item]) -> Void,
          onReveal: ((Item) -> Void)? = nil,
+         onOpenWith: ((Item, URL) -> Void)? = nil,
          onDismiss: @escaping () -> Void = {}) {
         self.state = state
         self.onPaste = onPaste
         self.onReveal = onReveal
+        self.onOpenWith = onOpenWith
         self.onDismiss = onDismiss
     }
 
@@ -59,14 +76,29 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         p.makeKeyAndOrderFront(nil)
         installKeyMonitor()
+        installGlobalClickMonitor()
         // 触发 SearchView 重新抢焦点 + kick refresh（panel 被复用，onAppear 不再 fire）
         state.openPulse &+= 1
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.85, 0.3, 1.0)
-            ctx.allowsImplicitAnimation = true
-            p.animator().setFrameOrigin(targetOrigin)
-            p.animator().alphaValue = 1
+        // 冷启动首次 show 时 SwiftUI .glassEffect / .ultraThickMaterial 渲染是 async 的,
+        // ensurePanel 的 layoutSubtreeIfNeeded 只保证 AppKit 层 layout pass 跑过,SwiftUI 的
+        // material 子层仍可能落后一帧。defer 一个 main runloop tick 让 render server 接管
+        // 后再启动 fadein 动画,黑影就藏在 alpha=0 阶段不会被用户看到
+        let wasFreshlyCreated = freshlyCreated
+        freshlyCreated = false
+        let animate: @MainActor () -> Void = { [weak p] in
+            guard let p else { return }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.85, 0.3, 1.0)
+                ctx.allowsImplicitAnimation = true
+                p.animator().setFrameOrigin(targetOrigin)
+                p.animator().alphaValue = 1
+            }
+        }
+        if wasFreshlyCreated {
+            DispatchQueue.main.async { MainActor.assumeIsolated(animate) }
+        } else {
+            animate()
         }
     }
 
@@ -76,6 +108,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         guard let p = panel, p.isVisible else {
             panel?.orderOut(nil)
             removeKeyMonitor()
+            removeGlobalClickMonitor()
             finalizeHide()
             return
         }
@@ -95,6 +128,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 // alpha 复位让下次 show 不会因为残留 alpha=0 被中断
                 self.panel?.alphaValue = 1
                 self.removeKeyMonitor()
+                self.removeGlobalClickMonitor()
                 self.finalizeHide()
             }
         })
@@ -129,16 +163,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             let keyCode = Int(event.keyCode)
             let isCmd = event.modifierFlags.contains(.command)
             // 横向卡片布局:←/→ 切换选中(123/124);↑/↓(126/125)继续兼容老用户 muscle memory
-            // (TextField 横向单行,↑/↓ 移光标无意义,可吞掉重定向到 navigate)
-            let interceptCodes: Set<Int> = [123, 124, 125, 126, 36, 76, 53]
+            // (TextField 横向单行,↑/↓ 移光标无意义,可吞掉重定向到 navigate)。
+            // 51 = Backspace,仅在 query 为空 + activeQualifiers 非空时拦截弹最后一个 chip,
+            // 其他情况透传给 TextField 让用户正常删字
+            let interceptCodes: Set<Int> = [123, 124, 125, 126, 36, 76, 53, 51]
             // ⌘P (keyCode=35) = 切换选中行的 pinned。仅 Cmd 修饰键命中时截走；
             // 不带修饰键的 P 透传给 TextField 当作正常字符输入
             let isCmdP = (keyCode == 35 && isCmd)
-            // 空格键(49)的拦截条件比较微妙——只在以下两种情况下吞掉:
+            // 空格键(49)的拦截条件比较微妙——只在以下三种情况下吞掉:
             //   1) preview 已经打开 → 空格关闭 preview(Quick Look 风格 toggle)
-            //   2) preview 关闭 + 搜索框为空 + 有选中项 → 空格打开 preview
-            // 搜索框非空(用户正在输入)时,空格必须透传给 TextField 当作正常字符,
-            // 否则 "hello world" 这种带空格的搜索就完全没法输入了。
+            //   2) preview 关闭 + query 为空 + 有选中项 → 空格打开 preview
+            //   3) 其余情况(query 非空)透传给 TextField 当字面空格输入,
+            //      让 "ipados news" / "hello world" 多词搜索可输入
             // MainActor.assumeIsolated 读 state 必须在闭包内,这里只决定 "要不要拦"
             // 不读 state 细节——用一个稍宽的过滤器,真正的分流在下面 switch
             let isSpace = (keyCode == 49)
@@ -159,6 +195,37 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 guard let self, let panel = self.panel, panel.isKeyWindow else {
                     return false
                 }
+                // slash 补全菜单优先消化 ↑↓/Enter/Esc——必须在卡片导航 / Quick Look /
+                // 粘贴路径之前判断,否则补全菜单的方向键会跟卡片导航打架
+                if self.state.completionMenuVisible {
+                    switch keyCode {
+                    case 125, 124:                              // ↓ / →
+                        self.state.moveCompletionHighlight(by: 1)
+                        return true
+                    case 126, 123:                              // ↑ / ←
+                        self.state.moveCompletionHighlight(by: -1)
+                        return true
+                    case 36, 76:                                // Return / Enter
+                        self.state.acceptCompletion()
+                        return true
+                    case 53:                                    // Esc
+                        self.state.dismissCompletion()
+                        return true
+                    default:
+                        break
+                    }
+                }
+                // Backspace 在 query 空 + activeQualifiers 非空时弹最后一个 chip。
+                // 补全菜单显示时 backspace 透传(让用户改 /xx 输入),不弹 chip
+                if keyCode == 51 {
+                    if !self.state.completionMenuVisible
+                        && self.state.query.isEmpty
+                        && !self.state.activeQualifiers.isEmpty {
+                        self.state.popLastQualifier()
+                        return true
+                    }
+                    return false  // 透传给 TextField 正常删字
+                }
                 switch keyCode {
                 case 49:                                        // Space — Quick Look 风格预览
                     if self.state.previewShown {
@@ -166,11 +233,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                         self.state.previewShown = false
                         return true
                     }
-                    // preview 未开:只要有选中项就开预览。这里**故意不**判 query.isEmpty——
-                    // user 反馈:搜 "pdf" 拿到结果后按空格,期望是预览不是往输入框塞空格。
-                    // 代价是搜索框输不进字面空格(FTS5 多词查询比如 "ipados news" 无法直输),
-                    // 但剪贴板搜索基本是单关键词,权衡可接受。Esc 清空 query 后空格仍能开预览,
-                    // ✕ 按钮可清 query
+                    // preview 未开 + query 非空 → 透传给 TextField 当字面空格,
+                    // 让 "ipados news" 这种多词搜索可输入。query 为空时空格触发 preview
+                    // (剪贴板搜索常态:打开 panel → 立刻看预览)
+                    let trimmed = self.state.query.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard trimmed.isEmpty else { return false }
                     if self.state.currentItem != nil {
                         self.state.previewShown = true
                         return true
@@ -240,6 +307,30 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         }
     }
 
+    /// 装全局鼠标监听:用户点击我们 app 之外区域(其它 app / 桌面)→ 主动 hide 整个
+    /// search panel + preview。global monitor 文档保证只能看到自家 app 之外的事件,
+    /// 所以点 search panel / preview panel 内部都不会误触发,无需额外 hit-test。
+    /// 跟 windowDidResignKey 互补:那条路径被 previewShown 守卫(防 TCC alert 误关),
+    /// 这里覆盖"鼠标主动点外面要退出"的明确意图——TCC alert 是系统弹窗不会派 mouseDown,
+    /// 所以两条路径不会冲突
+    private func installGlobalClickMonitor() {
+        guard globalClickMonitor == nil else { return }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.hide()
+            }
+        }
+    }
+
+    private func removeGlobalClickMonitor() {
+        if let m = globalClickMonitor {
+            NSEvent.removeMonitor(m)
+            globalClickMonitor = nil
+        }
+    }
+
     private func ensurePanel() -> NSPanel {
         if let p = panel { return p }
         // Floating island 风格:四周留 margin,四角都圆。早期推过"全宽贴底",但视觉太
@@ -248,11 +339,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         // 量呼吸。positionBottom 用同一对常量保持单一来源
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let hMargin: CGFloat = Self.panelHMargin
-        // header(~56) + filterBar(~32) + ScrollView(254) + 底 padding(14) = 356
+        // header(~56) + filterBar(~32) + ScrollView(254) + 底 padding(16) = 358
         let contentRect = NSRect(
             x: 0, y: 0,
             width: max(640, screenFrame.width - hMargin * 2),
-            height: 356
+            height: 358
         )
         // borderless 让 window frame 直接 = content rect,setFrameOrigin 设的 y 就是 content
         // 底沿。原 .titled + fullSizeContentView 组合下 window.frame.height = content + 28pt
@@ -309,7 +400,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 } else {
                     preview.hide()
                 }
-            }
+            },
+            // contextMenu "在 Finder 显示" + ⌘Return 走同一 onReveal handler
+            onReveal: onReveal,
+            // contextMenu "打开方式" 子菜单。nil 时 SearchView 自动隐藏该项
+            onOpenWith: onOpenWith
         )
         let hosting = NSHostingView(rootView: root)
         hosting.frame = contentRect
@@ -319,11 +414,21 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         hosting.layer?.cornerRadius = 22
         hosting.layer?.cornerCurve = .continuous
         hosting.layer?.masksToBounds = true
+        // 首次 show 时 SwiftUI `.glassEffect / .ultraThickMaterial` 子层渲染晚于 panel 现身一帧,
+        // 期间 wantsLayer=true 后默认 layer.backgroundColor=nil 会让 CA 渲染 fallback 黑色块
+        // ("第一次点开搜索框,中间黑影闪烁一下")。显式 .clear 让首帧透明,等 material 接管
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
         p.contentView = hosting
         // wantsLayer/cornerRadius 后 invalidate 让 shadow 重新按 mask 计算
         p.invalidateShadow()
+        // 强制 SwiftUI 跑一次 layout —— 否则 show() 路径 makeKeyAndOrderFront 后 SwiftUI 才
+        // 触发首次 layout/render,在 .glassEffect / .ultraThickMaterial 接管前的一两帧空隙里,
+        // image kind 卡片的 contentArea 区域露 layer backing store fallback 黑块
+        // ("第一次点开搜索框,中部偏左卡片大小黑影闪烁一下")
+        hosting.layoutSubtreeIfNeeded()
 
         panel = p
+        freshlyCreated = true
         return p
     }
 
@@ -345,7 +450,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// Panel 外边距(屏幕边/Dock 顶 → panel 边)。ensurePanel 算 contentRect width 和
     /// positionBottom 设 origin 都用同一对常量,保证 margin 真的对称
     fileprivate static let panelHMargin: CGFloat = 8
-    fileprivate static let panelVMargin: CGFloat = 6
+    fileprivate static let panelVMargin: CGFloat = 16
 
     /// macOS keyCode → 数字键面值(1-9)反查表。⌘+N 快捷粘贴用。
     /// 数字键 keyCode 不连续:1=18 2=19 3=20 4=21 5=23 6=22 7=26 8=28 9=25;
