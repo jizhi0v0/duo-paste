@@ -40,6 +40,10 @@ public struct SyncServer: Sendable {
         }
     }
 
+    /// `/health` 响应里 `ponte_host` 字段的来源。生产路径 = SurgePonte 自动发现；
+    /// 测试可注入固定值（避免依赖 dev mac 是否装了 Surge / 配了 Ponte）
+    public let ponteHostProvider: @Sendable () -> String?
+
     public init(
         deviceID: String,
         database: DuoPasteCore.Database,
@@ -48,7 +52,8 @@ public struct SyncServer: Sendable {
         port: Int,
         auth: HMACAuth,
         tls: TLSPaths? = nil,
-        broadcaster: WSBroadcaster? = nil
+        broadcaster: WSBroadcaster? = nil,
+        ponteHostProvider: @escaping @Sendable () -> String? = { SurgePonte.discoverSelfHostname() }
     ) {
         self.deviceID = deviceID
         self.database = database
@@ -58,16 +63,22 @@ public struct SyncServer: Sendable {
         self.auth = auth
         self.tls = tls
         self.broadcaster = broadcaster
+        self.ponteHostProvider = ponteHostProvider
     }
 
     public func run() async throws {
         let router = Router()
         router.add(middleware: HMACAuthMiddleware(auth: auth))
+        // 启动时一次性发现本机 Surge Ponte 主机名（没装 Surge → nil）。结果常驻 server 生命周期，
+        // 不每个 /health 重读 plist。SGCore.plist 真改了要重启 daemon 才会刷新，可接受——
+        // Surge 配置变更本来就属于运维事件
+        let pontePeerHost = ponteHostProvider()
         Self.registerRoutes(
             on: router,
             deviceID: deviceID,
             blobs: blobs,
-            sinceAPI: SinceAPI(database: database)
+            sinceAPI: SinceAPI(database: database),
+            ponteHost: pontePeerHost
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -198,14 +209,20 @@ public struct SyncServer: Sendable {
         on router: Router<Ctx>,
         deviceID: String,
         blobs: BlobStore,
-        sinceAPI: SinceAPI
+        sinceAPI: SinceAPI,
+        ponteHost: String? = nil
     ) {
         router.get("/health") { _, _ -> Response in
-            let payload: [String: String] = [
+            var payload: [String: String] = [
                 "ok": "true",
                 "device_id": deviceID,
                 "now_ms": String(Int64(Date().timeIntervalSince1970 * 1000)),
             ]
+            // 本机 Surge Ponte 主机名——告诉对端"用这个名字找我"。没装 Surge 就不写这个键，
+            // 对端 decode 时把它当 optional 处理
+            if let ponteHost {
+                payload["ponte_host"] = ponteHost
+            }
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
             var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
             resp.headers[.contentType] = "application/json"

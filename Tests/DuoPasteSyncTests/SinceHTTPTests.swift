@@ -243,6 +243,50 @@ private func decodeSince(
     #expect(next.nextCursor == page.nextCursor)
 }
 
+@Test func healthSurfacesPonteHostFromProvider() async throws {
+    // ponteHostProvider 注入固定值 → /health 返回 ponte_host=test.sgponte
+    // → HTTPPeerClient.fetchPrimaryHealth decode 出来在 outcome.ok 第三参数
+    // 测的是 wire 端到端：server JSON 编 + client decode 一条龙
+    let (db, blobs, auth, port) = try makeServerFixture(items: [])
+    let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                            host: "127.0.0.1", port: port, auth: auth,
+                            ponteHostProvider: { "test.sgponte" })
+    let serverTask = Task { try? await server.run() }
+    defer { serverTask.cancel() }
+    let base = URL(string: "http://127.0.0.1:\(port)")!
+    #expect(await waitReady(baseURL: base, auth: auth))
+
+    let client = HTTPPeerClient(baseURL: base, auth: auth, session: .shared)
+    let result = try await client.fetchPrimaryHealth()
+    guard case .ok(let deviceID, _, let ponteHost) = result.outcome else {
+        Issue.record("health 非 ok：\(result.outcome)")
+        return
+    }
+    #expect(deviceID == "p")
+    #expect(ponteHost == "test.sgponte")
+}
+
+@Test func healthPonteHostNilWhenProviderReturnsNil() async throws {
+    // ponteHostProvider 返回 nil（没装 Surge / 没配 Ponte）→ wire JSON 不写 ponte_host 键
+    // → client decodeIfPresent 给 nil。老 daemon 不返回该键的兼容路径也走这条
+    let (db, blobs, auth, port) = try makeServerFixture(items: [])
+    let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                            host: "127.0.0.1", port: port, auth: auth,
+                            ponteHostProvider: { nil })
+    let serverTask = Task { try? await server.run() }
+    defer { serverTask.cancel() }
+    let base = URL(string: "http://127.0.0.1:\(port)")!
+    #expect(await waitReady(baseURL: base, auth: auth))
+
+    let client = HTTPPeerClient(baseURL: base, auth: auth, session: .shared)
+    let result = try await client.fetchPrimaryHealth()
+    guard case .ok(_, _, let ponteHost) = result.outcome else {
+        Issue.record("health 非 ok：\(result.outcome)")
+        return
+    }
+    #expect(ponteHost == nil)
+}
+
 @Test func sinceHTTPEmptyResultPreservesCursor() async throws {
     let (db, blobs, auth, port) = try makeServerFixture(items: [
         item(id: "a", ingestedAtNs: 5),

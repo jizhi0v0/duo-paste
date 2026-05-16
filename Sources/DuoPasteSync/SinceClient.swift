@@ -30,7 +30,9 @@ public struct RemoteSinceResult: Sendable {
 
 public struct PrimaryHealthResult: Sendable {
     public enum Outcome: Sendable {
-        case ok(deviceID: String, nowMs: Int64)
+        /// `ponteHost` = 对端 daemon 通过 SurgePonte 自动发现的本机 `.sgponte` 主机名。
+        /// 老 peer / 没装 Surge 的 peer 返回 nil。SmartTransport 用它作 ponte URL candidate
+        case ok(deviceID: String, nowMs: Int64, ponteHost: String?)
         case unreachable(reason: String)
         case rejected(reason: String)
     }
@@ -40,21 +42,25 @@ public struct PrimaryHealthResult: Sendable {
 
 /// `/health` 响应的 wire 形态。注意 `now_ms` 服务端写成字符串（Server.swift），
 /// 这里宽容地两种都接：String → Int64 / Int → Int64。
+/// `ponte_host` 是后加字段，老 daemon 不返回，decode optional 兼容
 private struct HealthResponse: Codable {
     let ok: String?    // "true" / "false"，字符串
     let deviceID: String
     let nowMs: Int64
+    let ponteHost: String?
 
     enum CodingKeys: String, CodingKey {
         case ok
         case deviceID = "device_id"
         case nowMs = "now_ms"
+        case ponteHost = "ponte_host"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.ok = try c.decodeIfPresent(String.self, forKey: .ok)
         self.deviceID = try c.decode(String.self, forKey: .deviceID)
+        self.ponteHost = try c.decodeIfPresent(String.self, forKey: .ponteHost)
         if let s = try? c.decode(String.self, forKey: .nowMs), let n = Int64(s) {
             self.nowMs = n
         } else if let n = try? c.decode(Int64.self, forKey: .nowMs) {
@@ -72,6 +78,7 @@ private struct HealthResponse: Codable {
         try c.encodeIfPresent(ok, forKey: .ok)
         try c.encode(deviceID, forKey: .deviceID)
         try c.encode(String(nowMs), forKey: .nowMs)
+        try c.encodeIfPresent(ponteHost, forKey: .ponteHost)
     }
 }
 
@@ -171,7 +178,7 @@ extension HTTPPeerClient: SinceTransport {
         case 200...299:
             do {
                 let h = try JSONDecoder().decode(HealthResponse.self, from: data)
-                return PrimaryHealthResult(outcome: .ok(deviceID: h.deviceID, nowMs: h.nowMs))
+                return PrimaryHealthResult(outcome: .ok(deviceID: h.deviceID, nowMs: h.nowMs, ponteHost: h.ponteHost))
             } catch {
                 return PrimaryHealthResult(outcome: .unreachable(reason: "decode: \(error)"))
             }

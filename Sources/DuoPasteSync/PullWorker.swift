@@ -226,7 +226,8 @@ public actor PullWorker {
         let currentPeerID: String
         let peerNowMs: Int64
         switch healthRes.outcome {
-        case .ok(let id, let nowMs):
+        case .ok(let id, let nowMs, _):
+            // 第三个位置参数是 ponteHost，PullWorker 不消费——SmartTransport 在 reconcile 时单独 discover
             // 拒绝空 device_id：会污染 pull_cursor.peer_device_id 主键 + 在 reconcile 里假阳性
             // 触发清行。理论上 server 永远不会返回空（DeviceID.loadOrCreate 保证），但万一旧版
             // / 篡改 / 网络中间件改包，guard 在这里。

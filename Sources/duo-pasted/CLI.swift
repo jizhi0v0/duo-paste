@@ -25,6 +25,8 @@ enum CLI {
             runMeshDoctor(args: rest)
         case "mesh-fetch-missing":
             runMeshFetchMissing(args: rest)
+        case "ponte-self":
+            runPonteSelf(args: rest)
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -79,6 +81,14 @@ enum CLI {
                                   eager_blobs=false）升到新默认 full 后跑一次补历史。
                                   默认 concurrency=4。--peer 限定单个 peer URL（默认按
                                   config peers 顺序尝试每个）。--dry-run 只列缺失不拉。
+
+          ponte-self [--verbose]  从 ~/Library/Application Support/com.nssurge.surge-mac/
+                                  SGCore.plist 推断本机 Surge Ponte 主机名（按 hw.model
+                                  + ComputerName 在 PonteDeviceList 里挑 ponteType=3 的
+                                  entry），打印 `<name>.sgponte`。给对端配 pull_url 时
+                                  用——peer config 里写这个串就能走 ponte 快路径。
+                                  找不到（没装 Surge / 没配 Ponte / 算法不命中）退出码 1
+                                  + stderr 写原因。--verbose 多打硬件指纹方便排查。
         """
         FileHandle.standardOutput.write(Data((text + "\n").utf8))
     }
@@ -94,6 +104,35 @@ enum CLI {
             FileHandle.standardError.write(Data("init-secret failed: \(error)\n".utf8))
             exit(1)
         }
+    }
+
+    private static func runPonteSelf(args: [String]) {
+        var verbose = false
+        for a in args {
+            switch a {
+            case "--verbose", "-v":
+                verbose = true
+            default:
+                FileHandle.standardError.write(Data("ponte-self: 未知参数 \(a)\n".utf8))
+                exit(1)
+            }
+        }
+        let hwModel = SurgePonte.readHardwareModel()
+        let computerName = SurgePonte.readComputerName()
+        if verbose {
+            FileHandle.standardError.write(Data(
+                "ponte-self: hw.model=\(hwModel ?? "?") ComputerName=\(computerName ?? "?") plist=\(SurgePonte.defaultPlistPath)\n".utf8
+            ))
+        }
+        if let host = SurgePonte.discoverSelfHostname(hwModel: hwModel, computerName: computerName) {
+            print(host)
+            exit(0)
+        }
+        // 找不到时给一行 stderr 说明可能原因，但不抛错
+        FileHandle.standardError.write(Data(
+            "ponte-self: 未发现本机 Ponte 条目（plist 不存在 / 没装 Surge / 没配 Ponte / 算法未唯一命中）\n".utf8
+        ))
+        exit(1)
     }
 
     private static func runRetryFailedOCR(args: [String]) {
@@ -372,7 +411,7 @@ enum CLI {
             do {
                 let r = try await client.fetchPrimaryHealth()
                 switch r.outcome {
-                case .ok(let did, let nowMs): return .ok(deviceID: did, nowMs: nowMs)
+                case .ok(let did, let nowMs, _): return .ok(deviceID: did, nowMs: nowMs)
                 case .unreachable(let reason): return .unreachable(reason: reason)
                 case .rejected(let reason): return .rejected(reason: reason)
                 }

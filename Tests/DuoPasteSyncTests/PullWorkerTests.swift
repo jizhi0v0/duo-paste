@@ -75,7 +75,7 @@ private actor FakeSinceTransport: SinceTransport {
 
     private func _fetchPrimaryHealth() async -> PrimaryHealthResult {
         healthCalls += 1
-        return PrimaryHealthResult(outcome: .ok(deviceID: healthDeviceID, nowMs: healthNowMs))
+        return PrimaryHealthResult(outcome: .ok(deviceID: healthDeviceID, nowMs: healthNowMs, ponteHost: nil))
     }
 }
 

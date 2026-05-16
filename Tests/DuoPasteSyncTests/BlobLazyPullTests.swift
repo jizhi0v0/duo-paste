@@ -74,7 +74,7 @@ private actor FakeSinceTransport: SinceTransport {
         return RemoteSinceResult(outcome: .ok(pages.removeFirst()))
     }
     nonisolated func fetchPrimaryHealth() async throws -> PrimaryHealthResult {
-        PrimaryHealthResult(outcome: .ok(deviceID: healthDeviceID, nowMs: 1_000))
+        PrimaryHealthResult(outcome: .ok(deviceID: healthDeviceID, nowMs: 1_000, ponteHost: nil))
     }
 }
 
