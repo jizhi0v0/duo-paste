@@ -42,6 +42,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 后续点击 makeKeyAndOrderFront 复用同一个 window，关掉时 orderOut 不销毁
     /// 让 SwiftUI 状态（SettingsModel 的 working copy）保留
     private var settingsWindow: NSWindow?
+    private var settingsTrafficLightOverlay: TrafficLightGlyphOverlay?
+
+    private static var reopenSettingsFlag: URL {
+        Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
+    }
+
+    private static func consumeReopenSettingsFlag() -> Bool {
+        let url = reopenSettingsFlag
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        try? FileManager.default.removeItem(at: url)
+        return true
+    }
 
     /// StatusBarController 触发的「设置…」入口。accessory app 没 Dock + 无主菜单，
     /// SwiftUI Settings scene 不响应 `showSettingsWindow:` —— 自管 NSWindow 绕开整个机制
@@ -75,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 自动 respawn 新进程（plist 有 KeepAlive=true）。daemon 进程级重启比手动
     /// `launchctl kickstart` 直接，且新进程会重读 config 让所有非热重载字段生效
     func restartDaemon() {
+        try? "1".write(to: Self.reopenSettingsFlag, atomically: true, encoding: .utf8)
         fputs("restart requested via settings — exiting for launchd respawn\n", stderr)
         exit(0)
     }
@@ -82,23 +95,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showSettings() {
         NSApp.activate(ignoringOtherApps: true)
         if let win = settingsWindow {
+            centerSettingsWindow(win)
             win.makeKeyAndOrderFront(nil)
             return
         }
-        let host = NSHostingController(rootView: SettingsView())
-        let win = NSWindow(contentViewController: host)
-        // 自管 NSWindow，但采用系统默认 Settings 窗口外观：标准 titlebar +
-        // SwiftUI NavigationSplitView sidebar，而不是把内容铺进标题栏手画 sidebar。
-        win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        win.title = "设置"
-        win.titlebarAppearsTransparent = false
-        win.titleVisibility = .visible
-        win.setContentSize(NSSize(width: 880, height: 660))
-        win.minSize = NSSize(width: 820, height: 600)
+        // Paste 风格窗口：内容铺进 titlebar，traffic lights 漂在 sidebar 顶部。
+        // 必须在创建时就传完整 styleMask——NSWindow(contentViewController:) 先用默认
+        // styleMask 完成首次布局，事后追加 .fullSizeContentView 在 macOS 26 上不重新 layout
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        let host = FullBleedHostingView(rootView: SettingsView())
+        win.contentView = host
+        win.title = ""
+        win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
+        win.setContentSize(NSSize(width: 760, height: 620))
+        win.minSize = NSSize(width: 700, height: 560)
+        win.maxSize = win.frame.size
         win.isReleasedWhenClosed = false   // close 走 orderOut，下次直接复用
-        win.center()
+        win.delegate = self
+        centerSettingsWindow(win)
         self.settingsWindow = win
         win.makeKeyAndOrderFront(nil)
+        positionSettingsTrafficLights(in: win)
+    }
+
+    private func centerSettingsWindow(_ window: NSWindow) {
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? window.screen
+            ?? NSScreen.main
+        guard let visibleFrame = screen?.visibleFrame else {
+            window.center()
+            return
+        }
+
+        let frame = window.frame
+        let origin = NSPoint(
+            x: visibleFrame.midX - frame.width / 2,
+            y: visibleFrame.midY - frame.height / 2
+        )
+        window.setFrameOrigin(origin)
+    }
+
+    private func positionSettingsTrafficLights(in window: NSWindow) {
+        guard let close = window.standardWindowButton(.closeButton),
+              let mini = window.standardWindowButton(.miniaturizeButton),
+              let zoom = window.standardWindowButton(.zoomButton),
+              let contentView = window.contentView else { return }
+
+        for button in [close, mini, zoom] where button.superview !== contentView {
+            contentView.addSubview(button, positioned: .above, relativeTo: nil)
+        }
+
+        let topInset: CGFloat = 40
+        let leftInset: CGFloat = 34
+        let spacing: CGFloat = 25
+        let y = contentView.isFlipped
+            ? topInset
+            : contentView.bounds.height - topInset - close.frame.height
+
+        close.setFrameOrigin(NSPoint(x: leftInset, y: y))
+        mini.setFrameOrigin(NSPoint(x: leftInset + spacing, y: y))
+        zoom.setFrameOrigin(NSPoint(x: leftInset + spacing * 2, y: y))
+
+        let overlay = settingsTrafficLightOverlay ?? TrafficLightGlyphOverlay()
+        if overlay.superview !== contentView {
+            overlay.removeFromSuperview()
+            contentView.addSubview(overlay, positioned: .above, relativeTo: nil)
+            settingsTrafficLightOverlay = overlay
+        }
+        overlay.frame = NSRect(
+            x: close.frame.minX - 1,
+            y: min(close.frame.minY, mini.frame.minY, zoom.frame.minY) - 1,
+            width: zoom.frame.maxX - close.frame.minX + 2,
+            height: max(close.frame.height, mini.frame.height, zoom.frame.height) + 2
+        )
+        overlay.buttonDiameter = close.frame.width
+        overlay.buttonSpacing = spacing
+        overlay.needsDisplay = true
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -168,6 +247,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · storage_mode=\(deps.config.mesh.storageMode.rawValue) · db=\(deps.paths.mainDB.path)\n", stderr)
+        if Self.consumeReopenSettingsFlag() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.showSettings()
+            }
+        }
     }
 
     /// 用 config.hotkey 注册 Carbon 全局快捷键；失败时回退到默认 ⌥⌘V 再试一次。
@@ -792,5 +876,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return .failure(reason: "拉取失败")
+    }
+}
+
+extension AppDelegate: NSWindowDelegate {
+    func windowDidResize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === settingsWindow else { return }
+        positionSettingsTrafficLights(in: window)
+    }
+}
+
+private final class FullBleedHostingView<Content: View>: NSHostingView<Content> {
+    override var safeAreaInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+}
+
+private final class TrafficLightGlyphOverlay: NSView {
+    var buttonDiameter: CGFloat = 14
+    var buttonSpacing: CGFloat = 25
+    private var isHovering = false
+
+    override var isFlipped: Bool { true }
+
+    override func updateTrackingAreas() {
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self
+        ))
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+        needsDisplay = true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard isHovering, let context = NSGraphicsContext.current?.cgContext else { return }
+        context.setLineCap(.round)
+        context.setLineWidth(1.25)
+        context.setStrokeColor(NSColor.black.withAlphaComponent(0.52).cgColor)
+
+        drawClose(in: context, center: center(forButtonAt: 0))
+        drawMiniaturize(in: context, center: center(forButtonAt: 1))
+        drawZoom(in: context, center: center(forButtonAt: 2))
+    }
+
+    private func center(forButtonAt index: Int) -> CGPoint {
+        CGPoint(
+            x: 1 + buttonDiameter / 2 + CGFloat(index) * buttonSpacing,
+            y: 1 + buttonDiameter / 2
+        )
+    }
+
+    private func drawClose(in context: CGContext, center: CGPoint) {
+        let r: CGFloat = 3.2
+        context.beginPath()
+        context.move(to: CGPoint(x: center.x - r, y: center.y - r))
+        context.addLine(to: CGPoint(x: center.x + r, y: center.y + r))
+        context.move(to: CGPoint(x: center.x + r, y: center.y - r))
+        context.addLine(to: CGPoint(x: center.x - r, y: center.y + r))
+        context.strokePath()
+    }
+
+    private func drawMiniaturize(in context: CGContext, center: CGPoint) {
+        let r: CGFloat = 3.8
+        context.beginPath()
+        context.move(to: CGPoint(x: center.x - r, y: center.y))
+        context.addLine(to: CGPoint(x: center.x + r, y: center.y))
+        context.strokePath()
+    }
+
+    private func drawZoom(in context: CGContext, center: CGPoint) {
+        let r: CGFloat = 3.9
+        context.beginPath()
+        context.move(to: CGPoint(x: center.x - r, y: center.y))
+        context.addLine(to: CGPoint(x: center.x + r, y: center.y))
+        context.move(to: CGPoint(x: center.x, y: center.y - r))
+        context.addLine(to: CGPoint(x: center.x, y: center.y + r))
+        context.strokePath()
     }
 }

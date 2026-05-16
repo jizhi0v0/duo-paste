@@ -1,47 +1,165 @@
 import SwiftUI
 import AppKit
+import Vision
 import DuoPasteCore
 import DuoPasteSync
 
-/// macOS Settings 窗口入口。三个 tab：常规 / OCR / 关于。
-///
-/// 设计：
-/// - 读写 `~/Library/Application Support/duo-paste/config.json`。所有改动**需要重启 daemon
-///   才能生效**——SwiftUI 端只写盘 + 弹「需要 launchctl kickstart」提示，daemon 启动时
-///   读 config 时机依赖 launchd 拉起新进程
-/// - 通过 `AppDelegate.shared` 取活的 AppState（device-id / mode summary / mesh status）
-/// - 「关于」tab 的「补齐缺失 blob」按钮直接调 `Admin.fetchMissingBlobs`（跟 CLI
-///   `mesh-fetch-missing` 同款实现），跑完弹结果
+/// Paste 风格 Settings：左侧自绘 sidebar，右侧标题 + 紧凑分组卡片。
+/// SwiftUI Settings scene 在 accessory app 里不可靠，所以窗口仍由 AppDelegate 自管。
 struct SettingsView: View {
-    var body: some View {
-        TabView {
-            GeneralSettingsTab()
-                .tabItem { Label("常规", systemImage: "gearshape") }
-            OCRSettingsTab()
-                .tabItem { Label("OCR", systemImage: "text.viewfinder") }
-            AboutSettingsTab()
-                .tabItem { Label("关于", systemImage: "info.circle") }
+    @State private var model = SettingsModel()
+    @State private var pane: Pane = .general
+
+    enum Pane: String, CaseIterable, Hashable, Identifiable {
+        case general, ocr, about
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .general: return "常规"
+            case .ocr: return "OCR"
+            case .about: return "关于"
+            }
         }
-        .frame(width: 560, height: 520)
+
+        var icon: String {
+            switch self {
+            case .general: return "gearshape"
+            case .ocr: return "text.viewfinder"
+            case .about: return "info.circle"
+            }
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Sidebar(pane: $pane)
+                .frame(width: 220)
+            SettingsDetail(pane: pane, model: model)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .ignoresSafeArea()
+        .frame(minWidth: 700, idealWidth: 760, minHeight: 560, idealHeight: 620)
     }
 }
 
-// MARK: - 配置读写共用
+private struct Sidebar: View {
+    @Binding var pane: SettingsView.Pane
 
-/// 读 config + 处理 form 状态 + 写回。所有 tab 共用一份 working copy，
-/// 「应用」按钮按 tab 分散触发 Config.write。
+    var body: some View {
+        sidebarBody
+    }
+
+    private var sidebarBody: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(SettingsView.Pane.allCases) { p in
+                SidebarRow(pane: p, selected: p == pane)
+                    .contentShape(Rectangle())
+                    .onTapGesture { pane = p }
+            }
+            Spacer(minLength: 0)
+            HelpRow()
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 52)
+        .padding(.bottom, 12)
+        .frame(maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.62))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.13), lineWidth: 1)
+        )
+        .padding(.leading, 8)
+        .padding(.trailing, 8)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
+        .frame(maxHeight: .infinity)
+    }
+}
+
+private struct SidebarRow: View {
+    let pane: SettingsView.Pane
+    let selected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: pane.icon)
+                .font(.system(size: 14, weight: selected ? .semibold : .regular))
+                .frame(width: 22)
+            Text(pane.title)
+                .font(.system(size: 14, weight: selected ? .semibold : .regular))
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(selected ? Color.white : Color.primary)
+        .padding(.horizontal, 12)
+        .frame(height: 38)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(selected ? Color.accentColor : Color.clear)
+        )
+    }
+}
+
+private struct HelpRow: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 14, weight: .regular))
+                .frame(width: 22)
+            Text("帮助")
+                .font(.system(size: 13, weight: .regular))
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 12)
+        .frame(height: 36)
+        .opacity(0.8)
+    }
+}
+
+private struct SettingsDetail: View {
+    let pane: SettingsView.Pane
+    @Bindable var model: SettingsModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                switch pane {
+                case .general: GeneralPane(model: model)
+                case .ocr: OCRPane(model: model)
+                case .about: AboutPane()
+                }
+            }
+            .frame(maxWidth: 480, alignment: .leading)
+            .padding(.horizontal, 34)
+            .padding(.top, 32)
+            .padding(.bottom, pane == .about ? 28 : 118)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .overlay(alignment: .bottom) {
+            if pane != .about && (model.isDirty || model.statusMessage != nil) {
+                ApplyBar(model: model)
+                    .padding(.bottom, 28)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.smooth(duration: 0.18), value: model.isDirty)
+        .animation(.smooth(duration: 0.18), value: model.statusMessage)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 @MainActor
 @Observable
 final class SettingsModel {
-    /// 当前磁盘上的 config 路径
     let configPath: URL
-    /// 读盘后的 working copy；UI 直接 bind 编辑
     var config: Config
-    /// 启动时读到的 baseline，对比看哪些字段 dirty
     private(set) var initial: Config
-    /// 最近一次写盘的状态文案（绿色「已应用」/ 红色「写盘失败：…」）
     var statusMessage: String?
-    var statusIsError: Bool = false
+    var statusIsError = false
 
     init() {
         let paths = Paths.makeDefault()
@@ -53,23 +171,15 @@ final class SettingsModel {
 
     var isDirty: Bool { config != initial }
 
-    /// dirty 字段是否仅限「能热重载」的范围。hotkey 改动可以热重载（GlobalHotKey.register
-    /// 幂等）；其他字段（storage_mode / capture / mesh / ocr）要重 spawn 对应 worker，
-    /// 当前架构没暴露 hot reload API，所以提示重启 daemon。
-    /// 用 keypath 比较避免漏字段——任何 != initial 的非 hotkey 改动都标 needsRestart
     var needsRestart: Bool {
         guard isDirty else { return false }
-        // 把 hotkey 拿掉对比剩余字段
         var a = config
-        let b = initial
-        a.hotkey = b.hotkey
-        return a != b
+        a.hotkey = initial.hotkey
+        return a != initial
     }
 
-    /// 写回磁盘；成功后把 initial 同步为 config（之后 isDirty=false）。
-    /// hotkey dirty 时顺路调 daemon 的 reloadHotkey() 让新组合立即生效
     func apply() {
-        let hotkeyChanged = (config.hotkey != initial.hotkey)
+        let hotkeyChanged = config.hotkey != initial.hotkey
         let restartNeeded = needsRestart
         do {
             try Config.write(config, to: configPath)
@@ -77,9 +187,7 @@ final class SettingsModel {
             if hotkeyChanged {
                 AppDelegate.shared?.reloadHotkey()
             }
-            statusMessage = restartNeeded
-                ? "已应用 · 部分字段需重启 daemon 生效（用下方「立即重启」）"
-                : "已应用 · 立即生效"
+            statusMessage = restartNeeded ? "已应用 · 部分字段需重启 daemon 生效" : "已应用 · 立即生效"
             statusIsError = false
         } catch {
             statusMessage = "写盘失败：\(error)"
@@ -87,150 +195,294 @@ final class SettingsModel {
         }
     }
 
-    /// 用户点「立即重启」时调用。`exit(0)` + launchd KeepAlive 自动 respawn
-    func restartDaemon() {
-        AppDelegate.shared?.restartDaemon()
-    }
-
-    /// 撤回到 baseline（取消未应用的修改）
     func discard() {
         config = initial
         statusMessage = nil
     }
+
+    func restartDaemon() {
+        AppDelegate.shared?.restartDaemon()
+    }
 }
 
-// MARK: - 常规 tab
+private struct SettingsGroup<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
 
-private struct GeneralSettingsTab: View {
-    @State private var model = SettingsModel()
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+            VStack(spacing: 0) {
+                content
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.primary.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+    }
+}
 
-    // **关键 bug fix**：原版 body 在 `var body: some View` 里写了 `Form{}.formStyle(...)` 后
-    // 紧跟一行 `applyBar`——SwiftUI @ViewBuilder 把它们打包成 TupleView，TabView 又把
-    // TupleView 的每个子 View 当成独立 tab 渲染，所以会看到 5 个 tab。必须用 VStack 显式包
+private struct SettingsRow<Trailing: View>: View {
+    let title: String
+    var subtitle: String?
+    var isFirst = false
+    @ViewBuilder var trailing: Trailing
+
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                Section("快捷键") {
-                    LabeledContent("键位") {
-                        TextField("", text: $model.config.hotkey.key)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 60)
-                            .help("单个字符：A-Z / 0-9 / 标点 \\ ; ' , . / [ ] = - `")
-                    }
-                    LabeledContent("修饰键") {
-                        HStack(spacing: 8) {
-                            modifierToggle("⌘", name: "cmd")
-                            modifierToggle("⌥", name: "option")
-                            modifierToggle("⌃", name: "control")
-                            modifierToggle("⇧", name: "shift")
-                        }
-                    }
-                    LabeledContent("当前组合") {
-                        Text("\(modifiersHumanString)\(displayKey)")
-                            .font(.body.monospaced())
+            if !isFirst {
+                Divider().padding(.leading, 16).opacity(0.55)
+            }
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .regular))
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.system(size: 11, weight: .regular))
                             .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Section("存储模式") {
-                    Picker("blob 同步策略", selection: $model.config.mesh.storageMode) {
+                Spacer(minLength: 10)
+                trailing
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, subtitle == nil ? 8 : 10)
+            .frame(minHeight: 40)
+        }
+    }
+}
+
+private struct SettingsNoteRow: View {
+    let text: String
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider().padding(.leading, 16).opacity(0.55)
+            Text(text)
+                .font(.system(size: 11, weight: .regular))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct SettingsBlock<Content: View>: View {
+    var isFirst = false
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if !isFirst {
+                Divider().padding(.leading, 16).opacity(0.55)
+            }
+            content
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+        }
+    }
+}
+
+private struct HotkeyRecorder: NSViewRepresentable {
+    @Binding var config: Config.HotkeyConfig
+
+    func makeNSView(context: Context) -> HotkeyRecorderField {
+        let view = HotkeyRecorderField()
+        view.onChange = { newValue in
+            config = newValue
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: HotkeyRecorderField, context: Context) {
+        nsView.config = config
+        nsView.onChange = { newValue in
+            config = newValue
+        }
+    }
+}
+
+private final class HotkeyRecorderField: NSView {
+    var onChange: ((Config.HotkeyConfig) -> Void)?
+
+    var config: Config.HotkeyConfig = .default {
+        didSet { updateLabel() }
+    }
+
+    private let label = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+
+        label.alignment = .center
+        label.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        label.textColor = .labelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        updateLabel()
+        updateChrome(focused: false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        updateChrome(focused: true)
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        updateChrome(focused: false)
+        return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let key = Self.keyString(from: event),
+              Config.HotkeyConfig.supportedKeys.contains(key) else {
+            NSSound.beep()
+            return
+        }
+        let modifiers = Self.modifiers(from: event)
+        guard modifiers.contains(where: { $0 != "shift" }) else {
+            NSSound.beep()
+            return
+        }
+        let newConfig = Config.HotkeyConfig(key: key, modifiers: modifiers)
+        config = newConfig
+        onChange?(newConfig)
+        window?.makeFirstResponder(nil)
+    }
+
+    private func updateLabel() {
+        label.stringValue = hotkeyDisplay(config)
+    }
+
+    private func updateChrome(focused: Bool) {
+        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.35).cgColor
+        layer?.borderColor = (focused ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
+        layer?.borderWidth = focused ? 2 : 1
+    }
+
+    private static func keyString(from event: NSEvent) -> String? {
+        guard let raw = event.charactersIgnoringModifiers, !raw.isEmpty else { return nil }
+        let first = String(raw.prefix(1))
+        return first.uppercased()
+    }
+
+    private static func modifiers(from event: NSEvent) -> [String] {
+        let flags = event.modifierFlags
+        var result: [String] = []
+        if flags.contains(.command) { result.append("cmd") }
+        if flags.contains(.option) { result.append("option") }
+        if flags.contains(.control) { result.append("control") }
+        if flags.contains(.shift) { result.append("shift") }
+        return result
+    }
+}
+
+private func hotkeyDisplay(_ config: Config.HotkeyConfig) -> String {
+    let mods = config.modifiers.map { m -> String in
+        switch m.lowercased() {
+        case "cmd", "command": return "⌘"
+        case "option", "alt": return "⌥"
+        case "control", "ctrl": return "⌃"
+        case "shift": return "⇧"
+        default: return m
+        }
+    }.joined()
+    return "\(mods)\(config.key.uppercased())"
+}
+
+private struct GeneralPane: View {
+    @Bindable var model: SettingsModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsGroup(title: "快捷键") {
+                SettingsRow(title: "快捷键",
+                            subtitle: "点按后直接输入新的组合键",
+                            isFirst: true) {
+                    HotkeyRecorder(config: $model.config.hotkey)
+                        .frame(width: 138, height: 28)
+                }
+            }
+
+            SettingsGroup(title: "存储模式") {
+                SettingsRow(title: "blob 同步策略", isFirst: true) {
+                    Picker("", selection: $model.config.mesh.storageMode) {
                         Text("完整 mirror").tag(StorageMode.full)
                         Text("按需拉取").tag(StorageMode.optimized)
                     }
                     .pickerStyle(.segmented)
-                    Text(model.config.mesh.storageMode == .full
-                         ? "PullWorker 每轮顺路把对端 blob 字节拉到本机做完整副本。日用机推荐。"
-                         : "只同步元数据；缩略图 / 预览 / 粘贴时按需 GET。给小盘备机 / iOS 用。")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    .labelsHidden()
+                    .frame(width: 190)
                 }
-                Section("Mesh 同步") {
-                    Toggle("启用 mesh 同步", isOn: $model.config.mesh.enabled)
-                    Toggle("启用 WebSocket 实时通知", isOn: $model.config.mesh.wsEnabled)
-                    LabeledContent("Pull 周期") {
-                        Stepper(value: $model.config.mesh.pullIntervalSec, in: 5...600, step: 5) {
-                            Text("\(model.config.mesh.pullIntervalSec) 秒").monospacedDigit()
-                        }
-                    }
-                }
-                Section("捕获守门") {
-                    LabeledContent("blob 上限") {
-                        Stepper(value: blobMBBinding, in: 1...512) {
-                            Text("\(blobMBBinding.wrappedValue) MB").monospacedDigit()
-                        }
-                    }
-                    LabeledContent("文本上限") {
-                        Stepper(value: textKBBinding, in: 1...8192, step: 16) {
-                            Text("\(textKBBinding.wrappedValue) KB").monospacedDigit()
-                        }
-                    }
-                    Text("超过 → capture 跳过入库，剪贴板本身仍可 Cmd+V 粘贴。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
-            ApplyBar(model: model)
-        }
-    }
-
-    /// 单个修饰键 toggle——pill 样式跟 hotkey 心智一致，比一行一个 Toggle 紧凑。
-    /// on/off 切换走 smooth 动画 + 选中态加 accent glow,跟 SearchView 的 chip 一致
-    private func modifierToggle(_ glyph: String, name: String) -> some View {
-        let isOn = modifierBinding(name)
-        return Button {
-            isOn.wrappedValue.toggle()
-        } label: {
-            Text(glyph)
-                .font(.system(size: 14, weight: .medium))
-                .frame(width: 32, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isOn.wrappedValue
-                              ? Color.accentColor
-                              : Color.primary.opacity(0.08))
+                SettingsNoteRow(
+                    text: model.config.mesh.storageMode == .full
+                        ? "PullWorker 每轮顺路把对端 blob 字节拉到本机做完整副本。日用机推荐。"
+                        : "只同步元数据；缩略图 / 预览 / 粘贴时按需 GET。给小盘备机 / iOS 用。"
                 )
-                .foregroundStyle(isOn.wrappedValue ? Color.white : Color.primary)
-                .shadow(
-                    color: isOn.wrappedValue ? Color.accentColor.opacity(0.35) : .clear,
-                    radius: isOn.wrappedValue ? 5 : 0,
-                    y: 1
-                )
-                .animation(.smooth(duration: 0.18), value: isOn.wrappedValue)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func modifierBinding(_ name: String) -> Binding<Bool> {
-        Binding(
-            get: { model.config.hotkey.modifiers.contains(name) },
-            set: { isOn in
-                var set = Set(model.config.hotkey.modifiers)
-                if isOn { set.insert(name) } else { set.remove(name) }
-                // 维持稳定顺序：cmd > option > control > shift
-                let order = ["cmd", "option", "control", "shift"]
-                model.config.hotkey.modifiers = order.filter { set.contains($0) }
             }
-        )
-    }
 
-    /// 字母 uppercase 显示更醒目（"V" 而不是 "v"），标点保持原样
-    private var displayKey: String {
-        let k = model.config.hotkey.key
-        if k.count == 1, let c = k.first, c.isLetter {
-            return k.uppercased()
-        }
-        return k
-    }
-
-    private var modifiersHumanString: String {
-        model.config.hotkey.modifiers.map { m -> String in
-            switch m.lowercased() {
-            case "cmd", "command": return "⌘"
-            case "option", "alt": return "⌥"
-            case "control", "ctrl": return "⌃"
-            case "shift": return "⇧"
-            default: return m
+            SettingsGroup(title: "Mesh 同步") {
+                SettingsRow(title: "启用 mesh 同步", isFirst: true) {
+                    Toggle("", isOn: $model.config.mesh.enabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+                SettingsRow(title: "启用 WebSocket 实时通知") {
+                    Toggle("", isOn: $model.config.mesh.wsEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+                SettingsRow(title: "Pull 周期") {
+                    Stepper(value: $model.config.mesh.pullIntervalSec, in: 5...600, step: 5) {
+                        Text("\(model.config.mesh.pullIntervalSec) 秒").monospacedDigit()
+                    }
+                }
+                SettingsNoteRow(text: "WebSocket 会在对端 cursor_advanced 时推送，目标是 < 1s 同步延迟。")
             }
-        }.joined()
+
+            SettingsGroup(title: "捕获守门") {
+                SettingsRow(title: "blob 上限", isFirst: true) {
+                    Stepper(value: blobMBBinding, in: 1...512) {
+                        Text("\(blobMBBinding.wrappedValue) MB").monospacedDigit()
+                    }
+                }
+                SettingsRow(title: "文本上限") {
+                    Stepper(value: textKBBinding, in: 1...8192, step: 16) {
+                        Text("\(textKBBinding.wrappedValue) KB").monospacedDigit()
+                    }
+                }
+                SettingsNoteRow(text: "超过上限时 capture 跳过入库，剪贴板本身仍可 Cmd+V 粘贴。")
+            }
+        }
     }
 
     private var blobMBBinding: Binding<Int> {
@@ -248,190 +500,334 @@ private struct GeneralSettingsTab: View {
     }
 }
 
-// MARK: - OCR tab
-
-private struct OCRSettingsTab: View {
-    @State private var model = SettingsModel()
-    @State private var languagesText: String
-
-    init() {
-        let paths = Paths.makeDefault()
-        let cfg = (try? Config.load(from: paths.configFile)) ?? .default
-        _languagesText = State(initialValue: cfg.ocr.languages.joined(separator: ", "))
-    }
+private struct OCRPane: View {
+    @Bindable var model: SettingsModel
+    @State private var isLanguagePickerPresented = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            Form {
-                Section("OCR 索引") {
-                    Toggle("启用 OCR (把图片里的文字写进搜索索引)", isOn: $model.config.ocr.enabled)
-                    Picker("识别精度", selection: $model.config.ocr.recognitionLevel) {
-                        Text("accurate (默认)").tag("accurate")
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsGroup(title: "OCR 索引") {
+                SettingsRow(title: "启用 OCR",
+                            subtitle: "把图片里的文字写进搜索索引",
+                            isFirst: true) {
+                    Toggle("", isOn: $model.config.ocr.enabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+                SettingsRow(title: "识别精度") {
+                    Picker("", selection: $model.config.ocr.recognitionLevel) {
+                        Text("accurate（默认）").tag("accurate")
                         Text("fast").tag("fast")
                     }
                     .pickerStyle(.segmented)
-                    LabeledContent("单图字节上限") {
-                        Stepper(value: $model.config.ocr.maxBlobMB, in: 1...128) {
-                            Text("\(model.config.ocr.maxBlobMB) MB").monospacedDigit()
-                        }
+                    .labelsHidden()
+                    .frame(width: 190)
+                }
+                SettingsRow(title: "单图字节上限") {
+                    Stepper(value: $model.config.ocr.maxBlobMB, in: 1...128) {
+                        Text("\(model.config.ocr.maxBlobMB) MB").monospacedDigit()
                     }
-                    Text("超过上限 → 标 skipped 不喂 Vision。默认 16MB。fast 中文易漏字。")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Section("识别语言") {
-                    TextField("逗号分隔，按优先级排", text: $languagesText)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: languagesText) { _, newValue in
-                            model.config.ocr.languages = newValue
-                                .split(separator: ",")
-                                .map { $0.trimmingCharacters(in: .whitespaces) }
-                                .filter { !$0.isEmpty }
-                        }
-                    Text("Vision recognitionLanguages hint。常用：zh-Hans, en-US, ja-JP")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                SettingsNoteRow(text: "超过上限会标记 skipped，不喂 Vision。默认 16MB；fast 中文易漏字。")
             }
-            .formStyle(.grouped)
-            ApplyBar(model: model, onDiscard: {
-                languagesText = model.config.ocr.languages.joined(separator: ", ")
-            })
+
+            SettingsGroup(title: "识别语言") {
+                SettingsRow(title: "语言", isFirst: true) {
+                    Button {
+                        isLanguagePickerPresented.toggle()
+                    } label: {
+                        HStack(spacing: 7) {
+                            HStack(spacing: 4) {
+                                ForEach(languageSummaryTokens.prefix(3), id: \.self) { token in
+                                    Text(token)
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 3)
+                                        .background(
+                                            Capsule(style: .continuous)
+                                                .fill(Color.accentColor.opacity(0.16))
+                                        )
+                                }
+                                if languageSummaryTokens.count > 3 {
+                                    Text("+\(languageSummaryTokens.count - 3)")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: 160, alignment: .trailing)
+                            .clipped()
+
+                            Image(systemName: isLanguagePickerPresented ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.leading, 8)
+                        .padding(.trailing, 7)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.primary.opacity(0.055))
+                        )
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                        .frame(maxWidth: 190, alignment: .trailing)
+                    }
+                    .buttonStyle(.plain)
+                    .popover(isPresented: $isLanguagePickerPresented, arrowEdge: .bottom) {
+                        LanguageMultiSelectPopover(
+                            options: OCRLanguageOption.allOptions,
+                            selectedIDs: selectedLanguageIDs,
+                            onToggle: toggleLanguage
+                        )
+                        .frame(width: 260)
+                        .padding(10)
+                    }
+                }
+                SettingsNoteRow(text: "来自本机 Vision 支持列表；可连续勾选多个语言，仍会自动检测语言。")
+            }
         }
+    }
+
+    private var selectedLanguageIDs: Set<String> {
+        Set(model.config.ocr.languages)
+    }
+
+    private var languageSummary: String {
+        languageSummaryTokens.joined(separator: ", ")
+    }
+
+    private var languageSummaryTokens: [String] {
+        let selected = OCRLanguageOption.allOptions
+            .filter { selectedLanguageIDs.contains($0.id) }
+            .map(\.shortTitle)
+        return selected.isEmpty ? ["选择"] : selected
+    }
+
+    private func toggleLanguage(_ id: String) {
+        var ids = model.config.ocr.languages
+        if let idx = ids.firstIndex(of: id) {
+            guard ids.count > 1 else { return }
+            ids.remove(at: idx)
+        } else {
+            ids.append(id)
+        }
+        model.config.ocr.languages = ids
     }
 }
 
-/// 共用 apply/discard 底栏。**必须**抽出来——把 Form 跟 ApplyBar 直接写在 tab body 里会
-/// 让 SwiftUI @ViewBuilder 把它们打包成 TupleView，TabView 误判每个子 View 是独立 tab，
-/// 视觉上 tab 数翻倍。tab body 用 VStack 显式包 Form + ApplyBar 才正确
-private struct ApplyBar: View {
-    @Bindable var model: SettingsModel
-    /// OCR tab 的 discard 路径要顺路把 languagesText state 重置——通过闭包注入
-    var onDiscard: () -> Void = {}
+private struct LanguageMultiSelectPopover: View {
+    let options: [OCRLanguageOption]
+    let selectedIDs: Set<String>
+    let onToggle: (String) -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            if let msg = model.statusMessage {
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(model.statusIsError ? Color.red : Color.green)
-                    .lineLimit(2)
-            }
-            Spacer()
-            // apply 后如果还有未生效的非 hotkey 字段，提供一键重启按钮——比让用户去敲
-            // `launchctl kickstart -k gui/$UID/io.duopaste.agent` 友好
-            if !model.isDirty && model.statusMessage != nil && needsRestartHint {
-                Button("立即重启") { model.restartDaemon() }
-                    .buttonStyle(.bordered)
-            }
-            Button("撤回") {
-                model.discard()
-                onDiscard()
-            }
-            .disabled(!model.isDirty)
-            Button("应用") { model.apply() }
-                .keyboardShortcut(.return)
-                .buttonStyle(.borderedProminent)
-                .disabled(!model.isDirty)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .background(applyBarBackground)
-        // tab 切换时 ApplyBar 状态文本变化平滑过渡;dirty / clean 切换的按钮 enable
-        // 也走系统默认 fade
-        .animation(.smooth(duration: 0.18), value: model.isDirty)
-        .animation(.smooth(duration: 0.18), value: model.statusMessage)
-    }
+        VStack(alignment: .leading, spacing: 8) {
+            Text("识别语言")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
 
-    /// macOS 26+ Liquid Glass;老系统兜底 `.bar` 材质
-    @ViewBuilder
-    private var applyBarBackground: some View {
-        if #available(macOS 26.0, *) {
-            Color.clear.glassEffect(.regular, in: Rectangle())
-        } else {
-            Rectangle().fill(.bar)
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(options) { option in
+                        Button {
+                            onToggle(option.id)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: selectedIDs.contains(option.id) ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(selectedIDs.contains(option.id) ? Color.accentColor : Color.secondary)
+                                Text(option.title)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .frame(height: 30)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(selectedIDs.contains(option.id) ? Color.accentColor.opacity(0.12) : Color.clear)
+                        )
+                    }
+                }
+            }
+            .frame(maxHeight: 260)
         }
-    }
-
-    /// statusMessage 含「重启」时才显示重启按钮——简单文本探测，避免引入新字段
-    private var needsRestartHint: Bool {
-        model.statusMessage?.contains("重启") ?? false
     }
 }
 
-// MARK: - 关于 tab
+private struct OCRLanguageOption: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let shortTitle: String
 
-private struct AboutSettingsTab: View {
+    static let defaultOption = OCRLanguageOption(
+        id: "zh-Hans",
+        title: "简体中文 (zh-Hans)",
+        shortTitle: "简中"
+    )
+
+    static var allOptions: [OCRLanguageOption] {
+        let supported = supportedLanguages
+        var options: [OCRLanguageOption] = [
+            defaultOption,
+            OCRLanguageOption(id: "en-US", title: "English (en-US)", shortTitle: "EN"),
+            OCRLanguageOption(id: "zh-Hant", title: "繁體中文 (zh-Hant)", shortTitle: "繁中"),
+            OCRLanguageOption(id: "ja-JP", title: "日本語 (ja-JP)", shortTitle: "日本語"),
+            OCRLanguageOption(id: "ko-KR", title: "한국어 (ko-KR)", shortTitle: "한국어")
+        ].filter { option in
+            supported.contains(option.id)
+        }
+
+        for language in supported where !options.contains(where: { $0.id == language }) {
+            options.append(OCRLanguageOption(
+                id: language,
+                title: languageDisplayName(language),
+                shortTitle: language
+            ))
+        }
+        return options
+    }
+
+    private static var supportedLanguages: [String] {
+        let accurateRequest = VNRecognizeTextRequest()
+        accurateRequest.recognitionLevel = .accurate
+        let fastRequest = VNRecognizeTextRequest()
+        fastRequest.recognitionLevel = .fast
+        let accurate = (try? accurateRequest.supportedRecognitionLanguages()) ?? []
+        let fast = (try? fastRequest.supportedRecognitionLanguages()) ?? []
+        let union = Set(accurate).union(fast)
+        if union.isEmpty {
+            return ["zh-Hans", "en-US", "ja-JP"]
+        }
+        return union.sorted { languageDisplayName($0) < languageDisplayName($1) }
+    }
+
+    private static func languageDisplayName(_ code: String) -> String {
+        let locale = Locale.current
+        if let name = locale.localizedString(forIdentifier: code) {
+            return "\(name) (\(code))"
+        }
+        return code
+    }
+}
+
+private struct AboutPane: View {
     @State private var fetchInProgress = false
+    @State private var showFetchProgress = false
     @State private var fetchReport: String?
-    @State private var fetchIsError: Bool = false
-    /// blob 仓库占用——nil 表示尚未算出 / 计算失败。
-    /// onAppear / fetch-missing 完成后异步刷新
+    @State private var fetchIsError = false
+    @State private var fetchCooldownUntil: Date?
     @State private var blobsTotalBytes: Int64?
-    /// blob 仓库所在卷可用空间。同上，按需异步刷
     @State private var diskAvailableBytes: Int64?
 
     var body: some View {
-        Form {
-            Section("进程") {
-                LabeledContent("应用", value: "duo-paste")
-                LabeledContent("Device ID", value: deviceIDDisplay)
-                LabeledContent("拓扑", value: modeSummary)
-                LabeledContent("存储模式", value: storageModeDisplay)
-            }
-            Section("Peers") {
-                if peerList.isEmpty {
-                    Text("未配置 peer（standalone 模式）").foregroundStyle(.secondary)
-                } else {
-                    ForEach(peerList, id: \.self) { entry in
-                        Text(entry).font(.caption.monospaced())
-                    }
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsGroup(title: "进程") {
+                SettingsRow(title: "应用", isFirst: true) {
+                    Text("duo-paste").foregroundStyle(.secondary)
+                }
+                SettingsRow(title: "Device ID") {
+                    Text(deviceIDDisplay)
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                SettingsRow(title: "拓扑") {
+                    Text(modeSummary).foregroundStyle(.secondary)
+                }
+                SettingsRow(title: "存储模式") {
+                    Text(storageModeDisplay).foregroundStyle(.secondary)
                 }
             }
-            Section("Blob 补齐") {
-                HStack(spacing: 8) {
-                    Button {
-                        runFetchMissing()
-                    } label: {
-                        if fetchInProgress {
-                            HStack(spacing: 4) {
-                                ProgressView().controlSize(.small)
-                                Text("拉取中…")
-                            }
-                        } else {
-                            Text("补齐缺失 blob")
+
+            SettingsGroup(title: "Peers") {
+                if peerList.isEmpty {
+                    SettingsBlock(isFirst: true) {
+                        Text("未配置 peer（standalone 模式）")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else {
+                    ForEach(Array(peerList.enumerated()), id: \.offset) { idx, entry in
+                        SettingsBlock(isFirst: idx == 0) {
+                            Text(entry)
+                                .font(.system(.callout, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
-                    .disabled(fetchInProgress || AppDelegate.shared?.dependencies == nil)
-                    Spacer()
                 }
-                if let r = fetchReport {
-                    Text(r).font(.caption)
-                        .foregroundStyle(fetchIsError ? Color.red : Color.green)
+            }
+
+            SettingsGroup(title: "Blob 补齐") {
+                SettingsBlock(isFirst: true) {
+                    HStack {
+                        Button {
+                            runFetchMissing()
+                        } label: {
+                            if showFetchProgress {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.small)
+                                    Text("拉取中…")
+                                }
+                            } else if isFetchCoolingDown {
+                                Text("无需补齐")
+                            } else {
+                                Text("补齐缺失 blob")
+                            }
+                        }
+                        .disabled(fetchInProgress || isFetchCoolingDown || AppDelegate.shared?.dependencies == nil)
+                        Spacer()
+                    }
+                    if let fetchReport {
+                        Text(fetchReport)
+                            .font(.caption)
+                            .foregroundStyle(fetchIsError ? Color.red : Color.green)
+                            .padding(.top, 4)
+                    }
                 }
-                Text("扫所有 peer-origin 缺字节的 image/file → 并发 GET /blob 拉回。等价 CLI `mesh-fetch-missing`。")
-                    .font(.caption).foregroundStyle(.secondary)
+                SettingsNoteRow(text: "扫所有 peer-origin 缺字节的 image/file → 并发 GET /blob 拉回。等价 CLI `mesh-fetch-missing`。")
             }
-            Section("存储") {
-                LabeledContent("Blob 仓库占用",
-                              value: blobsTotalBytes.map(Self.formatBytes) ?? "计算中…")
-                LabeledContent("磁盘可用",
-                              value: diskAvailableBytes.map(Self.formatBytes) ?? "—")
-                Text("可用 < 5 GB 时自动驱逐最老的非 pinned blob 文件到 10 GB；text / pinned / OCR 提取文本始终保留。")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+
+            SettingsGroup(title: "存储") {
+                SettingsRow(title: "Blob 仓库占用", isFirst: true) {
+                    Text(blobsTotalBytes.map(Self.formatBytes) ?? "计算中…")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                SettingsRow(title: "磁盘可用") {
+                    Text(diskAvailableBytes.map(Self.formatBytes) ?? "—")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                SettingsNoteRow(text: "可用 < 5 GB 时自动驱逐最老的非 pinned blob 文件到 10 GB；text / pinned / OCR 提取文本始终保留。")
             }
-            Section("路径") {
+
+            SettingsGroup(title: "路径") {
                 let paths = Paths.makeDefault()
-                LabeledContent("Config", value: paths.configFile.path)
-                LabeledContent("数据库", value: paths.mainDB.path)
-                LabeledContent("Blob 仓库", value: paths.blobsDir.path)
+                pathRow("Config", path: paths.configFile.path, isFirst: true)
+                pathRow("数据库", path: paths.mainDB.path)
+                pathRow("Blob 仓库", path: paths.blobsDir.path)
             }
         }
-        .formStyle(.grouped)
         .task { await refreshStorageStats() }
     }
 
-    /// 后台算 blob 总占用 + 卷可用空间。10k+ blob 走 enumerator < 1s，但仍异步跑不卡 UI
+    private func pathRow(_ title: String, path: String, isFirst: Bool = false) -> some View {
+        SettingsRow(title: title, isFirst: isFirst) {
+            PathChip(path: path)
+                .frame(maxWidth: 300, alignment: .trailing)
+        }
+    }
+
     private func refreshStorageStats() async {
         let blobsDir = Paths.makeDefault().blobsDir
         let (total, avail) = await Task.detached {
@@ -441,7 +837,6 @@ private struct AboutSettingsTab: View {
         diskAvailableBytes = avail
     }
 
-    /// ByteCountFormatter `.file` style，1.2 GB / 487 MB 风格
     private static func formatBytes(_ bytes: Int64) -> String {
         let f = ByteCountFormatter()
         f.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
@@ -450,24 +845,20 @@ private struct AboutSettingsTab: View {
     }
 
     private var deviceIDDisplay: String {
-        AppDelegate.shared?.dependencies?.deviceID ?? "（daemon 未启动）"
+        AppDelegate.shared?.dependencies?.deviceID ?? "(daemon 未启动)"
     }
 
     private var modeSummary: String {
-        AppDelegate.shared?.dependencies?.config.summary ?? "（daemon 未启动）"
+        AppDelegate.shared?.dependencies?.config.summary ?? "(daemon 未启动)"
     }
 
     private var storageModeDisplay: String {
-        guard let m = AppDelegate.shared?.dependencies?.config.mesh.storageMode else {
-            return "—"
-        }
-        return m.description
+        AppDelegate.shared?.dependencies?.config.mesh.storageMode.description ?? "—"
     }
 
     private var peerList: [String] {
         AppDelegate.shared?.dependencies?.config.peers.map { p -> String in
             let did = p.deviceID ?? "(learn)"
-            // 配了 pull_url 把它也展示出来——url 给 WS 通知，pull_url 给 PullWorker / fetch-missing / paste-fetcher
             if let pull = p.pullURL {
                 return "\(p.url.absoluteString) · \(did)\n  pull → \(pull.absoluteString)"
             }
@@ -476,17 +867,27 @@ private struct AboutSettingsTab: View {
     }
 
     private func runFetchMissing() {
-        guard let deps = AppDelegate.shared?.dependencies, !fetchInProgress else { return }
+        guard let deps = AppDelegate.shared?.dependencies,
+              !fetchInProgress,
+              !isFetchCoolingDown else { return }
         fetchInProgress = true
-        fetchReport = nil
+        showFetchProgress = false
         let blobs = deps.blobs
         let deviceID = deps.deviceID
         let dbPath = deps.paths.mainDB
-        // 跟 PullWorker / paste-fetcher 一致：fetch-missing 用 effectivePullURL（ponte 快路径优先）
         let peerURLs = deps.config.peers.map { $0.effectivePullURL }
         let sharedSecretFile = deps.paths.sharedSecretFile
         Task { @MainActor in
-            defer { fetchInProgress = false }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(280))
+                if fetchInProgress {
+                    showFetchProgress = true
+                }
+            }
+            defer {
+                fetchInProgress = false
+                showFetchProgress = false
+            }
             if peerURLs.isEmpty {
                 fetchReport = "未配置 peer，无法补齐"
                 fetchIsError = true
@@ -501,8 +902,6 @@ private struct AboutSettingsTab: View {
                 return
             }
             let auth = HMACAuth(secret: secret)
-            // 按 URL host 自动选 session：ponte 域名走 PonteSession.pontePool（Surge HTTP
-            // proxy + 跳 hostname check），tailscale 域名走 syncURLSession（直连 + 严格 TLS）
             let clients = peerURLs.map {
                 HTTPPeerClient(
                     baseURL: $0,
@@ -540,33 +939,176 @@ private struct AboutSettingsTab: View {
                     fetcher: fetcher,
                     concurrency: 4,
                     log: { msg in
-                        // 透传到 daemon stderr 让 `tail -f duo-pasted.err.log` 能看到进度
                         FileHandle.standardError.write(Data("fetch-missing: \(msg)\n".utf8))
                     }
                 )
                 FileHandle.standardError.write(Data(
                     "fetch-missing: done total=\(report.totalMissing) fetched=\(report.fetched) failed=\(report.failed)\n".utf8
                 ))
-                // 打详细失败 sample 让诊断 ponte 抖动 vs timeout vs 404 等（report.failures 最多 20 条）
                 for failure in report.failures {
                     FileHandle.standardError.write(Data(
                         "fetch-missing: failure sha=\(failure.sha) reason=\(failure.reason)\n".utf8
                     ))
                 }
-                fetchReport = "扫到 \(report.totalMissing) 个缺失 · 拉到 \(report.fetched) · 失败 \(report.failed)"
+                if report.totalMissing == 0 {
+                    startFetchCooldown()
+                    fetchReport = "没有缺失 blob"
+                } else {
+                    fetchReport = "扫到 \(report.totalMissing) 个缺失 · 拉到 \(report.fetched) · 失败 \(report.failed)"
+                }
                 fetchIsError = report.failed > 0
-                // 拉到字节后清缩略图缓存 + bump pulse 让 SearchView 卡片重渲。
-                // 没这两步用户会看到「拉到 N」但卡片仍是占位（缓存陈旧）
                 if report.fetched > 0 {
                     ImageThumbnailCache.shared.invalidateAll()
                     AppDelegate.shared?.state.blobInventoryPulse &+= 1
-                    // 字节落盘 → blob 占用变了，刷新展示
                     await refreshStorageStats()
                 }
             } catch {
                 fetchReport = "执行失败：\(error)"
                 fetchIsError = true
             }
+        }
+    }
+
+    private func startFetchCooldown() {
+        fetchCooldownUntil = Date().addingTimeInterval(4)
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(4))
+            fetchCooldownUntil = nil
+        }
+    }
+
+    private var isFetchCoolingDown: Bool {
+        guard let until = fetchCooldownUntil else { return false }
+        if Date() < until {
+            return true
+        }
+        return false
+    }
+}
+
+private struct PathChip: View {
+    let path: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(compactPath)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .layoutPriority(1)
+
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            } label: {
+                Image(systemName: "arrow.up.forward.app")
+                    .font(.system(size: 10, weight: .medium))
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.secondary)
+            .help("在 Finder 中显示")
+        }
+        .padding(.leading, 9)
+        .padding(.trailing, 5)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.primary.opacity(0.045))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.07), lineWidth: 1)
+        )
+        .help(path)
+    }
+
+    private var compactPath: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let display = path.hasPrefix(home)
+            ? "~" + path.dropFirst(home.count)
+            : path
+        guard display.count > 44 else { return display }
+
+        let parts = display.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard let duoIndex = parts.lastIndex(of: "duo-paste") else {
+            return "…/" + parts.suffix(3).joined(separator: "/")
+        }
+        let tail = parts.suffix(from: duoIndex).joined(separator: "/")
+        return "~/…/" + tail
+    }
+}
+
+private struct ApplyBar: View {
+    @Bindable var model: SettingsModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let msg = model.statusMessage {
+                Text(msg)
+                    .font(.system(size: 11))
+                    .foregroundStyle(model.statusIsError ? Color.red : Color.green)
+                    .lineLimit(2)
+            }
+            if !model.isDirty && model.statusMessage != nil && needsRestartHint {
+                GlassActionButton(title: "重启", isProminent: false) { model.restartDaemon() }
+            }
+            GlassActionButton(title: "恢复", isProminent: false, isDisabled: !model.isDirty) { model.discard() }
+            GlassActionButton(title: "应用", isProminent: true, isDisabled: !model.isDirty) { model.apply() }
+                .keyboardShortcut(.return)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(applyBarBackground)
+        .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+    }
+
+    private var needsRestartHint: Bool {
+        model.statusMessage?.contains("重启") ?? false
+    }
+
+    @ViewBuilder
+    private var applyBarBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(.regular, in: shape)
+        } else {
+            shape.fill(.ultraThinMaterial)
+        }
+    }
+}
+
+private struct GlassActionButton: View {
+    let title: String
+    let isProminent: Bool
+    var isDisabled = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(isProminent ? Color.white : Color.primary)
+                .frame(minWidth: 48)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(buttonBackground)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.45 : 1)
+    }
+
+    @ViewBuilder
+    private var buttonBackground: some View {
+        let shape = Capsule(style: .continuous)
+        if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(
+                .regular.tint(isProminent ? Color.accentColor.opacity(0.72) : Color.primary.opacity(0.08)),
+                in: shape
+            )
+        } else {
+            shape.fill(isProminent ? Color.accentColor : Color.primary.opacity(0.1))
         }
     }
 }
