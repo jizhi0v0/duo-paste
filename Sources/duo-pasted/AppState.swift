@@ -237,6 +237,10 @@ final class AppState {
     /// 原因：NSPanel 被复用（orderOut 不销毁 hosting view），onAppear / .task(id:query)
     /// 在 reshow 时不会再 fire，焦点会丢、stale results 不会刷新。
     var openPulse: Int = 0
+    /// 用户点过卡 / 空白把 input 摘焦点后再按字母键时,keyMonitor 拦下首字符吃进
+    /// query 并 bump 这个 pulse,让 SearchView 把 TextField 焦点抢回来。后续字符
+    /// 走正常 TextField 输入路径
+    var inputFocusPulse: Int = 0
     /// mesh-fetch-missing / 「补齐缺失 blob」拉回字节后 bump，让 SearchView 卡片 .task
     /// 重 fire 走 decode 路径（光清 ImageThumbnailCache.invalidateAll 不够——
     /// .task(id: cacheKey) 因为 sha 不变不会自动 re-fire，要把 pulse 拼进 id）
@@ -283,6 +287,47 @@ final class AppState {
     /// 跟 AppDelegate.pasteBlobFetcher 同一份引用——paste 路径 + UI 路径共用一个 fetcher
     /// 让 keep-alive 连接池命中率高
     var pasteBlobFetcher: (any BlobFetcher)?
+
+    /// SmartTransport 当前每个 peer 的决策快照——SettingsView 订阅展示。
+    /// MeshSupervisor 启动时 + 每次 reconcileTransports 完后 push 进来，时间戳让 UI 能算
+    /// "上次刷新于 N 秒前"
+    struct TransportSnapshot: Sendable, Equatable, Identifiable {
+        let id: Int           // peerIndex
+        let configuredHost: String
+        let chosenHost: String
+        let chosenPort: Int?
+        let learnedPonteHost: String?
+        let manualPullURL: String?
+        let kind: Kind        // .ponte / .tailscale —— 给 UI 上 chip 颜色用
+        let httpRttMs: [String: Int64]   // host → RTT，>= 0 = reachable，-1 = probe 失败
+
+        enum Kind: Sendable { case ponte, tailscale }
+
+        init(decision: SmartTransport.PeerDecision) {
+            self.id = decision.peerIndex
+            self.configuredHost = decision.configuredURL.host ?? "?"
+            self.chosenHost = decision.chosenPullURL.host ?? "?"
+            self.chosenPort = decision.chosenPullURL.port
+            self.learnedPonteHost = decision.learnedPonteHost
+            self.manualPullURL = decision.manualPullURL?.absoluteString
+            self.kind = decision.chosenWSKind == .urlSession ? .ponte : .tailscale
+            var rtts: [String: Int64] = [:]
+            for (url, ms) in decision.httpRttMs {
+                if let h = url.host { rtts[h] = ms }
+            }
+            self.httpRttMs = rtts
+        }
+    }
+
+    /// 当前 transport 决策快照列表 + 上次更新时间。MeshSupervisor 注入回调写这里
+    var transports: [TransportSnapshot] = []
+    var transportsUpdatedAt: Date? = nil
+
+    /// 由 AppDelegate 在 MeshSupervisor 初始化 / reconcile 完成时调（main actor）
+    func setTransports(_ decisions: [SmartTransport.PeerDecision]) {
+        self.transports = decisions.map(TransportSnapshot.init)
+        self.transportsUpdatedAt = Date()
+    }
 
     /// 单次跳过的提示。`bytes` / `limit` 单位字节，UI 端 humanize。`kind` 决定文案。
     struct SkipNotice: Equatable, Sendable {

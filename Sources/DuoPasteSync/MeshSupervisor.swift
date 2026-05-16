@@ -41,6 +41,8 @@ public final class MeshSupervisor: @unchecked Sendable {
     private let buildPeer: (@Sendable (SmartTransport.PeerDecision) -> Peer)?
     /// 测试注入点——覆盖 smart.discover 走 fake 返回固定 decisions；nil = 用 smart 真探
     private let discoverOverride: (@Sendable () async -> [SmartTransport.PeerDecision])?
+    /// reconcile 完后给外部（AppState）push 当前决策，让 UI 能订阅展示
+    private let onDecisionsUpdated: (@Sendable ([SmartTransport.PeerDecision]) -> Void)?
     private let reconcileGate: ReconcileGate
 
     // MARK: - Inits
@@ -56,6 +58,7 @@ public final class MeshSupervisor: @unchecked Sendable {
         tailscaleSession: URLSession? = nil,
         buildPeer: (@Sendable (SmartTransport.PeerDecision) -> Peer)? = nil,
         discoverOverride: (@Sendable () async -> [SmartTransport.PeerDecision])? = nil,
+        onDecisionsUpdated: (@Sendable ([SmartTransport.PeerDecision]) -> Void)? = nil,
         autoRecoverOnDNSChange: Bool = true,
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("mesh: \(msg)\n".utf8))
@@ -69,6 +72,7 @@ public final class MeshSupervisor: @unchecked Sendable {
         self.tailscaleSession = tailscaleSession
         self.buildPeer = buildPeer
         self.discoverOverride = discoverOverride
+        self.onDecisionsUpdated = onDecisionsUpdated
         self.reconcileGate = ReconcileGate()
         if autoRecoverOnDNSChange {
             // WakeBox 桥接：闭包不能直接 capture self（初始化未完），用一个 box 占位
@@ -224,6 +228,7 @@ public final class MeshSupervisor: @unchecked Sendable {
                 )
             }
             await applyDecisions(decisions, buildPeer: buildPeer)
+            onDecisionsUpdated?(decisions)
             if await reconcileGate.exitOrLoop() {
                 break  // 没 queued，本轮跑完干净退出
             }

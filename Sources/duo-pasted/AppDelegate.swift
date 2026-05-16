@@ -109,7 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        let host = FullBleedHostingView(rootView: SettingsView())
+        let host = FullBleedHostingView(rootView: SettingsView(appState: self.state))
         win.contentView = host
         win.title = ""
         win.titlebarAppearsTransparent = true
@@ -345,6 +345,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 stderr
             )
         }
+        // 让 SettingsView 一打开就能看到初始决策（reconcile 完后 onDecisionsUpdated 再刷）
+        self.state.setTransports(decisions)
 
         // 起 mesh supervisor（如果该起）
         if startMesh {
@@ -372,7 +374,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 expectedPeerDeviceIDs: cfg.peers.map { $0.deviceID }
             )
             let supervisorPeers = decisions.map { builder.build(decision: $0) }
-            let supervisor = MeshSupervisor(peers: supervisorPeers)
+            // reconcile 完后 hop 回 main actor 写 AppState，SwiftUI 自动刷新 SettingsView
+            // weak appState 防 supervisor 持 strong cycle（AppDelegate 也持 supervisor）
+            let appState = self.state
+            let supervisor = MeshSupervisor(
+                initialPeers: supervisorPeers,
+                initialDecisions: decisions,
+                smart: smart,
+                configPeers: cfg.peers,
+                auth: auth,
+                tailscaleSession: AppDependencies.syncURLSession,
+                buildPeer: { builder.build(decision: $0) },
+                onDecisionsUpdated: { newDecisions in
+                    Task { @MainActor [weak appState] in
+                        appState?.setTransports(newDecisions)
+                    }
+                }
+            )
             self.meshSupervisor = supervisor
             await supervisor.start()
             fputs("mesh supervisor → \(supervisorPeers.count) peer(s) (interval=\(intervalSec)s, ws=\(cfg.mesh.wsEnabled ? "on" : "off"))\n", stderr)
