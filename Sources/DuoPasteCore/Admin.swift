@@ -83,6 +83,11 @@ public enum Admin {
         /// 本机 pull_cursor 表里这个 peer 的行（peer_device_id, cursor_ns, cursor_id）。
         /// nil = 还没 cursor 行（首次启动 / 学习模式 expected 跟 cursor PK 不同）
         public let pullCursor: PullCursorSnapshot?
+        /// PR 4/5：当前 SmartTransport 决策给这个 peer 的 transport label，形如
+        /// `ponte (mbp.sgponte:8443)` / `tailscale (mbp.tail.ts.net:8443)`。mesh-doctor
+        /// 自己跑一遍 discover 拿决策（**只读不动**，不通过 daemon IPC）→ 等价"daemon 现在应
+        /// 该用什么"。nil = CLI 没传 transportLabels（Core 不依赖 Sync，留可选）
+        public let currentTransport: String?
     }
 
     public struct PullCursorSnapshot: Sendable, Equatable {
@@ -125,7 +130,8 @@ public enum Admin {
         dbPath: URL,
         blobs: BlobStore,
         healthProbe: @Sendable (URL) async -> HealthProbeOutcome,
-        nowNs: @Sendable () -> Int64 = { Clock.nowNs() }
+        nowNs: @Sendable () -> Int64 = { Clock.nowNs() },
+        transportLabels: [URL: String] = [:]
     ) async throws -> MeshDoctorReport {
         let db = try Database(path: dbPath)
         let cursorRows: [PullCursorSnapshot] = try await db.pool.read { conn -> [PullCursorSnapshot] in
@@ -178,7 +184,8 @@ public enum Admin {
                 expectedDeviceID: peer.deviceID,
                 health: healthOutcome,
                 deviceIDMatches: matches,
-                pullCursor: cursor
+                pullCursor: cursor,
+                currentTransport: transportLabels[peer.url]
             ))
         }
 

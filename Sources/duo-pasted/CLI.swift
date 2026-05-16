@@ -419,6 +419,26 @@ enum CLI {
                 return .unreachable(reason: "\(error)")
             }
         }
+        // PR 5：自家跑一遍 SmartTransport.discover 算"daemon 现在应该用什么 transport"
+        // ——只读，跟 daemon 没 IPC 通道；如果 daemon 已经在跑同样的 config，决策应该一致
+        let transportLabels: [URL: String]
+        if let secret {
+            let auth = HMACAuth(secret: secret)
+            let peers = cfg.peers
+            let discoverTask: @Sendable () async throws -> [URL: String] = {
+                let decisions = await SmartTransport().discover(
+                    peers: peers,
+                    auth: auth,
+                    tailscaleSession: .shared
+                )
+                var map: [URL: String] = [:]
+                for d in decisions { map[d.configuredURL] = d.transportLabel }
+                return map
+            }
+            transportLabels = (try? runBlocking(discoverTask)) ?? [:]
+        } else {
+            transportLabels = [:]
+        }
         let report: Admin.MeshDoctorReport
         do {
             report = try runBlocking { @Sendable in
@@ -427,7 +447,8 @@ enum CLI {
                     peers: cfg.peers,
                     dbPath: paths.mainDB,
                     blobs: blobs,
-                    healthProbe: probe
+                    healthProbe: probe,
+                    transportLabels: transportLabels
                 )
             }
         } catch {
@@ -473,6 +494,9 @@ enum CLI {
                 lines.append("    health: ✗ unreachable — \(reason)")
             case .rejected(let reason):
                 lines.append("    health: ✗ rejected — \(reason)")
+            }
+            if let label = peer.currentTransport {
+                lines.append("    current_transport: \(label)")
             }
             if let cur = peer.pullCursor {
                 lines.append("    pull_cursor: ns=\(cur.cursorNs) id=\(cur.cursorID)")
