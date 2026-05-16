@@ -233,18 +233,31 @@ public struct Config: Codable, Sendable, Equatable {
     /// `deviceID` 可选——`mesh-init` 写新 config 时一般不知道（要等首次 /health 探测才能学到），
     /// 留 nil 让 PullWorker 跑学习模式（首次 tick 时把对端 device_id stamp 进 pull_cursor）。
     /// 显式给 deviceID 走严格模式：peer URL 指错机器时 PullWorker 立刻 transient skip 不污染 DB。
+    ///
+    /// **可选 `pullURL`**：fetch-missing / PullWorker / paste-fetcher 走的"快路径"URL，
+    /// 一般是 `*.sgponte`（Surge Ponte 域名，走 Surge HTTP proxy → ponte 隧道）。配了 →
+    /// 这些拉取路径用 pullURL；没配 → fallback 回 url。
+    /// **WSNotificationClient 永远用 url**（NIO WS client 不读系统 proxy，跑不了 ponte，
+    /// tailscale magic DNS 才解析得到）。
     public struct PeerConfig: Codable, Sendable, Equatable {
         public var url: URL
         public var deviceID: String?
+        public var pullURL: URL?
 
-        public init(url: URL, deviceID: String? = nil) {
+        public init(url: URL, deviceID: String? = nil, pullURL: URL? = nil) {
             self.url = url
             self.deviceID = deviceID
+            self.pullURL = pullURL
         }
+
+        /// PullWorker / fetch-missing / paste-fetcher 走的拉取 URL：优先 pullURL，
+        /// 没配 fallback 到 url。WS 通知层不应该用这个 helper（永远用 .url）。
+        public var effectivePullURL: URL { pullURL ?? url }
 
         enum CodingKeys: String, CodingKey {
             case url
             case deviceID = "device_id"
+            case pullURL = "pull_url"
         }
 
         public init(from decoder: Decoder) throws {
@@ -260,12 +273,25 @@ public struct Config: Codable, Sendable, Equatable {
             }
             self.url = u
             self.deviceID = try c.decodeIfPresent(String.self, forKey: .deviceID)
+            if let pullStr = try c.decodeIfPresent(String.self, forKey: .pullURL) {
+                guard let pu = URL(string: pullStr),
+                      let pscheme = pu.scheme?.lowercased(),
+                      ["http", "https"].contains(pscheme),
+                      pu.host != nil
+                else {
+                    throw ConfigError.invalidPeerURL("pull_url: \(pullStr)")
+                }
+                self.pullURL = pu
+            } else {
+                self.pullURL = nil
+            }
         }
 
         public func encode(to encoder: Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             try c.encode(url.absoluteString, forKey: .url)
             try c.encodeIfPresent(deviceID, forKey: .deviceID)
+            try c.encodeIfPresent(pullURL?.absoluteString, forKey: .pullURL)
         }
     }
 

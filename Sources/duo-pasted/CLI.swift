@@ -363,9 +363,11 @@ enum CLI {
                 return .unreachable(reason: "shared-secret 未配置")
             }
             // CLI 是 one-shot exit，没必要复用 keep-alive 连接池——URLSession.shared 够了
+            // 但 url 是 ponte 域名时必须用 ponte session（含 Surge proxy + 跳 hostname）
             let client = HTTPPeerClient(
                 baseURL: url,
-                auth: HMACAuth(secret: secret)
+                auth: HMACAuth(secret: secret),
+                session: PonteSession.session(for: url, fallback: .shared)
             )
             do {
                 let r = try await client.fetchPrimaryHealth()
@@ -510,11 +512,13 @@ enum CLI {
         let blobs = BlobStore(root: paths.blobsDir)
 
         // peer 候选列表：--peer 显式给 → 单峰；否则用 config.peers 全部按序尝试
+        // 默认走 effectivePullURL（ponte 快路径优先）；--peer 显式给的值原样用，
+        // 让用户能 override 调试单个 URL
         let peerURLs: [URL]
         if let p = peerOverride {
             peerURLs = [p]
         } else {
-            peerURLs = cfg.peers.map { $0.url }
+            peerURLs = cfg.peers.map { $0.effectivePullURL }
         }
         if peerURLs.isEmpty && !dryRun {
             FileHandle.standardError.write(Data("mesh-fetch-missing: 没有配置 peer（config peers 空 + 未给 --peer）\n".utf8))
@@ -535,8 +539,14 @@ enum CLI {
             }
             let auth = HMACAuth(secret: secret)
             // 每个 peer 一个 HTTPPeerClient，按 peerURLs 顺序对每个 sha 尝试
+            // ponte URL 走 PonteSession.pontePool（Surge proxy + 跳 hostname check），
+            // 其他走 .shared（CLI 短命进程，不复用 daemon 的 keep-alive 池）
             let clients: [HTTPPeerClient] = peerURLs.map {
-                HTTPPeerClient(baseURL: $0, auth: auth)
+                HTTPPeerClient(
+                    baseURL: $0,
+                    auth: auth,
+                    session: PonteSession.session(for: $0, fallback: .shared)
+                )
             }
             fetcher = { sha in
                 var lastErr: Admin.BlobFetchOutcome = .notFound

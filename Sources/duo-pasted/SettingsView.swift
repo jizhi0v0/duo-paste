@@ -467,6 +467,10 @@ private struct AboutSettingsTab: View {
     private var peerList: [String] {
         AppDelegate.shared?.dependencies?.config.peers.map { p -> String in
             let did = p.deviceID ?? "(learn)"
+            // 配了 pull_url 把它也展示出来——url 给 WS 通知，pull_url 给 PullWorker / fetch-missing / paste-fetcher
+            if let pull = p.pullURL {
+                return "\(p.url.absoluteString) · \(did)\n  pull → \(pull.absoluteString)"
+            }
             return "\(p.url.absoluteString) · \(did)"
         } ?? []
     }
@@ -478,7 +482,8 @@ private struct AboutSettingsTab: View {
         let blobs = deps.blobs
         let deviceID = deps.deviceID
         let dbPath = deps.paths.mainDB
-        let peerURLs = deps.config.peers.map { $0.url }
+        // 跟 PullWorker / paste-fetcher 一致：fetch-missing 用 effectivePullURL（ponte 快路径优先）
+        let peerURLs = deps.config.peers.map { $0.effectivePullURL }
         let sharedSecretFile = deps.paths.sharedSecretFile
         Task { @MainActor in
             defer { fetchInProgress = false }
@@ -496,7 +501,15 @@ private struct AboutSettingsTab: View {
                 return
             }
             let auth = HMACAuth(secret: secret)
-            let clients = peerURLs.map { HTTPPeerClient(baseURL: $0, auth: auth) }
+            // 按 URL host 自动选 session：ponte 域名走 PonteSession.pontePool（Surge HTTP
+            // proxy + 跳 hostname check），tailscale 域名走 syncURLSession（直连 + 严格 TLS）
+            let clients = peerURLs.map {
+                HTTPPeerClient(
+                    baseURL: $0,
+                    auth: auth,
+                    session: PonteSession.session(for: $0, fallback: AppDependencies.syncURLSession)
+                )
+            }
             let fetcher: @Sendable (String) async -> Admin.BlobFetchOutcome = { sha in
                 var lastErr: Admin.BlobFetchOutcome = .notFound
                 for c in clients {
@@ -534,6 +547,12 @@ private struct AboutSettingsTab: View {
                 FileHandle.standardError.write(Data(
                     "fetch-missing: done total=\(report.totalMissing) fetched=\(report.fetched) failed=\(report.failed)\n".utf8
                 ))
+                // 打详细失败 sample 让诊断 ponte 抖动 vs timeout vs 404 等（report.failures 最多 20 条）
+                for failure in report.failures {
+                    FileHandle.standardError.write(Data(
+                        "fetch-missing: failure sha=\(failure.sha) reason=\(failure.reason)\n".utf8
+                    ))
+                }
                 fetchReport = "扫到 \(report.totalMissing) 个缺失 · 拉到 \(report.fetched) · 失败 \(report.failed)"
                 fetchIsError = report.failed > 0
                 // 拉到字节后清缩略图缓存 + bump pulse 让 SearchView 卡片重渲。

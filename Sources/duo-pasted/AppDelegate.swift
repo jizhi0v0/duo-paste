@@ -87,9 +87,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let host = NSHostingController(rootView: SettingsView())
         let win = NSWindow(contentViewController: host)
-        win.title = "duo-paste 设置"
-        win.styleMask = [.titled, .closable, .miniaturizable]
-        win.setContentSize(NSSize(width: 600, height: 500))
+        // 自管 NSWindow，但采用系统默认 Settings 窗口外观：标准 titlebar +
+        // SwiftUI NavigationSplitView sidebar，而不是把内容铺进标题栏手画 sidebar。
+        win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        win.title = "设置"
+        win.titlebarAppearsTransparent = false
+        win.titleVisibility = .visible
+        win.setContentSize(NSSize(width: 880, height: 660))
+        win.minSize = NSSize(width: 820, height: 600)
         win.isReleasedWhenClosed = false   // close 走 orderOut，下次直接复用
         win.center()
         self.settingsWindow = win
@@ -213,10 +218,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let intervalSec = max(1, cfg.mesh.pullIntervalSec)
             var supervisorPeers: [MeshSupervisor.Peer] = []
             for peer in cfg.peers {
+                // PullWorker 走 peer.effectivePullURL（ponte 快路径优先），WSNotificationClient
+                // 仍用 peer.url（NIO WS 不读系统 proxy，跑不了 ponte）
+                let pullURL = peer.effectivePullURL
                 let client = HTTPPeerClient(
-                    baseURL: peer.url,
+                    baseURL: pullURL,
                     auth: auth,
-                    session: AppDependencies.syncURLSession
+                    session: PonteSession.session(
+                        for: pullURL,
+                        fallback: AppDependencies.syncURLSession
+                    )
                 )
                 // 严格模式：peer.deviceID 显式给了 → 严格校验对端 /health 返回 device_id
                 // 不匹配立即 transient skip。学习模式：deviceID=nil → 首次 /health 学到
@@ -285,16 +296,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let secret = try SharedSecret.load(from: deps.paths.sharedSecretFile)
             let auth = HMACAuth(secret: secret)
+            // 同 PullWorker：paste / 缩略图 / 预览的 blob 拉取走 effectivePullURL
+            // （ponte 快路径优先），fallback URL = tailscale URL（让 syncURLSession 处理）
+            let pullURL = firstPeer.effectivePullURL
             let fetcher = HTTPPeerClient(
-                baseURL: firstPeer.url,
+                baseURL: pullURL,
                 auth: auth,
-                session: AppDependencies.syncURLSession
+                session: PonteSession.session(
+                    for: pullURL,
+                    fallback: AppDependencies.syncURLSession
+                )
             )
             self.pasteBlobFetcher = fetcher
             // PR cloudy-mirroring-walnut PR 3：UI 路径（缩略图 / 空格预览）optimized 模式
             // 下也走这个 fetcher 按需拉 blob。同 instance 让连接池跨场景复用
             self.state.pasteBlobFetcher = fetcher
-            fputs("paste blob fetcher → \(firstPeer.url.absoluteString)\n", stderr)
+            fputs("paste blob fetcher → \(pullURL.absoluteString)\n", stderr)
         } catch {
             fputs("paste blob fetcher NOT initialized: \(error)\n", stderr)
         }

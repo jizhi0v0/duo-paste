@@ -62,6 +62,52 @@ private func tmpConfig(_ json: String) throws -> URL {
     #expect(cfg.summary.contains("2 peers"))
 }
 
+@Test func configPeerPullURLOptional() throws {
+    // pull_url 缺省时 effectivePullURL fallback 到 url
+    let url = try tmpConfig("""
+    {
+        "peers": [{ "url": "https://only-url.tail.ts.net:8443" }]
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.peers[0].pullURL == nil)
+    #expect(cfg.peers[0].effectivePullURL.absoluteString == "https://only-url.tail.ts.net:8443")
+}
+
+@Test func configPeerPullURLPresent() throws {
+    // pull_url 配了 → effectivePullURL 用它，url 留给 WS 等其他路径
+    let url = try tmpConfig("""
+    {
+        "peers": [{
+            "url": "https://bobbys-mac-mini.tail.ts.net:8443",
+            "pull_url": "https://mac.sgponte:8443"
+        }]
+    }
+    """)
+    let cfg = try Config.load(from: url)
+    #expect(cfg.peers[0].url.absoluteString == "https://bobbys-mac-mini.tail.ts.net:8443")
+    #expect(cfg.peers[0].pullURL?.absoluteString == "https://mac.sgponte:8443")
+    #expect(cfg.peers[0].effectivePullURL.absoluteString == "https://mac.sgponte:8443")
+}
+
+@Test func configPeerPullURLRejectsBogusScheme() throws {
+    // pull_url 必须 http/https，scheme 错 → ConfigError.invalidPeerURL
+    let url = try tmpConfig("""
+    {
+        "peers": [{
+            "url": "https://valid.tail.ts.net:8443",
+            "pull_url": "ftp://wrong-scheme.example:21"
+        }]
+    }
+    """)
+    do {
+        _ = try Config.load(from: url)
+        Issue.record("expected to throw invalidPeerURL")
+    } catch {
+        // 任意 throw 即可——具体匹配 ConfigError 要看 enum 是否 Equatable，简单起见只验 throw
+    }
+}
+
 @Test func configStandalonePrimaryMode() throws {
     // 只 serve 不连任何 peer——standalone primary（接受其他人来连，但本机不主动出去）
     let url = try tmpConfig("""
