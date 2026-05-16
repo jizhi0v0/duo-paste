@@ -67,6 +67,10 @@ public actor WSNotificationClient {
     private let config: Config
     private let now: @Sendable () -> Int64
     private let log: @Sendable (String) -> Void
+    /// 字节层 transport。tailscale 路径 = `NIOWebSocketTransport`；ponte 路径 =
+    /// `URLSessionWebSocketTransport(session: PonteSession.pontePool.session)`。
+    /// PR 3 起 AppDelegate / SmartTransport 按 host 决定注入哪个
+    private let transport: WSTransport
 
     private var runTask: Task<Void, Never>?
     /// 当前 backoff sleep task。wake() 取消它让 retry 立即触发——
@@ -84,7 +88,8 @@ public actor WSNotificationClient {
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("ws-client: \(msg)\n".utf8))
-        }
+        },
+        transport: WSTransport = NIOWebSocketTransport()
     ) {
         self.peerURL = peerURL
         self.auth = auth
@@ -95,6 +100,7 @@ public actor WSNotificationClient {
         self.config = config
         self.now = now
         self.log = log
+        self.transport = transport
     }
 
     public func start() {
@@ -185,66 +191,83 @@ public actor WSNotificationClient {
         log("stopped")
     }
 
-    /// 跑一次完整连接生命周期。connect 内 for-await 关闭后函数返回。
-    /// 抛错 / cancel 由调用方 catch。
+    /// 跑一次完整连接生命周期。transport 内 inbound 循环关闭后函数返回。
+    /// 抛错 / cancel 由调用方 catch。字节层 transport 由 init 注入——
+    /// NIO 默认 / URLSession 用于 ponte
     private func connectOnce() async throws {
         let wsURL = Self.makeWSURL(peerURL, path: "/sync/ws")
-        let headers = makeAuthHeaders(method: "GET", path: "/sync/ws")
-        var clientLogger = Logger(label: "duo-ws-client")
-        clientLogger.logLevel = .warning
+        let authFields = makeAuthHeaders(method: "GET", path: "/sync/ws")
+        // HTTPFields → [(String, String)]——transport 接口跟具体 HTTP lib 解耦
+        var headers: [(name: String, value: String)] = []
+        for f in authFields {
+            headers.append((name: f.name.rawName, value: f.value))
+        }
 
         // 闭包要 capture 这些 Sendable 值（actor self 不能跨 nonisolated 闭包）
         let onCursor = self.onCursorAdvanced
         let logFn = self.log
         let expectedPeer = self.expectedPeerDeviceID
         let maxBytes = self.config.maxInboundMessageBytes
-        let pingPeriodSec = max(1, Int(self.config.heartbeatSec))
+        let heartbeatSec = self.config.heartbeatSec
         // setConnected 是 actor isolated；用 nonisolated wrapper 让闭包内能调用。
         // detached Task 顺便避免被外层 task local 上下文 capture
         let setConn: @Sendable (Bool) -> Void = { [weak self] v in
             let _: Task<Void, Never> = Task { [weak self] in await self?.setConnected(v) }
         }
+        // hello expectedPeer 校验失败时往 onText 后续帧通报"别再处理"。transport 没主动关
+        // 接口；下一帧自然 onText 看到 flag 跳过 + 我们最后 throw 让外层 backoff 重连
+        let closeSignal = CloseSignal()
 
-        try await WebSocketClient.connect(
-            url: wsURL,
-            configuration: .init(
-                additionalHeaders: headers,
-                autoPing: .enabled(timePeriod: .seconds(pingPeriodSec))
-            ),
-            logger: clientLogger
-        ) { inbound, _, _ in
-            setConn(true)
-            defer { setConn(false) }
-            for try await msg in inbound.messages(maxSize: maxBytes) {
-                guard case .text(let s) = msg else { continue }
+        try await transport.runOnce(
+            wsURL: wsURL,
+            headers: headers,
+            maxInboundMessageBytes: maxBytes,
+            heartbeatSec: heartbeatSec,
+            onConnected: setConn,
+            onText: { text in
+                if await closeSignal.isSet { return }
                 let m: WSMessage
                 do {
-                    m = try WSMessage.decodeJSON(s)
+                    m = try WSMessage.decodeJSON(text)
                 } catch {
                     logFn("decode failed: \(error)")
-                    continue
+                    return
                 }
                 switch m {
                 case .cursorAdvanced(_, let deviceID, let latest):
                     if let expectedPeer, deviceID != expectedPeer {
                         logFn("cursor_advanced from unexpected peer \(deviceID), expected \(expectedPeer); ignoring")
-                        continue
+                        return
                     }
                     onCursor(latest)
                 case .hello(_, let deviceID, _, let latest):
                     if let expectedPeer, deviceID != expectedPeer {
                         logFn("hello from unexpected peer \(deviceID), expected \(expectedPeer); closing")
+                        await closeSignal.set()
                         return
                     }
                     // hello 也算一次 advance 通知，让 PullWorker 立刻做"我已经追平了吗"自检
                     onCursor(latest)
                 case .ping, .pong:
-                    // 应用层 ping/pong 当前不消费——WebSocket 协议层 autoPing 已处理 keep-alive
-                    continue
+                    // 应用层 ping/pong 当前不消费——WS 协议层 autoPing/heartbeat 已处理 keep-alive
+                    return
                 }
             }
+        )
+        if await closeSignal.isSet {
+            // expectedPeer 校验失败——让外层 runLoop 把这次算失败 + backoff 重连
+            throw WSExpectedPeerMismatch()
         }
     }
+
+    /// 一次性 close 信号——hello 校验失败后下一帧 onText 看到这个就 early-return
+    private actor CloseSignal {
+        private(set) var isSet: Bool = false
+        func set() { isSet = true }
+    }
+
+    /// hello 报告 device_id 跟 expectedPeer 不匹配——让外层 runLoop 把这次算失败 + backoff
+    public struct WSExpectedPeerMismatch: Error, Sendable {}
 
     /// HTTP url → ws/wss url。`http` → `ws`，`https` → `wss`，其他 scheme 原样返回（让连接抛错给上层）。
     static func makeWSURL(_ httpURL: URL, path: String) -> String {
