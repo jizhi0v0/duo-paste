@@ -122,6 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.settingsWindow = win
         win.makeKeyAndOrderFront(nil)
         positionSettingsTrafficLights(in: win)
+        // 某些机器 NSThemeFrame 在 makeKeyAndOrderFront 之后还要 layout 一次，
+        // 会把我们的 setFrameOrigin 覆盖回默认位置。延后一拍再摆一次，赢这场 race。
+        DispatchQueue.main.async { [weak self] in
+            self?.positionSettingsTrafficLights(in: win)
+        }
     }
 
     private func centerSettingsWindow(_ window: NSWindow) {
@@ -143,40 +148,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func positionSettingsTrafficLights(in window: NSWindow) {
-        guard let close = window.standardWindowButton(.closeButton),
-              let mini = window.standardWindowButton(.miniaturizeButton),
-              let zoom = window.standardWindowButton(.zoomButton),
-              let contentView = window.contentView else { return }
+        guard let contentView = window.contentView else { return }
 
-        for button in [close, mini, zoom] where button.superview !== contentView {
-            contentView.addSubview(button, positioned: .above, relativeTo: nil)
+        // 系统 standardWindowButton 在某些 macOS 版本上 NSThemeFrame 会反复 re-layout
+        // 把我们的 setFrameOrigin 覆盖回左上角默认位置（mini 上复现，MBP 上 OK）。
+        // 干脆隐藏掉走真·自绘——overlay 自己画红黄绿 + 处理点击。
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(kind)?.isHidden = true
         }
 
-        let topInset: CGFloat = 40
-        let leftInset: CGFloat = 34
-        let spacing: CGFloat = 25
-        let y = contentView.isFlipped
-            ? topInset
-            : contentView.bounds.height - topInset - close.frame.height
-
-        close.setFrameOrigin(NSPoint(x: leftInset, y: y))
-        mini.setFrameOrigin(NSPoint(x: leftInset + spacing, y: y))
-        zoom.setFrameOrigin(NSPoint(x: leftInset + spacing * 2, y: y))
+        let topInset: CGFloat = 32   // 跟右侧 SettingsGroup title (.padding(.top, 32) + 13pt) 垂直中心对齐
+        let leftInset: CGFloat = 34  // 跟 sidebar 项左边缘对齐 = sidebar padding(14) + 内 padding(8) + row padding(12)
+        let diameter: CGFloat = 14
+        let spacing: CGFloat = 20
 
         let overlay = settingsTrafficLightOverlay ?? TrafficLightGlyphOverlay()
+        overlay.hostWindow = window
+        overlay.buttonDiameter = diameter
+        overlay.buttonSpacing = spacing
         if overlay.superview !== contentView {
             overlay.removeFromSuperview()
             contentView.addSubview(overlay, positioned: .above, relativeTo: nil)
             settingsTrafficLightOverlay = overlay
         }
+        let y = contentView.isFlipped
+            ? topInset
+            : contentView.bounds.height - topInset - diameter
         overlay.frame = NSRect(
-            x: close.frame.minX - 1,
-            y: min(close.frame.minY, mini.frame.minY, zoom.frame.minY) - 1,
-            width: zoom.frame.maxX - close.frame.minX + 2,
-            height: max(close.frame.height, mini.frame.height, zoom.frame.height) + 2
+            x: leftInset,
+            y: y,
+            width: diameter + spacing * 2 + 2,
+            height: diameter + 2
         )
-        overlay.buttonDiameter = close.frame.width
-        overlay.buttonSpacing = spacing
+        overlay.needsDisplay = true
         overlay.needsDisplay = true
     }
 
@@ -894,9 +898,31 @@ private final class FullBleedHostingView<Content: View>: NSHostingView<Content> 
 }
 
 private final class TrafficLightGlyphOverlay: NSView {
+    weak var hostWindow: NSWindow? {
+        didSet {
+            for obs in keyObservers { NotificationCenter.default.removeObserver(obs) }
+            keyObservers.removeAll()
+            guard let win = hostWindow else { return }
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification, NSWindow.didBecomeMainNotification, NSWindow.didResignMainNotification] {
+                let obs = NotificationCenter.default.addObserver(forName: name, object: win, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.needsDisplay = true }
+                }
+                keyObservers.append(obs)
+            }
+        }
+    }
     var buttonDiameter: CGFloat = 14
-    var buttonSpacing: CGFloat = 25
+    var buttonSpacing: CGFloat = 20
     private var isHovering = false
+    private var keyObservers: [NSObjectProtocol] = []
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            for obs in keyObservers { NotificationCenter.default.removeObserver(obs) }
+            keyObservers.removeAll()
+        }
+    }
 
     override var isFlipped: Bool { true }
 
@@ -906,7 +932,7 @@ private final class TrafficLightGlyphOverlay: NSView {
         }
         addTrackingArea(NSTrackingArea(
             rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways],
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
             owner: self
         ))
         super.updateTrackingAreas()
@@ -922,12 +948,44 @@ private final class TrafficLightGlyphOverlay: NSView {
         needsDisplay = true
     }
 
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        nil
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard let win = hostWindow else { return }
+        let idx = Int(floor((p.x - 1) / buttonSpacing))
+        switch idx {
+        case 0: win.performClose(nil)
+        case 1: win.performMiniaturize(nil)
+        case 2: win.performZoom(nil)
+        default: break
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard isHovering, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let isActive = hostWindow?.isKeyWindow ?? hostWindow?.isMainWindow ?? false
+        let fills: [NSColor] = isActive
+            ? [NSColor(srgbRed: 1.0, green: 0.373, blue: 0.341, alpha: 1),
+               NSColor(srgbRed: 0.996, green: 0.737, blue: 0.184, alpha: 1),
+               NSColor(srgbRed: 0.157, green: 0.784, blue: 0.251, alpha: 1)]
+            : Array(repeating: NSColor(srgbRed: 0.32, green: 0.32, blue: 0.32, alpha: 1), count: 3)
+
+        for i in 0..<3 {
+            let c = center(forButtonAt: i)
+            let rect = CGRect(
+                x: c.x - buttonDiameter / 2,
+                y: c.y - buttonDiameter / 2,
+                width: buttonDiameter,
+                height: buttonDiameter
+            )
+            context.setFillColor(fills[i].cgColor)
+            context.fillEllipse(in: rect)
+            // 极淡描边模仿系统
+            context.setStrokeColor(NSColor.black.withAlphaComponent(0.12).cgColor)
+            context.setLineWidth(0.5)
+            context.strokeEllipse(in: rect.insetBy(dx: 0.25, dy: 0.25))
+        }
+
+        guard isHovering else { return }
         context.setLineCap(.round)
         context.setLineWidth(1.25)
         context.setStrokeColor(NSColor.black.withAlphaComponent(0.52).cgColor)

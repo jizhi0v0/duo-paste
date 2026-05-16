@@ -72,10 +72,10 @@ private struct Sidebar: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(Color.white.opacity(0.13), lineWidth: 1)
         )
-        .padding(.leading, 8)
-        .padding(.trailing, 8)
-        .padding(.top, 10)
-        .padding(.bottom, 10)
+        .padding(.leading, 14)
+        .padding(.trailing, 10)
+        .padding(.top, 16)
+        .padding(.bottom, 16)
         .frame(maxHeight: .infinity)
     }
 }
