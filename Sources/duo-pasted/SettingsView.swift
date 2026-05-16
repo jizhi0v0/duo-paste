@@ -966,26 +966,6 @@ private struct AboutPane: View {
                 }
             }
 
-            SettingsGroup(title: "Peers") {
-                if peerList.isEmpty {
-                    SettingsBlock(isFirst: true) {
-                        Text("未配置 peer（standalone 模式）")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                } else {
-                    ForEach(Array(peerList.enumerated()), id: \.offset) { idx, entry in
-                        SettingsBlock(isFirst: idx == 0) {
-                            Text(entry)
-                                .font(.system(.callout, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                }
-            }
-
             SettingsGroup(title: "Blob 补齐") {
                 SettingsBlock(isFirst: true) {
                     HStack {
@@ -1084,16 +1064,6 @@ private struct AboutPane: View {
 
     private var storageModeDisplay: String {
         AppDelegate.shared?.dependencies?.config.mesh.storageMode.description ?? "—"
-    }
-
-    private var peerList: [String] {
-        AppDelegate.shared?.dependencies?.config.peers.map { p -> String in
-            let did = p.deviceID ?? "(learn)"
-            if let pull = p.pullURL {
-                return "\(p.url.absoluteString) · \(did)\n  pull → \(pull.absoluteString)"
-            }
-            return "\(p.url.absoluteString) · \(did)"
-        } ?? []
     }
 
     private func runFetchMissing() {
