@@ -204,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state: state,
             onPaste: { [weak self] items in self?.pasteBack(items) },
             onReveal: { [weak self] item in self?.revealInFinder(item) },
+            onOpenWith: { [weak self] item, app in self?.openWith(item, app: app) },
             onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() }
         )
         statusBar = StatusBarController { [weak self] in
@@ -224,6 +225,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         snapshotScheduler = SnapshotScheduler(deps: deps)
         snapshotScheduler.start()
+
+        // "打开方式" 临时文件清理:删 24h 以上旧 staging 子目录。挂在 detached low-priority
+        // 队列,不阻塞 launch。staging 目录不存在直接 no-op,首次运行无副作用
+        let stagingRoot = deps.paths.openWithStagingDir
+        Task.detached(priority: .background) {
+            OpenWithStaging.cleanupOldStaging(root: stagingRoot)
+        }
 
         if deps.config.serve {
             startSyncServer()
@@ -574,6 +582,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.panel.hide()
             case .failure(let reason):
                 self.state.pasteProgress = .failed(reason: reason)
+            }
+        }
+    }
+
+    /// 右键 contextMenu "打开方式" 触发——用指定 app 打开该 item。
+    ///
+    /// 三种 item 路径:
+    /// 1. 本机有 blob / 是 text/url/本机存在 file → 同步物化 + NSWorkspace.open
+    /// 2. blob 不在本机但配了 pasteBlobFetcher → 复用 lazy fetch (5s race timeout) 拉完再 open
+    /// 3. blob 不在本机也没 fetcher → pasteProgress.failed banner
+    ///
+    /// 跟 pasteBack 共享 currentPasteTask:多次右键不同 app 时旧 task 自动 cancel,
+    /// panel hide / Esc 也通过 onDismiss → cancelLazyPasteIfAny 路径 cancel
+    private func openWith(_ item: Item, app: URL) {
+        currentPasteTask?.cancel()
+        currentPasteTask = nil
+        state.pasteProgress = .idle
+
+        // 需要 blob 字节但本机没缓存 → 走 lazy 拉路径。
+        // text/url/rtf/html: 没 blob 不需要拉。
+        // file kind: 本机路径存在直接 open,blob 才是兜底
+        let needsLazyBlob: Bool = {
+            guard let sha = item.blobSha256 else { return false }
+            if deps.blobs.exists(sha256: sha) { return false }
+            // file kind 且本机路径存在 → 直接 open 不依赖 blob
+            if item.kind == .file {
+                let urls = fileURLs(from: item)
+                if urls.contains(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+                    return false
+                }
+            }
+            return true
+        }()
+
+        if needsLazyBlob, let sha = item.blobSha256 {
+            guard let fetcher = pasteBlobFetcher else {
+                state.pasteProgress = .failed(reason: "blob 在本机未缓存,且未配置 primary 拉取通道")
+                return
+            }
+            state.pasteProgress = .fetching(itemID: item.id, sizeHint: item.blobSize)
+            currentPasteTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let outcome = await self.fetchBlobLazy(sha: sha, fetcher: fetcher)
+                if Task.isCancelled { return }
+                switch outcome {
+                case .success:
+                    self.state.pasteProgress = .idle
+                    self.performOpenWith(item, app: app)
+                case .failure(let reason):
+                    self.state.pasteProgress = .failed(reason: reason)
+                }
+            }
+            return
+        }
+
+        performOpenWith(item, app: app)
+    }
+
+    /// 同步路径——blob 字节已就位 / 不需要 blob。物化 → NSWorkspace 调起目标 app。
+    /// 失败走 pasteProgress.failed banner;成功 panel.hide()
+    private func performOpenWith(_ item: Item, app: URL) {
+        let target: OpenWithTarget
+        do {
+            target = try OpenWithStaging.materialize(
+                item: item,
+                blobs: deps.blobs,
+                root: deps.paths.openWithStagingDir
+            )
+        } catch {
+            state.pasteProgress = .failed(reason: "物化失败: \(error)")
+            return
+        }
+
+        // file/webURL 都用同一个 open([URL], withApplicationAt:, configuration:) 路径:
+        // - file URL 让目标 app 把它当作文件打开
+        // - web URL 让浏览器 / scheme handler 打开 URL 字符串
+        // 两者 NSWorkspace 都接受
+        let url: URL
+        switch target {
+        case .fileURL(let u), .webURL(let u):
+            url = u
+        }
+
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        // 剪贴板内容是临时,不该污染目标 app 的 Recent / 最近列表
+        config.addsToRecentItems = false
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await NSWorkspace.shared.open(
+                    [url], withApplicationAt: app, configuration: config
+                )
+                self.panel.hide()
+            } catch {
+                self.state.pasteProgress = .failed(reason: "打开失败: \(error.localizedDescription)")
             }
         }
     }
