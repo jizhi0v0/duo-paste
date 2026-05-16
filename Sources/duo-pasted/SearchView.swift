@@ -515,11 +515,16 @@ struct SearchView: View {
                 y: 1
             )
             .animation(.smooth(duration: 0.18), value: searchFieldFocused)
-            // slash 补全候选浮层——绑在搜索框下方,跟搜索框 capsule 同宽
-            .overlay(alignment: .bottomLeading) {
+            // slash 补全候选浮层——绑在搜索框下方。
+            // 锚点必须用 .topLeading 而非 .bottomLeading:候选 VStack 内部 top-down 渲染,
+            // 用 bottomLeading 会让 popup 以底部为锚向上扩,候选多时(全列表 20+ 条)
+            // 顶端 alphabetical first 几条会被 panel 顶边裁掉只剩末尾 /xml /yaml /yml。
+            // topLeading + offset(y: 44, x: 8) = popup 顶端贴 capsule 底下方 + 略向右
+            // 让顶端左圆角避开 capsule 圆形左端的曲线 overlap(用户红圈反馈)
+            .overlay(alignment: .topLeading) {
                 if state.completionMenuVisible && !state.completionCandidates.isEmpty {
                     completionOverlay
-                        .offset(y: 36)  // 36pt = capsule 高度 + 4pt 间距
+                        .offset(x: 8, y: 44)
                         .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
@@ -555,42 +560,68 @@ struct SearchView: View {
         }
     }
 
-    /// slash 补全候选浮层——VStack 列出 QueryParser.suggestions 候选,高亮项 accent 背景
+    /// slash 补全候选浮层——VStack 列 QueryParser.suggestions 候选,高亮项 accent capsule 背景。
+    /// 设计取舍:
+    ///   * 14pt 圆角(panel 22 / 卡片 14 居中)
+    ///   * **不**用 .glassEffect:popup 盖在已经是 Liquid Glass 的 panel 之上,glass-over-glass
+    ///     视觉发糊读不清。用 ultraThickMaterial 给一层半实体材质让候选文字可读
+    ///   * 候选行选中态用 capsule + horizontal inset 跟 Paste 风格圆形语言一致
+    ///   * 包 ScrollView + maxHeight 280:候选 22+ 条(用户单字符 /)时不溢出 panel 边界
     private var completionOverlay: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(state.completionCandidates.enumerated()), id: \.offset) { idx, candidate in
-                let isHighlighted = idx == state.completionHighlight
-                Button {
-                    acceptCompletion(at: idx)
-                } label: {
-                    HStack(spacing: 8) {
-                        Text(candidate.display)
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundStyle(isHighlighted ? Color.white : .primary)
-                        Spacer()
-                        Text(qualifierHint(candidate.qualifier))
-                            .font(.system(size: 11))
-                            .foregroundStyle(isHighlighted ? Color.white.opacity(0.75) : .secondary)
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        // ScrollViewReader 让 ↑↓ 改 completionHighlight 时自动 scrollTo 选中行,
+        // 候选 22+ 条溢出 280pt 高度时,导航不会"看不见选中项"。
+        // .id(idx) 钉在 completionRow 上让 proxy.scrollTo(idx) 能定位
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(state.completionCandidates.enumerated()), id: \.offset) { idx, candidate in
+                        completionRow(idx: idx, candidate: candidate)
+                            .id(idx)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(isHighlighted ? Color.accentColor : Color.clear)
                 }
-                .buttonStyle(.plain)
+                .padding(.vertical, 6)
+                .frame(width: 320)
+            }
+            .onChange(of: state.completionHighlight) { _, newIdx in
+                // 不包 withAnimation:material 背景 + ScrollView 动画滚动时
+                // SwiftUI 在过渡帧间保留前一位置叠加渲染,会看到候选行残影。
+                // 即时 scroll 跟键盘节奏匹配,体感也更跟手
+                proxy.scrollTo(newIdx, anchor: .center)
             }
         }
-        .padding(.vertical, 4)
-        .frame(width: 320)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.ultraThinMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
-        )
-        .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
+        .frame(width: 320, height: min(CGFloat(state.completionCandidates.count) * 32 + 12, 280))
+        .background(shape.fill(.ultraThickMaterial))
+        .overlay(shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5))
+        .clipShape(shape)
+        .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
+    }
+
+    @ViewBuilder
+    private func completionRow(idx: Int, candidate: (display: String, qualifier: QueryQualifier)) -> some View {
+        let isHighlighted = idx == state.completionHighlight
+        Button {
+            acceptCompletion(at: idx)
+        } label: {
+            HStack(spacing: 8) {
+                Text(candidate.display)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(isHighlighted ? Color.white : .primary)
+                Spacer()
+                Text(qualifierHint(candidate.qualifier))
+                    .font(.system(size: 11))
+                    .foregroundStyle(isHighlighted ? Color.white.opacity(0.78) : .secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(isHighlighted ? Color.accentColor : Color.clear)
+            )
+            .padding(.horizontal, 6)
+        }
+        .buttonStyle(.plain)
     }
 
     /// qualifier 显示对应的中文提示文本（候选行右侧）

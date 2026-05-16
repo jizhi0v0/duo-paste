@@ -76,12 +76,18 @@ final class PreviewPanelController {
         currentItemID = item.id
         if isItemChange { loadTask?.cancel() }
 
-        // 1) 缓存命中 → 同步 apply
+        // 1) 缓存命中 → 同步 apply。但"本该能解码却拿到 .none"的负向缓存不算命中
+        // ——image/pdf/video kind 失败常因 TCC 还没 prompt / 路径暂时不可读;
+        // 用户授权 Allow 后想再次预览自然期望重试,不应被 stale .none 锁死
         if let cached = mediaCache[item.id] {
-            apply(item: item, media: cached,
-                  visibleFrame: visibleFrame, anchor: anchor,
-                  cardRectInGlobal: cardRectInGlobal)
-            return
+            let isNoneCache: Bool = { if case .none = cached { return true }; return false }()
+            let isNegativeCacheOnDecodable = isNoneCache && needsAsyncDecode(item)
+            if !isNegativeCacheOnDecodable {
+                apply(item: item, media: cached,
+                      visibleFrame: visibleFrame, anchor: anchor,
+                      cardRectInGlobal: cardRectInGlobal)
+                return
+            }
         }
         // 2) 不需要异步解码 → 同步 .none + 缓存(下次同 item reposition 不重判)
         if !needsAsyncDecode(item) {
@@ -255,10 +261,20 @@ final class PreviewPanelController {
                let raw = item.textFull,
                let first = raw.split(separator: "\n", omittingEmptySubsequences: true).first {
                 let path = String(first)
-                if FileManager.default.fileExists(atPath: path),
-                   let doc = PDFDocument(url: URL(fileURLWithPath: path)) {
-                    // 后台触一下首页 mediaBox 让 PDFKit lazy-parse 首页结构,
-                    // 主线程上 PDFView setDocument 时不会再卡
+                let url = URL(fileURLWithPath: path)
+                // 先用 Data 读字节再 PDFDocument(data:)——跟 PDFDocument(url:) 比绕开
+                // PDFKit URL 路径里在 worker thread 上调 CG 的不确定行为。某些 PDF
+                // (Documents/ 里这条 6 页 PDF 1.4)在 detached task 上 PDFDocument(url:)
+                // 返回 nil 且 CoreGraphics 静默 log 错误,改 (data:) 后稳定可解
+                // 用 NSFileCoordinator 读——iCloud Drive (Documents/Desktop 同步) +
+                // CleanShotX 等 FileProvider 管理的文件,daemon 后台直接 open() 会触
+                // FileProvider IPC 死锁返回 EDEADLK (errno 11 / NSCocoaError 256)。
+                // NSFileCoordinator 是 macOS 给 cloud 文件的标准协议路径:发起 read
+                // intent 让 FileProvider 先 materialize 再放行,绕开死锁。
+                // 首次 TCC 拒绝后 .none 不进缓存(见上面 mediaCache 逻辑),用户授权
+                // Allow 后再次预览同条会重 decode 成功——macOS 本身无 wait-for-TCC API
+                if let data = Self.readDataViaCoordinator(url: url),
+                   let doc = PDFDocument(data: data) {
                     _ = doc.page(at: 0)?.bounds(for: .mediaBox)
                     return .pdf(doc)
                 }
@@ -311,6 +327,19 @@ final class PreviewPanelController {
             if let p = item.textFull, fileLooksLikeImage(path: p) { return true }
         }
         return false
+    }
+
+    /// 用 NSFileCoordinator 读字节——iCloud Drive / CleanShotX 等 FileProvider 管理的
+    /// 文件,daemon 直接 Data(contentsOf:) 会触发 FileProvider IPC 死锁 (EDEADLK)。
+    /// coordinator 发 read intent → FileProvider 按需 materialize → 再放行同步读
+    nonisolated static func readDataViaCoordinator(url: URL) -> Data? {
+        let coord = NSFileCoordinator(filePresenter: nil)
+        var coordErr: NSError?
+        var bytes: Data?
+        coord.coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordErr) { coordinatedURL in
+            bytes = try? Data(contentsOf: coordinatedURL)
+        }
+        return coordErr == nil ? bytes : nil
     }
 
     /// PDF 判别——不走 blob(单文件 PDF capture 不存 blob),凭 textFull 路径后缀 / 兜底 mime
