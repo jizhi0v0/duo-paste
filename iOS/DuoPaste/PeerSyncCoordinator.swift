@@ -276,6 +276,12 @@ final class PeerSyncCoordinator {
         client = nil
         pendingAdvance = false
         lastConnectedStampAt = nil
+        // 清掉 endpoint 选择状态——避免 UI 残留候选列表 / "当前 URL" 在断开后还显示
+        currentEndpointURL = nil
+        availableEndpoints = []
+        currentSecret = nil
+        lastProbes = []
+        lastRTT = [:]
         status = .unconfigured
     }
 

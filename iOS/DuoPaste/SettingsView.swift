@@ -86,13 +86,21 @@ struct SettingsView: View {
             }
             if !sharedSecretHex.isEmpty {
                 Button(role: .destructive) {
-                    coordinator.stop()
+                    disconnectAndForget()
                 } label: {
                     Label("断开", systemImage: "stop.circle")
                 }
-                .disabled(disconnectDisabled)
             }
         }
+    }
+
+    /// 断开 + 清持久化:coordinator.stop 重置运行时态,AppStorage 清三个字段。
+    /// 下次想连得重新 PIN 配对。按钮的 `if !sharedSecretHex.isEmpty` 自动让自己消失
+    private func disconnectAndForget() {
+        coordinator.stop()
+        sharedSecretHex = ""
+        peerURL = ""
+        peerEndpointsJSON = ""
     }
 
     /// 显示 EndpointPicker 探到的全部候选 + RTT,选中的标记 ★。
@@ -286,13 +294,6 @@ struct SettingsView: View {
         case .error: .red
         case .connecting, .backoff: .orange
         default: .secondary
-        }
-    }
-
-    private var disconnectDisabled: Bool {
-        switch coordinator.status {
-        case .unconfigured, .idle: true
-        default: false
         }
     }
 
