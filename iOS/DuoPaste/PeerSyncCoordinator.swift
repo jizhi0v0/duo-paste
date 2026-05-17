@@ -56,7 +56,9 @@ final class PeerSyncCoordinator {
     private var repickTask: Task<Void, Never>?
     /// 每个 endpoint URL 最近一次实测 RTT。re-probe 时跟新最优比,差 < `rttStableEpsilon` →
     /// 不切防 flap。在 disconnected 期间所有候选都失败 -1 → 不更新 → 不影响 stable guard
-    private var lastRTT: [String: Int] = [:]
+    private(set) var lastRTT: [String: Int] = [:]
+    /// 最近一次 probe 完整结果(含失败的) — 给 Settings UI 显示用
+    private(set) var lastProbes: [EndpointPicker.Probe] = []
     /// RTT 抖动容忍——新最优比当前 RTT 差超过这个 ratio 才切。0.2 = 20%
     nonisolated let rttStableEpsilon: Double = 0.2
     /// 周期 safety probe task——5min 一次,即便 NWPathMonitor / WS 都没火,也防 endpoint
@@ -156,6 +158,7 @@ final class PeerSyncCoordinator {
             FileHandle.standardError.write(Data("endpoint pick: best=\(best.endpoint.kind.rawValue) (\(best.rttMs)ms) [\(summary)]\n".utf8))
             await MainActor.run {
                 self?.recordRTTs(probes: probes)
+                self?.lastProbes = probes
                 self?.applyPick(endpoint: best.endpoint, rttMs: best.rttMs, secret: secret)
             }
         }

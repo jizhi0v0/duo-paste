@@ -13,10 +13,11 @@ import DuoPasteCore
 /// WS endpoints_changed / 周期 timer)
 @MainActor
 enum EndpointPicker {
-    struct Probe: Equatable, Sendable {
+    struct Probe: Equatable, Sendable, Identifiable {
         let endpoint: PeerEndpoint
         let rttMs: Int     // -1 = 失败
         var ok: Bool { rttMs >= 0 }
+        var id: String { endpoint.url }
     }
 
     /// 并发探活所有 endpoint。返回完整结果(含失败的),按 RTT 升序。

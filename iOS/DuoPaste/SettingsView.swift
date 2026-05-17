@@ -21,6 +21,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 statusSection
+                candidatesSection
                 discoverySection
                 advancedSection
             }
@@ -81,6 +82,43 @@ struct SettingsView: View {
                     Label("断开", systemImage: "stop.circle")
                 }
                 .disabled(disconnectDisabled)
+            }
+        }
+    }
+
+    /// 显示 EndpointPicker 探到的全部候选 + RTT,选中的标记 ★。
+    /// 不只是 Bonjour 发现的 Mac——还包括 mesh peer Mac 通过 /endpoints 透传过来的
+    /// (iOS 配对 mini 后 mini 把 MBP 的 endpoints 也传过来,即便 Bonjour 跨 LAN 拿不到)
+    @ViewBuilder
+    private var candidatesSection: some View {
+        let probes: [EndpointPicker.Probe] = coordinator.lastProbes
+        if !probes.isEmpty {
+            Section {
+                ForEach(probes, id: \EndpointPicker.Probe.id) { (probe: EndpointPicker.Probe) in
+                    HStack {
+                        let isCurrent = probe.endpoint.url == coordinator.currentEndpointURL
+                        Text(isCurrent ? "★" : "·")
+                            .foregroundStyle(isCurrent ? .green : .secondary)
+                            .frame(width: 16)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(probe.endpoint.url)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(probe.endpoint.kind.rawValue)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(probe.ok ? "\(probe.rttMs)ms" : "—")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(probe.ok ? Color.primary : Color.red)
+                    }
+                }
+            } header: {
+                Text("候选 endpoint(\(probes.count))")
+            } footer: {
+                Text("★ = 当前连接。包括本机 Mac 透传的整个 mesh 候选——iOS Bonjour 跨 LAN 拿不到的 Mac 也在这里。RTT 排序选最低延迟。")
             }
         }
     }
@@ -207,16 +245,15 @@ struct SettingsView: View {
     }
 
     /// PIN 配对成功 → 持久化 secret + endpoints + 让 coordinator probe 选最快。
-    /// `page` 含 self + mesh_peers,扁平化让 picker 跨全 mesh 探活选最快
+    /// `page` 含 self + mesh_peers,扁平化让 picker 跨全 mesh 探活选最快。
+    ///
+    /// **不立即写 peerURL**——避免 status 闪一下 preferred URL(通常 tailscale)然后又
+    /// 切到 picker 实际选中的(通常 .local)。让 statusSection 只看 currentEndpointURL,
+    /// picker 完成才有第一个 URL 显示
     private func handlePairingSuccess(secret: Data, page: PeerEndpointsPage) {
         let secretHex = secret.map { String(format: "%02x", $0) }.joined()
         sharedSecretHex = secretHex
         let flat = PeerSyncCoordinator.flattenEndpoints(page)
-        // 回填 peerURL 让 advanced section 显示一致(coordinator.applyPick 也会写
-        // currentEndpointURL,UI 二者择一显示)
-        if let first = flat.first(where: { $0.preferred }) ?? flat.first {
-            peerURL = first.url
-        }
         // 持久化扁平化后的 endpoint list 让重启后能从这恢复
         if let data = try? JSONEncoder().encode(flat),
            let json = String(data: data, encoding: .utf8) {
