@@ -12,7 +12,7 @@ import DuoPasteCore
 struct PinPairingSheet: View {
     let peer: PeerDiscovery.DiscoveredPeer
     @Binding var isPresented: Bool
-    let onPaired: (Data, String, [PeerEndpoint]) -> Void
+    let onPaired: (Data, String, PeerEndpointsPage) -> Void
 
     @State private var pin: String = ""
     @State private var status: Status = .input
@@ -135,8 +135,10 @@ struct PinPairingSheet: View {
                 let client = PeerClient(config: cfg)
                 let endpoints = try await client.fetchEndpoints()
 
-                // 3) callback 让 coordinator 接管:probe + 选最快 + 持久化
-                onPaired(resp.secret, resp.deviceID, endpoints.endpoints)
+                // 3) callback 让 coordinator 接管:probe + 选最快 + 持久化。
+                //    `endpoints` 是 PeerEndpointsPage,含 self + mesh_peers,coordinator
+                //    扁平化后探活全部候选
+                onPaired(resp.secret, resp.deviceID, endpoints)
                 status = .done
                 // 短暂展示成功后关闭
                 try? await Task.sleep(nanoseconds: 600_000_000)

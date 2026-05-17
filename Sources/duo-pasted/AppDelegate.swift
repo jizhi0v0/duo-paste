@@ -25,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// daemon 启动时构造一份。Mac Settings"显示配对码"调它 generatePIN(),
     /// /pair/<pin> 路由调它 validateAndConsumePIN
     private(set) var pairingService: PairingService?
+    /// MeshSupervisor 起来后构造,周期 fetch mesh peer 的 /endpoints,聚合给本机
+    /// /endpoints 路由暴露 + snapshot 变化时通过 wsBroadcaster 推 endpoints_changed
+    private var meshEndpointsCache: MeshEndpointsCache?
     /// Mesh peer 拉取入口。PR 2 单 peer 部署下 supervisor 内只有一个 PullWorker，行为跟原
     /// `pullWorker: PullWorker?` 等价；PR 5 mesh-init 后多 peer 列表自然 fan-out 进 N 个 worker
     private var meshSupervisor: MeshSupervisor?
@@ -389,6 +392,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // reconcile 完后 hop 回 main actor 写 AppState，SwiftUI 自动刷新 SettingsView
             // weak appState 防 supervisor 持 strong cycle（AppDelegate 也持 supervisor）
             let appState = self.state
+            // reconcile 完成回调:既 push 到 AppState 让 Settings 显示新 transport,也踢
+            // MeshEndpointsCache 立即 refreshNow——避免新发现的 peer / ponte_host 等
+            // 周期 60s 才出现在 iOS 端
+            let onDecisionsUpdated: @Sendable ([SmartTransport.PeerDecision]) -> Void = { [weak self] newDecisions in
+                Task { @MainActor [weak appState] in
+                    appState?.setTransports(newDecisions)
+                }
+                Task { @MainActor [weak self] in
+                    if let cache = self?.meshEndpointsCache {
+                        await cache.refreshNow()
+                    }
+                }
+            }
             let supervisor = MeshSupervisor(
                 initialPeers: supervisorPeers,
                 initialDecisions: decisions,
@@ -397,15 +413,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 auth: auth,
                 tailscaleSession: AppDependencies.syncURLSession,
                 buildPeer: { builder.build(decision: $0) },
-                onDecisionsUpdated: { newDecisions in
-                    Task { @MainActor [weak appState] in
-                        appState?.setTransports(newDecisions)
-                    }
-                }
+                onDecisionsUpdated: onDecisionsUpdated
             )
             self.meshSupervisor = supervisor
             await supervisor.start()
             fputs("mesh supervisor → \(supervisorPeers.count) peer(s) (interval=\(intervalSec)s, ws=\(cfg.mesh.wsEnabled ? "on" : "off"))\n", stderr)
+
+            // 装配 MeshEndpointsCache:周期 fetch mesh peer 的 /endpoints,聚合给本机
+            // /endpoints 暴露给 iOS。snapshot 变化时让 broadcaster 推 endpoints_changed
+            // 给 client(iOS) re-fetch + re-probe
+            let broadcaster = deps.wsBroadcaster
+            let cache = MeshEndpointsCache.production(
+                supervisor: supervisor,
+                auth: auth,
+                selfDeviceID: deps.deviceID,
+                session: AppDependencies.syncURLSession,
+                onSnapshotChanged: { updatedAtUnix in
+                    Task {
+                        await broadcaster.broadcastEndpointsChanged(updatedAtUnix: updatedAtUnix)
+                    }
+                }
+            )
+            self.meshEndpointsCache = cache
+            await cache.startRefreshLoop()
+            fputs("mesh endpoints cache started\n", stderr)
         }
 
         // paste-back blob fetcher 用 peers[0] 的决策——多 peer 部署下 image 通常在主力机产，
@@ -494,6 +525,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let endpointsProvider: @Sendable () -> [PeerEndpoint] = {
                 EndpointDiscovery.discover(config: configCopy)
             }
+            // meshEndpointsProvider 通过 weak self 拿 cache(supervisor 起后才创建,SyncServer
+            // 启动时此处可能还是 nil → 返 nil = mesh_peers 字段缺失,iOS 老逻辑兼容)
+            let meshEndpointsProvider: @Sendable () async -> [MeshPeerEntry]? = { [weak self] in
+                guard let cache = await MainActor.run(body: { self?.meshEndpointsCache }) else {
+                    return nil
+                }
+                return await cache.snapshot()
+            }
             let server = SyncServer(
                 deviceID: deviceID,
                 database: deps.database,
@@ -505,6 +544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 broadcaster: deps.wsBroadcaster,
                 appIconStore: appIconStore,
                 endpointsProvider: endpointsProvider,
+                meshEndpointsProvider: meshEndpointsProvider,
                 pairingService: pairingService
             )
             serverTask = Task.detached(priority: .utility) {

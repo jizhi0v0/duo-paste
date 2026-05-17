@@ -46,25 +46,39 @@ final class PeerWebSocket {
     private let auth: HMACAuth
     private let session: URLSession
     private let onAdvance: @MainActor (Int64) -> Void
+    /// 连续 N 次 WS 失败 → 触发 coordinator 重新探活选别的 endpoint
+    /// (默 3 次,跟 backoff 配合下大约 1+2+4=7s + 3×receive timeout 触发)
+    private let onReprobeNeeded: @MainActor (String) -> Void
+    /// WS endpoints_changed 收到 → coordinator refetch /endpoints + re-probe
+    private let onEndpointsChanged: @MainActor () -> Void
     nonisolated let pingIntervalSec: TimeInterval
     nonisolated let pongTimeoutSec: TimeInterval
+    nonisolated let reprobeFailureThreshold: Int
 
     private var runTask: Task<Void, Never>?
     private var currentSocket: URLSessionWebSocketTask?
+    /// 连续失败计数。`.hello` 收到清零(证明这条 URL 还能用),阈值触发后也清零
+    private var consecutiveFailures: Int = 0
 
     init(
         config: PeerConfig,
         session: URLSession = TrustAnyHTTP.shared,
         pingIntervalSec: TimeInterval = 30,
         pongTimeoutSec: TimeInterval = 10,
-        onAdvance: @escaping @MainActor (Int64) -> Void
+        reprobeFailureThreshold: Int = 3,
+        onAdvance: @escaping @MainActor (Int64) -> Void,
+        onReprobeNeeded: @escaping @MainActor (String) -> Void = { _ in },
+        onEndpointsChanged: @escaping @MainActor () -> Void = {}
     ) {
         self.config = config
         self.auth = HMACAuth(secret: config.sharedSecret)
         self.session = session
         self.pingIntervalSec = pingIntervalSec
         self.pongTimeoutSec = pongTimeoutSec
+        self.reprobeFailureThreshold = reprobeFailureThreshold
         self.onAdvance = onAdvance
+        self.onReprobeNeeded = onReprobeNeeded
+        self.onEndpointsChanged = onEndpointsChanged
     }
 
     func start() {
@@ -72,6 +86,7 @@ final class PeerWebSocket {
         state = .connecting
         lastHeartbeatAt = nil
         lastPongAt = nil
+        consecutiveFailures = 0
         runTask = Task { [weak self] in
             await self?.runLoop()
         }
@@ -91,11 +106,21 @@ final class PeerWebSocket {
             do {
                 try await connectOnce()
                 failures += 1 // remote close 也算一次失败防 hot-loop
+                consecutiveFailures += 1
             } catch is CancellationError {
                 return
             } catch {
                 failures += 1
+                consecutiveFailures += 1
                 state = .failed(String(describing: error))
+            }
+            // 失败累计达阈值 → 通知 coordinator 重新探活选别的 endpoint。复位计数让
+            // coordinator switch URL 后(新 PeerWebSocket 起来)从头计;旧的 runLoop
+            // 接下来还在跑会等 backoff,直到 reconfigure() stop 它
+            if consecutiveFailures >= reprobeFailureThreshold {
+                let reason = "ws-failures=\(consecutiveFailures)"
+                consecutiveFailures = 0
+                onReprobeNeeded(reason)
             }
             if Task.isCancelled { return }
             let backoff = min(pow(2.0, Double(max(failures - 1, 0))), 60.0)
@@ -180,6 +205,8 @@ final class PeerWebSocket {
         switch msg {
         case .hello(_, let deviceID, _, let latest):
             state = .connected(peerDeviceID: deviceID)
+            // 连接成功 → 复位连续失败计数,重新建立 trust 这个 URL
+            consecutiveFailures = 0
             if latest > lastAdvanceNs { lastAdvanceNs = latest }
             onAdvance(latest)
         case .cursorAdvanced(_, _, let latest):
@@ -191,11 +218,10 @@ final class PeerWebSocket {
             // server 不主动发应用层 ping (asymmetric protocol) — 收到也 noop
             break
         case .endpointsChanged:
-            // Mac 通知:endpoints 候选 list 变了。让 coordinator re-fetch + re-probe。
-            // 通过 onAdvance(0) 触发 — 但这样会 noop 跳过 pull。
-            // 真正的 endpoints refetch 不在 PeerWebSocket 层做,留给 PeerSyncCoordinator
-            // 监听 ws.endpointsChangedPulse 计数器(下个 PR 加)。这里只记日志
+            // Mac 通知:endpoints 候选 list 变了(新 peer 加入 / ponte_host 改 /
+            // mesh peer 重启等)→ coordinator refetch /endpoints + re-probe
             FileHandle.standardError.write(Data("ws: endpoints_changed received\n".utf8))
+            onEndpointsChanged()
         }
     }
 

@@ -52,6 +52,11 @@ public struct SyncServer: Sendable {
     /// hostname),变化时调 `setEndpointsProvider` 更新让下次请求返新值。nil → 路由 503
     public let endpointsProvider: @Sendable () -> [PeerEndpoint]
 
+    /// Mesh-wide endpoints 聚合 snapshot 提供者。daemon 启动时 AppDelegate 注入这个
+    /// 闭包,内部 forward 到 `MeshEndpointsCache.snapshot()`。闭包模式让 SyncServer 可以
+    /// 在 supervisor 还没起来时就启动,后续 MeshEndpointsCache 创建后 closure 才返实际值
+    public let meshEndpointsProvider: @Sendable () async -> [MeshPeerEntry]?
+
     /// `POST /pair/<pin>` 路由背后的 PIN 验证 + secret 返回服务。nil → 路由 503(daemon
     /// 没启用 pairing)
     public let pairingService: PairingService?
@@ -68,6 +73,7 @@ public struct SyncServer: Sendable {
         ponteHostProvider: @escaping @Sendable () -> String? = { SurgePonte.discoverSelfHostname() },
         appIconStore: AppIconStore? = nil,
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
+        meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil
     ) {
         self.deviceID = deviceID
@@ -81,6 +87,7 @@ public struct SyncServer: Sendable {
         self.ponteHostProvider = ponteHostProvider
         self.appIconStore = appIconStore
         self.endpointsProvider = endpointsProvider
+        self.meshEndpointsProvider = meshEndpointsProvider
         self.pairingService = pairingService
     }
 
@@ -101,6 +108,7 @@ public struct SyncServer: Sendable {
             appIconStore: appIconStore,
             broadcaster: broadcaster,
             endpointsProvider: endpointsProvider,
+            meshEndpointsProvider: meshEndpointsProvider,
             pairingService: pairingService
         )
 
@@ -255,6 +263,7 @@ public struct SyncServer: Sendable {
         appIconStore: AppIconStore? = nil,
         broadcaster: WSBroadcaster? = nil,
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
+        meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil
     ) {
         router.get("/health") { _, _ -> Response in
@@ -403,16 +412,23 @@ public struct SyncServer: Sendable {
             }
         }
 
-        // GET /endpoints:返回本机当前所有可达 URL 候选(Tailscale / Ponte / .local)
+        // GET /endpoints:返回本机当前所有可达 URL 候选 + 整个 mesh 其他 peer 的候选。
         // 给 iOS 端 EndpointPicker 并发探活测 RTT 选最低延迟连接。
+        //
+        // - `endpoints`:本机 self 候选(Tailscale / Ponte / .local)由 endpointsProvider 算
+        // - `mesh_peers`:hub Mac 周期从其他 mesh peer 拉的 endpoints 聚合(Phase B);
+        //   nil = 单机部署 / 测试场景
         //
         // **HMAC 认证**——iOS 必须先有 secret(PIN 配对走 /pair 拿)才能查 endpoints。
         // 防止网络上的扫描者列举本机服务边界。
         router.get("/endpoints") { _, _ -> Response in
             let list = endpointsProvider()
+            let mesh = await meshEndpointsProvider()
             let page = PeerEndpointsPage(
+                deviceID: deviceID,
                 endpoints: list,
-                updatedAtUnix: Int64(Date().timeIntervalSince1970)
+                updatedAtUnix: Int64(Date().timeIntervalSince1970),
+                meshPeers: mesh
             )
             do {
                 let encoder = JSONEncoder()

@@ -132,6 +132,16 @@ public actor WSBroadcaster {
         await broadcast(msg)
     }
 
+    /// 广播 `endpoints_changed` 给所有 client。MeshEndpointsCache snapshot 变化时调,
+    /// 触发 iOS re-fetch /endpoints + re-probe(覆盖周期 60s 之外的 burst 场景)
+    public func broadcastEndpointsChanged(updatedAtUnix: Int64) async {
+        let msg = WSMessage.endpointsChanged(
+            version: WSMessage.currentVersion,
+            updatedAtUnix: updatedAtUnix
+        )
+        await broadcast(msg)
+    }
+
     /// 通用广播。每个连接独立超时 + 独立踢——一条死连接不影响其他正常连接收到这条消息。
     public func broadcast(_ message: WSMessage) async {
         guard !connections.isEmpty else { return }

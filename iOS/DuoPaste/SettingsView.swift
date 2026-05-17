@@ -26,8 +26,8 @@ struct SettingsView: View {
             }
             .navigationTitle("设置")
             .sheet(item: $selectedPeer) { peer in
-                PinPairingSheet(peer: peer, isPresented: pairingSheetBinding) { secret, _, endpoints in
-                    handlePairingSuccess(secret: secret, endpoints: endpoints)
+                PinPairingSheet(peer: peer, isPresented: pairingSheetBinding) { secret, _, page in
+                    handlePairingSuccess(secret: secret, page: page)
                 }
             }
             // 用 alert 避免 Form inline 错误被键盘遮挡。统一所有 Settings 错误源
@@ -206,21 +206,23 @@ struct SettingsView: View {
         }
     }
 
-    /// PIN 配对成功 → 持久化 secret + endpoints + 让 coordinator probe 选最快
-    private func handlePairingSuccess(secret: Data, endpoints: [PeerEndpoint]) {
+    /// PIN 配对成功 → 持久化 secret + endpoints + 让 coordinator probe 选最快。
+    /// `page` 含 self + mesh_peers,扁平化让 picker 跨全 mesh 探活选最快
+    private func handlePairingSuccess(secret: Data, page: PeerEndpointsPage) {
         let secretHex = secret.map { String(format: "%02x", $0) }.joined()
         sharedSecretHex = secretHex
-        // 把"被选中的 URL"也回填到 peerURL,让 advanced section 显示一致
-        // (coordinator.applyPick 也会写 currentEndpointURL,UI 二者择一显示)
-        if let first = endpoints.first(where: { $0.preferred }) ?? endpoints.first {
+        let flat = PeerSyncCoordinator.flattenEndpoints(page)
+        // 回填 peerURL 让 advanced section 显示一致(coordinator.applyPick 也会写
+        // currentEndpointURL,UI 二者择一显示)
+        if let first = flat.first(where: { $0.preferred }) ?? flat.first {
             peerURL = first.url
         }
-        // 把 endpoint list 持久化让重启后能从这恢复
-        if let data = try? JSONEncoder().encode(endpoints),
+        // 持久化扁平化后的 endpoint list 让重启后能从这恢复
+        if let data = try? JSONEncoder().encode(flat),
            let json = String(data: data, encoding: .utf8) {
             peerEndpointsJSON = json
         }
-        coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
+        coordinator.reconfigureFromPairing(secret: secret, endpoints: flat)
     }
 
     /// 高级面板手填路径——还是支持单 URL + secret 直接连。

@@ -54,6 +54,15 @@ final class PeerSyncCoordinator {
     /// 最近一次 endpoint pick 选中的 URL,UI 显示 + 避免 idle 重选时反复切
     private(set) var currentEndpointURL: String?
     private var repickTask: Task<Void, Never>?
+    /// 每个 endpoint URL 最近一次实测 RTT。re-probe 时跟新最优比,差 < `rttStableEpsilon` →
+    /// 不切防 flap。在 disconnected 期间所有候选都失败 -1 → 不更新 → 不影响 stable guard
+    private var lastRTT: [String: Int] = [:]
+    /// RTT 抖动容忍——新最优比当前 RTT 差超过这个 ratio 才切。0.2 = 20%
+    nonisolated let rttStableEpsilon: Double = 0.2
+    /// 周期 safety probe task——5min 一次,即便 NWPathMonitor / WS 都没火,也防 endpoint
+    /// 在没人通知的情况下变快了/慢了让 iOS 没法选最优
+    private var periodicRepickTask: Task<Void, Never>?
+    nonisolated let periodicRepickIntervalSec: TimeInterval = 300
 
     init(store: HistoryStore) {
         self.store = store
@@ -89,9 +98,20 @@ final class PeerSyncCoordinator {
         appIconCache.fetcher = { bid in
             try await client.fetchAppIcon(bundleID: bid)
         }
-        let ws = PeerWebSocket(config: config, onAdvance: { [weak self] _ in
-            self?.kickPull()
-        })
+        let ws = PeerWebSocket(
+            config: config,
+            onAdvance: { [weak self] _ in
+                self?.kickPull()
+            },
+            onReprobeNeeded: { [weak self] reason in
+                // WS 连续失败 → 已 pick 的 endpoint 不再 viable,主动重新探活选别的候选
+                self?.repickEndpoint(reason: "ws: \(reason)")
+            },
+            onEndpointsChanged: { [weak self] in
+                // Mac 推送说 mesh endpoints 更新了 → refetch /endpoints + re-probe
+                self?.refetchAndRepick(reason: "ws: endpoints_changed")
+            }
+        )
         self.ws = ws
         ws.start()
         startStatusTick()
@@ -108,11 +128,14 @@ final class PeerSyncCoordinator {
         }
         self.currentSecret = secret
         self.availableEndpoints = endpoints
+        startPeriodicRepick()
         repickEndpoint(reason: "pairing complete")
     }
 
     /// 触发并发 probe + 选最快 → reconfigure(挑中 URL)。
-    /// secret / endpoints 没准备好(没配对过)直接 noop
+    /// secret / endpoints 没准备好(没配对过)直接 noop。
+    /// **稳定性 guard**:已 pick 当前 endpoint + 新最优 RTT 跟它差 < `rttStableEpsilon` →
+    /// 不切防 flap(20% 差异内属于测量噪音,不值得 reconfigure 抖一下)
     func repickEndpoint(reason: String) {
         guard let secret = currentSecret, !availableEndpoints.isEmpty else { return }
         repickTask?.cancel()
@@ -127,20 +150,36 @@ final class PeerSyncCoordinator {
                 }
                 return
             }
-            // log RTT 排名让调试 endpoint 选择有线索
             let summary = probes.map { p in
                 "\(p.endpoint.kind.rawValue)=\(p.rttMs)ms"
             }.joined(separator: " ")
             FileHandle.standardError.write(Data("endpoint pick: best=\(best.endpoint.kind.rawValue) (\(best.rttMs)ms) [\(summary)]\n".utf8))
             await MainActor.run {
-                self?.applyPick(endpoint: best.endpoint, secret: secret)
+                self?.recordRTTs(probes: probes)
+                self?.applyPick(endpoint: best.endpoint, rttMs: best.rttMs, secret: secret)
             }
         }
     }
 
-    private func applyPick(endpoint: PeerEndpoint, secret: Data) {
-        // 同 endpoint 不重启 connection——避免 5s 网络抖动反复 reconfigure
+    private func recordRTTs(probes: [EndpointPicker.Probe]) {
+        for p in probes where p.ok {
+            lastRTT[p.endpoint.url] = p.rttMs
+        }
+    }
+
+    private func applyPick(endpoint: PeerEndpoint, rttMs: Int, secret: Data) {
+        // 1) 完全同 URL → noop
         if currentEndpointURL == endpoint.url {
+            return
+        }
+        // 2) 已 pick 当前 endpoint + 当前 RTT 已知 → 跟新最优比,差不显著就不切
+        if let current = currentEndpointURL,
+           let currentRTT = lastRTT[current],
+           currentRTT > 0,
+           Double(currentRTT - rttMs) / Double(currentRTT) < rttStableEpsilon {
+            // 新最优只比当前快 < 20% → 视为噪音不切
+            FileHandle.standardError.write(Data(
+                "endpoint pick skipped: current=\(currentRTT)ms new=\(rttMs)ms (within \(Int(rttStableEpsilon*100))%)\n".utf8))
             return
         }
         currentEndpointURL = endpoint.url
@@ -151,6 +190,52 @@ final class PeerSyncCoordinator {
         let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
         // reconfigure 内部 stop + 起新连接;blob/icon cache 也 resetAll
         reconfigure(cfg)
+    }
+
+    /// 5min 周期重 probe——NWPathMonitor / WS 失败回调没火的兜底。endpoint 实际可用性
+    /// 可能在没事件通知的情况下变化(对端 Mac 重启 + ponte_host 切了等),周期 probe
+    /// 让 iOS 总能选最优
+    private func startPeriodicRepick() {
+        periodicRepickTask?.cancel()
+        let intervalNs = UInt64(periodicRepickIntervalSec * 1_000_000_000)
+        periodicRepickTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNs)
+                guard let self else { return }
+                self.repickEndpoint(reason: "periodic")
+            }
+        }
+    }
+
+    /// WS endpoints_changed 收到 → refetch /endpoints 拿新列表(可能 Mac 加了
+    /// peer 或学到新 ponte_host)→ re-probe
+    private func refetchAndRepick(reason: String) {
+        guard let client else { return }
+        Task { [weak self] in
+            do {
+                let page = try await client.fetchEndpoints()
+                let flat = Self.flattenEndpoints(page)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.availableEndpoints = flat
+                    self.repickEndpoint(reason: reason)
+                }
+            } catch {
+                FileHandle.standardError.write(Data("refetchAndRepick failed: \(error)\n".utf8))
+            }
+        }
+    }
+
+    /// PeerEndpointsPage 的 self + mesh_peers 扁平化成 picker 用的 [PeerEndpoint]
+    /// (mesh_peers 字段在 Phase B 加,缺失时只返 self)
+    nonisolated static func flattenEndpoints(_ page: PeerEndpointsPage) -> [PeerEndpoint] {
+        var out = page.endpoints
+        if let peers = page.meshPeers {
+            for entry in peers where entry.healthy {
+                out.append(contentsOf: entry.endpoints)
+            }
+        }
+        return out
     }
 
     /// 跨设备"复制即顶":iOS UI 已经 store.bumpToFront 乐观顶 + UCB 写 pasteboard,
@@ -176,6 +261,10 @@ final class PeerSyncCoordinator {
         ws = nil
         pullTask?.cancel()
         pullTask = nil
+        periodicRepickTask?.cancel()
+        periodicRepickTask = nil
+        repickTask?.cancel()
+        repickTask = nil
         statusTickTask?.cancel()
         statusTickTask = nil
         client = nil
