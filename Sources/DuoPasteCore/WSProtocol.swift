@@ -30,10 +30,17 @@ public enum WSMessage: Codable, Equatable, Sendable {
     /// `nowMs` 给 client 做时钟偏移 sanity check（同 `/health`）。
     case hello(version: Int, deviceID: String, nowMs: Int64, latestIngestedAtNs: Int64)
 
-    /// 应用层 ping/pong 占位。当前不使用——WebSocket 协议层 autoPing 已处理 keep-alive。
-    /// decode 时遇到不报错（向前兼容性占位）。
+    /// 应用层 ping/pong——iOS URLSessionWebSocketTask 路径走这条做 zombie 检测
+    /// (Mac hbws 端 autoPing 走协议层 PING/PONG,不用这个)。client 30s 周期 send ping,
+    /// 10s 内没收到 pong → 重连。server 收 ping 回 pong
     case ping(version: Int)
     case pong(version: Int)
+
+    /// Mac 通知 iOS:endpoints 候选 list 变了(SmartTransport reconcile / SurgePonte
+    /// plist 改 / cert 更新),"重新 GET /endpoints 然后 re-probe 测延迟"。当前 Mac 端
+    /// 不主动发——iOS 走 hello / NWPathMonitor / 周期 timer 自己 refetch;wire format
+    /// 预留让未来 Mac 主动 push 时不破坏 protocol 兼容性
+    case endpointsChanged(version: Int, updatedAtUnix: Int64)
 
     public static let currentVersion: Int = 1
 
@@ -43,6 +50,7 @@ public enum WSMessage: Codable, Equatable, Sendable {
         case deviceID = "device_id"
         case nowMs = "now_ms"
         case latestIngestedAtNs = "latest_ingested_at_ns"
+        case updatedAtUnix = "updated_at_unix"
     }
 
     public init(from decoder: Decoder) throws {
@@ -63,6 +71,9 @@ public enum WSMessage: Codable, Equatable, Sendable {
             self = .ping(version: version)
         case "pong":
             self = .pong(version: version)
+        case "endpoints_changed":
+            let ts = try c.decode(Int64.self, forKey: .updatedAtUnix)
+            self = .endpointsChanged(version: version, updatedAtUnix: ts)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c,
@@ -91,6 +102,10 @@ public enum WSMessage: Codable, Equatable, Sendable {
         case .pong(let version):
             try c.encode("pong", forKey: .type)
             try c.encode(version, forKey: .version)
+        case .endpointsChanged(let version, let ts):
+            try c.encode("endpoints_changed", forKey: .type)
+            try c.encode(version, forKey: .version)
+            try c.encode(ts, forKey: .updatedAtUnix)
         }
     }
 

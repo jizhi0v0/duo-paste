@@ -32,6 +32,14 @@ import DuoPasteCore
         }
     }
 
+    @Test func endpointsChangedRoundTrip() throws {
+        let m = WSMessage.endpointsChanged(version: 1, updatedAtUnix: 1_700_000_123)
+        let s = try m.encodeJSON()
+        #expect(s.contains("\"type\":\"endpoints_changed\""))
+        #expect(s.contains("\"updated_at_unix\":1700000123"))
+        #expect(try WSMessage.decodeJSON(s) == m)
+    }
+
     @Test func unknownTypeThrowsDecodingError() {
         let bogus = "{\"type\":\"whatever\",\"version\":1}"
         #expect(throws: DecodingError.self) {

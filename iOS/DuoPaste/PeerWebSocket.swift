@@ -190,6 +190,12 @@ final class PeerWebSocket {
         case .ping:
             // server 不主动发应用层 ping (asymmetric protocol) — 收到也 noop
             break
+        case .endpointsChanged:
+            // Mac 通知:endpoints 候选 list 变了。让 coordinator re-fetch + re-probe。
+            // 通过 onAdvance(0) 触发 — 但这样会 noop 跳过 pull。
+            // 真正的 endpoints refetch 不在 PeerWebSocket 层做,留给 PeerSyncCoordinator
+            // 监听 ws.endpointsChangedPulse 计数器(下个 PR 加)。这里只记日志
+            FileHandle.standardError.write(Data("ws: endpoints_changed received\n".utf8))
         }
     }
 

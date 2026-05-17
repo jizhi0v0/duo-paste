@@ -119,6 +119,19 @@ actor PeerClient {
         return data
     }
 
+    // MARK: - GET /endpoints
+
+    /// 拿 Mac 当前的可达 URL 候选 list。iOS EndpointPicker 用来探活测 RTT 选最低
+    func fetchEndpoints() async throws -> PeerEndpointsPage {
+        let url = config.baseURL.appendingPathComponent("/endpoints")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, method: "GET", signedPath: "/endpoints", bodyHash: HMACAuth.emptyBodyHashHex)
+        let (data, resp) = try await session.data(for: req)
+        try Self.requireOK(resp)
+        return try decoder.decode(PeerEndpointsPage.self, from: data)
+    }
+
     // MARK: - POST /bump/<id>
 
     /// 跨设备一致"复制即顶":iOS tap 某条 → Mac DB bump captured/ingested_at_ns →

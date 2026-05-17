@@ -14,10 +14,18 @@ import DuoPasteCore
 public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
     public let auth: HMACAuth
     public let now: @Sendable () -> Int64
+    /// 路径前缀白名单——这些路径**跳过** HMAC 校验,handler 自己处理 auth(典型:`/pair/`
+    /// PIN 配对路径,iOS 还没有 secret 不能签名,走 PIN + rate-limit 替代)
+    public let skipPathPrefixes: [String]
 
-    public init(auth: HMACAuth, now: @escaping @Sendable () -> Int64 = { Self.currentMs() }) {
+    public init(
+        auth: HMACAuth,
+        now: @escaping @Sendable () -> Int64 = { Self.currentMs() },
+        skipPathPrefixes: [String] = ["/pair/"]
+    ) {
         self.auth = auth
         self.now = now
+        self.skipPathPrefixes = skipPathPrefixes
     }
 
     public static func currentMs() -> Int64 {
@@ -29,6 +37,10 @@ public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
         context: Context,
         next: (Request, Context) async throws -> Response
     ) async throws -> Response {
+        let rawPath = request.uri.path
+        if skipPathPrefixes.contains(where: { rawPath.hasPrefix($0) }) {
+            return try await next(request, context)
+        }
         guard
             let tsName = HTTPField.Name(HMACAuth.timestampHeader),
             let hashName = HTTPField.Name(HMACAuth.bodyHashHeader),

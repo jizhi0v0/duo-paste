@@ -48,6 +48,14 @@ public struct SyncServer: Sendable {
     /// 比如测试环境)。daemon 启动时构造好注入,内部 resolver 闭包从 AppKit 拿 NSWorkspace.icon
     public let appIconStore: AppIconStore?
 
+    /// `GET /endpoints` 路由的候选 list 来源。AppDelegate 启动时注入(读 config + SurgePonte +
+    /// hostname),变化时调 `setEndpointsProvider` 更新让下次请求返新值。nil → 路由 503
+    public let endpointsProvider: @Sendable () -> [PeerEndpoint]
+
+    /// `POST /pair/<pin>` 路由背后的 PIN 验证 + secret 返回服务。nil → 路由 503(daemon
+    /// 没启用 pairing)
+    public let pairingService: PairingService?
+
     public init(
         deviceID: String,
         database: DuoPasteCore.Database,
@@ -58,7 +66,9 @@ public struct SyncServer: Sendable {
         tls: TLSPaths? = nil,
         broadcaster: WSBroadcaster? = nil,
         ponteHostProvider: @escaping @Sendable () -> String? = { SurgePonte.discoverSelfHostname() },
-        appIconStore: AppIconStore? = nil
+        appIconStore: AppIconStore? = nil,
+        endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
+        pairingService: PairingService? = nil
     ) {
         self.deviceID = deviceID
         self.database = database
@@ -70,6 +80,8 @@ public struct SyncServer: Sendable {
         self.broadcaster = broadcaster
         self.ponteHostProvider = ponteHostProvider
         self.appIconStore = appIconStore
+        self.endpointsProvider = endpointsProvider
+        self.pairingService = pairingService
     }
 
     public func run() async throws {
@@ -87,7 +99,9 @@ public struct SyncServer: Sendable {
             sinceAPI: SinceAPI(database: database),
             ponteHost: pontePeerHost,
             appIconStore: appIconStore,
-            broadcaster: broadcaster
+            broadcaster: broadcaster,
+            endpointsProvider: endpointsProvider,
+            pairingService: pairingService
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -239,7 +253,9 @@ public struct SyncServer: Sendable {
         sinceAPI: SinceAPI,
         ponteHost: String? = nil,
         appIconStore: AppIconStore? = nil,
-        broadcaster: WSBroadcaster? = nil
+        broadcaster: WSBroadcaster? = nil,
+        endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
+        pairingService: PairingService? = nil
     ) {
         router.get("/health") { _, _ -> Response in
             var payload: [String: String] = [
@@ -345,6 +361,68 @@ public struct SyncServer: Sendable {
                 return errorJSON(.gone, "item is tombstoned")
             } catch {
                 return errorJSON(.internalServerError, "bump failed: \(error)")
+            }
+        }
+
+        // POST /pair/{pin}:iOS PIN 配对入口。**无 HMAC**(AuthMiddleware 白名单跳过)。
+        // 校验 PIN → 返回 shared-secret hex 让 iOS 建立后续 HMAC 信任。
+        //
+        // 安全:
+        // - PIN 单次有效 + 60s expiry + 5 次错误封锁(都在 PairingService 里)
+        // - 路径里 pin 是 6 位数字,长度上限校验后才比对
+        // - secret 以 hex 文本明文返回—— TLS 信任完整性 + 用户主动展示 PIN 才有 session
+        router.post("/pair/:pin") { request, context -> Response in
+            guard let service = pairingService else {
+                return errorJSON(.serviceUnavailable, "pairing disabled")
+            }
+            guard let pin = context.parameters.get("pin"),
+                  pin.count == 6,
+                  pin.allSatisfy({ $0.isASCII && $0.isNumber }) else {
+                return errorJSON(.badRequest, "pin must be 6 digits")
+            }
+            // body 必须空(或忽略)——drain 避免 hbws 投诉
+            _ = try? await request.body.collect(upTo: 1024)
+            do {
+                let secret = try await service.validateAndConsumePIN(pin)
+                let hex = secret.map { String(format: "%02x", $0) }.joined()
+                let payload: [String: Any] = ["ok": true, "secret": hex, "device_id": deviceID]
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                resp.headers[.contentType] = "application/json"
+                return resp
+            } catch PairingService.Error.pinMismatch {
+                return errorJSON(.unauthorized, "pin mismatch")
+            } catch PairingService.Error.pinExpired {
+                return errorJSON(.gone, "pin expired")
+            } catch PairingService.Error.rateLimited {
+                return errorJSON(.tooManyRequests, "too many attempts")
+            } catch PairingService.Error.noActiveSession {
+                return errorJSON(.notFound, "no active pairing session")
+            } catch {
+                return errorJSON(.internalServerError, "pair failed: \(error)")
+            }
+        }
+
+        // GET /endpoints:返回本机当前所有可达 URL 候选(Tailscale / Ponte / .local)
+        // 给 iOS 端 EndpointPicker 并发探活测 RTT 选最低延迟连接。
+        //
+        // **HMAC 认证**——iOS 必须先有 secret(PIN 配对走 /pair 拿)才能查 endpoints。
+        // 防止网络上的扫描者列举本机服务边界。
+        router.get("/endpoints") { _, _ -> Response in
+            let list = endpointsProvider()
+            let page = PeerEndpointsPage(
+                endpoints: list,
+                updatedAtUnix: Int64(Date().timeIntervalSince1970)
+            )
+            do {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(page)
+                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                resp.headers[.contentType] = "application/json"
+                return resp
+            } catch {
+                return errorJSON(.internalServerError, "endpoints encode failed: \(error)")
             }
         }
 

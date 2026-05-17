@@ -18,6 +18,7 @@ final class PeerDiscovery {
         let displayName: String
         let deviceID: String?
         let tls: Bool
+        let port: Int       // TXT record port=8443
         let endpoint: NWEndpoint
         static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     }
@@ -87,11 +88,15 @@ final class PeerDiscovery {
                 txt = [:]
             }
             let name = Self.endpointDisplayName(r.endpoint)
+            // port 从 TXT 拿(BonjourAdvertiser 也设 NetService.port,但 .service endpoint
+            // 客户端拿不到 port,必须走 TXT 或 resolve)。默认 8443 兜底
+            let port = txt["port"].flatMap { Int($0) } ?? 8443
             let peer = DiscoveredPeer(
                 id: "\(r.endpoint)",
                 displayName: name,
                 deviceID: txt["device_id"],
                 tls: txt["tls"] == "1",
+                port: port,
                 endpoint: r.endpoint
             )
             out.append(peer)

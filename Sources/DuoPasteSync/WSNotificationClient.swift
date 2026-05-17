@@ -251,6 +251,10 @@ public actor WSNotificationClient {
                 case .ping, .pong:
                     // 应用层 ping/pong 当前不消费——WS 协议层 autoPing/heartbeat 已处理 keep-alive
                     return
+                case .endpointsChanged:
+                    // Mac peer 间互连不关心 endpoints 列表变化(自己已经 mesh-init 配好 peer URL),
+                    // 只有 iOS 才 refetch。Mac 收到这条 noop
+                    return
                 }
             }
         )

@@ -22,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var snapshotScheduler: SnapshotScheduler!
     private var serverTask: Task<Void, Never>?
     private var bonjourAdvertiser: BonjourAdvertiser?
+    /// daemon 启动时构造一份。Mac Settings"显示配对码"调它 generatePIN(),
+    /// /pair/<pin> 路由调它 validateAndConsumePIN
+    private(set) var pairingService: PairingService?
     /// Mesh peer 拉取入口。PR 2 单 peer 部署下 supervisor 内只有一个 PullWorker，行为跟原
     /// `pullWorker: PullWorker?` 等价；PR 5 mesh-init 后多 peer 列表自然 fan-out 进 N 个 worker
     private var meshSupervisor: MeshSupervisor?
@@ -480,6 +483,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 database: deps.database,
                 resolver: AppKitAppIconResolver.resolver()
             )
+            // PIN 配对 service:用户在 Settings 主动点"显示配对码"才 generatePIN()。
+            // secretsProvider 闭包延迟到验证成功才读 disk,避免常驻 secret 在 actor 状态里
+            let pairingService = PairingService(
+                secretsProvider: { try SharedSecret.load(from: secretPath) }
+            )
+            self.pairingService = pairingService
+            // endpointsProvider:每次 /endpoints 调用现算(EndpointDiscovery 读 cfg + SurgePonte)
+            let configCopy = cfg
+            let endpointsProvider: @Sendable () -> [PeerEndpoint] = {
+                EndpointDiscovery.discover(config: configCopy)
+            }
             let server = SyncServer(
                 deviceID: deviceID,
                 database: deps.database,
@@ -489,7 +503,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 auth: auth,
                 tls: tls,
                 broadcaster: deps.wsBroadcaster,
-                appIconStore: appIconStore
+                appIconStore: appIconStore,
+                endpointsProvider: endpointsProvider,
+                pairingService: pairingService
             )
             serverTask = Task.detached(priority: .utility) {
                 do {

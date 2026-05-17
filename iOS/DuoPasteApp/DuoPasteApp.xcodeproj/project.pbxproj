@@ -23,8 +23,11 @@
 		C5EF4C3C2FB999F9004E643A /* ShareCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5EF4C3B2FB999F9004E643A /* ShareCoordinator.swift */; };
 		C5EF4D012FB9A001004E643A /* AppIconCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5EF4D002FB9A001004E643A /* AppIconCache.swift */; };
 		D1A00010000000000000A001 /* PeerDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00010000000000000B001 /* PeerDiscovery.swift */; };
-		D1A00020000000000000A002 /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00020000000000000B002 /* QRScannerView.swift */; };
 		D1A00030000000000000A003 /* BackgroundPullService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00030000000000000B003 /* BackgroundPullService.swift */; };
+		D1A00050000000000000A005 /* EndpointPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00050000000000000B005 /* EndpointPicker.swift */; };
+		D1A00060000000000000A006 /* PinPairingClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00060000000000000B006 /* PinPairingClient.swift */; };
+		D1A00070000000000000A007 /* NetworkChangeWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00070000000000000B007 /* NetworkChangeWatcher.swift */; };
+		D1A00080000000000000A008 /* PinPairingSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00080000000000000B008 /* PinPairingSheet.swift */; };
 /* End PBXBuildFile section */
 
 
@@ -45,8 +48,11 @@
 		C5EF4C3B2FB999F9004E643A /* ShareCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareCoordinator.swift; sourceTree = "<group>"; };
 		C5EF4D002FB9A001004E643A /* AppIconCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIconCache.swift; sourceTree = "<group>"; };
 		D1A00010000000000000B001 /* PeerDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDiscovery.swift; sourceTree = "<group>"; };
-		D1A00020000000000000B002 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
 		D1A00030000000000000B003 /* BackgroundPullService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundPullService.swift; sourceTree = "<group>"; };
+		D1A00050000000000000B005 /* EndpointPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointPicker.swift; sourceTree = "<group>"; };
+		D1A00060000000000000B006 /* PinPairingClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinPairingClient.swift; sourceTree = "<group>"; };
+		D1A00070000000000000B007 /* NetworkChangeWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkChangeWatcher.swift; sourceTree = "<group>"; };
+		D1A00080000000000000B008 /* PinPairingSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinPairingSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -104,8 +110,11 @@
 				C502A56C2FB97CE00055B250 /* RootView.swift */,
 				C502A56D2FB97CE00055B250 /* SettingsView.swift */,
 				D1A00010000000000000B001 /* PeerDiscovery.swift */,
-				D1A00020000000000000B002 /* QRScannerView.swift */,
 				D1A00030000000000000B003 /* BackgroundPullService.swift */,
+				D1A00050000000000000B005 /* EndpointPicker.swift */,
+				D1A00060000000000000B006 /* PinPairingClient.swift */,
+				D1A00070000000000000B007 /* NetworkChangeWatcher.swift */,
+				D1A00080000000000000B008 /* PinPairingSheet.swift */,
 			);
 			name = DuoPaste;
 			path = ../DuoPaste;
@@ -205,8 +214,11 @@
 				C502A5792FB97CE00055B250 /* HistoryStore.swift in Sources */,
 				C502A57A2FB97CE00055B250 /* Models.swift in Sources */,
 				D1A00010000000000000A001 /* PeerDiscovery.swift in Sources */,
-				D1A00020000000000000A002 /* QRScannerView.swift in Sources */,
 				D1A00030000000000000A003 /* BackgroundPullService.swift in Sources */,
+				D1A00050000000000000A005 /* EndpointPicker.swift in Sources */,
+				D1A00060000000000000A006 /* PinPairingClient.swift in Sources */,
+				D1A00070000000000000A007 /* NetworkChangeWatcher.swift in Sources */,
+				D1A00080000000000000A008 /* PinPairingSheet.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

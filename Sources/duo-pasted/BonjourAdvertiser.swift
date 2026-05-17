@@ -46,6 +46,7 @@ final class BonjourAdvertiser: NSObject {
         let txt: [String: Data] = [
             "device_id": Data(deviceID.utf8),
             "tls": Data((tls ? "1" : "0").utf8),
+            "port": Data(String(port).utf8),
             "v": Data("1".utf8),
         ]
         let txtData = NetService.data(fromTXTRecord: txt)

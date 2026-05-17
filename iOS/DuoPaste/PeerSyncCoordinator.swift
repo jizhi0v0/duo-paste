@@ -47,11 +47,24 @@ final class PeerSyncCoordinator {
     private var pendingAdvance: Bool = false
     /// `applyConnectedStatus` 在 pull 成功时 stamp,heartbeat-stale 检测保护它不被覆盖
     private var lastConnectedStampAt: Date?
+    /// 配对完成后 Mac 暴露的 endpoint 候选 list。NetworkChangeWatcher / WS endpoints_changed
+    /// 触发 repickEndpoint() 时从这 re-probe 选最快。nil = 未配对(走 reconfigure 单 URL 路径)
+    private var availableEndpoints: [PeerEndpoint] = []
+    private var currentSecret: Data?
+    /// 最近一次 endpoint pick 选中的 URL,UI 显示 + 避免 idle 重选时反复切
+    private(set) var currentEndpointURL: String?
+    private var repickTask: Task<Void, Never>?
 
     init(store: HistoryStore) {
         self.store = store
         self.blobCache = BlobCache()
         self.appIconCache = AppIconCache()
+        // 网络变化 → 重新 probe + reselect
+        NetworkChangeWatcher.shared.addListener { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.repickEndpoint(reason: "network changed")
+            }
+        }
     }
 
     func reconfigure(_ config: PeerConfig?) {
@@ -83,6 +96,61 @@ final class PeerSyncCoordinator {
         ws.start()
         startStatusTick()
         kickPull()
+    }
+
+    /// PIN 配对完成 → 调这条入口让 coordinator 拿 secret + endpoint list,自动 probe
+    /// 选最快连接。endpoints 缓存到 availableEndpoints,网络变 / WS endpoints_changed
+    /// 时从这 re-probe
+    func reconfigureFromPairing(secret: Data, endpoints: [PeerEndpoint]) {
+        guard !endpoints.isEmpty else {
+            status = .error("Mac 没返回任何 endpoint 候选")
+            return
+        }
+        self.currentSecret = secret
+        self.availableEndpoints = endpoints
+        repickEndpoint(reason: "pairing complete")
+    }
+
+    /// 触发并发 probe + 选最快 → reconfigure(挑中 URL)。
+    /// secret / endpoints 没准备好(没配对过)直接 noop
+    func repickEndpoint(reason: String) {
+        guard let secret = currentSecret, !availableEndpoints.isEmpty else { return }
+        repickTask?.cancel()
+        let endpoints = availableEndpoints
+        FileHandle.standardError.write(Data("endpoint repick: \(reason) (\(endpoints.count) candidates)\n".utf8))
+        repickTask = Task { [weak self] in
+            let probes = await EndpointPicker.probeAll(endpoints: endpoints, secret: secret)
+            guard !Task.isCancelled else { return }
+            guard let best = probes.first(where: { $0.ok }) else {
+                await MainActor.run {
+                    self?.status = .error("所有 endpoint 都不通,检查 Mac 是否在线 + 网络")
+                }
+                return
+            }
+            // log RTT 排名让调试 endpoint 选择有线索
+            let summary = probes.map { p in
+                "\(p.endpoint.kind.rawValue)=\(p.rttMs)ms"
+            }.joined(separator: " ")
+            FileHandle.standardError.write(Data("endpoint pick: best=\(best.endpoint.kind.rawValue) (\(best.rttMs)ms) [\(summary)]\n".utf8))
+            await MainActor.run {
+                self?.applyPick(endpoint: best.endpoint, secret: secret)
+            }
+        }
+    }
+
+    private func applyPick(endpoint: PeerEndpoint, secret: Data) {
+        // 同 endpoint 不重启 connection——避免 5s 网络抖动反复 reconfigure
+        if currentEndpointURL == endpoint.url {
+            return
+        }
+        currentEndpointURL = endpoint.url
+        guard let url = URL(string: endpoint.url) else {
+            status = .error("invalid endpoint URL: \(endpoint.url)")
+            return
+        }
+        let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
+        // reconfigure 内部 stop + 起新连接;blob/icon cache 也 resetAll
+        reconfigure(cfg)
     }
 
     /// 跨设备"复制即顶":iOS UI 已经 store.bumpToFront 乐观顶 + UCB 写 pasteboard,

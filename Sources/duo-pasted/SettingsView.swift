@@ -1,8 +1,6 @@
 import SwiftUI
 import AppKit
 import Vision
-import CoreImage
-import CoreImage.CIFilterBuiltins
 import DuoPasteCore
 import DuoPasteSync
 
@@ -1318,15 +1316,15 @@ private struct GlassActionButton: View {
     }
 }
 
-// MARK: - iOS 配对(Bonjour + QR)
+// MARK: - iOS PIN 配对(Bonjour + PIN)
 
 /// daemon 在 serve=true 时通过 BonjourAdvertiser 广播 `_duopaste._tcp`,iOS Settings
-/// 端 NWBrowser 浏到本机后用户 tap → 弹 QR 扫描。Mac 这边需要 user 主动展开 QR 才显示
-/// (含 shared-secret hex)——默认隐藏防止 secret 长期在屏幕上裸奔。60s 自动隐藏。
+/// 端 NWBrowser 浏到本机后用户 tap → 输 6 位 PIN → POST /pair/<pin> 拿 secret + endpoints。
+/// 60s expiry + 5 次错误封锁,PIN 用过即失效
 @MainActor
 private struct IOSPairingGroup: View {
     @Bindable var model: SettingsModel
-    @State private var showQR: Bool = false
+    @State private var showPIN: Bool = false
 
     var body: some View {
         SettingsGroup(title: "iOS 配对") {
@@ -1338,206 +1336,119 @@ private struct IOSPairingGroup: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(model.config.serve ? Color.green : Color.secondary)
             }
-            SettingsRow(title: "二维码配对") {
-                Button("显示二维码") {
-                    showQR = true
+            SettingsRow(title: "PIN 配对") {
+                Button("显示配对码") {
+                    showPIN = true
                 }
                 .controlSize(.small)
                 .disabled(!model.config.serve)
             }
-            SettingsNoteRow(text: "QR 含 baseURL + shared-secret hex。iOS Settings 的「扫描 QR」对准 → 自动填好。窗口 60s 后自动消失防 secret 暴露。")
+            SettingsNoteRow(text: "iOS Settings 选「发现的 Mac」对应一行 → 输入这边显示的 6 位数字 → 自动获取 secret + 候选 endpoints。PIN 60s 失效,错 5 次封锁")
         }
-        .sheet(isPresented: $showQR) {
-            IOSPairingQRSheet(model: model, isPresented: $showQR)
+        .sheet(isPresented: $showPIN) {
+            IOSPairingPINSheet(isPresented: $showPIN)
         }
     }
 }
 
+// MARK: - PIN 配对 sheet
+
 @MainActor
-private struct IOSPairingQRSheet: View {
-    let model: SettingsModel
+private struct IOSPairingPINSheet: View {
     @Binding var isPresented: Bool
 
-    enum URLChoice: String, CaseIterable, Identifiable {
-        case tailscale, ponte, local
-        var id: String { rawValue }
-        var label: String {
-            switch self {
-            case .tailscale: return "Tailscale"
-            case .ponte:     return "Ponte (Surge)"
-            case .local:     return ".local (mDNS)"
-            }
-        }
-    }
-
-    @State private var urlChoice: URLChoice = .tailscale
-    @State private var qrImage: NSImage?
-    @State private var secondsLeft: Int = 60
-    @State private var countdownTask: Task<Void, Never>?
+    @State private var pin: String?
+    @State private var secondsLeft: Int = 0
+    @State private var refreshTask: Task<Void, Never>?
     @State private var errorText: String?
-    @State private var currentURL: String = ""
 
     var body: some View {
         VStack(spacing: 16) {
             Text("iOS 配对")
                 .font(.system(size: 18, weight: .semibold))
 
-            // URL 候选:Tailscale 默认(cert 匹配,跨 LAN 通),Ponte 走 Surge 代理(iOS 装
-            // 了 Surge 才能用),.local mDNS(同 Wi-Fi)。每个选项重新生成 QR
-            Picker("URL 方式", selection: $urlChoice) {
-                ForEach(availableChoices, id: \.self) { c in
-                    Text(c.label).tag(c)
+            if let pin {
+                // PIN 渲染:每位数字 monospaced + spacing 让远距离也能看清
+                HStack(spacing: 10) {
+                    ForEach(Array(pin), id: \.self) { ch in
+                        Text(String(ch))
+                            .font(.system(size: 36, weight: .bold, design: .monospaced))
+                            .frame(width: 36, height: 52)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    }
                 }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 280)
-            .onChange(of: urlChoice) { _, _ in regenerate() }
-
-            if let img = qrImage {
-                Image(nsImage: img)
-                    .interpolation(.none)
-                    .resizable()
-                    .aspectRatio(1, contentMode: .fit)
-                    .frame(width: 240, height: 240)
             } else {
-                ProgressView().frame(width: 240, height: 240)
+                ProgressView().frame(height: 52)
             }
-            Text(currentURL)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 280)
+
             if let errorText {
                 Text(errorText)
                     .foregroundStyle(.red)
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
+            } else if secondsLeft > 0 {
+                Text("剩余 \(secondsLeft)s · iOS Settings → 发现的 Mac → 输入这串数字")
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .multilineTextAlignment(.center)
             } else {
-                Text("剩余 \(secondsLeft)s · iOS Settings 选「扫描 Mac 显示的二维码」")
+                Text("已过期 · 关闭后重新打开生成新 PIN")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
             }
-            HStack {
-                Button("关闭") { isPresented = false }
-                    .keyboardShortcut(.escape)
+
+            HStack(spacing: 12) {
+                Button("重新生成") {
+                    generatePIN()
+                }
+                .controlSize(.small)
+                Button("关闭") {
+                    cancelPIN()
+                    isPresented = false
+                }
+                .controlSize(.small)
+                .keyboardShortcut(.escape)
             }
         }
         .padding(24)
-        .frame(width: 320)
-        .onAppear {
-            regenerate()
-            startCountdown()
-        }
+        .frame(width: 360)
+        .onAppear { generatePIN() }
         .onDisappear {
-            countdownTask?.cancel()
-            countdownTask = nil
-            qrImage = nil  // GC secret-containing image
-            currentURL = ""
+            refreshTask?.cancel()
+            refreshTask = nil
+            cancelPIN()
         }
     }
 
-    /// 可选 URL 方式——ponte 没装 Surge 就隐藏(避免 user 选到无效选项)。
-    /// Tailscale + .local 永远可选
-    private var availableChoices: [URLChoice] {
-        var out: [URLChoice] = [.tailscale]
-        if SurgePonte.discoverSelfHostname() != nil {
-            out.append(.ponte)
-        }
-        out.append(.local)
-        return out
-    }
-
-    private func regenerate() {
-        guard let payload = makePairingPayload() else {
-            qrImage = nil
+    private func generatePIN() {
+        guard let service = AppDelegate.shared?.pairingService else {
+            errorText = "daemon 未启动或 pairing service 未配置"
             return
         }
-        qrImage = QRGenerator.makeImage(from: payload, size: 240)
-    }
-
-    /// 生成 QR 内容:JSON {url, secret}。
-    private func makePairingPayload() -> String? {
-        guard let deps = AppDelegate.shared?.dependencies else {
-            errorText = "daemon 未启动"
-            return nil
-        }
-        do {
-            let secretBytes = try SharedSecret.load(from: deps.paths.sharedSecretFile)
-            let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
-            let cfg = deps.config
-            let scheme = cfg.serveTLS ? "https" : "http"
-            let host = resolveHost(cfg: cfg)
-            let url = "\(scheme)://\(host):\(cfg.servePort)"
-            currentURL = url
-            errorText = nil
-            let payload: [String: String] = ["url": url, "secret": secretHex, "v": "1"]
-            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-            return String(data: data, encoding: .utf8)
-        } catch {
-            errorText = "读 secret 失败: \(error.localizedDescription)"
-            return nil
+        errorText = nil
+        Task { @MainActor in
+            let (newPin, sec) = await service.generatePIN()
+            self.pin = newPin
+            self.secondsLeft = sec
+            startCountdown()
         }
     }
 
-    /// 按 urlChoice 解析 host。
-    /// - tailscale:从 tlsCertPath 文件名拿 stem(即 cert CN,跨 LAN 通)
-    /// - ponte:SurgePonte.discoverSelfHostname()(本机 SGCore.plist 配的 ponte 名)
-    /// - local:Host.current() hostname + .local 兜底
-    private func resolveHost(cfg: Config) -> String {
-        switch urlChoice {
-        case .tailscale:
-            if let cert = cfg.tlsCertPath {
-                let stem = (cert as NSString).lastPathComponent
-                    .replacingOccurrences(of: ".crt", with: "")
-                if !stem.isEmpty { return stem }
-            }
-            return localHostnameWithDotLocal()
-        case .ponte:
-            if let p = SurgePonte.discoverSelfHostname(), !p.isEmpty {
-                return p
-            }
-            return localHostnameWithDotLocal()
-        case .local:
-            return localHostnameWithDotLocal()
-        }
-    }
-
-    private func localHostnameWithDotLocal() -> String {
-        let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
-        return hn.hasSuffix(".local") ? hn : "\(hn).local"
+    private func cancelPIN() {
+        guard let service = AppDelegate.shared?.pairingService else { return }
+        Task { await service.cancel() }
     }
 
     private func startCountdown() {
-        countdownTask?.cancel()
-        countdownTask = Task { @MainActor in
-            for s in stride(from: 59, through: 0, by: -1) {
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor in
+            while !Task.isCancelled, secondsLeft > 0 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
-                self.secondsLeft = s
-                if s == 0 {
-                    self.isPresented = false
-                    return
-                }
+                self.secondsLeft -= 1
             }
         }
     }
 }
 
-/// 用 CoreImage QR generator 生成 PNG/NSImage。size 是输出像素边长,
-/// 内部 nearest-neighbor 放大让 QR 边缘锐利不糊
-enum QRGenerator {
-    static func makeImage(from string: String, size: CGFloat) -> NSImage? {
-        guard let data = string.data(using: .utf8) else { return nil }
-        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
-        filter.setValue(data, forKey: "inputMessage")
-        filter.setValue("M", forKey: "inputCorrectionLevel")
-        guard let ci = filter.outputImage else { return nil }
-        let scale = size / ci.extent.width
-        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        let context = CIContext()
-        guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: size, height: size))
-    }
-}

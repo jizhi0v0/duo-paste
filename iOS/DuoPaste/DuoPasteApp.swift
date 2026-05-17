@@ -28,6 +28,8 @@ struct DuoPasteApp: App {
 
     @AppStorage("peerURL") private var peerURL: String = ""
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
+    /// PIN 配对后持久化 — 重启 app 从这恢复 endpoint list + 网络变重 probe
+    @AppStorage("peerEndpointsJSON") private var peerEndpointsJSON: String = ""
 
     init() {
         UILatencyLog.mark("app init begin")
@@ -40,6 +42,8 @@ struct DuoPasteApp: App {
         UILatencyLog.mark("app state ready")
         // BGTaskScheduler.register 必须在 init,不能延迟到 scenePhase
         BackgroundPullService.register()
+        // 网络监听让 coordinator 在 Wi-Fi 切 cellular / 切网段时 re-probe endpoints
+        NetworkChangeWatcher.shared.start()
         Self.prewarmSystemServices()
         Self.cleanupShareTempFiles()
         UILatencyLog.mark("app init end")
@@ -54,7 +58,14 @@ struct DuoPasteApp: App {
                 .environment(coordinator.appIconCache)
                 .environment(shareCoord)
                 .task {
-                    if let cfg = try? PeerConfig.parse(
+                    // 启动恢复:优先走 endpoints+secret(PIN 配对后)→ probe 选最快;
+                    // 没 endpoints 但有手填 URL+secret(advanced 路径)→ 直接 reconfigure
+                    if let data = peerEndpointsJSON.data(using: .utf8),
+                       let endpoints = try? JSONDecoder().decode([PeerEndpoint].self, from: data),
+                       !endpoints.isEmpty,
+                       let secret = Data(hexString: sharedSecretHex) {
+                        coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
+                    } else if let cfg = try? PeerConfig.parse(
                         urlString: peerURL, secretHex: sharedSecretHex
                     ) {
                         coordinator.reconfigure(cfg)
