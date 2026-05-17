@@ -10,6 +10,5 @@ struct RootView: View {
                 SettingsView()
             }
         }
-        .tabBarMinimizeBehavior(.onScrollDown)
     }
 }

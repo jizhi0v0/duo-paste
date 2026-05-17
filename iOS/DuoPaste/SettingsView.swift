@@ -32,14 +32,20 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                if isPaired {
-                    statusSection
-                    pairedMacSection
-                    candidatesSection
-                } else {
-                    pairingSection
+            ZStack {
+                Color(.systemGroupedBackground)
+                    .ignoresSafeArea()
+
+                Form {
+                    if isPaired {
+                        statusSection
+                        pairedMacSection
+                        candidatesSection
+                    } else {
+                        pairingSection
+                    }
                 }
+                .scrollContentBackground(.hidden)
             }
             .navigationTitle("设置")
             .sheet(item: $selectedPeer) { peer in
@@ -184,6 +190,39 @@ struct SettingsView: View {
     @State private var showLogShare: Bool = false
     @State private var logShareText: String = ""
 
+    private func phaseIcon(_ phase: PeerSyncCoordinator.PoolURLStatus.Phase) -> String {
+        switch phase {
+        case .connected: return "antenna.radiowaves.left.and.right"
+        case .connecting: return "arrow.triangle.2.circlepath"
+        case .backoff: return "antenna.radiowaves.left.and.right.slash"
+        case .cooldown: return "snowflake"
+        case .absent: return "circle"
+        }
+    }
+    private func phaseColor(_ phase: PeerSyncCoordinator.PoolURLStatus.Phase) -> Color {
+        switch phase {
+        case .connected: return .green
+        case .connecting: return .orange
+        case .backoff: return .red
+        case .cooldown: return .blue
+        case .absent: return .secondary
+        }
+    }
+    private func phaseLabel(_ s: PeerSyncCoordinator.PoolURLStatus) -> String {
+        switch s.phase {
+        case .connected: return "WS 在线"
+        case .connecting: return "WS 连接中"
+        case .backoff: return "WS 重试中"
+        case .cooldown:
+            if let until = s.cooldownUntil {
+                let secs = max(0, Int(until.timeIntervalSinceNow))
+                return "冷却 \(secs)s"
+            }
+            return "冷却中"
+        case .absent: return "未启 WS"
+        }
+    }
+
     /// 显示 picker 探到的全部候选 + RTT,选中的标记 ★。配 "刷新候选" / "导出日志" 按钮
     /// 让用户调试链路情况
     @ViewBuilder
@@ -196,19 +235,27 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(probes, id: \EndpointPicker.Probe.id) { (probe: EndpointPicker.Probe) in
+                    let poolStatus = coordinator.poolStatus(for: probe.endpoint.url)
                     HStack {
                         let isCurrent = probe.endpoint.url == coordinator.currentEndpointURL
                         Text(isCurrent ? "★" : "·")
                             .foregroundStyle(isCurrent ? Color.green : Color.secondary)
                             .frame(width: 16)
+                        Image(systemName: phaseIcon(poolStatus.phase))
+                            .foregroundStyle(phaseColor(poolStatus.phase))
+                            .frame(width: 18)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(probe.endpoint.url)
                                 .font(.caption.monospaced())
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            Text(probe.endpoint.kind.rawValue)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                            HStack(spacing: 6) {
+                                Text(probe.endpoint.kind.rawValue)
+                                Text("·")
+                                Text(phaseLabel(poolStatus))
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                         }
                         Spacer()
                         Text(probe.ok ? "\(probe.rttMs)ms" : "—")
@@ -231,7 +278,7 @@ struct SettingsView: View {
         } header: {
             Text("候选 endpoint(\(probes.count))· 调试")
         } footer: {
-            Text("★ = 当前 picker 选中。优先级 ponte > tailscale > local,同 kind 按 RTT。导出日志拿到全部 endpoint repick / pick / 失败原因。")
+            Text("★ = HTTP /since 当前用的 URL。icon 是该 URL 在 WS pool 的状态:\u{1F4F6} 在线 / \u{1F501} 连接中 / \u{274C} 重试 / \u{2744}\u{FE0F} 冷却 / \u{25CB} 未启。pool 同时开 top-2 URL,任一推 cursor_advanced 都触发拉取——单 URL 死(如 iOS cellular WS TLS bug)不影响其他 URL 工作。")
         }
         .sheet(isPresented: $showLogShare) {
             ActivityShareSheet(items: [logShareText])

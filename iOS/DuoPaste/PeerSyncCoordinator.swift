@@ -39,7 +39,9 @@ final class PeerSyncCoordinator {
 
     private let store: HistoryStore
     private var client: PeerClient?
-    private var ws: PeerWebSocket?
+    /// 多 URL 并发 WS 池。HTTP probe 通但单 URL WS TLS 挂时(iOS cellular Surge 链路坑),
+    /// pool 让其他 URL 的 WS 还在工作推 cursor_advanced。see PeerWSPool 注释
+    private var wsPool: PeerWSPool?
     private var cursor: SinceCursor = .zero
     private var pullTask: Task<Void, Never>?
     private var statusTickTask: Task<Void, Never>?
@@ -65,6 +67,43 @@ final class PeerSyncCoordinator {
     private(set) var lastRTT: [String: Int] = [:]
     /// 最近一次 probe 完整结果(含失败的) — 给 Settings UI 显示用
     private(set) var lastProbes: [EndpointPicker.Probe] = []
+
+    /// 给 Settings UI 显示 pool 里每个 URL 的 WS 状态——是 connected / connecting / backoff / cooldown
+    struct PoolURLStatus: Equatable, Sendable {
+        enum Phase: String, Sendable {
+            case connected
+            case connecting
+            case backoff
+            case cooldown
+            case absent  // probe ok 但没在 pool 里(超出 top-K)
+        }
+        let url: String
+        let phase: Phase
+        let lastHeartbeatAt: Date?
+        let cooldownUntil: Date?
+    }
+
+    /// 把 pool 状态扁平成 URL → phase map,给 UI 渲染。pool nil → 全 absent
+    func poolStatus(for url: String) -> PoolURLStatus {
+        guard let pool = wsPool else {
+            return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil, cooldownUntil: nil)
+        }
+        let cooldownMap = Dictionary(uniqueKeysWithValues: pool.cooldownSnapshot().map { ($0.url, $0.until) })
+        if let until = cooldownMap[url] {
+            return PoolURLStatus(url: url, phase: .cooldown, lastHeartbeatAt: nil, cooldownUntil: until)
+        }
+        let socks = pool.snapshot()
+        if let s = socks.first(where: { $0.url == url }) {
+            let phase: PoolURLStatus.Phase = switch s.state {
+            case .connected: .connected
+            case .connecting: .connecting
+            case .backoff, .failed: .backoff
+            case .idle, .stopped: .absent
+            }
+            return PoolURLStatus(url: url, phase: phase, lastHeartbeatAt: s.lastHeartbeatAt, cooldownUntil: nil)
+        }
+        return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil, cooldownUntil: nil)
+    }
     /// RTT 抖动容忍——新最优比当前 RTT 差超过这个 ratio 才切。0.2 = 20%
     nonisolated let rttStableEpsilon: Double = 0.2
     /// 周期 safety probe task——5min 一次,即便 NWPathMonitor / WS 都没火,也防 endpoint
@@ -84,10 +123,9 @@ final class PeerSyncCoordinator {
         }
     }
 
+    /// 手填 advanced URL 路径用——单 URL 当作单 probe 走 pool。配对路径走
+    /// `reconfigureFromPairing` + `applyPicks`,不应进这里
     func reconfigure(_ config: PeerConfig?) {
-        // **不调 stop()** ——stop() 在 nil 路径已经清,reconfigure 内部 cancelRuntimeTasks
-        // 让 currentEndpointURL / availableEndpoints / currentSecret 在 URL switch 时
-        // 保留(避免 applyPick 设了 currentEndpointURL 又被 stop 清掉的 race)
         cancelRuntimeTasks()
         lastProbes = []
         blobCache.resetAll()
@@ -96,36 +134,52 @@ final class PeerSyncCoordinator {
         appIconCache.fetcher = nil
         guard let config else {
             status = .unconfigured
+            currentSecret = nil
+            availableEndpoints = []
+            currentEndpointURL = nil
             return
         }
-        let client = PeerClient(config: config)
+        self.currentSecret = config.sharedSecret
+        let manualEP = PeerEndpoint(url: config.baseURL.absoluteString, kind: .tailscale)
+        self.availableEndpoints = [manualEP]
+        self.status = .connecting
+        // 手填 URL 不走 probe → 直接用 0ms 占位 probe 走 pool
+        let probe = EndpointPicker.Probe(endpoint: manualEP, rttMs: 0)
+        setupClientAndPool(probes: [probe], secret: config.sharedSecret)
+    }
+
+    /// 公共装配路径:重 PeerClient + PeerWSPool,注入 blob/icon fetcher。
+    /// 既给手填 URL 用(单 probe),也给 paired probe 路径用(top-K)
+    private func setupClientAndPool(probes: [EndpointPicker.Probe], secret: Data) {
+        guard let bestProbe = probes.first(where: { $0.ok }),
+              let bestURL = URL(string: bestProbe.endpoint.url) else {
+            status = .error("无可达 endpoint")
+            return
+        }
+        self.currentEndpointURL = bestProbe.endpoint.url
+        let cfg = PeerConfig(baseURL: bestURL, sharedSecret: secret)
+        let client = PeerClient(config: cfg)
         self.client = client
         self.cursor = .zero
-        self.status = .connecting
-        // 注入 blob fetcher——长按 share image / 单击 image cell 时走这个
-        blobCache.fetcher = { sha in
-            try await client.fetchBlob(sha256: sha)
-        }
-        // 注入 app icon fetcher——HistoryCellView 拿到 sourceApp 时触发
-        appIconCache.fetcher = { bid in
-            try await client.fetchAppIcon(bundleID: bid)
-        }
-        let ws = PeerWebSocket(
-            config: config,
+        if case .connected = status {} else { self.status = .connecting }
+        blobCache.fetcher = { sha in try await client.fetchBlob(sha256: sha) }
+        appIconCache.fetcher = { bid in try await client.fetchAppIcon(bundleID: bid) }
+        let pool = PeerWSPool(
+            secret: secret,
+            topK: 2,
             onAdvance: { [weak self] _ in
                 self?.kickPull()
             },
-            onReprobeNeeded: { [weak self] reason in
-                // WS 连续失败 → 已 pick 的 endpoint 不再 viable,主动重新探活选别的候选
-                self?.repickEndpoint(reason: "ws: \(reason)")
+            onAllDown: { [weak self] reason in
+                // 全 WS 都死了——升级到 repick 重新探活全 candidate list
+                self?.repickEndpoint(reason: "ws-pool: \(reason)")
             },
             onEndpointsChanged: { [weak self] in
-                // Mac 推送说 mesh endpoints 更新了 → refetch /endpoints + re-probe
                 self?.refetchAndRepick(reason: "ws: endpoints_changed")
             }
         )
-        self.ws = ws
-        ws.start()
+        self.wsPool = pool
+        pool.reconcile(probes: probes)
         startStatusTick()
         kickPull()
     }
@@ -192,7 +246,7 @@ final class PeerSyncCoordinator {
             await MainActor.run {
                 self?.recordRTTs(probes: probes)
                 self?.lastProbes = probes
-                self?.applyPick(endpoint: best.endpoint, rttMs: best.rttMs, secret: secret)
+                self?.applyPicks(probes: probes, secret: secret)
             }
         }
     }
@@ -205,35 +259,54 @@ final class PeerSyncCoordinator {
         }
     }
 
-    private func applyPick(endpoint: PeerEndpoint, rttMs: Int, secret: Data) {
-        // **判 "已有活连接" 用 ws != nil 不用 status**——status .connecting 可能只是
-        // reconfigureFromPairing 刚设的"期望状态",WS 还没起;此时同 URL 也要走 reconfigure
-        // 真正起 WS,否则用户重连卡"连接中"永远不连上
-        let hasLiveConnection = (ws != nil)
-
-        // 1) 同 URL + 活连接 → noop(stability):正常 connected 状态下 repick 同 URL 不重启
-        if currentEndpointURL == endpoint.url, hasLiveConnection {
+    /// 把最新 probe 结果调和给 pool——top-K reachable URL 起 / 保持 WS,其他关掉。
+    /// HTTP `client` 跟到 best probe URL(只在 URL 变了或 client nil 时重建)。
+    ///
+    /// **关键差异 vs 旧 applyPick**: pool 自动复用已活的 WS(reconcile 内部 diff),
+    /// 不会因为同 URL 触发整体重启。flap guard 还在但只挡 client URL 切换,**WS pool
+    /// 始终更新**(让新增 endpoint 立刻被开 WS)
+    private func applyPicks(probes: [EndpointPicker.Probe], secret: Data) {
+        guard let bestProbe = probes.first(where: { $0.ok }) else {
+            status = .error("所有 endpoint 都不通,检查 Mac 是否在线 + 网络")
             return
         }
-        // 2) 不同 URL + 活连接 + RTT 改善不显著 → 视为测量噪音不切防 flap。
-        //    没活连接时(刚重连 / disconnect 后)不走 guard,确保能起 WS
+        // pool 必须刷新——新 probe 可能新增 / 删除 reachable URL
+        if let pool = wsPool {
+            pool.reconcile(probes: probes)
+        } else {
+            // 没 pool → 走 setup
+            setupClientAndPool(probes: probes, secret: secret)
+            return
+        }
+
+        // client URL 切换 guard:同 URL noop;不同 URL + 有活连接 + RTT 改善不显著 → flap
+        let bestURL = bestProbe.endpoint.url
+        let hasLiveConnection: Bool = {
+            if case .connected = wsPool?.state { return true } else { return false }
+        }()
+        if currentEndpointURL == bestURL, client != nil { return }
         if let current = currentEndpointURL,
-           current != endpoint.url,
+           current != bestURL,
            let currentRTT = lastRTT[current],
            currentRTT > 0,
            hasLiveConnection,
-           Double(currentRTT - rttMs) / Double(currentRTT) < rttStableEpsilon {
-            DebugLog.shared.append("endpoint pick skipped: current=\(currentRTT)ms new=\(rttMs)ms (within \(Int(rttStableEpsilon*100))%)")
+           Double(currentRTT - bestProbe.rttMs) / Double(currentRTT) < rttStableEpsilon {
+            DebugLog.shared.append("client pick skipped: current=\(currentRTT)ms new=\(bestProbe.rttMs)ms (within \(Int(rttStableEpsilon*100))%)")
             return
         }
-        currentEndpointURL = endpoint.url
-        guard let url = URL(string: endpoint.url) else {
-            status = .error("invalid endpoint URL: \(endpoint.url)")
+        // 切 client URL
+        guard let url = URL(string: bestURL) else {
+            status = .error("invalid endpoint URL: \(bestURL)")
             return
         }
+        currentEndpointURL = bestURL
         let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
-        // reconfigure 内部 cancelRuntimeTasks + 起新连接;blob/icon cache 也 resetAll
-        reconfigure(cfg)
+        let newClient = PeerClient(config: cfg)
+        self.client = newClient
+        blobCache.fetcher = { sha in try await newClient.fetchBlob(sha256: sha) }
+        appIconCache.fetcher = { bid in try await newClient.fetchAppIcon(bundleID: bid) }
+        DebugLog.shared.append("client URL switched to: \(bestURL) (\(bestProbe.endpoint.kind.rawValue) \(bestProbe.rttMs)ms)")
+        kickPull()
     }
 
     /// 5min 周期重 probe——NWPathMonitor / WS 失败回调没火的兜底。endpoint 实际可用性
@@ -303,8 +376,8 @@ final class PeerSyncCoordinator {
     /// 仅取消运行时 task / 连接,**不动 config**(currentSecret / availableEndpoints /
     /// currentEndpointURL)。`reconfigure(cfg)` 内部用,switch URL 时让 config 保留
     private func cancelRuntimeTasks() {
-        ws?.stop()
-        ws = nil
+        wsPool?.stop()
+        wsPool = nil
         pullTask?.cancel()
         pullTask = nil
         periodicRepickTask?.cancel()
@@ -388,11 +461,11 @@ final class PeerSyncCoordinator {
     }
 
     private func applyConnectedStatus() {
-        guard let ws else {
+        guard let pool = wsPool else {
             status = .idle
             return
         }
-        switch ws.state {
+        switch pool.state {
         case .connected(let pid):
             status = .connected(peerDeviceID: pid, lastSync: Date())
             lastConnectedStampAt = Date()
@@ -424,10 +497,10 @@ final class PeerSyncCoordinator {
     }
 
     private func tickStatus() {
-        guard let ws else { return }
-        // 1) 同步 ws.state 到 status——但只在状态从 connected 变到其他时主动覆盖
-        //    (避免每 5s 把 lastSync 时间戳清掉)
-        switch ws.state {
+        guard let pool = wsPool else { return }
+        // pool.state 聚合多 WS:任一 .connected → pool.connected,否则取最活跃子 state.
+        // 单 WS 死 + 其他活 = pool.connected,UI 仍显示已连接(这正是 pool 价值)
+        switch pool.state {
         case .connecting:
             if case .connected = status {} else { status = .connecting }
         case .backoff(let f):
@@ -435,17 +508,15 @@ final class PeerSyncCoordinator {
         case .failed(let m):
             status = .error(m)
         case .stopped, .idle:
-            // 不动 status——stop() 已经处理
             break
         case .connected(let pid):
-            // 2) zombie 检测:state 说 connected 但 lastHeartbeatAt 太老 → 降级
-            let last = ws.lastHeartbeatAt ?? lastConnectedStampAt ?? .distantPast
+            // zombie 检测:pool 说 connected 但所有 sub WS 帧都太老 → 降级
+            let last = pool.lastHeartbeatAt ?? lastConnectedStampAt ?? .distantPast
             if Date().timeIntervalSince(last) > heartbeatStaleTimeoutSec {
                 status = .error("链路无响应 (\(Int(Date().timeIntervalSince(last)))s)")
             } else if case .connected = status {
-                // 已经显 connected,保留原 lastSync 不刷新(避免每 tick 假装"刚同步过")
+                // 已经显 connected 保留 lastSync
             } else {
-                // ws 重新 connected 但 status 还在 backoff/error → 走 applyConnectedStatus
                 status = .connected(peerDeviceID: pid, lastSync: lastConnectedStampAt)
             }
         }

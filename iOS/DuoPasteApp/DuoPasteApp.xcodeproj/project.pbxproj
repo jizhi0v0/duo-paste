@@ -31,6 +31,7 @@
 		D1A00090000000000000A009 /* TrustAnyDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00090000000000000B009 /* TrustAnyDelegate.swift */; };
 		D1A000A0000000000000A00A /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A000A0000000000000B00A /* QRScannerView.swift */; };
 		D1A000B0000000000000A00B /* DebugLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A000B0000000000000B00B /* DebugLog.swift */; };
+		D1A000C0000000000000A00C /* PeerWSPool.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A000C0000000000000B00C /* PeerWSPool.swift */; };
 /* End PBXBuildFile section */
 
 
@@ -59,6 +60,7 @@
 		D1A00090000000000000B009 /* TrustAnyDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustAnyDelegate.swift; sourceTree = "<group>"; };
 		D1A000A0000000000000B00A /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
 		D1A000B0000000000000B00B /* DebugLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLog.swift; sourceTree = "<group>"; };
+		D1A000C0000000000000B00C /* PeerWSPool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWSPool.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -124,6 +126,7 @@
 				D1A00090000000000000B009 /* TrustAnyDelegate.swift */,
 				D1A000A0000000000000B00A /* QRScannerView.swift */,
 				D1A000B0000000000000B00B /* DebugLog.swift */,
+				D1A000C0000000000000B00C /* PeerWSPool.swift */,
 			);
 			name = DuoPaste;
 			path = ../DuoPaste;
@@ -231,6 +234,7 @@
 				D1A00090000000000000A009 /* TrustAnyDelegate.swift in Sources */,
 				D1A000A0000000000000A00A /* QRScannerView.swift in Sources */,
 				D1A000B0000000000000A00B /* DebugLog.swift in Sources */,
+				D1A000C0000000000000A00C /* PeerWSPool.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

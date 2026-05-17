@@ -44,6 +44,7 @@ struct HistoryView: View {
             .padding(.bottom, 24)
         }
         .scrollContentBackground(.hidden)
+        .scrollEdgeEffectHidden(true, for: .top)
     }
 
     private var emptyState: some View {
