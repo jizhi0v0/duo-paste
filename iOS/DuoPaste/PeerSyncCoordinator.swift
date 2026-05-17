@@ -54,6 +54,12 @@ final class PeerSyncCoordinator {
     /// 最近一次 endpoint pick 选中的 URL,UI 显示 + 避免 idle 重选时反复切
     private(set) var currentEndpointURL: String?
     private var repickTask: Task<Void, Never>?
+    /// 最近一次 repick 开始时间——给节流用。network 抖动 / WS 失败级联触发的 repick
+    /// 受 minRepickIntervalSec 限制,防止 cellular 切换期 NWPathMonitor 多次火 + WS
+    /// 失败回调连环触发大量并发 probe 拖垮 URLSession 池(实测有 crash)
+    private var lastRepickStartedAt: Date?
+    /// 节流间隔:相邻自动 repick 之间最小间隔。用户主动操作(配对 / 手动刷新)绕过
+    nonisolated let minRepickIntervalSec: TimeInterval = 3
     /// 每个 endpoint URL 最近一次实测 RTT。re-probe 时跟新最优比,差 < `rttStableEpsilon` →
     /// 不切防 flap。在 disconnected 期间所有候选都失败 -1 → 不更新 → 不影响 stable guard
     private(set) var lastRTT: [String: Int] = [:]
@@ -151,13 +157,25 @@ final class PeerSyncCoordinator {
         // reconfigureFromPairing 会先把 status 设到 .connecting 才调本函数,正常路径
         // 此 guard 不阻塞
         if case .unconfigured = status, reason != "pairing complete" {
-            FileHandle.standardError.write(Data("endpoint repick suppressed (.unconfigured): \(reason)\n".utf8))
+            DebugLog.shared.append("endpoint repick suppressed (.unconfigured): \(reason)")
+            return
+        }
+        // 节流——cellular 切换 / Wi-Fi 抖动期 NWPathMonitor 多次火 + WS 失败回调级联
+        // 会让 repick 短时间内被触发十几次,每次起 6 个并发 URLSession probe,把 Surge
+        // 隧道 / URLSession 连接池压垮可能 crash。用户主动操作绕过节流
+        let userInitiated = reason == "pairing complete"
+            || reason == "manual refresh"
+            || reason.hasPrefix("ws: endpoints_changed")
+        if !userInitiated, let last = lastRepickStartedAt,
+           Date().timeIntervalSince(last) < minRepickIntervalSec {
+            DebugLog.shared.append("endpoint repick throttled: \(reason) (last=\(Int(Date().timeIntervalSince(last) * 1000))ms ago)")
             return
         }
         guard let secret = currentSecret, !availableEndpoints.isEmpty else { return }
+        lastRepickStartedAt = Date()
         repickTask?.cancel()
         let endpoints = availableEndpoints
-        FileHandle.standardError.write(Data("endpoint repick: \(reason) (\(endpoints.count) candidates)\n".utf8))
+        DebugLog.shared.append("endpoint repick: \(reason) (\(endpoints.count) candidates)")
         repickTask = Task { [weak self] in
             let probes = await EndpointPicker.probeAll(endpoints: endpoints, secret: secret)
             guard !Task.isCancelled else { return }
@@ -170,7 +188,7 @@ final class PeerSyncCoordinator {
             let summary = probes.map { p in
                 "\(p.endpoint.kind.rawValue)=\(p.rttMs)ms"
             }.joined(separator: " ")
-            FileHandle.standardError.write(Data("endpoint pick: best=\(best.endpoint.kind.rawValue) (\(best.rttMs)ms) [\(summary)]\n".utf8))
+            DebugLog.shared.append("endpoint pick: best=\(best.endpoint.kind.rawValue) (\(best.rttMs)ms) [\(summary)]")
             await MainActor.run {
                 self?.recordRTTs(probes: probes)
                 self?.lastProbes = probes
@@ -205,8 +223,7 @@ final class PeerSyncCoordinator {
            currentRTT > 0,
            hasLiveConnection,
            Double(currentRTT - rttMs) / Double(currentRTT) < rttStableEpsilon {
-            FileHandle.standardError.write(Data(
-                "endpoint pick skipped: current=\(currentRTT)ms new=\(rttMs)ms (within \(Int(rttStableEpsilon*100))%)\n".utf8))
+            DebugLog.shared.append("endpoint pick skipped: current=\(currentRTT)ms new=\(rttMs)ms (within \(Int(rttStableEpsilon*100))%)")
             return
         }
         currentEndpointURL = endpoint.url
@@ -248,7 +265,7 @@ final class PeerSyncCoordinator {
                     self.repickEndpoint(reason: reason)
                 }
             } catch {
-                FileHandle.standardError.write(Data("refetchAndRepick failed: \(error)\n".utf8))
+                DebugLog.shared.append("refetchAndRepick failed: \(error)")
             }
         }
     }
@@ -278,7 +295,7 @@ final class PeerSyncCoordinator {
                 try await client.bumpItem(id: id)
             } catch {
                 // swallow——bump 是 best-effort 的跨设备一致信号,失败不阻塞 UI
-                FileHandle.standardError.write(Data("bumpItemOnServer(\(id)) failed: \(error.localizedDescription)\n".utf8))
+                DebugLog.shared.append("bumpItemOnServer(\(id)) failed: \(error.localizedDescription)")
             }
         }
     }

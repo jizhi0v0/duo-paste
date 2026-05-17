@@ -36,6 +36,7 @@ struct SettingsView: View {
                 if isPaired {
                     statusSection
                     pairedMacSection
+                    candidatesSection
                 } else {
                     pairingSection
                 }
@@ -180,6 +181,65 @@ struct SettingsView: View {
             Text("已配对")
         } footer: {
             Text("左滑取消配对。取消后 secret 本地清空,需重新走 PIN 配对。Mac 端无需通知——HMAC 失效后请求自动 401。")
+        }
+    }
+
+    // MARK: - 候选 endpoint(调试用)
+
+    @State private var showLogShare: Bool = false
+    @State private var logShareText: String = ""
+
+    /// 显示 picker 探到的全部候选 + RTT,选中的标记 ★。配 "刷新候选" / "导出日志" 按钮
+    /// 让用户调试链路情况
+    @ViewBuilder
+    private var candidatesSection: some View {
+        let probes: [EndpointPicker.Probe] = coordinator.lastProbes
+        Section {
+            if probes.isEmpty {
+                Text("没探到候选——配对后或点下方刷新")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(probes, id: \EndpointPicker.Probe.id) { (probe: EndpointPicker.Probe) in
+                    HStack {
+                        let isCurrent = probe.endpoint.url == coordinator.currentEndpointURL
+                        Text(isCurrent ? "★" : "·")
+                            .foregroundStyle(isCurrent ? Color.green : Color.secondary)
+                            .frame(width: 16)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(probe.endpoint.url)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(probe.endpoint.kind.rawValue)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(probe.ok ? "\(probe.rttMs)ms" : "—")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(probe.ok ? Color.primary : Color.red)
+                    }
+                }
+            }
+            Button {
+                coordinator.repickEndpoint(reason: "manual refresh")
+            } label: {
+                Label("刷新候选", systemImage: "arrow.clockwise")
+            }
+            Button {
+                logShareText = DebugLog.shared.snapshot()
+                showLogShare = true
+            } label: {
+                Label("导出日志", systemImage: "doc.text.below.ecg")
+            }
+        } header: {
+            Text("候选 endpoint(\(probes.count))· 调试")
+        } footer: {
+            Text("★ = 当前 picker 选中。优先级 ponte > tailscale > local,同 kind 按 RTT。导出日志拿到全部 endpoint repick / pick / 失败原因。")
+        }
+        .sheet(isPresented: $showLogShare) {
+            ActivityShareSheet(items: [logShareText])
         }
     }
 
@@ -345,4 +405,16 @@ struct SettingsView: View {
 
 extension QRPayload: Identifiable {
     var id: String { "\(host):\(port)" }
+}
+
+/// 简易 UIActivityViewController wrapper—— "导出日志" 按钮分享 text 文件。
+/// 不复用 ShareCoordinator(那个绑了 image 字节流场景)
+private struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }

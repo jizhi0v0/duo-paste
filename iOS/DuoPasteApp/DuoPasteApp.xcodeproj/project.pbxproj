@@ -30,6 +30,7 @@
 		D1A00080000000000000A008 /* PinPairingSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00080000000000000B008 /* PinPairingSheet.swift */; };
 		D1A00090000000000000A009 /* TrustAnyDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00090000000000000B009 /* TrustAnyDelegate.swift */; };
 		D1A000A0000000000000A00A /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A000A0000000000000B00A /* QRScannerView.swift */; };
+		D1A000B0000000000000A00B /* DebugLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A000B0000000000000B00B /* DebugLog.swift */; };
 /* End PBXBuildFile section */
 
 
@@ -57,6 +58,7 @@
 		D1A00080000000000000B008 /* PinPairingSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinPairingSheet.swift; sourceTree = "<group>"; };
 		D1A00090000000000000B009 /* TrustAnyDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustAnyDelegate.swift; sourceTree = "<group>"; };
 		D1A000A0000000000000B00A /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
+		D1A000B0000000000000B00B /* DebugLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLog.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -121,6 +123,7 @@
 				D1A00080000000000000B008 /* PinPairingSheet.swift */,
 				D1A00090000000000000B009 /* TrustAnyDelegate.swift */,
 				D1A000A0000000000000B00A /* QRScannerView.swift */,
+				D1A000B0000000000000B00B /* DebugLog.swift */,
 			);
 			name = DuoPaste;
 			path = ../DuoPaste;
@@ -227,6 +230,7 @@
 				D1A00080000000000000A008 /* PinPairingSheet.swift in Sources */,
 				D1A00090000000000000A009 /* TrustAnyDelegate.swift in Sources */,
 				D1A000A0000000000000A00A /* QRScannerView.swift in Sources */,
+				D1A000B0000000000000A00B /* DebugLog.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

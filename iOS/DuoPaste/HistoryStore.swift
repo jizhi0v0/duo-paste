@@ -102,7 +102,7 @@ final class HistoryStore {
                 let data = try encoder.encode(snapshot)
                 try data.write(to: url, options: .atomic)
             } catch {
-                FileHandle.standardError.write(Data("HistoryStore.persist failed: \(error)\n".utf8))
+                DebugLog.shared.append("HistoryStore.persist failed: \(error)")
             }
         }
     }
@@ -140,7 +140,7 @@ struct PersistedCursor: Codable {
             let data = try JSONEncoder().encode(self)
             try data.write(to: url, options: .atomic)
         } catch {
-            FileHandle.standardError.write(Data("PersistedCursor.save failed: \(error)\n".utf8))
+            DebugLog.shared.append("PersistedCursor.save failed: \(error)")
         }
     }
 }

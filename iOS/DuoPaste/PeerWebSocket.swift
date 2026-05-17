@@ -220,7 +220,7 @@ final class PeerWebSocket {
         case .endpointsChanged:
             // Mac 通知:endpoints 候选 list 变了(新 peer 加入 / ponte_host 改 /
             // mesh peer 重启等)→ coordinator refetch /endpoints + re-probe
-            FileHandle.standardError.write(Data("ws: endpoints_changed received\n".utf8))
+            DebugLog.shared.append("ws: endpoints_changed received")
             onEndpointsChanged()
         }
     }

@@ -50,7 +50,7 @@ enum BackgroundPullService {
         do {
             try BGTaskScheduler.shared.submit(req)
         } catch {
-            FileHandle.standardError.write(Data("BG schedule failed: \(error)\n".utf8))
+            DebugLog.shared.append("BG schedule failed: \(error)")
         }
     }
 
@@ -62,7 +62,7 @@ enum BackgroundPullService {
                 try await runPull()
                 task.setTaskCompleted(success: true)
             } catch {
-                FileHandle.standardError.write(Data("BG pull failed: \(error)\n".utf8))
+                DebugLog.shared.append("BG pull failed: \(error)")
                 task.setTaskCompleted(success: false)
             }
         }

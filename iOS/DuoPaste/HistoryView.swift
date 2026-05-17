@@ -29,12 +29,6 @@ struct HistoryView: View {
             )
             .onChange(of: searchText) { _, new in store.query = new }
             .toolbar { statusToolbar }
-            // 钉死 opaque nav bar——iOS 26 Liquid Glass 默认让 ScrollView 内容滚到
-            // nav bar 下方靠 blur 遮住,但 Tab crossfade 切换时 blur 衰减一帧,顶部
-            // 历史 list 数据就从设置页 nav bar 区透出来。强制 solid background 是唯一
-            // 跨 tab 不漏的姿态,代价是丢滚动边缘虚化(可接受)
-            .toolbarBackgroundVisibility(.visible, for: .navigationBar)
-            .toolbarBackground(Color(.systemBackground), for: .navigationBar)
         }
     }
 
@@ -56,6 +50,10 @@ struct HistoryView: View {
             .padding(.bottom, 24)
         }
         .scrollContentBackground(.hidden)
+        // iOS 26 API:把顶/底 edge effect 从默认 soft(柔化模糊)切到 hard(硬边)。
+        // soft 模式下内容滚到 nav bar 下方会被柔化半透显示,Tab crossfade 那一帧 blur
+        // 抖一下就漏到对面 tab。hard 模式硬切,内容到 safe area 边就停,不再延伸到 bar 下
+        .scrollEdgeEffectStyle(.hard, for: .top)
     }
 
     private var emptyState: some View {
