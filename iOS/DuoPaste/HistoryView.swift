@@ -16,9 +16,11 @@ struct HistoryView: View {
                 }
             }
             // iOS 26 TabView crossfade 会让两个 tab 同时半透明叠加。
-            // 不给根视图加 opaque 底,Liquid Glass 卡片之间的缝就会漏出对面 tab 内容
+            // 不给根视图加 opaque 底,Liquid Glass 卡片之间的缝就会漏出对面 tab 内容。
+            // ignoresSafeArea 让 opaque 底延伸到 nav bar / search drawer / tab bar 下面,
+            // 这样 Liquid Glass blur 永远只看到一个 solid color 而不是对面 tab 的内容
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(.systemBackground))
+            .background(Color(.systemBackground).ignoresSafeArea())
             .navigationTitle("DuoPaste")
             .searchable(
                 text: $searchText,
@@ -27,6 +29,12 @@ struct HistoryView: View {
             )
             .onChange(of: searchText) { _, new in store.query = new }
             .toolbar { statusToolbar }
+            // 钉死 opaque nav bar——iOS 26 Liquid Glass 默认让 ScrollView 内容滚到
+            // nav bar 下方靠 blur 遮住,但 Tab crossfade 切换时 blur 衰减一帧,顶部
+            // 历史 list 数据就从设置页 nav bar 区透出来。强制 solid background 是唯一
+            // 跨 tab 不漏的姿态,代价是丢滚动边缘虚化(可接受)
+            .toolbarBackgroundVisibility(.visible, for: .navigationBar)
+            .toolbarBackground(Color(.systemBackground), for: .navigationBar)
         }
     }
 

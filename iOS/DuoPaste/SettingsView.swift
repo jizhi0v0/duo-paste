@@ -41,9 +41,10 @@ struct SettingsView: View {
                 }
             }
             // 跟 HistoryView 同款 opaque 底——防 iOS 26 Tab crossfade 期间
-            // 对面 tab 内容从 Form sections 缝里透过来
+            // 对面 tab 内容从 Form sections 缝里透过来。
+            // ignoresSafeArea 把底延到 nav bar / tab bar 下,让 Liquid Glass 永远 blur 实底
             .scrollContentBackground(.hidden)
-            .background(Color(.systemGroupedBackground))
+            .background(Color(.systemGroupedBackground).ignoresSafeArea())
             .navigationTitle("设置")
             .sheet(item: $selectedPeer) { peer in
                 PinPairingSheet(

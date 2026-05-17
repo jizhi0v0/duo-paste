@@ -179,9 +179,11 @@ final class PeerSyncCoordinator {
         }
     }
 
+    /// 记录每次 probe 的 RTT(含失败 = -1)。失败值参与 stability guard:current URL
+    /// 在最新 probe 里 -1 时,guard 的 `currentRTT > 0` 自然 false → 不抑制切换
     private func recordRTTs(probes: [EndpointPicker.Probe]) {
-        for p in probes where p.ok {
-            lastRTT[p.endpoint.url] = p.rttMs
+        for p in probes {
+            lastRTT[p.endpoint.url] = p.rttMs   // -1 for failed too
         }
     }
 

@@ -20,8 +20,10 @@ enum EndpointPicker {
         var id: String { endpoint.url }
     }
 
-    /// 并发探活所有 endpoint。返回完整结果(含失败的),按 RTT 升序。
-    /// 失败的 RTT = -1,排在最后(用 .max sort key)。
+    /// 并发探活所有 endpoint。返回完整结果(含失败的)。
+    /// 排序按 (kind 优先级, RTT 升序)——跟 macOS SmartTransport 一致:reachability 决定
+    /// 走哪条路 (ponte > tailscale > local),不是纯 RTT 比赛。RTT 只是评估证据 +
+    /// 同 kind 内的 tiebreaker。
     /// timeout 默 5s——cellular 经 Surge ponte 路径首次握手可能慢
     static func probeAll(
         endpoints: [PeerEndpoint],
@@ -38,15 +40,30 @@ enum EndpointPicker {
             }
             var results: [Probe] = []
             for await r in group { results.append(r) }
+            // 按 (kind 优先级, RTT) 排:不可达的排到最后
             return results.sorted { a, b in
-                let ra = a.rttMs < 0 ? Int.max : a.rttMs
-                let rb = b.rttMs < 0 ? Int.max : b.rttMs
-                return ra < rb
+                let pa = kindPriority(a.endpoint.kind)
+                let pb = kindPriority(b.endpoint.kind)
+                if !a.ok && b.ok { return false }
+                if a.ok && !b.ok { return true }
+                if !a.ok && !b.ok { return pa < pb }
+                if pa != pb { return pa < pb }
+                return a.rttMs < b.rttMs
             }
         }
     }
 
-    /// 选最快候选;全部失败返回 nil
+    /// 选最优候选——按 kind 优先级 + RTT。跟 macOS SmartTransport 一致:
+    /// **优先级** ponte > tailscale > local > lan_ip;**同 kind** 内按 RTT 升序。
+    /// 全部不可达返回 nil。
+    ///
+    /// 设计动机:
+    /// - ponte (Surge 代理) 是用户显式配过的"快路径",优先用
+    /// - tailscale 是稳定 fallback,cert 匹配跨网络通
+    /// - local mDNS 路径在 iOS 经常不稳(IPv6 link-local RST / DNS 缓存 stale),
+    ///   只在 ponte / tailscale 都不通时兜底
+    /// - **不**纯 RTT 比 60ms local vs 65ms tailscale,因为 local 那 5ms 优势经常被
+    ///   mDNS 解析抖动抹掉,长尾 latency 更差
     static func pickBest(
         endpoints: [PeerEndpoint],
         secret: Data,
@@ -54,6 +71,16 @@ enum EndpointPicker {
     ) async -> PeerEndpoint? {
         let probes = await probeAll(endpoints: endpoints, secret: secret, timeoutSec: timeoutSec)
         return probes.first(where: { $0.ok })?.endpoint
+    }
+
+    /// kind 优先级:小数字 = 高优先。ponte=0, tailscale=1, local=2, lan_ip=3
+    nonisolated private static func kindPriority(_ k: PeerEndpoint.Kind) -> Int {
+        switch k {
+        case .ponte: return 0
+        case .tailscale: return 1
+        case .local: return 2
+        case .lanIP: return 3
+        }
     }
 
     // MARK: - 内部
