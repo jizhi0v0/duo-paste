@@ -13,9 +13,17 @@ struct SettingsView: View {
     @State private var alertText: String?
     @State private var showAlert: Bool = false
     @State private var showAdvanced: Bool = false
+    @State private var showManualPairing: Bool = false
 
     @State private var discovery = PeerDiscovery()
     @State private var selectedPeer: PeerDiscovery.DiscoveredPeer?
+
+    /// 手动配对状态(Bonjour 扫不到时走这条)
+    @State private var manualHost: String = ""
+    @State private var manualPortStr: String = "8443"
+    @State private var manualTLS: Bool = true
+    @State private var manualPIN: String = ""
+    @State private var manualPairing: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -23,6 +31,7 @@ struct SettingsView: View {
                 statusSection
                 candidatesSection
                 discoverySection
+                manualPairingSection
                 advancedSection
             }
             .navigationTitle("设置")
@@ -179,6 +188,49 @@ struct SettingsView: View {
         }
     }
 
+    /// 手动配对——Bonjour 扫不到 Mac 时(不同 LAN / Local Network 权限拒 / Mac
+    /// daemon serve=false 等)的兜底。只需 hostname + 6 位 PIN,跟 Bonjour 配对走
+    /// 一样的安全模型(trust anchor = 用户在 Mac 前看到的 PIN),省 64 字符 hex secret
+    @ViewBuilder
+    private var manualPairingSection: some View {
+        Section {
+            DisclosureGroup(isExpanded: $showManualPairing) {
+                TextField("hostname 例 bobbys-mac-mini.tail69730a.ts.net", text: $manualHost)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                HStack {
+                    Text("端口")
+                    Spacer()
+                    TextField("8443", text: $manualPortStr)
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 80)
+                }
+                Toggle("TLS (https)", isOn: $manualTLS)
+                TextField("Mac 显示的 6 位 PIN", text: $manualPIN)
+                    .keyboardType(.numberPad)
+                    .font(.system(.body, design: .monospaced))
+                    .onChange(of: manualPIN) { _, newValue in
+                        manualPIN = String(newValue.filter { $0.isNumber }.prefix(6))
+                    }
+                Button {
+                    runManualPairing()
+                } label: {
+                    HStack {
+                        Image(systemName: "checkmark.shield")
+                        Text(manualPairing ? "配对中…" : "配对")
+                    }
+                }
+                .disabled(manualPairing || manualHost.isEmpty || manualPIN.count != 6)
+            } label: {
+                Label("手动配对(Bonjour 没发现 Mac)", systemImage: "keyboard")
+            }
+        } footer: {
+            Text("Bonjour 扫不到 Mac 时用——iOS 跟 Mac 不同 LAN / iOS 关了 Local Network 权限 / Mac daemon 关掉 serve 都会让 Bonjour 失效。Mac Settings 显示 PIN 后这里输 hostname + PIN 一样能 secret 自动落地。")
+        }
+    }
+
     @ViewBuilder
     private var advancedSection: some View {
         Section {
@@ -260,6 +312,45 @@ struct SettingsView: View {
             peerEndpointsJSON = json
         }
         coordinator.reconfigureFromPairing(secret: secret, endpoints: flat)
+    }
+
+    /// 手动配对走 PinPairingClient 流程,跟 Bonjour 配对最终走同 handlePairingSuccess。
+    /// 失败弹 alert 不被键盘遮挡
+    private func runManualPairing() {
+        let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pin = manualPIN
+        guard !host.isEmpty, pin.count == 6 else {
+            presentAlert("请填 hostname + 6 位 PIN")
+            return
+        }
+        let port = Int(manualPortStr) ?? 8443
+        let tls = manualTLS
+        manualPairing = true
+        Task { @MainActor in
+            defer { manualPairing = false }
+            do {
+                let resp = try await PinPairingClient.pair(host: host, port: port, tls: tls, pin: pin)
+                // 用 secret 构 PeerConfig 拉 /endpoints
+                let scheme = tls ? "https" : "http"
+                var comp = URLComponents()
+                comp.scheme = scheme
+                comp.host = host
+                comp.port = port
+                guard let initialURL = comp.url else {
+                    throw PinPairingClient.Error.badURL
+                }
+                let cfg = PeerConfig(baseURL: initialURL, sharedSecret: resp.secret)
+                let client = PeerClient(config: cfg)
+                let page = try await client.fetchEndpoints()
+                handlePairingSuccess(secret: resp.secret, page: page)
+                // 清空表单
+                manualHost = ""
+                manualPIN = ""
+                showManualPairing = false
+            } catch {
+                presentAlert(error.localizedDescription)
+            }
+        }
     }
 
     /// 高级面板手填路径——还是支持单 URL + secret 直接连。
