@@ -146,6 +146,14 @@ final class PeerSyncCoordinator {
     /// **稳定性 guard**:已 pick 当前 endpoint + 新最优 RTT 跟它差 < `rttStableEpsilon` →
     /// 不切防 flap(20% 差异内属于测量噪音,不值得 reconfigure 抖一下)
     func repickEndpoint(reason: String) {
+        // 用户主动 disconnect 后 status = .unconfigured。NetworkChangeWatcher 仍然
+        // 会触发本函数,但**不能自动恢复连接**——尊重用户意图,等他点"重新连接"。
+        // reconfigureFromPairing 会先把 status 设到 .connecting 才调本函数,正常路径
+        // 此 guard 不阻塞
+        if case .unconfigured = status, reason != "pairing complete" {
+            FileHandle.standardError.write(Data("endpoint repick suppressed (.unconfigured): \(reason)\n".utf8))
+            return
+        }
         guard let secret = currentSecret, !availableEndpoints.isEmpty else { return }
         repickTask?.cancel()
         let endpoints = availableEndpoints

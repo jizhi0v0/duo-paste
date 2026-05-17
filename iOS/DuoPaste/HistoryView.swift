@@ -15,6 +15,10 @@ struct HistoryView: View {
                     listScroll
                 }
             }
+            // iOS 26 TabView crossfade 会让两个 tab 同时半透明叠加。
+            // 不给根视图加 opaque 底,Liquid Glass 卡片之间的缝就会漏出对面 tab 内容
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemBackground))
             .navigationTitle("DuoPaste")
             .searchable(
                 text: $searchText,

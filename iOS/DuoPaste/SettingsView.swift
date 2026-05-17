@@ -40,6 +40,10 @@ struct SettingsView: View {
                     pairingSection
                 }
             }
+            // 跟 HistoryView 同款 opaque 底——防 iOS 26 Tab crossfade 期间
+            // 对面 tab 内容从 Form sections 缝里透过来
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemGroupedBackground))
             .navigationTitle("设置")
             .sheet(item: $selectedPeer) { peer in
                 PinPairingSheet(
