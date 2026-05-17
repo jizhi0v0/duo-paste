@@ -16,9 +16,19 @@ struct HistoryCellView: View {
 
     @Environment(BlobCache.self) private var blobs
     @Environment(AppIconCache.self) private var appIcons
+    @Environment(HistoryStore.self) private var store
     @Environment(ShareCoordinator.self) private var shareCoord
     @State private var copyPulse: Int = 0
-    @State private var showCopiedBadge = false
+    @State private var copyState: CopyState = .idle
+    @State private var copyBadgeTask: Task<Void, Never>?
+
+    /// 复制反馈四态:闲 / 正在拉(image 未命中 cache)/ 成功 / 拉取失败
+    enum CopyState: Equatable {
+        case idle
+        case copying     // image 未命中 blob cache,起 fetch 中,先给 immediate badge 反馈
+        case copied      // 已写 pasteboard
+        case failed      // fetch / decode 失败
+    }
 
     var body: some View {
         cardSurface
@@ -118,12 +128,36 @@ struct HistoryCellView: View {
 
     @ViewBuilder
     private var copiedBadge: some View {
-        if showCopiedBadge {
+        switch copyState {
+        case .idle:
+            EmptyView()
+        case .copying:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini).tint(.white)
+                Text("复制中")
+            }
+            .font(.caption.bold())
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.gray.opacity(0.85), in: .capsule)
+            .foregroundStyle(.white)
+            .padding(8)
+            .transition(.opacity.combined(with: .scale(scale: 0.85)))
+        case .copied:
             Text("已复制")
                 .font(.caption.bold())
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(.green.opacity(0.85), in: .capsule)
+                .foregroundStyle(.white)
+                .padding(8)
+                .transition(.opacity.combined(with: .scale(scale: 0.85)))
+        case .failed:
+            Text("拉取失败")
+                .font(.caption.bold())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(.red.opacity(0.85), in: .capsule)
                 .foregroundStyle(.white)
                 .padding(8)
                 .transition(.opacity.combined(with: .scale(scale: 0.85)))
@@ -250,12 +284,18 @@ struct HistoryCellView: View {
 
     private func triggerCopy() {
         UILatencyLog.mark("copy action begin", itemLogDetail())
+        // 乐观顶 — 立即本机重排,不等 Mac UCB → /since 链路。详见 HistoryStore.bumpToFront
+        store.bumpToFront(id: item.id)
+
         if item.kind == .image, let sha = item.blobSha256 {
             if let cached = blobs.cached(sha) {
                 UILatencyLog.mark("copy image cache hit", itemLogDetail("bytes=\(cached.count)"))
                 copyImageBytes(cached, sha: sha, reason: "copy cached")
                 return
             }
+            // 未命中 — 立即出 "复制中" badge 给 immediate 反馈,async fetch 完再切到
+            // .copied / .failed。原先无任何反馈用户体感"卡了"
+            showBadge(.copying, autoHideMs: nil)
             Task {
                 do {
                     let start = CACurrentMediaTime()
@@ -268,6 +308,7 @@ struct HistoryCellView: View {
                     copyImageBytes(data, sha: sha, reason: "copy fetched")
                 } catch {
                     UILatencyLog.mark("copy image failed", itemLogDetail("error=\(error.localizedDescription)"))
+                    showBadge(.failed, autoHideMs: 1800)
                 }
             }
         } else {
@@ -396,14 +437,25 @@ struct HistoryCellView: View {
         return (nil, "bin")
     }
 
+    /// 成功路径 — 弹"已复制"绿 badge + 触觉。900ms 后自动消
     private func flashCopied() {
         UILatencyLog.mark("copy badge show", itemLogDetail())
         copyPulse &+= 1
-        withAnimation(.spring(response: 0.3)) { showCopiedBadge = true }
-        Task {
-            try? await Task.sleep(for: .milliseconds(900))
-            withAnimation(.easeOut(duration: 0.25)) { showCopiedBadge = false }
-            UILatencyLog.mark("copy badge hide", itemLogDetail())
+        showBadge(.copied, autoHideMs: 900)
+    }
+
+    /// badge 状态机统一入口 — autoHideMs nil = 不自动消(留给后续 state 切换覆盖)
+    private func showBadge(_ state: CopyState, autoHideMs: Int?) {
+        copyBadgeTask?.cancel()
+        withAnimation(.spring(response: 0.3)) { copyState = state }
+        guard let ms = autoHideMs else { return }
+        copyBadgeTask = Task { [self] in
+            try? await Task.sleep(for: .milliseconds(ms))
+            if Task.isCancelled { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.25)) { copyState = .idle }
+                UILatencyLog.mark("copy badge hide", itemLogDetail())
+            }
         }
     }
 
