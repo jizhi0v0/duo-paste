@@ -1,10 +1,11 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
     name: "duo-paste",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        .iOS(.v26),
     ],
     products: [
         .library(name: "DuoPasteCore", targets: ["DuoPasteCore"]),

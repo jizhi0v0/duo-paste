@@ -6,6 +6,7 @@ import Hummingbird
 import HummingbirdWebSocket
 import HummingbirdWSClient
 import ServiceLifecycle
+import DuoPasteCore
 @testable import DuoPasteSync
 
 /// PR 3 WSNotificationClient 端到端测试。

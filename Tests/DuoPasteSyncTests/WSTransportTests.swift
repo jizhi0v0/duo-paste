@@ -7,6 +7,7 @@ import HummingbirdWebSocket
 import HummingbirdWSClient
 import WSCore
 import ServiceLifecycle
+import DuoPasteCore
 @testable import DuoPasteSync
 
 /// PR 2 WSTransport 抽象端到端测试。

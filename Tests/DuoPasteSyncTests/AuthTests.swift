@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import DuoPasteCore
 @testable import DuoPasteSync
 
 private let testSecret = Data(repeating: 0x42, count: 32)

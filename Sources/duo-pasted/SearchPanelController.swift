@@ -170,20 +170,38 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // ⌘P (keyCode=35) = 切换选中行的 pinned。仅 Cmd 修饰键命中时截走；
             // 不带修饰键的 P 透传给 TextField 当作正常字符输入
             let isCmdP = (keyCode == 35 && isCmd)
-            // 空格键(49)的拦截条件比较微妙——只在以下三种情况下吞掉:
-            //   1) preview 已经打开 → 空格关闭 preview(Quick Look 风格 toggle)
-            //   2) preview 关闭 + query 为空 + 有选中项 → 空格打开 preview
-            //   3) 其余情况(query 非空)透传给 TextField 当字面空格输入,
-            //      让 "ipados news" / "hello world" 多词搜索可输入
-            // MainActor.assumeIsolated 读 state 必须在闭包内,这里只决定 "要不要拦"
-            // 不读 state 细节——用一个稍宽的过滤器,真正的分流在下面 switch
+            // 空格键(49)的拦截条件——以 input 焦点状态为主分流:
+            //   A) input 没焦点(用户点了卡 / 空白) → 无视 query 直接 toggle preview
+            //   B) input 有焦点 + preview 已开 → 空格关 preview(从 preview 状态退出)
+            //   C) input 有焦点 + preview 未开 + query 为空 → 打开 preview
+            //   D) input 有焦点 + query 非空 → 透传字面空格(多词搜索 "ipados news")
+            // firstResponder is NSTextView 检测——TextField 拿焦点时 field editor
+            // (NSTextView)是 firstResponder;否则是 panel / hosting view
+            let inputFocused = (event.window?.firstResponder is NSTextView)
             let isSpace = (keyCode == 49)
             // ⌘1 ~ ⌘9 = 直接粘贴 results[N-1](paste-app 风格快捷键)。macOS 数字键
             // keyCode 不连续(1=18, 2=19, 3=20, 4=21, 5=23, 6=22, 7=26, 8=28, 9=25),
             // 用 dict 反查。仅 Cmd 修饰键命中时拦截;不带 Cmd 的数字键透传给 TextField
             let cmdDigitPos: Int? = isCmd ? Self.digitKeyMap[keyCode] : nil
+            // 点卡 / 点空白摘焦点后,用户打可见字符 → 吃进 query 再 refocus,
+            // 把"摘焦点状态下输入"重新引回正常搜索路径。命中条件:
+            //   - input 没焦点
+            //   - 没 Cmd / Ctrl 修饰键(快捷键不算输入)
+            //   - characters 非空 + 单字符 + 非 control char(Tab / Return / Esc 等已在 interceptCodes)
+            let isCtrl = event.modifierFlags.contains(.control)
+            let printableChar: String? = {
+                if inputFocused || isCmd || isCtrl { return nil }
+                if interceptCodes.contains(keyCode) || isSpace { return nil }
+                guard let chars = event.characters, chars.count == 1 else { return nil }
+                guard let scalar = chars.unicodeScalars.first else { return nil }
+                // 控制字符(< 0x20)以及 DEL(0x7F)统统跳过——printable 范围是 0x20+ 但
+                // space 已上面单独处理过,所以这里取 0x21+
+                guard scalar.value >= 0x21 && scalar.value != 0x7F else { return nil }
+                return chars
+            }()
             guard interceptCodes.contains(keyCode)
-                    || isCmdP || isSpace || cmdDigitPos != nil else { return event }
+                    || isCmdP || isSpace || cmdDigitPos != nil
+                    || printableChar != nil else { return event }
             // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
             // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
             if let tv = event.window?.firstResponder as? NSTextView, tv.hasMarkedText() {
@@ -194,6 +212,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             let shouldConsume = MainActor.assumeIsolated { () -> Bool in
                 guard let self, let panel = self.panel, panel.isKeyWindow else {
                     return false
+                }
+                // 摘焦点状态下首个可见字符——append 到 query + bump pulse 让
+                // SearchView 把 TextField 焦点抢回来,后续字符走正常 TextField 输入
+                if let ch = printableChar {
+                    self.state.query.append(ch)
+                    self.state.inputFocusPulse &+= 1
+                    return true
                 }
                 // slash 补全菜单优先消化 ↑↓/Enter/Esc——必须在卡片导航 / Quick Look /
                 // 粘贴路径之前判断,否则补全菜单的方向键会跟卡片导航打架
@@ -233,9 +258,18 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                         self.state.previewShown = false
                         return true
                     }
-                    // preview 未开 + query 非空 → 透传给 TextField 当字面空格,
-                    // 让 "ipados news" 这种多词搜索可输入。query 为空时空格触发 preview
-                    // (剪贴板搜索常态:打开 panel → 立刻看预览)
+                    // input 没焦点(用户点过卡 / 空白)→ 直接 toggle preview,无视 query
+                    // 内容。"点击非 input 区域 = 离开编辑状态" 的心智下,空格自然是
+                    // Quick Look,不应该被 query 是否空决定
+                    if !inputFocused {
+                        if self.state.currentItem != nil {
+                            self.state.previewShown = true
+                            return true
+                        }
+                        return true                            // 无选中项也消费,避免空格漏到底下
+                    }
+                    // input 有焦点 + query 非空 → 透传给 TextField 当字面空格,
+                    // 让 "ipados news" 这种多词搜索可输入
                     let trimmed = self.state.query.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard trimmed.isEmpty else { return false }
                     if self.state.currentItem != nil {

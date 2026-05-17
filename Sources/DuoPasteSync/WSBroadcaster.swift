@@ -1,5 +1,6 @@
 import Foundation
 import HummingbirdWebSocket
+import DuoPasteCore
 
 /// Server 侧活动 WS 连接注册中心。每个上游 client 一个 ConnectionID + outbound writer。
 ///

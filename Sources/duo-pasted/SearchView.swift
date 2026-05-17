@@ -45,10 +45,26 @@ final class ImageThumbnailCache {
     ///   填满后台 CPU 不挤压;数字大了对单图延迟没帮助,反而吃光 thread。
     /// - `qos=.utility`：thumbnail prefetch 是"提前准备 UI 资源"，比 OCR（用户感知索引）
     ///   优先级低一档。两者各自有 budget,不再互相抢
-    private static let decodeQueue: OperationQueue = {
+    private static let imageDecodeQueue: OperationQueue = {
         let q = OperationQueue()
-        q.name = "io.duopaste.thumbnail.decode"
+        q.name = "io.duopaste.thumbnail.image.decode"
         q.maxConcurrentOperationCount = 4
+        q.qualityOfService = .utility
+        return q
+    }()
+
+    /// 视频缩略图**独立队列**——根本原因:NSFileCoordinator 在 daemon 没 Full Disk
+    /// Access 时,iCloud Drive / FileProvider 管理的 mp4 会让 `coordinateReadingItemAt`
+    /// 同步 block API 永久等不到 FileProvider IPC 响应,工作线程死锁(stack 顶部停在
+    /// `-[NSFileCoordinator coordinateReadingItemAtURL:...]`)。共享队列下 maxConcurrent=4
+    /// 个 mp4 卡死 → image 缩略图全饿死 → 卡片永远占位图(2026-05-17 现场 sample 实锤)。
+    ///
+    /// 单独走 video queue + maxConcurrent=2 让 image 缩略图永远不被拖垮;`decodeVideoThumbnail`
+    /// 内部 4 秒 `coord.cancel()` 兜底防止 video queue 自己越积越深
+    private static let videoDecodeQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "io.duopaste.thumbnail.video.decode"
+        q.maxConcurrentOperationCount = 2
         q.qualityOfService = .utility
         return q
     }()
@@ -120,8 +136,19 @@ final class ImageThumbnailCache {
 
         // 提交到专用 OperationQueue 隔离 thread budget(详 `decodeQueue` 注释)。
         // Task.detached 旧实现走 cooperative pool .userInitiated 会把 OCR 饿死
-        let img: NSImage? = await withCheckedContinuation { cont in
-            Self.decodeQueue.addOperation {
+        //
+        // **bytesUnavailable vs failedToDecode**:Xcode 大 TIFF 偶发占位卡死的根因——
+        // `BlobStore.put` atomic rename 跟随后 `refresh → prefetch` 的微秒级窗口让
+        // `blobs.locate(sha)` 返 nil(rename 已完成但本进程 contentsOfDirectory cache
+        // 还没看到 dirent / FS metadata 没 flush),decode 拿不到字节返 nil。旧实现把这
+        // 种 transient 失败和"字节齐全但解码器返 nil"(真坏图)都塞进 notDecodable,
+        // 后者一旦进黑名单只能等 daemon 重启或 SettingsView「补齐缺失 blob」bump
+        // `blobInventoryPulse` 才能复活。区分两类:字节缺 → 不黑名单(下次 .task
+        // 重试自然恢复);真解码失败 → 黑名单(LazyHStack 重渲不再反复重试)
+        // image 跟 video 各走独立队列。共享会让卡死的 mp4(coord hang)饿死 image 缩略图
+        let queue: OperationQueue = isVideo ? Self.videoDecodeQueue : Self.imageDecodeQueue
+        let outcome: DecodeOutcome = await withCheckedContinuation { cont in
+            queue.addOperation {
                 // 选源 URL:优先 BlobStore(content-addressed 稳),没 blob 退化到本机文件路径
                 let sourceURL: URL? = {
                     if let sha, let blobURL = blobs.locate(sha256: sha) { return blobURL }
@@ -132,28 +159,53 @@ final class ImageThumbnailCache {
                     return nil
                 }()
                 if isVideo {
-                    guard let sourceURL else { cont.resume(returning: nil); return }
-                    cont.resume(returning: Self.decodeVideoThumbnail(url: sourceURL, maxPx: maxPx))
+                    guard let sourceURL else { cont.resume(returning: .bytesUnavailable); return }
+                    if let img = Self.decodeVideoThumbnail(url: sourceURL, maxPx: maxPx) {
+                        cont.resume(returning: .decoded(img))
+                    } else {
+                        cont.resume(returning: .failedToDecode)
+                    }
                     return
                 }
                 // image 路径:优先 BlobStore.read(零拷贝走 Data),没 blob 时直读文件 URL
                 if let sha, let data = try? blobs.read(sha256: sha) ?? nil {
-                    cont.resume(returning: Self.decodeImageThumbnail(data: data, maxPx: maxPx))
+                    if let img = Self.decodeImageThumbnail(data: data, maxPx: maxPx) {
+                        cont.resume(returning: .decoded(img))
+                    } else {
+                        cont.resume(returning: .failedToDecode)
+                    }
                     return
                 }
                 if let sourceURL, let data = try? Data(contentsOf: sourceURL) {
-                    cont.resume(returning: Self.decodeImageThumbnail(data: data, maxPx: maxPx))
+                    if let img = Self.decodeImageThumbnail(data: data, maxPx: maxPx) {
+                        cont.resume(returning: .decoded(img))
+                    } else {
+                        cont.resume(returning: .failedToDecode)
+                    }
                     return
                 }
-                cont.resume(returning: nil)
+                cont.resume(returning: .bytesUnavailable)
             }
         }
-        if let img {
+        switch outcome {
+        case .decoded(let img):
             cache[key] = img
-        } else {
+            return img
+        case .failedToDecode:
             notDecodable.insert(key)
+            return nil
+        case .bytesUnavailable:
+            // 不黑名单——字节还没到位,下次 .task 重试
+            return nil
         }
-        return img
+    }
+
+    /// `thumbnail()` 内部解码三态。`bytesUnavailable` 跟 `failedToDecode` 都返 nil 给
+    /// caller,但前者**不**进 `notDecodable` 让下次重试有机会
+    private enum DecodeOutcome {
+        case decoded(NSImage)
+        case failedToDecode
+        case bytesUnavailable
     }
 
     /// 后台预热——AppState.init / refresh 后调,把 results 里 thumbnailable 项(image +
@@ -233,6 +285,17 @@ final class ImageThumbnailCache {
 
     /// 视频缩略图——AVAssetImageGenerator 抽帧。优先取 0.5s 帧避开开头黑场/淡入,失败
     /// 兜底 0s。maximumSize 让 AVF 自己 downscale 不传整张 4K decode 进内存
+    ///
+    /// **NSFileCoordinator 包裹**——CleanShotX / iCloud Drive 等 FileProvider 管理的 mp4,
+    /// AVF 直接 open 触发 FileProvider IPC 死锁,copyCGImage 报 NSPOSIXErrorDomain 11
+    /// "Resource deadlock avoided"。coordinator 发 read intent → FileProvider 先 materialize
+    /// 再放行,跟 PDF 路径同源(见 PreviewOverlay.readDataViaCoordinator)
+    ///
+    /// **4 秒 cancel timer 兜底**——daemon 没 Full Disk Access 时,coordinator 等 FileProvider
+    /// IPC 响应可能永远收不到,同步 block API 没原生 timeout,工作线程死锁(2026-05-17 sample
+    /// 实锤:4 个 decodeQueue 线程全停在 `coordinateReadingItemAtURL` 上,image 缩略图全饿死)。
+    /// 外部 `coord.cancel()` 让 hang 死的 coordinate 调用至少能 return → block 返 nil → 走
+    /// `coordErr` 分支记日志退场,避免 video queue 自己越积越深
     nonisolated private static func decodeVideoThumbnail(url: URL, maxPx: Int) -> NSImage? {
         // 先做文件 readability sanity check——`FileManager.fileExists` 在 iCloud Documents /
         // ~/Documents 等 TCC 受保护目录上会返 true 但实际 daemon read 0 字节（macOS 14+
@@ -245,23 +308,41 @@ final class ImageThumbnailCache {
             ))
             return nil
         }
-        let asset = AVURLAsset(url: url)
-        let gen = AVAssetImageGenerator(asset: asset)
-        gen.appliesPreferredTrackTransform = true   // 应用 metadata 旋转(竖拍视频别躺着)
-        gen.maximumSize = CGSize(width: CGFloat(maxPx), height: CGFloat(maxPx))
-        let attempts: [CMTime] = [
-            CMTime(seconds: 0.5, preferredTimescale: 600),
-            .zero,
-        ]
+        let coord = NSFileCoordinator(filePresenter: nil)
+        var coordErr: NSError?
+        var result: NSImage?
         var lastErr: Error?
-        for t in attempts {
-            do {
-                let cgImg = try gen.copyCGImage(at: t, actualTime: nil)
-                let size = NSSize(width: CGFloat(cgImg.width) / 2, height: CGFloat(cgImg.height) / 2)
-                return NSImage(cgImage: cgImg, size: size)
-            } catch {
-                lastErr = error
+        // 4 秒后强制 cancel 防 hang(daemon 没 Full Disk Access 时 FileProvider IPC 不响应)。
+        // cancel 后 coordinate 调用走 error 分支返回,同步 block API 才能逃离
+        let cancelTimer = DispatchWorkItem { [weak coord] in coord?.cancel() }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 4.0, execute: cancelTimer)
+        defer { cancelTimer.cancel() }
+        coord.coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordErr) { coordinatedURL in
+            let asset = AVURLAsset(url: coordinatedURL)
+            let gen = AVAssetImageGenerator(asset: asset)
+            gen.appliesPreferredTrackTransform = true   // 应用 metadata 旋转(竖拍视频别躺着)
+            gen.maximumSize = CGSize(width: CGFloat(maxPx), height: CGFloat(maxPx))
+            let attempts: [CMTime] = [
+                CMTime(seconds: 0.5, preferredTimescale: 600),
+                .zero,
+            ]
+            for t in attempts {
+                do {
+                    let cgImg = try gen.copyCGImage(at: t, actualTime: nil)
+                    let size = NSSize(width: CGFloat(cgImg.width) / 2, height: CGFloat(cgImg.height) / 2)
+                    result = NSImage(cgImage: cgImg, size: size)
+                    return
+                } catch {
+                    lastErr = error
+                }
             }
+        }
+        if let result { return result }
+        if let coordErr {
+            FileHandle.standardError.write(Data(
+                "video-thumb: coordinator failed url=\(url.lastPathComponent) err=\(coordErr)\n".utf8
+            ))
+            return nil
         }
         FileHandle.standardError.write(Data(
             "video-thumb: copyCGImage failed url=\(url.lastPathComponent) err=\(lastErr.map { "\($0)" } ?? "nil")\n".utf8
@@ -381,6 +462,9 @@ struct SearchView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             if state.previewShown { state.previewShown = false }
+            // 摘掉 input 焦点——让随后的空格不被 TextField 当字面输入吞掉,
+            // keyMonitor 看到 firstResponder 非 NSTextView 后直接 toggle preview
+            searchFieldFocused = false
         }
         .overlay(alignment: .top) {
             // banner 用 overlay 浮在 header 上方,不占主体高度。
@@ -457,6 +541,11 @@ struct SearchView: View {
                 searchFieldFocused = true
             }
             Task { await state.refresh() }
+        }
+        // 摘焦点状态(点卡 / 空白)下用户开始打字 → keyMonitor 把字符吃进 query 再 bump
+        // 这个 pulse,这里负责把 TextField 焦点抢回来,后续字符走正常 TextField 输入
+        .onChange(of: state.inputFocusPulse) { _, _ in
+            searchFieldFocused = true
         }
         // 注：箭头 / Return / Esc 由 SearchPanelController 的 NSEvent local monitor
         // 截下来直接调 state.navigate / onPaste，绕过 SwiftUI TextField 对箭头键的吞噬。
@@ -884,6 +973,10 @@ struct SearchView: View {
                         // 单击改 selection;NSEvent.modifierFlags 同步取 cmd/shift 状态
                         .simultaneousGesture(
                             TapGesture(count: 1).onEnded {
+                                // 点卡 → 摘 input 焦点,让随后空格走 preview toggle 而非
+                                // 字面空格输入。点卡心智 = "我看上这条了",离开 input
+                                // 编辑状态合理
+                                searchFieldFocused = false
                                 let mods = NSEvent.modifierFlags
                                 if mods.contains(.command) {
                                     if let i = state.selectedIDs.firstIndex(of: item.id) {
@@ -952,6 +1045,15 @@ struct SearchView: View {
                     withAnimation(.linear(duration: 0.12)) {
                         proxy.scrollTo(id)
                     }
+                }
+            }
+            // panel 复用——上次关 panel 时滚到 card N,SwiftUI ScrollView 持久化了那个
+            // offset。这里 openPulse 触发硬归零:anchor=.leading 让 firstID 贴左边界,
+            // 显式覆盖 stale offset。不依赖后续 navigate 的 minimal-scroll 兜底
+            .onChange(of: state.openPulse) { _, _ in
+                if let id = state.results.first?.id {
+                    // 不加动画——panel 才刚 show,瞬时归位比 0.12s 滑回去自然
+                    proxy.scrollTo(id, anchor: .leading)
                 }
             }
         }

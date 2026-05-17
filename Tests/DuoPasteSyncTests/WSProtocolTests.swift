@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import DuoPasteCore
 @testable import DuoPasteSync
 
 @Suite struct WSProtocolTests {

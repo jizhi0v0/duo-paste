@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import HTTPTypes
+import DuoPasteCore
 
 /// Hummingbird 中间件：校验 HMAC 签名 + 时间窗口。
 ///

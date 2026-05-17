@@ -6,6 +6,7 @@ import Hummingbird
 import HummingbirdWebSocket
 import HummingbirdWSClient
 import ServiceLifecycle
+import DuoPasteCore
 @testable import DuoPasteSync
 
 // PoC：验证 hummingbird-websocket 在 duo-paste 现有环境下能跑通核心路径。

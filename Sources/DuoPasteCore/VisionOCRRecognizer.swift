@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import Vision
 import AppKit
@@ -107,3 +108,4 @@ extension VisionOCRRecognizer {
         }
     }
 }
+#endif

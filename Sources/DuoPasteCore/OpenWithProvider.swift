@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import Foundation
 import UniformTypeIdentifiers
@@ -206,3 +207,4 @@ public enum OpenWithProvider {
         return URL(fileURLWithPath: trimmed)
     }
 }
+#endif
