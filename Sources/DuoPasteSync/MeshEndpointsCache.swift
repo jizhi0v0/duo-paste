@@ -5,8 +5,7 @@ import DuoPasteCore
 /// 拿对端候选 list,缓存供本机 `/endpoints` 路由聚合返回给 iOS。
 ///
 /// 让 iOS 配对**任一**Mac 就能拿到全 mesh 所有 peer 的 endpoint 候选 → EndpointPicker
-/// 探活全部 → 选全局最快。比如 iOS 跟 MBP 同 LAN 跟 mini 不同 LAN,配 mini 后仍能
-/// pick 到 MBP 的 `.local` 走 LAN 最快路径。
+/// 探活全部 → 按 Mac preferred hint + 本机网络策略选全局最佳路线。
 ///
 /// **不变量**:
 /// - 周期 60s refresh,但 `MeshSupervisor.reconcileTransports()` 完成后调 `refreshNow()`
@@ -159,16 +158,17 @@ public actor MeshEndpointsCache {
         var anyChange = false
         let now = Int64(Date().timeIntervalSince1970)
 
-        await withTaskGroup(of: (URL, Result<PeerEndpointsPage, FetchError>).self) { group in
+        await withTaskGroup(of: (SmartTransport.PeerDecision, Result<PeerEndpointsPage, FetchError>).self) { group in
             for decision in decisions {
                 let url = decision.chosenPullURL
                 let provider = self.fetchProvider
                 group.addTask {
                     let r = await provider(url)
-                    return (url, r)
+                    return (decision, r)
                 }
             }
-            for await (url, result) in group {
+            for await (decision, result) in group {
+                let url = decision.chosenPullURL
                 switch result {
                 case .success(let page) where page.deviceID == selfDeviceID:
                     log("skip self (\(url)) — same device_id")
@@ -183,14 +183,18 @@ public actor MeshEndpointsCache {
                     urlToDeviceID[url] = peerDeviceID
                     let oldEntry = entries[peerDeviceID]
                     let oldEndpoints = oldEntry?.endpoints
+                    let endpoints = Self.markPreferredEndpoint(
+                        page.endpoints,
+                        preferredURL: decision.chosenPullURL
+                    )
                     let wasUnhealthy = oldEntry?.healthy == false
                     entries[peerDeviceID] = Entry(
-                        endpoints: page.endpoints,
+                        endpoints: endpoints,
                         learnedAtUnix: now,
                         healthy: true,
                         firstFailureAtUnix: nil
                     )
-                    if oldEndpoints != page.endpoints || wasUnhealthy {
+                    if oldEndpoints != endpoints || wasUnhealthy {
                         anyChange = true
                     }
                 case .failure(let err):
@@ -236,9 +240,24 @@ public actor MeshEndpointsCache {
             for ep in e.endpoints {
                 hasher.combine(ep.url)
                 hasher.combine(ep.kind.rawValue)
+                hasher.combine(ep.preferred)
             }
         }
         return hasher.finalize()
+    }
+
+    nonisolated static func markPreferredEndpoint(
+        _ endpoints: [PeerEndpoint],
+        preferredURL: URL
+    ) -> [PeerEndpoint] {
+        let preferred = preferredURL.absoluteString
+        return endpoints.map { ep in
+            PeerEndpoint(
+                url: ep.url,
+                kind: ep.kind,
+                preferred: ep.url == preferred
+            )
+        }
     }
 
     // MARK: - 内部 HTTP

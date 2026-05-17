@@ -14,6 +14,7 @@ enum PinPairingClient {
     struct Response: Sendable {
         let secret: Data
         let deviceID: String
+        let endpointsPage: PeerEndpointsPage
     }
 
     enum Error: LocalizedError {
@@ -26,6 +27,7 @@ enum PinPairingClient {
         case serverError(status: Int, body: String)
         case malformedResponse
         case secretNotHex
+        case missingEndpoints
 
         var errorDescription: String? {
             switch self {
@@ -38,6 +40,7 @@ enum PinPairingClient {
             case .serverError(let s, _): return "服务端错误 HTTP \(s)"
             case .malformedResponse: return "服务端返回格式错误"
             case .secretNotHex: return "服务端返回 secret 非 hex"
+            case .missingEndpoints: return "服务端未返回 endpoints,请更新 Mac 端 duo-pasted"
             }
         }
     }
@@ -83,15 +86,31 @@ enum PinPairingClient {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw Error.serverError(status: http.statusCode, body: body)
         }
-        guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let secretHex = dict["secret"] as? String,
-              let deviceID = dict["device_id"] as? String else {
+        let wire: PairWire
+        do {
+            wire = try JSONDecoder().decode(PairWire.self, from: data)
+        } catch {
             throw Error.malformedResponse
         }
-        guard let secret = Data(hex: secretHex) else {
+        guard let secret = Data(hex: wire.secret) else {
             throw Error.secretNotHex
         }
-        return Response(secret: secret, deviceID: deviceID)
+        guard !wire.endpointsPage.endpoints.isEmpty || !(wire.endpointsPage.meshPeers ?? []).isEmpty else {
+            throw Error.missingEndpoints
+        }
+        return Response(secret: secret, deviceID: wire.deviceID, endpointsPage: wire.endpointsPage)
+    }
+
+    private struct PairWire: Decodable {
+        let secret: String
+        let deviceID: String
+        let endpointsPage: PeerEndpointsPage
+
+        enum CodingKeys: String, CodingKey {
+            case secret
+            case deviceID = "device_id"
+            case endpointsPage = "endpoints_page"
+        }
     }
 }
 

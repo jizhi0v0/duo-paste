@@ -58,7 +58,7 @@ struct DuoPasteApp: App {
                 .environment(coordinator.appIconCache)
                 .environment(shareCoord)
                 .task {
-                    // 启动恢复:优先走 endpoints+secret(PIN 配对后)→ probe 选最快;
+                    // 启动恢复:优先走 endpoints+secret(PIN 配对后)→ probe + Mac hint 选最佳路线;
                     // 没 endpoints 但有手填 URL+secret(advanced 路径)→ 直接 reconfigure
                     if let data = peerEndpointsJSON.data(using: .utf8),
                        let endpoints = try? JSONDecoder().decode([PeerEndpoint].self, from: data),

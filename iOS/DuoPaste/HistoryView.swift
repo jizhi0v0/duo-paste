@@ -23,6 +23,8 @@ struct HistoryView: View {
             )
             .onChange(of: searchText) { _, new in store.query = new }
             .toolbar { statusToolbar }
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(.visible, for: .tabBar)
         }
     }
 
@@ -44,7 +46,6 @@ struct HistoryView: View {
             .padding(.bottom, 24)
         }
         .scrollContentBackground(.hidden)
-        .scrollEdgeEffectHidden(true, for: .top)
     }
 
     private var emptyState: some View {

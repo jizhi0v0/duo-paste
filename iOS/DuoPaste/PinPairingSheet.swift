@@ -5,8 +5,8 @@ import DuoPasteCore
 /// - Bonjour 发现 tap:peer 信息已知,用户手输 PIN
 /// - QR 扫码:全部信息都从 QR 拿到 (prefilledPIN 非 nil),自动 pairing
 ///
-/// 多阶段 loading,直到 coordinator.status == .connected 才关 sheet(让用户看到
-/// "配对成功"是真就绪了,不是骗局)。15s 超时兜底防永久挂。
+/// 多阶段 loading。PIN 成功并拿到 endpoints 即算配对成功；实际可用性测试和最佳
+/// endpoint 选择交给 PeerSyncCoordinator 在 Settings 里持续展示。
 @MainActor
 struct PinPairingSheet: View {
     let displayName: String
@@ -18,7 +18,6 @@ struct PinPairingSheet: View {
     @Binding var isPresented: Bool
     let onPaired: (Data, String, PeerEndpointsPage) -> Void
 
-    @Environment(PeerSyncCoordinator.self) private var coordinator
     @State private var pin: String = ""
     @State private var stage: Stage = .input
     @State private var errorText: String?
@@ -27,9 +26,8 @@ struct PinPairingSheet: View {
 
     enum Stage: Equatable {
         case input            // 等用户输 PIN
-        case pairing          // POST /pair 中
-        case probing          // /endpoints + EndpointPicker 中
-        case waitingConnect   // 等 WS hello → status .connected
+        case pairing          // POST /pair 中,原子拿 secret + endpoints
+        case probing          // 保存 endpoints + 启动 runtime 可用性测试
         case connected
     }
 
@@ -119,8 +117,7 @@ struct PinPairingSheet: View {
         switch stage {
         case .input: return ""
         case .pairing: return "配对中…"
-        case .probing: return "获取地址列表…"
-        case .waitingConnect: return "建立连接…"
+        case .probing: return "读取候选地址…"
         case .connected: return "配对成功"
         }
     }
@@ -134,40 +131,7 @@ struct PinPairingSheet: View {
                     host: host, port: port, tls: tls, pin: pinCopy
                 )
                 stage = .probing
-
-                var comp = URLComponents()
-                comp.scheme = tls ? "https" : "http"
-                comp.host = host
-                comp.port = port
-                guard let initialURL = comp.url else {
-                    throw PinPairingClient.Error.badURL
-                }
-                let cfg = PeerConfig(baseURL: initialURL, sharedSecret: resp.secret)
-                let client = PeerClient(config: cfg)
-                let page = try await client.fetchEndpoints()
-
-                // 让 coordinator 接管:probe + 选最快 + reconfigure + 起 WS。
-                // resp.deviceID 透传给 SettingsView 持久化作为"已配对的 Mac"显示名
-                onPaired(resp.secret, resp.deviceID, page)
-                stage = .waitingConnect
-
-                // 等真连接成功:status == .connected。15s 超时兜底防永远挂
-                let deadline = Date().addingTimeInterval(15)
-                while Date() < deadline {
-                    if case .connected = coordinator.status {
-                        stage = .connected
-                        try? await Task.sleep(nanoseconds: 700_000_000)
-                        isPresented = false
-                        return
-                    }
-                    if case .error(let m) = coordinator.status {
-                        // coordinator 探活全失败:也算配对失败
-                        throw PairingTimeoutError(message: m)
-                    }
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                }
-                // 15s 后仍未 .connected:可能慢网络,still close as "成功"——secret
-                // 已落地,后台继续连接,用户在 Settings 看到状态
+                onPaired(resp.secret, resp.deviceID, resp.endpointsPage)
                 stage = .connected
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 isPresented = false
@@ -178,9 +142,4 @@ struct PinPairingSheet: View {
             }
         }
     }
-}
-
-private struct PairingTimeoutError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
 }

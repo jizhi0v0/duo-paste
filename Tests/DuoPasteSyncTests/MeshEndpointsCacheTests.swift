@@ -116,6 +116,28 @@ private func makePage(deviceID: String, kinds: [PeerEndpoint.Kind] = [.tailscale
         #expect(snap[0].endpoints == originalEps)
     }
 
+    @Test func marksMacChosenRouteAsPreferred() async {
+        let chosen = "https://peer-route-1.example:8443"
+        let page = PeerEndpointsPage(
+            deviceID: "peer-route",
+            endpoints: [
+                PeerEndpoint(url: "https://peer-route-0.example:8443", kind: .tailscale, preferred: true),
+                PeerEndpoint(url: chosen, kind: .ponte, preferred: false),
+            ],
+            updatedAtUnix: 100,
+            meshPeers: nil
+        )
+        let cache = MeshEndpointsCache(
+            selfDeviceID: "self",
+            decisionsProvider: { [makeDecision(index: 0, urlString: chosen)] },
+            fetchProvider: { _ in .success(page) }
+        )
+        await cache.refreshNow()
+        let endpoints = await cache.snapshot().first?.endpoints ?? []
+        #expect(endpoints.first(where: { $0.url == chosen })?.preferred == true)
+        #expect(endpoints.first(where: { $0.url != chosen })?.preferred == false)
+    }
+
     @Test func snapshotChangeFiresCallback() async {
         let fired = IntBox()
         let onChange: @Sendable (Int64) -> Void = { _ in

@@ -5,7 +5,8 @@ import DuoPasteCore
 @testable import DuoPasteSync
 
 /// POST /pair/<pin> + GET /endpoints 的 HTTP 路径回归。
-/// /pair 不走 HMAC,但 path 里 pin 必须 6 位数字。/endpoints 走 HMAC
+/// /pair 不走 HMAC,但 path 里 pin 必须 6 位数字,且成功响应必须原子包含 endpoints。
+/// /endpoints 仍单独存在并走 HMAC,供后续刷新候选使用。
 
 private typealias DuoDB = DuoPasteCore.Database
 
@@ -45,6 +46,10 @@ private func waitReadyPair(baseURL: URL, auth: HMACAuth) async -> Bool {
 struct PairHTTPTests {
     @Test func pairReturns200WithSecretOnCorrectPIN() async throws {
         let (db, blobs, auth, port, secret) = try makePairServerFixture()
+        let endpoints = [
+            PeerEndpoint(url: "https://mbp.example:8443", kind: .tailscale, preferred: true),
+            PeerEndpoint(url: "https://mbp.sgponte:8443", kind: .ponte),
+        ]
         let pairing = PairingService(
             pinLifetimeSec: 60,
             secretsProvider: { secret },
@@ -59,6 +64,7 @@ struct PairHTTPTests {
             host: "127.0.0.1",
             port: port,
             auth: auth,
+            endpointsProvider: { endpoints },
             pairingService: pairing
         )
         let serverTask = Task { try? await server.run() }
@@ -79,6 +85,12 @@ struct PairHTTPTests {
         let hex = dict["secret"] as? String
         let expectedHex = secret.map { String(format: "%02x", $0) }.joined()
         #expect(hex == expectedHex)
+        let pageDict = dict["endpoints_page"] as? [String: Any]
+        let eps = pageDict?["endpoints"] as? [[String: Any]]
+        #expect(pageDict?["device_id"] as? String == "mac-test")
+        #expect(eps?.count == 2)
+        #expect(eps?.first?["url"] as? String == "https://mbp.example:8443")
+        #expect(eps?.last?["kind"] as? String == "ponte")
     }
 
     @Test func pairReturns401OnPINMismatch() async throws {

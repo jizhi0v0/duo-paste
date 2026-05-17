@@ -339,7 +339,7 @@ struct SettingsView: View {
         } header: {
             Text("配对")
         } footer: {
-            Text("配对任一 Mac 即可——mesh 里其他设备的地址会自动透传过来,网络变化时自动切最快连接。")
+            Text("配对任一 Mac 即可——mesh 里其他设备的地址会自动透传过来,网络变化时自动选择最佳连接。")
         }
     }
 
@@ -388,7 +388,7 @@ struct SettingsView: View {
 
     // MARK: - 动作
 
-    /// 配对成功 → 持久化全部 + coordinator 接管 probe + 选最快
+    /// 配对成功 → 持久化全部 + coordinator 接管 probe + route hint 选路
     private func handlePairingSuccess(
         secret: Data, deviceID: String,
         page: PeerEndpointsPage, displayName: String
@@ -405,7 +405,7 @@ struct SettingsView: View {
         coordinator.reconfigureFromPairing(secret: secret, endpoints: flat)
     }
 
-    /// 重新连接——用 AppStorage 里保存的 secret + endpoints,coordinator 走 probe 选最快
+    /// 重新连接——用 AppStorage 里保存的 secret + endpoints,coordinator 走 probe + Mac hint 选最佳路线
     private func reconnect() {
         guard !sharedSecretHex.isEmpty, !peerEndpointsJSON.isEmpty else {
             presentAlert("配对信息丢失,请重新走 PIN 配对")

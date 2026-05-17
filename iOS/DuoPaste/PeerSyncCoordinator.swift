@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Observation
 import DuoPasteCore
 
@@ -50,7 +51,7 @@ final class PeerSyncCoordinator {
     /// `applyConnectedStatus` 在 pull 成功时 stamp,heartbeat-stale 检测保护它不被覆盖
     private var lastConnectedStampAt: Date?
     /// 配对完成后 Mac 暴露的 endpoint 候选 list。NetworkChangeWatcher / WS endpoints_changed
-    /// 触发 repickEndpoint() 时从这 re-probe 选最快。nil = 未配对(走 reconfigure 单 URL 路径)
+    /// 触发 repickEndpoint() 时从这 re-probe 并按 route hint 选路。nil = 未配对(走 reconfigure 单 URL 路径)
     private var availableEndpoints: [PeerEndpoint] = []
     private var currentSecret: Data?
     /// 最近一次 endpoint pick 选中的 URL,UI 显示 + 避免 idle 重选时反复切
@@ -67,6 +68,13 @@ final class PeerSyncCoordinator {
     private(set) var lastRTT: [String: Int] = [:]
     /// 最近一次 probe 完整结果(含失败的) — 给 Settings UI 显示用
     private(set) var lastProbes: [EndpointPicker.Probe] = []
+    /// route election 期间不要把 probe/HTTP/WS 的瞬态错误直接暴露给 Settings。
+    /// 网络切换时几个 endpoint 会同时 TLS/DNS/backoff 报错,这些只是选路证据。
+    private var routeElectionID: UInt64 = 0
+    private var routeElectionStartedAt: Date?
+    private var routeElectionTimeoutTask: Task<Void, Never>?
+    private var pendingRouteError: String?
+    nonisolated let routeElectionGraceSec: TimeInterval = 12
 
     /// 给 Settings UI 显示 pool 里每个 URL 的 WS 状态
     struct PoolURLStatus: Equatable, Sendable {
@@ -106,14 +114,30 @@ final class PeerSyncCoordinator {
         self.store = store
         self.blobCache = BlobCache()
         self.appIconCache = AppIconCache()
-        // 网络变化 → 重新 probe(给 HTTP client URL 更新最快路径)。WS 不需要触发——
+        // 网络变化 → 重新 probe(给 HTTP client URL 更新最佳路径)。WS 不需要触发——
         // pool 里每个 WS 都在自己 backoff/重连,网络变了它们自然在下次 reconnect 时
         // 用新网络重试
         NetworkChangeWatcher.shared.addListener { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.repickEndpoint(reason: "network changed")
+                self?.handleNetworkChange()
             }
         }
+    }
+
+    /// 网络切换（Wi-Fi ↔ cellular / VPN path 变化）是硬边界：旧 TCP/WS 状态不可信。
+    /// 立即清掉旧 pull + 重启 WS pool，让 UI 不再展示 stale green；cellular/expensive
+    /// path 下先偏向 Ponte，因为 Tailscale 与 Surge 在 iOS 上会竞争 Network Extension。
+    private func handleNetworkChange() {
+        DebugLog.shared.append("network changed")
+        if case .unconfigured = status {
+            DebugLog.shared.append("network changed ignored (.unconfigured)")
+            return
+        }
+        beginRouteElection(reason: "network changed")
+        cancelPullForHTTPRouteChange()
+        preferPonteForCurrentPath()
+        wsPool?.restartAll(reason: "network changed")
+        repickEndpoint(reason: "network changed")
     }
 
     /// 手填 advanced URL 路径用——单 URL 走 pool。配对路径走 `reconfigureFromPairing`
@@ -134,28 +158,28 @@ final class PeerSyncCoordinator {
         self.currentSecret = config.sharedSecret
         let manualEP = PeerEndpoint(url: config.baseURL.absoluteString, kind: .tailscale)
         self.availableEndpoints = [manualEP]
-        self.status = .connecting
+        seedProbes(from: [manualEP])
+        beginRouteElection(reason: "manual config")
         setupClientAndPool(endpoints: [manualEP], httpClientURL: manualEP.url, secret: config.sharedSecret)
     }
 
     /// 公共装配路径:重 PeerClient + PeerWSPool。pool 对所有 endpoint 全开 WS,
     /// HTTP client 用 httpClientURL(配对完成时还没 probe,先用第一个,probe 完后切换)
-    private func setupClientAndPool(endpoints: [PeerEndpoint], httpClientURL: String, secret: Data) {
-        guard let bestURL = URL(string: httpClientURL) else {
-            status = .error("无效 URL")
+    private func setupClientAndPool(
+        endpoints: [PeerEndpoint],
+        httpClientURL: String,
+        secret: Data,
+        kickInitialPull: Bool = true
+    ) {
+        guard setHTTPClient(urlString: httpClientURL, secret: secret, reason: "setup") != nil else {
             return
         }
-        self.currentEndpointURL = httpClientURL
-        let cfg = PeerConfig(baseURL: bestURL, sharedSecret: secret)
-        let client = PeerClient(config: cfg)
-        self.client = client
         self.cursor = .zero
-        if case .connected = status {} else { self.status = .connecting }
-        blobCache.fetcher = { sha in try await client.fetchBlob(sha256: sha) }
-        appIconCache.fetcher = { bid in try await client.fetchAppIcon(bundleID: bid) }
+        if case .connected = status {} else if !isElectingRoute { self.status = .connecting }
         let pool = PeerWSPool(
             secret: secret,
             onAdvance: { [weak self] _ in
+                self?.promoteHTTPToPreferredWS(reason: "ws advance")
                 self?.kickPull()
             },
             onEndpointsChanged: { [weak self] in
@@ -165,7 +189,9 @@ final class PeerSyncCoordinator {
         self.wsPool = pool
         pool.reconcile(endpoints: endpoints)
         startStatusTick()
-        kickPull()
+        if kickInitialPull {
+            kickPull()
+        }
     }
 
     /// PIN 配对完成 → 拿 secret + endpoint list,**立刻**对所有 endpoint 开 WS pool
@@ -176,21 +202,23 @@ final class PeerSyncCoordinator {
             status = .error("Mac 没返回任何 endpoint 候选")
             return
         }
-        self.status = .connecting
         self.currentSecret = secret
         self.availableEndpoints = endpoints
-        // 先用第一个 URL 当 HTTP client(probe 完后会切到最快的);pool 立刻全开 WS
+        seedProbes(from: endpoints)
+        beginRouteElection(reason: "pairing complete")
+        // 先用第一个 URL 当 HTTP client(probe 完后会切到最佳路线);pool 立刻全开 WS
         setupClientAndPool(
             endpoints: endpoints,
             httpClientURL: endpoints.first?.url ?? "",
-            secret: secret
+            secret: secret,
+            kickInitialPull: false
         )
         startPeriodicRepick()
         // 并行触发 probe 拿 RTT 数据供 HTTP client URL 选择
         repickEndpoint(reason: "pairing complete")
     }
 
-    /// 触发并发 probe + 选最快 → reconfigure(挑中 URL)。
+    /// 触发并发 probe + route hint 选路 → reconfigure(挑中 URL)。
     /// secret / endpoints 没准备好(没配对过)直接 noop。
     /// **稳定性 guard**:已 pick 当前 endpoint + 新最优 RTT 跟它差 < `rttStableEpsilon` →
     /// 不切防 flap(20% 差异内属于测量噪音,不值得 reconfigure 抖一下)
@@ -208,6 +236,7 @@ final class PeerSyncCoordinator {
         // 隧道 / URLSession 连接池压垮可能 crash。用户主动操作绕过节流
         let userInitiated = reason == "pairing complete"
             || reason == "manual refresh"
+            || reason == "network changed"
             || reason.hasPrefix("ws: endpoints_changed")
         if !userInitiated, let last = lastRepickStartedAt,
            Date().timeIntervalSince(last) < minRepickIntervalSec {
@@ -218,13 +247,27 @@ final class PeerSyncCoordinator {
         lastRepickStartedAt = Date()
         repickTask?.cancel()
         let endpoints = availableEndpoints
+        if shouldSurfaceRouteElection(for: reason) {
+            beginRouteElection(reason: reason)
+        }
         DebugLog.shared.append("endpoint repick: \(reason) (\(endpoints.count) candidates)")
         repickTask = Task { [weak self] in
             let probes = await EndpointPicker.probeAll(endpoints: endpoints, secret: secret)
             guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.recordRTTs(probes: probes)
+                self?.lastProbes = probes
+            }
             guard let best = probes.first(where: { $0.ok }) else {
                 await MainActor.run {
-                    self?.status = .error("所有 endpoint 都不通,检查 Mac 是否在线 + 网络")
+                    guard let self else { return }
+                    if case .connected = self.wsPool?.state {
+                        self.applyConnectedStatus()
+                    } else if self.promoteHTTPToPreferredWS(reason: "probe all failed") {
+                        self.kickPull()
+                    } else {
+                        self.recordConnectionProblem("所有 endpoint 都不通,检查 Mac 是否在线 + 网络")
+                    }
                 }
                 return
             }
@@ -233,8 +276,6 @@ final class PeerSyncCoordinator {
             }.joined(separator: " ")
             DebugLog.shared.append("endpoint pick: best=\(best.endpoint.kind.rawValue) (\(best.rttMs)ms) [\(summary)]")
             await MainActor.run {
-                self?.recordRTTs(probes: probes)
-                self?.lastProbes = probes
                 self?.applyPicks(probes: probes, secret: secret)
             }
         }
@@ -248,7 +289,15 @@ final class PeerSyncCoordinator {
         }
     }
 
-    /// 探活完成 → 根据 probe 选 HTTP client URL(最快可达 URL),同时把**全部 endpoint**
+    /// 候选列表是配对/恢复时已经拿到的事实，不应等 probe 完才出现在 UI。
+    /// RTT 初始用 -1，占位显示 "—"，后续 probe 覆盖。
+    private func seedProbes(from endpoints: [PeerEndpoint]) {
+        lastProbes = endpoints.map { ep in
+            EndpointPicker.Probe(endpoint: ep, rttMs: lastRTT[ep.url] ?? -1)
+        }
+    }
+
+    /// 探活完成 → 根据 probe + route hint 选 HTTP client URL,同时把**全部 endpoint**
     /// 喂给 pool 让 pool 决定哪些开 WS(probe 只影响 HTTP,不影响 WS pool 决策——WS 全开)
     private func applyPicks(probes: [EndpointPicker.Probe], secret: Data) {
         let endpoints = availableEndpoints
@@ -263,18 +312,30 @@ final class PeerSyncCoordinator {
             return
         }
 
-        // HTTP client URL 切换:用 probe 最快 URL,带 flap guard
+        // HTTP client URL 切换:用 route picker 结果,带 flap guard
         guard let bestProbe = probes.first(where: { $0.ok }) else {
-            // probe 全失败但 pool 里可能某个 WS 已经 .connected——保留当前 client URL,
-            // 让 WS pool 自己负责连接;不报 error 让用户看到红色
-            DebugLog.shared.append("probe all failed, keep current client URL (\(currentEndpointURL ?? "?"))")
+            // probe 全失败但 pool 里可能某个 WS 已经 .connected。4G + Surge Ponte 下
+            // 常见现象是 /health probe 没 RTT,但 WS 已经 hello；这时把 WS 的 URL 当
+            // reachability 证据，HTTP /since 跟着它走，避免"WS 在线但数据卡住"。
+            if promoteHTTPToPreferredWS(reason: "probe all failed") {
+                kickPull()
+            } else {
+                DebugLog.shared.append("probe all failed, no connected WS; keep current client URL (\(currentEndpointURL ?? "?"))")
+            }
             return
         }
         let bestURL = bestProbe.endpoint.url
         let hasLiveConnection: Bool = {
             if case .connected = wsPool?.state { return true } else { return false }
         }()
-        if currentEndpointURL == bestURL, client != nil { return }
+        if currentEndpointURL == bestURL, client != nil {
+            // 重启恢复时 setup 阶段已经安装了第一个 HTTP client，但故意不做初始 pull，
+            // 等 probe/route hint 完成后再拉。若 bestURL 刚好没变，也必须 kick 一次
+            // /since，否则会出现“WS 已连接但历史为空，直到下一条 cursor_advanced 才有数据”。
+            DebugLog.shared.append("client pick unchanged, kick pull: \(bestURL)")
+            kickPull()
+            return
+        }
         if let current = currentEndpointURL,
            current != bestURL,
            let currentRTT = lastRTT[current],
@@ -284,18 +345,83 @@ final class PeerSyncCoordinator {
             DebugLog.shared.append("client pick skipped: current=\(currentRTT)ms new=\(bestProbe.rttMs)ms (within \(Int(rttStableEpsilon*100))%)")
             return
         }
-        guard let url = URL(string: bestURL) else {
-            status = .error("invalid endpoint URL: \(bestURL)")
+        let oldURL = currentEndpointURL
+        guard setHTTPClient(
+            urlString: bestURL,
+            secret: secret,
+            reason: "probe \(bestProbe.endpoint.kind.rawValue) \(bestProbe.rttMs)ms"
+        ) != nil else {
             return
         }
-        currentEndpointURL = bestURL
+        if oldURL != bestURL {
+            cancelPullForHTTPRouteChange()
+        }
+        kickPull()
+    }
+
+    /// 统一安装 HTTP client。返回 nil = URL 非法；true = URL/client 改变；false = 原样可用。
+    @discardableResult
+    private func setHTTPClient(urlString: String, secret: Data, reason: String) -> Bool? {
+        guard let url = URL(string: urlString) else {
+            recordConnectionProblem("invalid endpoint URL: \(urlString)")
+            return nil
+        }
+        let changed = currentEndpointURL != urlString || client == nil
+        guard changed else { return false }
+        currentEndpointURL = urlString
         let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
         let newClient = PeerClient(config: cfg)
         self.client = newClient
         blobCache.fetcher = { sha in try await newClient.fetchBlob(sha256: sha) }
         appIconCache.fetcher = { bid in try await newClient.fetchAppIcon(bundleID: bid) }
-        DebugLog.shared.append("client URL switched to: \(bestURL) (\(bestProbe.endpoint.kind.rawValue) \(bestProbe.rttMs)ms)")
-        kickPull()
+        DebugLog.shared.append("client URL switched to: \(urlString) (\(reason))")
+        return true
+    }
+
+    /// WS 已经 hello 的 URL 是比 HTTP /health probe 更强的可达信号。尤其在 4G + Surge
+    /// Ponte 下，probe 可能因为 DNS/proxy/证书路径差异失败，但 WS 证明隧道可用。
+    @discardableResult
+    private func promoteHTTPToPreferredWS(reason: String) -> Bool {
+        guard let secret = currentSecret,
+              let url = wsPool?.preferredHTTPURL(prefer: currentEndpointURL) else { return false }
+        if url == currentEndpointURL {
+            DebugLog.shared.append("ws preferred kept current route: \(url) (\(reason))")
+            return true
+        }
+        let oldURL = currentEndpointURL
+        guard setHTTPClient(urlString: url, secret: secret, reason: "ws preferred: \(reason)") != nil else {
+            return false
+        }
+        if oldURL != url {
+            cancelPullForHTTPRouteChange()
+        }
+        return true
+    }
+
+    /// 切换 HTTP route 时旧 `/since` 可能正卡在 tailscale 黑洞里。必须取消旧 pull,
+    /// 否则 `kickPull()` 只会置 pendingAdvance,新 Ponte client 要等旧请求超时才会用上。
+    private func cancelPullForHTTPRouteChange() {
+        if let t = pullTask, !t.isCancelled {
+            t.cancel()
+        }
+        pullTask = nil
+        pendingAdvance = false
+    }
+
+    /// 当前 path 是蜂窝/expensive 时，Ponte 是更符合用户配置意图的首选。这个切换只是
+    /// 抢先把 HTTP client 指向 Ponte；probe / WS hello 仍会继续修正最终选择。
+    private func preferPonteForCurrentPath() {
+        guard let path = NetworkChangeWatcher.shared.currentPath else { return }
+        guard path.usesInterfaceType(.cellular) || path.isExpensive else { return }
+        guard let secret = currentSecret,
+              let ponte = availableEndpoints.first(where: { $0.kind == .ponte }) else { return }
+        let oldURL = currentEndpointURL
+        guard setHTTPClient(urlString: ponte.url, secret: secret, reason: "network path prefers ponte") != nil else {
+            return
+        }
+        if oldURL != ponte.url {
+            cancelPullForHTTPRouteChange()
+        }
     }
 
     /// 5min 周期重 probe——NWPathMonitor / WS 失败回调没火的兜底。endpoint 实际可用性
@@ -324,6 +450,7 @@ final class PeerSyncCoordinator {
                 await MainActor.run {
                     guard let self else { return }
                     self.availableEndpoints = flat
+                    self.seedProbes(from: flat)
                     self.repickEndpoint(reason: reason)
                 }
             } catch {
@@ -333,11 +460,12 @@ final class PeerSyncCoordinator {
     }
 
     /// PeerEndpointsPage 的 self + mesh_peers 扁平化成 picker 用的 [PeerEndpoint]
-    /// (mesh_peers 字段在 Phase B 加,缺失时只返 self)
+    /// (mesh_peers 字段在 Phase B 加,缺失时只返 self)。healthy=false 的 peer 也保留:
+    /// Mac 端 MeshEndpointsCache 明确用 unhealthy+stale TTL 防短暂闪断让 iOS 丢 fallback。
     nonisolated static func flattenEndpoints(_ page: PeerEndpointsPage) -> [PeerEndpoint] {
         var out = page.endpoints
         if let peers = page.meshPeers {
-            for entry in peers where entry.healthy {
+            for entry in peers {
                 out.append(contentsOf: entry.endpoints)
             }
         }
@@ -351,13 +479,40 @@ final class PeerSyncCoordinator {
     /// 网络抖 / Mac daemon 暂时不可达 / 404(本机 store 比 Mac DB 新)。日志记录足够,
     /// 用户不应看到 banner
     func bumpItemOnServer(id: String) {
-        guard let client else { return }
+        guard let secret = currentSecret else { return }
+        var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
+        if urls.isEmpty, let currentEndpointURL {
+            urls = [currentEndpointURL]
+        }
+        urls = Array(Set(urls)).sorted { a, b in
+            if a == currentEndpointURL { return true }
+            if b == currentEndpointURL { return false }
+            return a < b
+        }
+        guard !urls.isEmpty else { return }
+        DebugLog.shared.append("bump fanout \(id): \(urls.count) route(s)")
         Task {
-            do {
-                try await client.bumpItem(id: id)
-            } catch {
-                // swallow——bump 是 best-effort 的跨设备一致信号,失败不阻塞 UI
-                DebugLog.shared.append("bumpItemOnServer(\(id)) failed: \(error.localizedDescription)")
+            await withTaskGroup(of: Void.self) { group in
+                for urlString in urls {
+                    group.addTask {
+                        guard let url = URL(string: urlString) else { return }
+                        let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+                        do {
+                            try await client.bumpItem(id: id)
+                            DebugLog.shared.append("bump ok \(String(id.prefix(8))) via \(urlString)")
+                        } catch let error as PeerClientError {
+                            switch error {
+                            case .itemNotFound, .itemTombstoned:
+                                DebugLog.shared.append("bump ignored \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                            default:
+                                DebugLog.shared.append("bump failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                            }
+                        } catch {
+                            // swallow——bump 是 best-effort 的跨设备一致信号,失败不阻塞 UI
+                            DebugLog.shared.append("bump failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                        }
+                    }
+                }
             }
         }
     }
@@ -375,6 +530,10 @@ final class PeerSyncCoordinator {
         repickTask = nil
         statusTickTask?.cancel()
         statusTickTask = nil
+        routeElectionTimeoutTask?.cancel()
+        routeElectionTimeoutTask = nil
+        routeElectionStartedAt = nil
+        pendingRouteError = nil
         client = nil
         pendingAdvance = false
         lastConnectedStampAt = nil
@@ -404,11 +563,13 @@ final class PeerSyncCoordinator {
         // 已有 inflight task → 不并发起新的,只置 pendingAdvance 让它收尾后再 kick
         if let t = pullTask, !t.isCancelled {
             pendingAdvance = true
+            DebugLog.shared.append("pull queued behind inflight")
             return
         }
         guard let client else { return }
         pendingAdvance = false
         let startCursor = cursor
+        DebugLog.shared.append("pull start cursor=(\(startCursor.ingestedAtNs),\(startCursor.id)) url=\(currentEndpointURL ?? "?")")
         pullTask = Task { [weak self] in
             await self?.runPull(client: client, from: startCursor)
         }
@@ -422,6 +583,7 @@ final class PeerSyncCoordinator {
             while !Task.isCancelled, pages < maxPages {
                 let page = try await client.fetchSince(cursor: cursor, limit: 500)
                 pages += 1
+                DebugLog.shared.append("pull page \(pages): items=\(page.items.count) hasMore=\(page.hasMore) next=(\(page.nextCursor.ingestedAtNs),\(page.nextCursor.id))")
                 // 每页就 merge,UI 渐进刷新(不等全部拉完才一次性显示)
                 store.merge(page.items)
                 cursor = page.nextCursor
@@ -435,12 +597,12 @@ final class PeerSyncCoordinator {
                 if !page.hasMore { break }
             }
             // 拉完了——更新状态 + 如果中途有 advance 进来,再 kick 一轮
+            DebugLog.shared.append("pull done pages=\(pages) storeItems=\(store.items.count)")
             applyConnectedStatus()
         } catch is CancellationError {
             // 静默
         } catch {
-            lastError = error.localizedDescription
-            status = .error(error.localizedDescription)
+            recordConnectionProblem(error.localizedDescription)
         }
         pullTask = nil
         if pendingAdvance {
@@ -456,16 +618,17 @@ final class PeerSyncCoordinator {
         }
         switch pool.state {
         case .connected(let pid):
+            finishRouteElection()
             status = .connected(peerDeviceID: pid, lastSync: Date())
             lastConnectedStampAt = Date()
         case .connecting:
             status = .connecting
         case .backoff(let f):
-            status = .backoff(failures: f)
+            if isElectingRoute { status = .connecting } else { status = .backoff(failures: f) }
         case .failed(let m):
-            status = .error(m)
+            recordConnectionProblem(m)
         case .idle, .stopped:
-            status = .idle
+            if isElectingRoute { status = .connecting } else { status = .idle }
         }
     }
 
@@ -493,21 +656,88 @@ final class PeerSyncCoordinator {
         case .connecting:
             if case .connected = status {} else { status = .connecting }
         case .backoff(let f):
-            status = .backoff(failures: f)
+            if isElectingRoute { status = .connecting } else { status = .backoff(failures: f) }
         case .failed(let m):
-            status = .error(m)
+            recordConnectionProblem(m)
         case .stopped, .idle:
             break
         case .connected(let pid):
             // zombie 检测:pool 说 connected 但所有 sub WS 帧都太老 → 降级
             let last = pool.lastHeartbeatAt ?? lastConnectedStampAt ?? .distantPast
             if Date().timeIntervalSince(last) > heartbeatStaleTimeoutSec {
-                status = .error("链路无响应 (\(Int(Date().timeIntervalSince(last)))s)")
+                recordConnectionProblem("链路无响应 (\(Int(Date().timeIntervalSince(last)))s)")
             } else if case .connected = status {
                 // 已经显 connected 保留 lastSync
             } else {
+                finishRouteElection()
                 status = .connected(peerDeviceID: pid, lastSync: lastConnectedStampAt)
             }
+        }
+    }
+
+    private var isElectingRoute: Bool {
+        routeElectionStartedAt != nil
+    }
+
+    private func shouldSurfaceRouteElection(for reason: String) -> Bool {
+        if reason == "pairing complete" { return true }
+        if reason == "manual refresh" { return true }
+        if reason == "network changed" { return true }
+        if reason.hasPrefix("ws: endpoints_changed") { return true }
+        if case .connected = status { return false }
+        return true
+    }
+
+    private func beginRouteElection(reason: String) {
+        routeElectionID &+= 1
+        let id = routeElectionID
+        routeElectionStartedAt = Date()
+        pendingRouteError = nil
+        status = .connecting
+        routeElectionTimeoutTask?.cancel()
+        let graceSec = self.routeElectionGraceSec
+        routeElectionTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(graceSec * 1_000_000_000))
+            await MainActor.run {
+                self?.routeElectionTimedOut(id: id)
+            }
+        }
+        DebugLog.shared.append("route election started: \(reason)")
+    }
+
+    private func finishRouteElection() {
+        guard isElectingRoute else { return }
+        routeElectionStartedAt = nil
+        pendingRouteError = nil
+        routeElectionTimeoutTask?.cancel()
+        routeElectionTimeoutTask = nil
+        DebugLog.shared.append("route election finished")
+    }
+
+    private func routeElectionTimedOut(id: UInt64) {
+        guard isElectingRoute, id == routeElectionID else { return }
+        if case .connected = wsPool?.state {
+            applyConnectedStatus()
+            return
+        }
+        let msg = pendingRouteError ?? "仍在选择可用路线"
+        routeElectionStartedAt = nil
+        routeElectionTimeoutTask = nil
+        status = .error(msg)
+        DebugLog.shared.append("route election timed out: \(msg)")
+    }
+
+    private func recordConnectionProblem(_ message: String) {
+        lastError = message
+        pendingRouteError = message
+        if isElectingRoute {
+            if case .connected = status {
+                return
+            }
+            status = .connecting
+            DebugLog.shared.append("transient route error suppressed: \(message)")
+        } else {
+            status = .error(message)
         }
     }
 }

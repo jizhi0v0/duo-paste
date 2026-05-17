@@ -5,52 +5,56 @@ import Foundation
 ///
 /// 容量:1000 行,够看半小时活动。线程安全:NSLock 守 buffer 写入。
 final class DebugLog: @unchecked Sendable {
-    static let shared = DebugLog()
+    nonisolated static let shared = DebugLog()
 
     private let lock = NSLock()
-    private var entries: [String] = []
+    nonisolated(unsafe) private var entries: [String] = []
+    private let stderrQueue = DispatchQueue(
+        label: "io.duopaste.debuglog.stderr",
+        qos: .utility
+    )
     private let capacity = 1000
 
-    private init() {}
+    nonisolated private init() {}
 
-    func append(_ msg: String) {
-        let ts = ISO8601DateFormatter.shared.string(from: Date())
+    nonisolated func append(_ msg: String) {
+        let ts = Self.timestamp()
         let line = "\(ts) \(msg)"
-        // 同时打 stderr 让 Xcode console 看到(开发期),无 console 时只进 buffer
-        FileHandle.standardError.write(Data((line + "\n").utf8))
         lock.lock()
         entries.append(line)
         if entries.count > capacity {
             entries.removeFirst(entries.count - capacity)
         }
         lock.unlock()
+
+        // Xcode attached 时 stderr 可能被 Console / debugger 背压拖慢；同步写会卡住
+        // MainActor。内存 ring buffer 仍同步更新，stderr 只做后台旁路诊断。
+        stderrQueue.async {
+            FileHandle.standardError.write(Data((line + "\n").utf8))
+        }
     }
 
     /// 导出整个 buffer 为单字符串。Settings "导出日志" 按钮调,share sheet 用
-    func snapshot() -> String {
+    nonisolated func snapshot() -> String {
         lock.lock()
         let copy = entries
         lock.unlock()
         let header = """
         DuoPaste iOS Debug Log
-        Exported: \(ISO8601DateFormatter.shared.string(from: Date()))
+        Exported: \(Self.timestamp())
         Entries: \(copy.count)
 
         """
         return header + copy.joined(separator: "\n") + "\n"
     }
 
-    func clear() {
+    nonisolated func clear() {
         lock.lock()
         entries.removeAll()
         lock.unlock()
     }
-}
 
-private extension ISO8601DateFormatter {
-    static let shared: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
+    nonisolated private static func timestamp() -> String {
+        String(format: "%.3f", Date().timeIntervalSince1970)
+    }
 }

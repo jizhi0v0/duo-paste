@@ -38,6 +38,23 @@ private func bumpItem(id: String) -> Item {
     )
 }
 
+private final class BumpCallbackBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [(String, Int64)] = []
+
+    func append(id: String, ingestedAtNs: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        events.append((id, ingestedAtNs))
+    }
+
+    func snapshot() -> [(String, Int64)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
 private func waitReadyBump(baseURL: URL, auth: HMACAuth) async -> Bool {
     for _ in 0..<50 {
         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -81,8 +98,12 @@ struct BumpHTTPTests {
     @Test func bumpHTTPSucceedsAndBumpsDB() async throws {
         let (db, blobs, auth, port) = try makeBumpServerFixture(items: [bumpItem(id: "row-1")])
         let broadcaster = WSBroadcaster(rotationIntervalSec: 0)
+        let callback = BumpCallbackBox()
         let server = SyncServer(deviceID: "mac-self", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth, broadcaster: broadcaster)
+                                host: "127.0.0.1", port: port, auth: auth, broadcaster: broadcaster,
+                                onBumpApplied: { id, ingestedAtNs in
+                                    callback.append(id: id, ingestedAtNs: ingestedAtNs)
+                                })
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
         let base = URL(string: "http://127.0.0.1:\(port)")!
@@ -105,6 +126,9 @@ struct BumpHTTPTests {
         #expect(after.ingestedAtNs == newIngest)
         #expect(after.capturedAtNs > 100)                  // 也被顶
         #expect(after.originDevice == "mac-self")          // origin 不动
+        #expect(callback.snapshot().count == 1)
+        #expect(callback.snapshot().first?.0 == "row-1")
+        #expect(callback.snapshot().first?.1 == newIngest)
     }
 
     @Test func bumpHTTPRejectsBadSignature() async throws {

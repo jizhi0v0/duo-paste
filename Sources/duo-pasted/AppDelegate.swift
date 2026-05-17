@@ -545,7 +545,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appIconStore: appIconStore,
                 endpointsProvider: endpointsProvider,
                 meshEndpointsProvider: meshEndpointsProvider,
-                pairingService: pairingService
+                pairingService: pairingService,
+                onBumpApplied: { _, _ in
+                    Task { @MainActor in
+                        await AppDelegate.shared?.state.refresh()
+                    }
+                }
             )
             serverTask = Task.detached(priority: .utility) {
                 do {

@@ -2,11 +2,11 @@ import Foundation
 import DuoPasteCore
 
 /// 计算本机 daemon 可被外部访问到的 URL 候选 list。iOS PeerSyncCoordinator 拿到后并发
-/// 探活测 RTT 选最低。
+/// 探活确认可达,再按 Mac hint / route 策略选择。
 ///
 /// 候选来源:
 /// - **Tailscale**:`tls_cert_path` 文件名 stem(即 cert CN)。TLS valid,iOS 需装
-///   Tailscale 客户端才能解析 hostname。preferred=true,iOS 探活前先尝试
+///   Tailscale 客户端才能解析 hostname
 /// - **Ponte**:`SurgePonte.discoverSelfHostname()`,iOS 装 Surge 才能用。TLS 名字不
 ///   匹配,iOS 端需要走自签或 HTTP——MVP 阶段先暴露 URL,客户端按场景自决定
 /// - **.local mDNS**:`<hostname>.local`,同 Wi-Fi。TLS 不匹配同上
@@ -31,7 +31,7 @@ public enum EndpointDiscovery {
                 out.append(PeerEndpoint(
                     url: "\(scheme)://\(stem):\(port)",
                     kind: .tailscale,
-                    preferred: true
+                    preferred: false
                 ))
             }
         }

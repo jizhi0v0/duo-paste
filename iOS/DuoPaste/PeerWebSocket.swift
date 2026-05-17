@@ -103,6 +103,17 @@ final class PeerWebSocket {
         state = .stopped
     }
 
+    /// 网络 path 变化时只打断当前 NWConnection，让既有 runLoop 自己进入 backoff/retry。
+    /// 不 cancel runTask、不重建 PeerWebSocket，因此 failures 指数退避不会被清零。
+    func reconnectPreservingBackoff(reason: String) {
+        guard runTask != nil else {
+            start()
+            return
+        }
+        DebugLog.shared.append("ws reconnect requested: \(config.baseURL.absoluteString) (\(reason))")
+        currentConnection?.cancel()
+    }
+
     private func runLoop() async {
         var failures = 0
         let urlStr = config.baseURL.absoluteString
@@ -190,8 +201,14 @@ final class PeerWebSocket {
         )
         DebugLog.shared.append("ws ready: \(config.baseURL.absoluteString)")
 
-        // receive + ping 双 task race
+        // receive + ping 双 task race. 任一边结束/抛错时必须先 cancel NWConnection,
+        // 否则另一个 task 可能还卡在 receiveMessage 的 continuation 里，group scope
+        // 等不到它收尾，外层 runLoop 就永远不进入 backoff/reconnect。
         try await withThrowingTaskGroup(of: Void.self) { group in
+            defer {
+                connection.cancel()
+                group.cancelAll()
+            }
             group.addTask { [weak self] in
                 try await self?.receiveLoop(connection: connection)
             }
@@ -199,7 +216,6 @@ final class PeerWebSocket {
                 try await self?.pingLoop(connection: connection)
             }
             try await group.next()
-            group.cancelAll()
         }
     }
 
@@ -256,9 +272,15 @@ final class PeerWebSocket {
                 try await Task.sleep(nanoseconds: UInt64(timeoutSec * 1_000_000_000))
                 throw WSError.handshakeTimeout(sinceSec: Int(timeoutSec))
             }
-            try await group.next()
-            group.cancelAll()
-        }
+            do {
+                try await group.next()
+                group.cancelAll()
+            } catch {
+                connection.cancel()
+                group.cancelAll()
+                throw error
+            }
+       }
     }
 
     /// continuation 单次 resume 保护——sec_protocol stateUpdateHandler 可能多次 fire
@@ -266,9 +288,10 @@ final class PeerWebSocket {
     /// (NSLock 包 Bool 也行,这里 final class 单一实例够用)
     fileprivate final class ResumeBox: @unchecked Sendable {
         private let lock = NSLock()
-        private var resumed = false
+        nonisolated(unsafe) private var resumed = false
+        nonisolated init() {}
         /// 返回 true = 应该 resume(头一次调);false = 已经 resume 过,skip
-        func resume() -> Bool {
+        nonisolated func resume() -> Bool {
             lock.lock()
             defer { lock.unlock() }
             if resumed { return false }
@@ -364,7 +387,7 @@ final class PeerWebSocket {
             handle(text: text)
         case .close:
             DebugLog.shared.append("ws got close frame: \(config.baseURL.absoluteString)")
-        case .ping, .pong:
+        case .ping, .pong, .cont:
             // 协议层 ping/pong — NWProtocolWebSocket.autoReplyPing 已经回 pong
             break
         @unknown default:

@@ -61,6 +61,10 @@ public struct SyncServer: Sendable {
     /// 没启用 pairing)
     public let pairingService: PairingService?
 
+    /// 本机 HTTP `/bump` 已落库后的回调。Mac daemon 用它刷新本机 UI；测试/headless
+    /// server 默认 no-op。WS broadcaster 只通知 peer，不会自动刷新本进程 SwiftUI state。
+    public let onBumpApplied: @Sendable (String, Int64) -> Void
+
     public init(
         deviceID: String,
         database: DuoPasteCore.Database,
@@ -74,7 +78,8 @@ public struct SyncServer: Sendable {
         appIconStore: AppIconStore? = nil,
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
-        pairingService: PairingService? = nil
+        pairingService: PairingService? = nil,
+        onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
     ) {
         self.deviceID = deviceID
         self.database = database
@@ -89,6 +94,7 @@ public struct SyncServer: Sendable {
         self.endpointsProvider = endpointsProvider
         self.meshEndpointsProvider = meshEndpointsProvider
         self.pairingService = pairingService
+        self.onBumpApplied = onBumpApplied
     }
 
     public func run() async throws {
@@ -109,7 +115,8 @@ public struct SyncServer: Sendable {
             broadcaster: broadcaster,
             endpointsProvider: endpointsProvider,
             meshEndpointsProvider: meshEndpointsProvider,
-            pairingService: pairingService
+            pairingService: pairingService,
+            onBumpApplied: onBumpApplied
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -264,7 +271,8 @@ public struct SyncServer: Sendable {
         broadcaster: WSBroadcaster? = nil,
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
-        pairingService: PairingService? = nil
+        pairingService: PairingService? = nil,
+        onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
     ) {
         router.get("/health") { _, _ -> Response in
             var payload: [String: String] = [
@@ -350,6 +358,7 @@ public struct SyncServer: Sendable {
             let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
             do {
                 let newIngest = try await database.bumpCapturedAt(id: id, now: now)
+                onBumpApplied(id, newIngest)
                 // 通知 peer:本机 cursor 推进了。fan-out 失败 swallow——bump 本身已落库
                 if let broadcaster {
                     Task {
@@ -374,12 +383,16 @@ public struct SyncServer: Sendable {
         }
 
         // POST /pair/{pin}:iOS PIN 配对入口。**无 HMAC**(AuthMiddleware 白名单跳过)。
-        // 校验 PIN → 返回 shared-secret hex 让 iOS 建立后续 HMAC 信任。
+        // 校验 PIN → 原子返回 shared-secret hex + 当前 endpoints page。
         //
         // 安全:
         // - PIN 单次有效 + 60s expiry + 5 次错误封锁(都在 PairingService 里)
         // - 路径里 pin 是 6 位数字,长度上限校验后才比对
         // - secret 以 hex 文本明文返回—— TLS 信任完整性 + 用户主动展示 PIN 才有 session
+        //
+        // 关键语义:
+        // - endpoints 必须跟 secret 同一个响应返回。不要让 iOS 在 PIN 被消费后再二次
+        //   GET /endpoints；那一步失败会造成 Mac 显示成功、iOS 显示失败，且 PIN 已不可重试。
         router.post("/pair/:pin") { request, context -> Response in
             guard let service = pairingService else {
                 return errorJSON(.serviceUnavailable, "pairing disabled")
@@ -394,8 +407,21 @@ public struct SyncServer: Sendable {
             do {
                 let secret = try await service.validateAndConsumePIN(pin)
                 let hex = secret.map { String(format: "%02x", $0) }.joined()
-                let payload: [String: Any] = ["ok": true, "secret": hex, "device_id": deviceID]
-                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                let page = PeerEndpointsPage(
+                    deviceID: deviceID,
+                    endpoints: endpointsProvider(),
+                    updatedAtUnix: Int64(Date().timeIntervalSince1970),
+                    meshPeers: await meshEndpointsProvider()
+                )
+                let payload = PairResponseWire(
+                    ok: true,
+                    secret: hex,
+                    deviceID: deviceID,
+                    endpointsPage: page
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(payload)
                 var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
                 resp.headers[.contentType] = "application/json"
                 return resp
@@ -413,7 +439,7 @@ public struct SyncServer: Sendable {
         }
 
         // GET /endpoints:返回本机当前所有可达 URL 候选 + 整个 mesh 其他 peer 的候选。
-        // 给 iOS 端 EndpointPicker 并发探活测 RTT 选最低延迟连接。
+        // 给 iOS 端 EndpointPicker 并发探活确认可达,再按 Mac hint / route 策略选连接。
         //
         // - `endpoints`:本机 self 候选(Tailscale / Ponte / .local)由 endpointsProvider 算
         // - `mesh_peers`:hub Mac 周期从其他 mesh peer 拉的 endpoints 聚合(Phase B);
@@ -519,5 +545,19 @@ public struct SyncServer: Sendable {
         var resp = Response(status: status, body: .init(byteBuffer: .init(bytes: data)))
         resp.headers[.contentType] = "application/json"
         return resp
+    }
+}
+
+private struct PairResponseWire: Encodable {
+    let ok: Bool
+    let secret: String
+    let deviceID: String
+    let endpointsPage: PeerEndpointsPage
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case secret
+        case deviceID = "device_id"
+        case endpointsPage = "endpoints_page"
     }
 }

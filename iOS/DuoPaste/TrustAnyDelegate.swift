@@ -19,14 +19,23 @@ import Foundation
 /// PinPairingClient 都用这个,让 .local hostname(cert 跟 Tailscale FQDN 不匹配)也能 TLS。
 /// HMAC 签名层兜底,TLS cert 校验不是 trust anchor
 enum TrustAnyHTTP {
-    static let shared: URLSession = {
+    nonisolated static let shared: URLSession = {
         let delegate = TrustAnyDelegate()
         return URLSession(
-            configuration: .default,
+            configuration: makeConfiguration(),
             delegate: delegate,
             delegateQueue: nil
         )
     }()
+
+    nonisolated static func makeConfiguration() -> URLSessionConfiguration {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 8
+        cfg.timeoutIntervalForResource = 20
+        cfg.urlCache = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return cfg
+    }
 }
 
 final class TrustAnyDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate {

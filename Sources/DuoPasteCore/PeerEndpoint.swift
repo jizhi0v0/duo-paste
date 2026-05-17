@@ -1,6 +1,7 @@
 import Foundation
 
-/// Mac daemon 暴露的可达 URL 候选。iOS 拿到 list 后并发探活测 RTT,选最低延迟连接。
+/// Mac daemon 暴露的可达 URL 候选。iOS 拿到 list 后并发探活确认可达,再按 Mac hint
+/// 和本机网络策略选择连接。
 ///
 /// 候选来源:
 /// - `tailscale`:TLS cert CN(由 `tailscale cert <host>` 产出),跨 LAN/WAN 通,iOS 需装
@@ -10,8 +11,9 @@ import Foundation
 /// - `lan_ip`:本机当前 LAN IPv4 / IPv6,无 DNS 也能连(但 TLS cert 不匹配 → iOS 用此条
 ///   走 HTTP 或自签名跳过)
 ///
-/// `preferred` 给个 hint,iOS 探活前可先尝试该 endpoint(避免无谓并发),探活结果仍然以
-/// 实测 RTT 为准。
+/// `preferred` 是 Mac 端选路结果的 hint：当 Mac 已经通过 speed/transport 测试判断
+/// 某条路线更适合当前 peer 时标 true。iOS 仍会探活确认可达,但不再把最低 RTT 当唯一
+/// 真相。
 public struct PeerEndpoint: Codable, Equatable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable {
         case tailscale, ponte, local, lanIP = "lan_ip"
@@ -32,7 +34,7 @@ public struct PeerEndpoint: Codable, Equatable, Sendable, Identifiable {
 
 /// 一台 mesh peer Mac 的 endpoint 候选 list(从 hub Mac 视角:本机周期 fetch peer 的
 /// /endpoints 缓存)。iOS 配对任一 Mac 后就能通过 `PeerEndpointsPage.meshPeers` 拿全
-/// mesh,picker 探活全部候选选全局最快。
+/// mesh,picker 探活全部候选选全局最佳路线。
 ///
 /// `healthy = true` 表示 hub Mac 最近一次 fetch peer 成功;`false` 表示当前不通但缓存
 /// 期内仍暴露(防 iOS 失去 fallback 候选)。`staleAfterSec` 之后 hub 把这条 peer 整个

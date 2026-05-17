@@ -113,9 +113,11 @@ final class HistoryStore {
     func restore() {
         guard let data = try? Data(contentsOf: Self.itemsFile),
               let restored = try? JSONDecoder().decode([Item].self, from: data) else {
+            DebugLog.shared.append("HistoryStore.restore: no cached items")
             return
         }
         self.items = restored
+        DebugLog.shared.append("HistoryStore.restore: items=\(restored.count)")
     }
 }
 

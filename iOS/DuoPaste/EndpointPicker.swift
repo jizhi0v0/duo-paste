@@ -1,10 +1,10 @@
 import Foundation
 import DuoPasteCore
 
-/// 并发探活 Mac 暴露的所有 endpoint 候选,测 RTT 选最低延迟。
+/// 并发探活 Mac 暴露的所有 endpoint 候选,确认可达后按 route hint/策略选择。
 ///
 /// 输入:候选 list(从 Mac GET /endpoints 拿)+ HMAC secret(签 /health 请求)
-/// 输出:按 RTT 升序的可用候选(失败 / 超时的不在列表)
+/// 输出:包含全部候选的 probe 结果。排序后的第一个 ok 候选即当前建议路线。
 ///
 /// 探活方式:HEAD /health (无 body) × 1 次,3s timeout。HEAD 比 GET 省字节,/health
 /// 不像 /since 那么大,但 /health 也允许 HEAD(没有 body 影响)。
@@ -21,9 +21,9 @@ enum EndpointPicker {
     }
 
     /// 并发探活所有 endpoint。返回完整结果(含失败的)。
-    /// 排序按 (kind 优先级, RTT 升序)——跟 macOS SmartTransport 一致:reachability 决定
-    /// 走哪条路 (ponte > tailscale > local),不是纯 RTT 比赛。RTT 只是评估证据 +
-    /// 同 kind 内的 tiebreaker。
+    /// 排序按 (Mac preferred hint, kind 优先级, RTT 升序)。
+    /// Mac 端后续做 speed/transport 测试后只要把最佳路线标成 preferred,iOS 会优先跟随。
+    /// RTT 只是 reachability 证据 + 同策略层级内的 tiebreaker,不是最终目标函数。
     /// timeout 默 5s——cellular 经 Surge ponte 路径首次握手可能慢
     static func probeAll(
         endpoints: [PeerEndpoint],
@@ -40,12 +40,15 @@ enum EndpointPicker {
             }
             var results: [Probe] = []
             for await r in group { results.append(r) }
-            // 按 (kind 优先级, RTT) 排:不可达的排到最后
+            // 按 (Mac hint, kind 优先级, RTT) 排:不可达的排到最后
             return results.sorted { a, b in
-                let pa = kindPriority(a.endpoint.kind)
-                let pb = kindPriority(b.endpoint.kind)
                 if !a.ok && b.ok { return false }
                 if a.ok && !b.ok { return true }
+                if a.endpoint.preferred != b.endpoint.preferred {
+                    return a.endpoint.preferred && !b.endpoint.preferred
+                }
+                let pa = kindPriority(a.endpoint.kind)
+                let pb = kindPriority(b.endpoint.kind)
                 if !a.ok && !b.ok { return pa < pb }
                 if pa != pb { return pa < pb }
                 return a.rttMs < b.rttMs
@@ -53,8 +56,9 @@ enum EndpointPicker {
         }
     }
 
-    /// 选最优候选——按 kind 优先级 + RTT。跟 macOS SmartTransport 一致:
-    /// **优先级** ponte > tailscale > local > lan_ip;**同 kind** 内按 RTT 升序。
+    /// 选最优候选——先尊重 Mac preferred hint,再按 kind 优先级 + RTT。跟 macOS
+    /// SmartTransport 一致:
+    /// **优先级** preferred > ponte > tailscale > local > lan_ip;**同 kind** 内按 RTT 升序。
     /// 全部不可达返回 nil。
     ///
     /// 设计动机:
@@ -115,10 +119,13 @@ enum EndpointPicker {
             let (_, resp) = try await session.data(for: req, delegate: delegate)
             let rtt = Int(Date().timeIntervalSince(started) * 1000)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                DebugLog.shared.append("probe failed: \(endpoint.kind.rawValue) \(endpoint.url) http=\(code)")
                 return Probe(endpoint: endpoint, rttMs: -1)
             }
             return Probe(endpoint: endpoint, rttMs: rtt)
         } catch {
+            DebugLog.shared.append("probe failed: \(endpoint.kind.rawValue) \(endpoint.url) error=\(error.localizedDescription)")
             return Probe(endpoint: endpoint, rttMs: -1)
         }
     }

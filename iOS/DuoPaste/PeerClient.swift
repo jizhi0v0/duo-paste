@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import DuoPasteCore
 
 /// iOS 端 peer HTTP client。直接 URLSession + HMAC,不复用 mac 端 DuoPasteSync 的 HTTPPeerClient
@@ -8,12 +9,24 @@ actor PeerClient {
     let config: PeerConfig
     private let auth: HMACAuth
     private let session: URLSession
+    private let taskDelegate: URLSessionTaskDelegate?
     private let decoder: JSONDecoder
 
-    init(config: PeerConfig, session: URLSession = TrustAnyHTTP.shared) {
+    init(config: PeerConfig, session: URLSession? = nil) {
         self.config = config
         self.auth = HMACAuth(secret: config.sharedSecret)
-        self.session = session
+        if let session {
+            self.session = session
+            self.taskDelegate = nil
+        } else {
+            let delegate = TrustAnyDelegate()
+            self.taskDelegate = delegate
+            self.session = URLSession(
+                configuration: TrustAnyHTTP.makeConfiguration(),
+                delegate: delegate,
+                delegateQueue: nil
+            )
+        }
         self.decoder = JSONDecoder()
     }
 
@@ -30,7 +43,7 @@ actor PeerClient {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         sign(&req, method: "GET", signedPath: "/health", bodyHash: HMACAuth.emptyBodyHashHex)
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await data(for: req)
         try Self.requireOK(resp)
         let h = try decoder.decode(HealthWire.self, from: data)
         return HealthInfo(deviceID: h.deviceID, nowMs: h.nowMs, ponteHost: h.ponteHost)
@@ -59,7 +72,7 @@ actor PeerClient {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         sign(&req, method: "GET", signedPath: signedPath, bodyHash: HMACAuth.emptyBodyHashHex)
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await data(for: req)
         try Self.requireOK(resp)
         return try decoder.decode(SincePageWire.self, from: data)
     }
@@ -90,7 +103,7 @@ actor PeerClient {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         sign(&req, method: "GET", signedPath: path, bodyHash: HMACAuth.emptyBodyHashHex)
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await data(for: req)
         try Self.requireOK(resp)
         let actual = HMACAuth.sha256Hex(data)
         guard actual.lowercased() == sha256.lowercased() else {
@@ -110,7 +123,7 @@ actor PeerClient {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         sign(&req, method: "GET", signedPath: path, bodyHash: HMACAuth.emptyBodyHashHex)
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw PeerClientError.nonHTTP }
         if http.statusCode == 404 { return nil }
         if !(200..<300).contains(http.statusCode) {
@@ -121,13 +134,13 @@ actor PeerClient {
 
     // MARK: - GET /endpoints
 
-    /// 拿 Mac 当前的可达 URL 候选 list。iOS EndpointPicker 用来探活测 RTT 选最低
+    /// 拿 Mac 当前的可达 URL 候选 list。iOS EndpointPicker 用来探活并按 route hint 选最佳路线。
     func fetchEndpoints() async throws -> PeerEndpointsPage {
         let url = config.baseURL.appendingPathComponent("/endpoints")
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         sign(&req, method: "GET", signedPath: "/endpoints", bodyHash: HMACAuth.emptyBodyHashHex)
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await data(for: req)
         try Self.requireOK(resp)
         return try decoder.decode(PeerEndpointsPage.self, from: data)
     }
@@ -148,7 +161,7 @@ actor PeerClient {
         // 显式 0-byte body 让 URLSession 不去 sniff 自动补 Content-Length
         req.httpBody = Data()
         sign(&req, method: "POST", signedPath: path, bodyHash: HMACAuth.emptyBodyHashHex)
-        let (_, resp) = try await session.data(for: req)
+        let (_, resp) = try await data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw PeerClientError.nonHTTP }
         switch http.statusCode {
         case 200...299: return
@@ -171,6 +184,19 @@ actor PeerClient {
         req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+    }
+
+    private func data(for req: URLRequest) async throws -> (Data, URLResponse) {
+        if Self.isPonte(req.url) {
+            DebugLog.shared.append("http nw transport: \(req.httpMethod ?? "GET") \(req.url?.absoluteString ?? "?")")
+            return try await NWHTTPTransport.data(for: req, timeoutSec: 12)
+        }
+        return try await session.data(for: req, delegate: taskDelegate)
+    }
+
+    private static func isPonte(_ url: URL?) -> Bool {
+        guard let host = url?.host?.lowercased() else { return false }
+        return host.hasSuffix(".sgponte")
     }
 
     private static func requireOK(_ resp: URLResponse) throws {
@@ -230,6 +256,200 @@ enum PeerClientError: LocalizedError {
             return "对端无此条目"
         case .itemTombstoned:
             return "对端已删除此条目"
+        }
+    }
+}
+
+private enum NWHTTPTransport {
+    static func data(for req: URLRequest, timeoutSec: TimeInterval) async throws -> (Data, URLResponse) {
+        guard let url = req.url,
+              let host = url.host,
+              let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? defaultPort(for: url))),
+              let method = req.httpMethod else {
+            throw URLError(.badURL)
+        }
+        let isTLS = (url.scheme?.lowercased() == "https")
+        let params: NWParameters
+        if isTLS {
+            let tls = NWProtocolTLS.Options()
+            sec_protocol_options_set_verify_block(
+                tls.securityProtocolOptions,
+                { _, _, complete in complete(true) },
+                DispatchQueue.global(qos: .userInitiated)
+            )
+            params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        } else {
+            params = NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
+        }
+
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: params)
+        let requestBytes = makeHTTPRequestBytes(req: req, method: method, url: url, host: host)
+        return try await withCheckedThrowingContinuation { cont in
+            let box = ResumeOnce()
+            var buffer = Data()
+            let queue = DispatchQueue(label: "io.duopaste.nw-http")
+
+            func finish(_ result: Result<(Data, URLResponse), Error>) {
+                if box.claim() {
+                    connection.stateUpdateHandler = nil
+                    connection.cancel()
+                    cont.resume(with: result)
+                }
+            }
+
+            func receiveMore() {
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { chunk, _, isComplete, error in
+                    if let error {
+                        finish(.failure(error))
+                        return
+                    }
+                    if let chunk {
+                        buffer.append(chunk)
+                    }
+                    if let parsed = tryParse(buffer: buffer, url: url) {
+                        finish(parsed)
+                        return
+                    }
+                    if isComplete {
+                        finish(tryParse(buffer: buffer, url: url) ?? .failure(URLError(.badServerResponse)))
+                        return
+                    }
+                    receiveMore()
+                }
+            }
+
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    connection.send(content: requestBytes, completion: .contentProcessed { error in
+                        if let error {
+                            finish(.failure(error))
+                        } else {
+                            receiveMore()
+                        }
+                    })
+                case .failed(let error):
+                    finish(.failure(error))
+                case .cancelled:
+                    finish(.failure(CancellationError()))
+                case .waiting(let error):
+                    finish(.failure(error))
+                case .setup, .preparing:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+            connection.start(queue: queue)
+
+            queue.asyncAfter(deadline: .now() + timeoutSec) {
+                finish(.failure(URLError(.timedOut)))
+            }
+        }
+    }
+
+    private static func defaultPort(for url: URL) -> Int {
+        (url.scheme?.lowercased() == "https") ? 443 : 80
+    }
+
+    private static func makeHTTPRequestBytes(req: URLRequest, method: String, url: URL, host: String) -> Data {
+        let path = pathAndQuery(for: url)
+        let portSuffix: String = {
+            guard let port = url.port, port != defaultPort(for: url) else { return "" }
+            return ":\(port)"
+        }()
+        var lines: [String] = [
+            "\(method) \(path) HTTP/1.1",
+            "Host: \(host)\(portSuffix)",
+            "Connection: close",
+            "Accept: */*",
+        ]
+        for (key, value) in req.allHTTPHeaderFields ?? [:] {
+            if key.lowercased() == "host" || key.lowercased() == "connection" { continue }
+            lines.append("\(key): \(value)")
+        }
+        let body = req.httpBody ?? Data()
+        if !body.isEmpty {
+            lines.append("Content-Length: \(body.count)")
+        }
+        var data = Data((lines.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+        data.append(body)
+        return data
+    }
+
+    private static func pathAndQuery(for url: URL) -> String {
+        var out = url.path.isEmpty ? "/" : url.path
+        if let query = url.query, !query.isEmpty {
+            out += "?\(query)"
+        }
+        return out
+    }
+
+    private static func tryParse(buffer: Data, url: URL) -> Result<(Data, URLResponse), Error>? {
+        guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let headerData = buffer[..<headerEnd.lowerBound]
+        guard let headerText = String(data: headerData, encoding: .isoLatin1) else {
+            return .failure(URLError(.badServerResponse))
+        }
+        let lines = headerText.components(separatedBy: "\r\n")
+        guard let statusLine = lines.first else { return .failure(URLError(.badServerResponse)) }
+        let parts = statusLine.split(separator: " ")
+        guard parts.count >= 2, let status = Int(parts[1]) else {
+            return .failure(URLError(.badServerResponse))
+        }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let sep = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<sep]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(line[line.index(after: sep)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            headers[key] = value
+        }
+
+        let bodyStart = headerEnd.upperBound
+        let body = buffer[bodyStart...]
+        if let te = headers.first(where: { $0.key.lowercased() == "transfer-encoding" })?.value.lowercased(),
+           te.contains("chunked") {
+            guard let decoded = decodeChunked(Data(body)) else { return nil }
+            return .success((decoded, response(url: url, status: status, headers: headers)))
+        }
+        if let cl = headers.first(where: { $0.key.lowercased() == "content-length" })?.value,
+           let len = Int(cl) {
+            guard body.count >= len else { return nil }
+            return .success((Data(body.prefix(len)), response(url: url, status: status, headers: headers)))
+        }
+        return nil
+    }
+
+    private static func response(url: URL, status: Int, headers: [String: String]) -> HTTPURLResponse {
+        HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
+    }
+
+    private static func decodeChunked(_ data: Data) -> Data? {
+        var pos = data.startIndex
+        var out = Data()
+        while true {
+            guard let lineRange = data[pos...].range(of: Data("\r\n".utf8)) else { return nil }
+            guard let line = String(data: data[pos..<lineRange.lowerBound], encoding: .ascii) else { return nil }
+            let sizeText = line.split(separator: ";", maxSplits: 1).first.map(String.init) ?? line
+            guard let size = Int(sizeText.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) else { return nil }
+            pos = lineRange.upperBound
+            if size == 0 { return out }
+            guard data.distance(from: pos, to: data.endIndex) >= size + 2 else { return nil }
+            let chunkEnd = data.index(pos, offsetBy: size)
+            out.append(data[pos..<chunkEnd])
+            pos = data.index(chunkEnd, offsetBy: 2)
+        }
+    }
+
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        nonisolated(unsafe) private var used = false
+        nonisolated func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if used { return false }
+            used = true
+            return true
         }
     }
 }

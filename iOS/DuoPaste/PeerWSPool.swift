@@ -23,6 +23,11 @@ final class PeerWSPool {
         let lastHeartbeatAt: Date?
     }
 
+    struct ConnectedRoute: Equatable, Sendable {
+        let url: String
+        let peerDeviceID: String
+    }
+
     enum State: Equatable, Sendable {
         case idle
         case connecting
@@ -91,6 +96,18 @@ final class PeerWSPool {
         sockets.removeAll()
     }
 
+    /// 网络接口/VPN 状态变化时，旧 NWConnection 可能短时间仍报告 connected，
+    /// 但底层 path 已经不可用。这里只打断当前 connection，让每个 WS 自己按现有
+    /// failures/backoff 重连；不销毁 socket 对象，避免 NWPathMonitor 抖动时把退避清零。
+    func restartAll(reason: String) {
+        guard !lastEndpoints.isEmpty else { return }
+        DebugLog.shared.append("ws-pool reconnect preserving backoff: \(reason)")
+        for ws in sockets.values {
+            ws.reconnectPreservingBackoff(reason: reason)
+        }
+        reconcile(endpoints: lastEndpoints)
+    }
+
     var state: State {
         if sockets.isEmpty { return .idle }
         var hasConnecting = false
@@ -122,14 +139,93 @@ final class PeerWSPool {
         sockets.values.compactMap { $0.lastHeartbeatAt }.max()
     }
 
-    var preferredHTTPURL: String? {
-        let connected = sockets.compactMap { (url, ws) -> (url: String, ws: PeerWebSocket)? in
-            if case .connected = ws.state { return (url, ws) } else { return nil }
+    func isConnected(url: String?) -> Bool {
+        guard let url, let ws = sockets[url] else { return false }
+        if case .connected = ws.state { return true }
+        return false
+    }
+
+    func preferredHTTPURL(prefer currentURL: String?) -> String? {
+        if isConnected(url: currentURL) {
+            return currentURL
+        }
+        let connected = sockets.compactMap { (url, ws) -> (url: String, ws: PeerWebSocket, endpoint: PeerEndpoint?)? in
+            if case .connected = ws.state {
+                let endpoint = lastEndpoints.first(where: { $0.url == url })
+                return (url, ws, endpoint)
+            }
+            return nil
         }
         guard !connected.isEmpty else { return nil }
         return connected
-            .sorted { ($0.ws.lastHeartbeatAt ?? .distantPast) > ($1.ws.lastHeartbeatAt ?? .distantPast) }
+            .sorted { a, b in
+                let pa = Self.endpointPriority(a.endpoint)
+                let pb = Self.endpointPriority(b.endpoint)
+                if pa != pb { return pa < pb }
+                return (a.ws.lastHeartbeatAt ?? .distantPast) > (b.ws.lastHeartbeatAt ?? .distantPast)
+            }
             .first?.url
+    }
+
+    var preferredHTTPURL: String? {
+        preferredHTTPURL(prefer: nil)
+    }
+
+    func connectedHTTPURLs(prefer currentURL: String?) -> [String] {
+        let connected = sockets.compactMap { (url, ws) -> (url: String, endpoint: PeerEndpoint?)? in
+            if case .connected = ws.state {
+                return (url, lastEndpoints.first(where: { $0.url == url }))
+            }
+            return nil
+        }
+        return connected
+            .sorted { a, b in
+                if a.url == currentURL { return true }
+                if b.url == currentURL { return false }
+                let pa = Self.endpointPriority(a.endpoint)
+                let pb = Self.endpointPriority(b.endpoint)
+                if pa != pb { return pa < pb }
+                return a.url < b.url
+            }
+            .map(\.url)
+    }
+
+    /// 返回每个 peer 设备最多一个可用 HTTP route。一个 Mac 可能同时有 local/tailscale
+    /// 多条 WS 都 connected；fanout `/bump` 时重复打同一台 Mac 会把同一行 bump 多次，
+    /// 造成 cursor/pull 噪声和排序抖动。
+    func connectedHTTPURLsByDevice(prefer currentURL: String?) -> [String] {
+        let connected = sockets.compactMap { (url, ws) -> (url: String, peerDeviceID: String, endpoint: PeerEndpoint?)? in
+            if case .connected(let peerDeviceID) = ws.state {
+                return (url, peerDeviceID, lastEndpoints.first(where: { $0.url == url }))
+            }
+            return nil
+        }
+        let sorted = connected.sorted { a, b in
+            if a.url == currentURL { return true }
+            if b.url == currentURL { return false }
+            let pa = Self.endpointPriority(a.endpoint)
+            let pb = Self.endpointPriority(b.endpoint)
+            if pa != pb { return pa < pb }
+            return a.url < b.url
+        }
+        var seen = Set<String>()
+        var urls: [String] = []
+        for route in sorted where !seen.contains(route.peerDeviceID) {
+            seen.insert(route.peerDeviceID)
+            urls.append(route.url)
+        }
+        return urls
+    }
+
+    private nonisolated static func endpointPriority(_ endpoint: PeerEndpoint?) -> Int {
+        guard let endpoint else { return 99 }
+        if endpoint.preferred { return 0 }
+        switch endpoint.kind {
+        case .ponte: return 1
+        case .tailscale: return 2
+        case .local: return 3
+        case .lanIP: return 4
+        }
     }
 
     func snapshot() -> [SocketSnapshot] {

@@ -37,7 +37,7 @@ public enum WSMessage: Codable, Equatable, Sendable {
     case pong(version: Int)
 
     /// Mac 通知 iOS:endpoints 候选 list 变了(SmartTransport reconcile / SurgePonte
-    /// plist 改 / cert 更新),"重新 GET /endpoints 然后 re-probe 测延迟"。当前 Mac 端
+    /// plist 改 / cert 更新),"重新 GET /endpoints 然后 re-probe 选路"。当前 Mac 端
     /// 不主动发——iOS 走 hello / NWPathMonitor / 周期 timer 自己 refetch;wire format
     /// 预留让未来 Mac 主动 push 时不破坏 protocol 兼容性
     case endpointsChanged(version: Int, updatedAtUnix: Int64)
