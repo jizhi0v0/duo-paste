@@ -115,16 +115,17 @@ final class PeerSyncCoordinator {
         self.store = store
         self.blobCache = BlobCache()
         self.appIconCache = AppIconCache()
-        // 网络变化 → 重新 probe + reselect
+        // 网络变化 → 清 WS pool cooldown(Wi-Fi 上 .sgponte 失败的 URL 在 cellular 上
+        // Surge 接管可能就通了,必须重试)+ 重新 probe + reselect
         NetworkChangeWatcher.shared.addListener { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.wsPool?.clearCooldowns(reason: "network changed")
                 self?.repickEndpoint(reason: "network changed")
             }
         }
     }
 
-    /// 手填 advanced URL 路径用——单 URL 当作单 probe 走 pool。配对路径走
-    /// `reconfigureFromPairing` + `applyPicks`,不应进这里
+    /// 手填 advanced URL 路径用——单 URL 走 pool。配对路径走 `reconfigureFromPairing`
     func reconfigure(_ config: PeerConfig?) {
         cancelRuntimeTasks()
         lastProbes = []
@@ -143,20 +144,17 @@ final class PeerSyncCoordinator {
         let manualEP = PeerEndpoint(url: config.baseURL.absoluteString, kind: .tailscale)
         self.availableEndpoints = [manualEP]
         self.status = .connecting
-        // 手填 URL 不走 probe → 直接用 0ms 占位 probe 走 pool
-        let probe = EndpointPicker.Probe(endpoint: manualEP, rttMs: 0)
-        setupClientAndPool(probes: [probe], secret: config.sharedSecret)
+        setupClientAndPool(endpoints: [manualEP], httpClientURL: manualEP.url, secret: config.sharedSecret)
     }
 
-    /// 公共装配路径:重 PeerClient + PeerWSPool,注入 blob/icon fetcher。
-    /// 既给手填 URL 用(单 probe),也给 paired probe 路径用(top-K)
-    private func setupClientAndPool(probes: [EndpointPicker.Probe], secret: Data) {
-        guard let bestProbe = probes.first(where: { $0.ok }),
-              let bestURL = URL(string: bestProbe.endpoint.url) else {
-            status = .error("无可达 endpoint")
+    /// 公共装配路径:重 PeerClient + PeerWSPool。pool 对所有 endpoint 全开 WS,
+    /// HTTP client 用 httpClientURL(配对完成时还没 probe,先用第一个,probe 完后切换)
+    private func setupClientAndPool(endpoints: [PeerEndpoint], httpClientURL: String, secret: Data) {
+        guard let bestURL = URL(string: httpClientURL) else {
+            status = .error("无效 URL")
             return
         }
-        self.currentEndpointURL = bestProbe.endpoint.url
+        self.currentEndpointURL = httpClientURL
         let cfg = PeerConfig(baseURL: bestURL, sharedSecret: secret)
         let client = PeerClient(config: cfg)
         self.client = client
@@ -166,12 +164,10 @@ final class PeerSyncCoordinator {
         appIconCache.fetcher = { bid in try await client.fetchAppIcon(bundleID: bid) }
         let pool = PeerWSPool(
             secret: secret,
-            topK: 2,
             onAdvance: { [weak self] _ in
                 self?.kickPull()
             },
             onAllDown: { [weak self] reason in
-                // 全 WS 都死了——升级到 repick 重新探活全 candidate list
                 self?.repickEndpoint(reason: "ws-pool: \(reason)")
             },
             onEndpointsChanged: { [weak self] in
@@ -179,25 +175,30 @@ final class PeerSyncCoordinator {
             }
         )
         self.wsPool = pool
-        pool.reconcile(probes: probes)
+        pool.reconcile(endpoints: endpoints)
         startStatusTick()
         kickPull()
     }
 
-    /// PIN 配对完成 → 调这条入口让 coordinator 拿 secret + endpoint list,自动 probe
-    /// 选最快连接。endpoints 缓存到 availableEndpoints,网络变 / WS endpoints_changed
-    /// 时从这 re-probe
+    /// PIN 配对完成 → 拿 secret + endpoint list,**立刻**对所有 endpoint 开 WS pool
+    /// (不等 probe,5s probe 延迟期间用户就能开始看见 WS 连上),probe 并行跑完后更新
+    /// HTTP client URL
     func reconfigureFromPairing(secret: Data, endpoints: [PeerEndpoint]) {
         guard !endpoints.isEmpty else {
             status = .error("Mac 没返回任何 endpoint 候选")
             return
         }
-        // 立刻把 status 切到 .connecting,避免 sheet 关掉后用户看到"未配置"——
-        // probe 完成才有 currentEndpointURL,这之间 3-5s 不让 UI 显示旧状态
         self.status = .connecting
         self.currentSecret = secret
         self.availableEndpoints = endpoints
+        // 先用第一个 URL 当 HTTP client(probe 完后会切到最快的);pool 立刻全开 WS
+        setupClientAndPool(
+            endpoints: endpoints,
+            httpClientURL: endpoints.first?.url ?? "",
+            secret: secret
+        )
         startPeriodicRepick()
+        // 并行触发 probe 拿 RTT 数据供 HTTP client URL 选择
         repickEndpoint(reason: "pairing complete")
     }
 
@@ -259,27 +260,28 @@ final class PeerSyncCoordinator {
         }
     }
 
-    /// 把最新 probe 结果调和给 pool——top-K reachable URL 起 / 保持 WS,其他关掉。
-    /// HTTP `client` 跟到 best probe URL(只在 URL 变了或 client nil 时重建)。
-    ///
-    /// **关键差异 vs 旧 applyPick**: pool 自动复用已活的 WS(reconcile 内部 diff),
-    /// 不会因为同 URL 触发整体重启。flap guard 还在但只挡 client URL 切换,**WS pool
-    /// 始终更新**(让新增 endpoint 立刻被开 WS)
+    /// 探活完成 → 根据 probe 选 HTTP client URL(最快可达 URL),同时把**全部 endpoint**
+    /// 喂给 pool 让 pool 决定哪些开 WS(probe 只影响 HTTP,不影响 WS pool 决策——WS 全开)
     private func applyPicks(probes: [EndpointPicker.Probe], secret: Data) {
-        guard let bestProbe = probes.first(where: { $0.ok }) else {
-            status = .error("所有 endpoint 都不通,检查 Mac 是否在线 + 网络")
-            return
-        }
-        // pool 必须刷新——新 probe 可能新增 / 删除 reachable URL
+        let endpoints = availableEndpoints
+        // pool reconcile 全 endpoints(不挑 probe 结果)
         if let pool = wsPool {
-            pool.reconcile(probes: probes)
+            pool.reconcile(endpoints: endpoints)
         } else {
-            // 没 pool → 走 setup
-            setupClientAndPool(probes: probes, secret: secret)
+            let bestURL = probes.first(where: { $0.ok })?.endpoint.url
+                ?? endpoints.first?.url
+                ?? ""
+            setupClientAndPool(endpoints: endpoints, httpClientURL: bestURL, secret: secret)
             return
         }
 
-        // client URL 切换 guard:同 URL noop;不同 URL + 有活连接 + RTT 改善不显著 → flap
+        // HTTP client URL 切换:用 probe 最快 URL,带 flap guard
+        guard let bestProbe = probes.first(where: { $0.ok }) else {
+            // probe 全失败但 pool 里可能某个 WS 已经 .connected——保留当前 client URL,
+            // 让 WS pool 自己负责连接;不报 error 让用户看到红色
+            DebugLog.shared.append("probe all failed, keep current client URL (\(currentEndpointURL ?? "?"))")
+            return
+        }
         let bestURL = bestProbe.endpoint.url
         let hasLiveConnection: Bool = {
             if case .connected = wsPool?.state { return true } else { return false }
@@ -294,7 +296,6 @@ final class PeerSyncCoordinator {
             DebugLog.shared.append("client pick skipped: current=\(currentRTT)ms new=\(bestProbe.rttMs)ms (within \(Int(rttStableEpsilon*100))%)")
             return
         }
-        // 切 client URL
         guard let url = URL(string: bestURL) else {
             status = .error("invalid endpoint URL: \(bestURL)")
             return

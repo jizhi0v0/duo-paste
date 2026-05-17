@@ -2,20 +2,22 @@ import Foundation
 import Observation
 import DuoPasteCore
 
-/// 多 URL 并发 WS 池。同时对 top-K 个 endpoint URL 起 PeerWebSocket,任一 URL 推
-/// cursor_advanced 都触发 onAdvance,任一 URL 推 endpoints_changed 都触发 onEndpointsChanged。
+/// 多 URL 并发 WS 池。**所有 endpoint** 全开 PeerWebSocket,任一 URL 推 cursor_advanced
+/// 都触发 onAdvance,任一 URL 推 endpoints_changed 都触发 onEndpointsChanged。
 ///
 /// 解决"WS 在一棵树上吊死"问题——iOS URLSessionWebSocketTask 在 cellular 经 Surge MITM
 /// 链路上对某 URL 的 TLS challenge 会跳过 delegate(已知 iOS bug),导致 HTTP probe 过了
-/// 但 WS TLS -1200 死循环。pool 让 tailscale wss 挂的同时 local / ponte wss 还在工作,
-/// cursor_advanced 仍然能进来。
+/// 但 WS TLS -1200 死循环;同时 Wi-Fi 上 .sgponte hostname 不通而 cellular 上 Surge 接管
+/// 这些 URL 就通。两种 case 都让"挑一个最快开 WS"挂掉。
 ///
-/// **state 聚合**: 任一 WS .connected → pool 是 .connected;否则取最"活跃"的子 state
-/// (.connecting > .backoff > .failed > .stopped)
+/// **设计**: 6 个 endpoint = 6 个 WS,握手字节预算 < 12KB(控制面 frame),即便 cellular
+/// 也微不足道。每个 WS 自己 backoff 重连,**probe RTT 仅给 coordinator 选 HTTP client URL,
+/// 不参与 WS pool 选择**——WS 本身就是"这个 URL 能不能用"的标准答案
 ///
-/// **失败处理**: 单 URL 的 WS 失败由它自己 backoff 重连(不出 pool);所有 URL 全部
-/// 进 backoff/failed → onAllDown 触发上层 repick。**不再有 onReprobeNeeded per-URL** 回调,
-/// pool 用 "all down" 作为 escalation 信号
+/// **state 聚合**: 任一 WS .connected → pool .connected;否则按活跃度降级
+///
+/// **失败处理**: 单 URL 连续 ws-failures 达阈值 → 60s cooldown(避免持续浪费 backoff 在
+/// 已知坏 URL 上)。**NetworkChangeWatcher 触发 clearCooldowns** 让网络切换瞬间重试所有 URL
 @MainActor
 @Observable
 final class PeerWSPool {
@@ -40,62 +42,56 @@ final class PeerWSPool {
     private(set) var sockets: [String: PeerWebSocket] = [:]
     private let secret: Data
     private let onAdvance: @MainActor (Int64) -> Void
-    /// 所有 WS 都不健康(全部 backoff/failed/stopped)→ 通知 coordinator 重 probe
+    /// 所有 WS 都不健康 → 通知 coordinator 触发新一轮 probe(给 HTTP client URL 更新数据)
     private let onAllDown: @MainActor (String) -> Void
     private let onEndpointsChanged: @MainActor () -> Void
-    /// 同时保持开的 WS 数。2 = 头部+次优;3 = 加三优(更冗余但 cellular 带宽稍高).
-    /// 默 2 是控制面字节 trade-off 的 sweet spot
-    nonisolated let topK: Int
     /// 单 URL 连续 ws-failures 达阈值后,这个 URL 进入 cooldown 不再被选 N 秒。
-    /// 默 60s——足够让 cellular NAT 重建 / Surge 路由切回正常,又不会永久封 URL
+    /// 默 60s——足够让 cellular NAT 重建 / Surge 路由切回正常,又不会永久封 URL.
+    /// **NetworkChangeWatcher 触发 clearCooldowns** 让 Wi-Fi→cellular 立即重试所有 URL
     nonisolated let cooldownSec: TimeInterval
     /// 单 URL 当前 cooldown 解锁时间
     private var cooldownUntil: [String: Date] = [:]
-    /// 最近一次 coordinator 喂的 probe list——sub WS 失败时 pool 自己用这个 re-reconcile
-    /// 选下一候选,不用 coordinator 重 probe(probe 慢,要 5s)
-    private var lastReceivedProbes: [EndpointPicker.Probe] = []
+    /// 最近一次 coordinator 喂的 endpoint list——sub WS 失败 / cooldown clear 时 pool
+    /// 自己用这个 re-reconcile,不需 coordinator 重新喂
+    private var lastEndpoints: [PeerEndpoint] = []
 
     init(
         secret: Data,
-        topK: Int = 2,
         cooldownSec: TimeInterval = 60,
         onAdvance: @escaping @MainActor (Int64) -> Void,
         onAllDown: @escaping @MainActor (String) -> Void = { _ in },
         onEndpointsChanged: @escaping @MainActor () -> Void = {}
     ) {
         self.secret = secret
-        self.topK = topK
         self.cooldownSec = cooldownSec
         self.onAdvance = onAdvance
         self.onAllDown = onAllDown
         self.onEndpointsChanged = onEndpointsChanged
     }
 
-    /// 用最新探活结果调和 pool——按 (kind 优先级,RTT) 排序后取 top-K 个 reachable URL,
-    /// 删掉不在选中 list 的旧 WS,给新选中的起 WS。已在 list 里的 WS **不动**(避免每次
-    /// repick 都重连)。
+    /// 把当前完整 endpoint list 调和给 pool——**所有非 cooldown 的 URL 全开 WS**。
+    /// 不再做 probe / RTT 过滤——probe 数据只给 coordinator 选 HTTP client URL 用,
+    /// WS 本身就是"这个 URL 能不能用"的标准。Wi-Fi 上 .sgponte 不通而 cellular 上通
+    /// 这种 case,probe 永远说 -1,但 WS 真试就能发现差别。
     ///
-    /// reachable 过滤是关键:probe 失败的 URL (rttMs < 0) 不要开 WS,否则 cellular 完全
-    /// 不通时全 6 个 URL 都白起白失败浪费。**cooldown 过滤**:连续 WS 失败的 URL
-    /// 60s 内被跳过,让 pool 自动 rotate 到下一候选(防 iOS WS TLS 一个 URL 死循环)
-    func reconcile(probes: [EndpointPicker.Probe]) {
-        self.lastReceivedProbes = probes
+    /// **cooldown 过滤**:连续 ws-failures 达阈值的 URL 60s 内被跳过,避免 backoff 浪费
+    /// 在已知坏 URL 上。NetworkChangeWatcher 触发 clearCooldowns 让网络切换瞬间重试所有
+    func reconcile(endpoints: [PeerEndpoint]) {
+        self.lastEndpoints = endpoints
         let now = Date()
-        let reachable = probes.filter { p in
-            guard p.ok else { return false }
-            if let until = cooldownUntil[p.endpoint.url], until > now { return false }
-            return true
-        }
-        let selected = Array(reachable.prefix(topK))
-        let desired = Set(selected.map { $0.endpoint.url })
-        let cooledOut = probes.filter { p in
-            p.ok && (cooldownUntil[p.endpoint.url] ?? .distantPast) > now
-        }.map { $0.endpoint.kind.rawValue }
+        let desired = Set(endpoints.compactMap { ep -> String? in
+            if let until = cooldownUntil[ep.url], until > now { return nil }
+            return ep.url
+        })
+        let cooledOut = endpoints.filter { ep in
+            (cooldownUntil[ep.url] ?? .distantPast) > now
+        }.map { $0.kind.rawValue }
         let coolStr = cooledOut.isEmpty ? "" : " cooldown=[\(cooledOut.joined(separator: ","))]"
-        DebugLog.shared.append("ws-pool reconcile: keep=\(desired.count) [\(selected.map { $0.endpoint.kind.rawValue }.joined(separator: ","))]\(coolStr)")
+        let kinds = endpoints.filter { desired.contains($0.url) }.map { $0.kind.rawValue }
+        DebugLog.shared.append("ws-pool reconcile: keep=\(desired.count) [\(kinds.joined(separator: ","))]\(coolStr)")
 
-        // 1) 关掉不在选中 list 的——**先 snapshot 再删**,迭代 dict 中 removeValue
-        //    是 undefined behavior,实测会让 swift 6 strict concurrency 下偶发 EXC_BAD_ACCESS
+        // 1) 关掉不在选中 list 的(主要是新被 cooldown 的 URL)——snapshot 后再 mutate 防
+        //    dict iteration mutation UB
         let toClose: [(String, PeerWebSocket)] = sockets.compactMap { (url, ws) in
             desired.contains(url) ? nil : (url, ws)
         }
@@ -104,26 +100,39 @@ final class PeerWSPool {
             sockets.removeValue(forKey: url)
             DebugLog.shared.append("ws-pool drop: \(url)")
         }
-        // 2) 给新选中的起 WS
-        for probe in selected where sockets[probe.endpoint.url] == nil {
-            guard let url = URL(string: probe.endpoint.url) else { continue }
+        // 2) 没在 sockets 里的全开 WS
+        for ep in endpoints where desired.contains(ep.url) && sockets[ep.url] == nil {
+            guard let url = URL(string: ep.url) else { continue }
             let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
+            let epURL = ep.url
             let ws = PeerWebSocket(
                 config: cfg,
                 onAdvance: { [weak self] ns in
                     self?.onAdvance(ns)
                 },
                 onReprobeNeeded: { [weak self] reason in
-                    // 单 URL 失败到 ws-failures 阈值——检查 pool 是否全死,全死才 escalate
-                    self?.handleSubFailure(url: probe.endpoint.url, reason: reason)
+                    self?.handleSubFailure(url: epURL, reason: reason)
                 },
                 onEndpointsChanged: { [weak self] in
                     self?.onEndpointsChanged()
                 }
             )
             ws.start()
-            sockets[probe.endpoint.url] = ws
-            DebugLog.shared.append("ws-pool open: \(probe.endpoint.url) (\(probe.endpoint.kind.rawValue) \(probe.rttMs)ms)")
+            sockets[ep.url] = ws
+            DebugLog.shared.append("ws-pool open: \(ep.url) (\(ep.kind.rawValue))")
+        }
+    }
+
+    /// 网络变化(NWPathMonitor 触发)→ 立刻清掉所有 cooldown,让之前失败过的 URL
+    /// 在新网络环境下重试。典型场景:Wi-Fi 上 .sgponte 没 Surge 路由失败 cooldown,
+    /// 切 cellular 后 Surge 接管,这些 URL 现在能工作——必须立刻给它们机会
+    func clearCooldowns(reason: String) {
+        guard !cooldownUntil.isEmpty else { return }
+        let n = cooldownUntil.count
+        cooldownUntil.removeAll()
+        DebugLog.shared.append("ws-pool clearCooldowns: \(reason) (cleared=\(n))")
+        if !lastEndpoints.isEmpty {
+            reconcile(endpoints: lastEndpoints)
         }
     }
 
@@ -181,20 +190,18 @@ final class PeerWSPool {
             .first?.url
     }
 
-    /// 子 WS 报告"我连续失败 N 次"——pool 把这个 URL cooldown 60s + 关掉它的 WS +
-    /// 用 lastReceivedProbes 立即 reconcile 选下一候选。如果备选 list 也空了或全 cooldown,
-    /// onAllDown escalate 给 coordinator 触发新一轮 probe
+    /// 子 WS 报告"我连续失败 N 次"——pool 把这个 URL cooldown 60s + 关掉它的 WS,
+    /// 再 reconcile 一次让其他还没在 pool 里的 endpoint 有机会被开 WS。如果全部 endpoint
+    /// 都 cooldown 了 → onAllDown escalate 给 coordinator 触发新一轮 probe + 提示用户
     private func handleSubFailure(url: String, reason: String) {
         cooldownUntil[url] = Date().addingTimeInterval(cooldownSec)
         DebugLog.shared.append("ws-pool cooldown \(Int(cooldownSec))s: \(url) \(reason)")
-        // 关掉这个 WS 让 reconcile 能从 sockets 里删掉重新选
         if let ws = sockets[url] {
             ws.stop()
             sockets.removeValue(forKey: url)
         }
-        // 立即用 cached probe list 补一个候选——pool 内部自治,不等 coordinator probe(5s)
-        if !lastReceivedProbes.isEmpty {
-            reconcile(probes: lastReceivedProbes)
+        if !lastEndpoints.isEmpty {
+            reconcile(endpoints: lastEndpoints)
         }
         if sockets.isEmpty {
             DebugLog.shared.append("ws-pool all-down: trigger repick (\(reason))")
