@@ -28,6 +28,7 @@
 		D1A00060000000000000A006 /* PinPairingClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00060000000000000B006 /* PinPairingClient.swift */; };
 		D1A00070000000000000A007 /* NetworkChangeWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00070000000000000B007 /* NetworkChangeWatcher.swift */; };
 		D1A00080000000000000A008 /* PinPairingSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00080000000000000B008 /* PinPairingSheet.swift */; };
+		D1A00090000000000000A009 /* TrustAnyDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00090000000000000B009 /* TrustAnyDelegate.swift */; };
 /* End PBXBuildFile section */
 
 
@@ -53,6 +54,7 @@
 		D1A00060000000000000B006 /* PinPairingClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinPairingClient.swift; sourceTree = "<group>"; };
 		D1A00070000000000000B007 /* NetworkChangeWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkChangeWatcher.swift; sourceTree = "<group>"; };
 		D1A00080000000000000B008 /* PinPairingSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinPairingSheet.swift; sourceTree = "<group>"; };
+		D1A00090000000000000B009 /* TrustAnyDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustAnyDelegate.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -115,6 +117,7 @@
 				D1A00060000000000000B006 /* PinPairingClient.swift */,
 				D1A00070000000000000B007 /* NetworkChangeWatcher.swift */,
 				D1A00080000000000000B008 /* PinPairingSheet.swift */,
+				D1A00090000000000000B009 /* TrustAnyDelegate.swift */,
 			);
 			name = DuoPaste;
 			path = ../DuoPaste;
@@ -219,6 +222,7 @@
 				D1A00060000000000000A006 /* PinPairingClient.swift in Sources */,
 				D1A00070000000000000A007 /* NetworkChangeWatcher.swift in Sources */,
 				D1A00080000000000000A008 /* PinPairingSheet.swift in Sources */,
+				D1A00090000000000000A009 /* TrustAnyDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

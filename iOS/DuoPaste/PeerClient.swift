@@ -10,7 +10,7 @@ actor PeerClient {
     private let session: URLSession
     private let decoder: JSONDecoder
 
-    init(config: PeerConfig, session: URLSession = .shared) {
+    init(config: PeerConfig, session: URLSession = TrustAnyHTTP.shared) {
         self.config = config
         self.auth = HMACAuth(secret: config.sharedSecret)
         self.session = session

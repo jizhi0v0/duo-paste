@@ -54,7 +54,7 @@ final class PeerWebSocket {
 
     init(
         config: PeerConfig,
-        session: URLSession = .shared,
+        session: URLSession = TrustAnyHTTP.shared,
         pingIntervalSec: TimeInterval = 30,
         pongTimeoutSec: TimeInterval = 10,
         onAdvance: @escaping @MainActor (Int64) -> Void

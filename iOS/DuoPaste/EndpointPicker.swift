@@ -70,10 +70,18 @@ enum EndpointPicker {
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
 
-        let session = URLSession(configuration: trustAnyCertConfig())
+        // TrustAnyDelegate 接受任何 cert——.local hostname 走 Tailscale cert TLS 不匹配
+        // 需要 bypass(HMAC 签名兜底防 MitM)。Tailscale FQDN 走默认信任也通过
+        let delegate = TrustAnyDelegate()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 3
+        cfg.timeoutIntervalForResource = 5
+        cfg.urlCache = nil
+        let session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
         let started = Date()
         do {
-            let (_, resp) = try await session.data(for: req)
+            let (_, resp) = try await session.data(for: req, delegate: delegate)
             let rtt = Int(Date().timeIntervalSince(started) * 1000)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
                 return Probe(endpoint: endpoint, rttMs: -1)
@@ -82,17 +90,5 @@ enum EndpointPicker {
         } catch {
             return Probe(endpoint: endpoint, rttMs: -1)
         }
-    }
-
-    /// 探活用的 URLSession config——cert 校验放宽给 .local / lan_ip 候选用。tailscale
-    /// cert 走默认信任也行;Ponte / .local 的 cert 名跟 host 不匹配,需 bypass。
-    /// 因为 HMAC 签名 + ts 校验已经保 request 完整性,TLS 只是 transport 加密层,
-    /// LAN 信任前提下 bypass 可接受
-    private static func trustAnyCertConfig() -> URLSessionConfiguration {
-        let c = URLSessionConfiguration.ephemeral
-        c.timeoutIntervalForRequest = 3
-        c.timeoutIntervalForResource = 5
-        c.urlCache = nil
-        return c
     }
 }

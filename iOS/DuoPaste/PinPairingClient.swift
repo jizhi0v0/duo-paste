@@ -69,7 +69,9 @@ enum PinPairingClient {
         )
         defer { session.invalidateAndCancel() }
 
-        let (data, resp) = try await session.data(for: req)
+        // data(for:delegate:) 走 URLSessionTaskDelegate;iOS 26 上 data(for:) 不可靠
+        // 触发 session-level didReceive challenge,task delegate 才稳触发(实测)
+        let (data, resp) = try await session.data(for: req, delegate: delegate)
         guard let http = resp as? HTTPURLResponse else { throw Error.nonHTTP }
         switch http.statusCode {
         case 200: break
@@ -93,23 +95,7 @@ enum PinPairingClient {
     }
 }
 
-/// `URLSessionDelegate` 接受任何 TLS cert。**仅 /pair 路径用**——pairing trust anchor 是
-/// PIN + Mac 端 server 验证,不依赖 TLS cert 正确性。pairing 完成后所有通信走 HMAC,
-/// HMAC 签名层兜底防 MitM,TLS 此时只是 transport 加密
-private final class TrustAnyDelegate: NSObject, URLSessionDelegate {
-    func urlSession(
-        _ session: URLSession,
-        didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-    ) {
-        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let trust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        } else {
-            completionHandler(.performDefaultHandling, nil)
-        }
-    }
-}
+// TrustAnyDelegate 提取到 TrustAnyDelegate.swift 共享给 EndpointPicker 等
 
 private extension Data {
     init?(hex: String) {
