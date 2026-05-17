@@ -83,12 +83,15 @@ public actor MeshEndpointsCache {
         self.log = log
     }
 
-    /// 生产路径方便 builder——supervisor + HMAC fetch 注入
+    /// 生产路径方便 builder——supervisor + HMAC fetch 注入。
+    /// `fallbackSession` 给非 ponte URL 用;ponte hostname (.sgponte) 走
+    /// `PonteSession.session(for:)` 自动选 TLS-bypass session。这跟 PullWorker /
+    /// blob fetcher 同款 session 路由,保证能复用 keep-alive + 通过 Ponte 自签 cert
     public static func production(
         supervisor: MeshSupervisor,
         auth: HMACAuth,
         selfDeviceID: String,
-        session: URLSession = .shared,
+        session fallbackSession: URLSession = .shared,
         config: Config = Config(),
         onSnapshotChanged: @escaping @Sendable (Int64) -> Void = { _ in }
     ) -> MeshEndpointsCache {
@@ -100,8 +103,11 @@ public actor MeshEndpointsCache {
                 return all.compactMap { $0 }
             },
             fetchProvider: { url in
-                await Self.fetchEndpoints(
-                    from: url, auth: auth, session: session, timeoutSec: timeout
+                // 跟 mesh PullWorker 同款 session 路由——ponte URL 自动走 TLS-bypass
+                // pontePool session,tailscale URL 走 fallbackSession 默认信任
+                let s = PonteSession.session(for: url, fallback: fallbackSession)
+                return await Self.fetchEndpoints(
+                    from: url, auth: auth, session: s, timeoutSec: timeout
                 )
             },
             config: config,
