@@ -132,10 +132,15 @@ struct SettingsView: View {
                             .foregroundStyle(probe.ok ? Color.primary : Color.red)
                     }
                 }
+                Button {
+                    coordinator.repickEndpoint(reason: "manual refresh")
+                } label: {
+                    Label("刷新候选", systemImage: "arrow.clockwise")
+                }
             } header: {
                 Text("候选 endpoint(\(probes.count))")
             } footer: {
-                Text("★ = 当前连接。包括本机 Mac 透传的整个 mesh 候选——iOS Bonjour 跨 LAN 拿不到的 Mac 也在这里。RTT 排序选最低延迟。")
+                Text("★ = 当前连接。包括本机 Mac 透传的整个 mesh 候选——iOS Bonjour 跨 LAN 拿不到的 Mac 也在这里。自动刷新触发点:网络变化 / WS endpoints_changed / 5min 周期 / WS 连续失败 ≥ 3 次。或上面手动「刷新候选」立刻重测。")
             }
         }
     }

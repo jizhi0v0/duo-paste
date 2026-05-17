@@ -21,11 +21,12 @@ enum EndpointPicker {
     }
 
     /// 并发探活所有 endpoint。返回完整结果(含失败的),按 RTT 升序。
-    /// 失败的 RTT = -1,排在最后(用 .max sort key)
+    /// 失败的 RTT = -1,排在最后(用 .max sort key)。
+    /// timeout 默 5s——cellular 经 Surge ponte 路径首次握手可能慢
     static func probeAll(
         endpoints: [PeerEndpoint],
         secret: Data,
-        timeoutSec: TimeInterval = 3
+        timeoutSec: TimeInterval = 5
     ) async -> [Probe] {
         guard !endpoints.isEmpty else { return [] }
         let auth = HMACAuth(secret: secret)
@@ -49,7 +50,7 @@ enum EndpointPicker {
     static func pickBest(
         endpoints: [PeerEndpoint],
         secret: Data,
-        timeoutSec: TimeInterval = 3
+        timeoutSec: TimeInterval = 5
     ) async -> PeerEndpoint? {
         let probes = await probeAll(endpoints: endpoints, secret: secret, timeoutSec: timeoutSec)
         return probes.first(where: { $0.ok })?.endpoint
@@ -71,12 +72,14 @@ enum EndpointPicker {
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
 
-        // TrustAnyDelegate 接受任何 cert——.local hostname 走 Tailscale cert TLS 不匹配
-        // 需要 bypass(HMAC 签名兜底防 MitM)。Tailscale FQDN 走默认信任也通过
+        // TrustAnyDelegate 接受任何 cert——.local / *.sgponte hostname 跟 Tailscale cert
+        // 不匹配需要 bypass(HMAC 签名兜底防 MitM)。Tailscale FQDN 走默认信任也通过
         let delegate = TrustAnyDelegate()
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 3
-        cfg.timeoutIntervalForResource = 5
+        // request + resource 双层 timeout 都设到 timeoutSec,避免 DNS 阻塞早早超时但
+        // resource 长 timeout 让总体等更久
+        cfg.timeoutIntervalForRequest = timeoutSec
+        cfg.timeoutIntervalForResource = timeoutSec + 2
         cfg.urlCache = nil
         let session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }

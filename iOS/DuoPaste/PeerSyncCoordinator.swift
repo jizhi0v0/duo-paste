@@ -174,14 +174,24 @@ final class PeerSyncCoordinator {
     }
 
     private func applyPick(endpoint: PeerEndpoint, rttMs: Int, secret: Data) {
-        // 1) 完全同 URL → noop
-        if currentEndpointURL == endpoint.url {
+        // 1) 同 URL + 已连接 → noop。但 status 处于 .error / .backoff 时不能 noop——
+        //    此前 probe 全失败 stamp 了 .error,这次同 URL 重新可达需要重启连接刷新 status
+        let wasHealthy: Bool = {
+            if case .connected = status { return true }
+            if case .connecting = status { return true }
+            return false
+        }()
+        if currentEndpointURL == endpoint.url, wasHealthy {
             return
         }
-        // 2) 已 pick 当前 endpoint + 当前 RTT 已知 → 跟新最优比,差不显著就不切
+        // 2) 不同 URL + 之前健康 + RTT 改善不显著 → 视为测量噪音不切。
+        //    `wasHealthy` 限定:之前没连上时(.error / .backoff)需要切到新 URL 恢复,
+        //    不该走稳定性 guard
         if let current = currentEndpointURL,
+           current != endpoint.url,
            let currentRTT = lastRTT[current],
            currentRTT > 0,
+           wasHealthy,
            Double(currentRTT - rttMs) / Double(currentRTT) < rttStableEpsilon {
             // 新最优只比当前快 < 20% → 视为噪音不切
             FileHandle.standardError.write(Data(
