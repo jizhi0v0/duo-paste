@@ -24,11 +24,18 @@ final class AppIconCache {
     /// nil → fetch 直接返 nil(等价"未配置")
     var fetcher: (@Sendable (String) async throws -> Data?)?
 
-    /// 磁盘持久化目录 — Caches/AppIcons/。系统在内存压力时会清掉,可接受
+    /// 磁盘持久化目录 — Caches/AppIcons/v<N>/。系统在内存压力时会清掉,可接受
     /// (下次启动重拉)。NSCachesDirectory 不进 iCloud backup。
+    ///
+    /// 路径里的 v<N> 是 encoder 格式版本 — daemon 端 encoder 升级(e.g. v2 干掉 dock
+    /// baseline shadow)时同步 bump 这个版本,老文件自然 orphan(iOS 会回收 Caches),
+    /// 新请求走新子目录 = 一定 miss → 拉新字节
+    private static let diskFormatVersion = 2
     private let diskDir: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        let dir = base.appendingPathComponent("AppIcons", isDirectory: true)
+        let dir = base
+            .appendingPathComponent("AppIcons", isDirectory: true)
+            .appendingPathComponent("v\(AppIconCache.diskFormatVersion)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()

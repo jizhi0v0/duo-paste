@@ -536,6 +536,14 @@ public struct Database: Sendable {
             """)
         }
 
+        m.registerMigration("v11_clear_app_icon_for_encoder_fix") { db in
+            // 老 encoder 走 image.cgImage(forProposedRect:),会把 NSImage 小 rep
+            // (32/64px)的 dock baseline shadow / 倒影烘进字节,iOS 卡片底部一条暗 strip。
+            // 新 encoder 直接挑最大 NSBitmapImageRep(1024px 干净 squircle)重绘。
+            // 清表让 daemon 重启后第一次 /app_icon/<bid> 自然 re-resolve 写入新字节
+            try db.execute(sql: "DELETE FROM app_icon;")
+        }
+
         return m
     }
 
