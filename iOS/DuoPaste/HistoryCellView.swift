@@ -315,6 +315,14 @@ struct HistoryCellView: View {
                     showBadge(.failed, autoHideMs: 1800)
                 }
             }
+        } else if item.kind == .file {
+            // .file kind text_full 是 Mac 上的文件路径——写到 iOS UIPasteboard 没有用
+            // (文件不在 iOS 上,paste 到别处只是个无意义路径字符串),而且 UCB 会把这字符串
+            // 送回 Mac 让 watcher 当 kind=text 重新 capture——跟原 kind=file 行 dedup
+            // miss (kind 不同就不 merge) → 出现重复 entry。
+            // 只 bump 不写 UIPasteboard,跨设备语义靠 POST /bump
+            UILatencyLog.mark("copy file: skip pasteboard write (bump only)", itemLogDetail())
+            flashCopied()
         } else {
             UILatencyLog.mark("copy text pasteboard set begin", itemLogDetail("chars=\(item.displayFull.count)"))
             UIPasteboard.general.string = item.displayFull
