@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import Vision
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import DuoPasteCore
 import DuoPasteSync
 
@@ -1358,6 +1360,7 @@ private struct IOSPairingPINSheet: View {
     @Binding var isPresented: Bool
 
     @State private var pin: String?
+    @State private var qrImage: NSImage?
     @State private var secondsLeft: Int = 0
     @State private var refreshTask: Task<Void, Never>?
     @State private var errorText: String?
@@ -1365,20 +1368,36 @@ private struct IOSPairingPINSheet: View {
     var body: some View {
         VStack(spacing: 16) {
             Text("iOS 配对")
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 20, weight: .semibold))
 
+            // QR 码 — iOS 一扫就拿到 host + port + tls + pin 自动配对
+            if let qrImage {
+                Image(nsImage: qrImage)
+                    .interpolation(.none)
+                    .resizable()
+                    .aspectRatio(1, contentMode: .fit)
+                    .frame(width: 260, height: 260)
+                    .background(Color.white)
+                    .padding(8)
+            } else if pin != nil {
+                ProgressView().frame(width: 260, height: 260)
+            }
+
+            // PIN 文本备份(iOS 不愿用相机时手动输入)
             if let pin {
-                // PIN 渲染:每位数字 monospaced + spacing 让远距离也能看清
-                HStack(spacing: 10) {
-                    ForEach(Array(pin), id: \.self) { ch in
-                        Text(String(ch))
-                            .font(.system(size: 36, weight: .bold, design: .monospaced))
-                            .frame(width: 36, height: 52)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                VStack(spacing: 4) {
+                    Text("或手动输入 PIN")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        ForEach(Array(pin), id: \.self) { ch in
+                            Text(String(ch))
+                                .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                .frame(width: 24, height: 34)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        }
                     }
                 }
-            } else {
-                ProgressView().frame(height: 52)
             }
 
             if let errorText {
@@ -1388,12 +1407,12 @@ private struct IOSPairingPINSheet: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             } else if secondsLeft > 0 {
-                Text("剩余 \(secondsLeft)s · iOS Settings → 发现的 Mac → 输入这串数字")
+                Text("剩余 \(secondsLeft)s · iOS DuoPaste 扫这个 QR")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
             } else {
-                Text("已过期 · 关闭后重新打开生成新 PIN")
+                Text("已过期 · 点重新生成")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
             }
@@ -1412,13 +1431,49 @@ private struct IOSPairingPINSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 360)
+        .frame(width: 320)
         .onAppear { generatePIN() }
         .onDisappear {
             refreshTask?.cancel()
             refreshTask = nil
             cancelPIN()
+            qrImage = nil  // 防 secret-containing image 在 onDisappear 残留 memory
         }
+    }
+
+    /// 选 host:tlsCertPath 文件 stem(Tailscale FQDN,跨 LAN 通) → fallback .local
+    private func resolveHost(cfg: Config) -> String {
+        if let cert = cfg.tlsCertPath {
+            let stem = (cert as NSString).lastPathComponent
+                .replacingOccurrences(of: ".crt", with: "")
+            if !stem.isEmpty { return stem }
+        }
+        let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
+        return hn.hasSuffix(".local") ? hn : "\(hn).local"
+    }
+
+    private func generateQR(pin: String) {
+        guard let deps = AppDelegate.shared?.dependencies else { return }
+        let cfg = deps.config
+        let payload: [String: Any] = [
+            "host": resolveHost(cfg: cfg),
+            "port": cfg.servePort,
+            "tls": cfg.serveTLS,
+            "pin": pin,
+            "v": 1,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let ci = filter.outputImage else { return }
+        let scale: CGFloat = 240 / ci.extent.width
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let context = CIContext()
+        guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return }
+        qrImage = NSImage(cgImage: cg, size: NSSize(width: 240, height: 240))
     }
 
     private func generatePIN() {
@@ -1431,6 +1486,7 @@ private struct IOSPairingPINSheet: View {
             let (newPin, sec) = await service.generatePIN()
             self.pin = newPin
             self.secondsLeft = sec
+            self.generateQR(pin: newPin)
             startCountdown()
         }
     }
