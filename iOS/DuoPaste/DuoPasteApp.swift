@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import OSLog
 import QuartzCore
+import DuoPasteCore
 
 enum UILatencyLog {
     private static let logger = Logger(subsystem: "io.duopaste.ios", category: "ui-latency")
@@ -23,6 +24,7 @@ struct DuoPasteApp: App {
     @State private var store: HistoryStore
     @State private var coordinator: PeerSyncCoordinator
     @State private var shareCoord = ShareCoordinator()
+    @Environment(\.scenePhase) private var scenePhase
 
     @AppStorage("peerURL") private var peerURL: String = ""
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
@@ -30,9 +32,14 @@ struct DuoPasteApp: App {
     init() {
         UILatencyLog.mark("app init begin")
         let store = HistoryStore()
+        // restore() 必须在 PeerSyncCoordinator 起 reconfigure 之前——否则 /since pull 跟
+        // 持久化文件 merge 时拿不到旧 cursor 之前的内容,首次 launch 重 pull 大量
+        store.restore()
         _store = State(initialValue: store)
         _coordinator = State(initialValue: PeerSyncCoordinator(store: store))
         UILatencyLog.mark("app state ready")
+        // BGTaskScheduler.register 必须在 init,不能延迟到 scenePhase
+        BackgroundPullService.register()
         Self.prewarmSystemServices()
         Self.cleanupShareTempFiles()
         UILatencyLog.mark("app init end")
@@ -51,6 +58,22 @@ struct DuoPasteApp: App {
                         urlString: peerURL, secretHex: sharedSecretHex
                     ) {
                         coordinator.reconfigure(cfg)
+                    }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    switch phase {
+                    case .background:
+                        // app 进后台:持久化 + 申请下次 background refresh
+                        store.persist()
+                        BackgroundPullService.scheduleNext()
+                    case .active:
+                        // 回前台:磁盘可能被 BG task 更新,merge 一次让 UI 显示最新
+                        if let data = try? Data(contentsOf: HistoryStore.itemsFile),
+                           let restored = try? JSONDecoder().decode([Item].self, from: data) {
+                            store.merge(restored)
+                        }
+                    default:
+                        break
                     }
                 }
         }

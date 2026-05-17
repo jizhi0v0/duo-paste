@@ -119,6 +119,32 @@ actor PeerClient {
         return data
     }
 
+    // MARK: - POST /bump/<id>
+
+    /// 跨设备一致"复制即顶":iOS tap 某条 → Mac DB bump captured/ingested_at_ns →
+    /// broadcaster 推 cursor_advanced → 其他 peer 通过 PullWorker 看到这条顶到前面。
+    /// body 空,id 在 path 里被 HMAC 签名覆盖。
+    ///
+    /// 错误处理:404 → `.itemNotFound`(本机历史可能比 Mac DB 新,正常,swallow 不影响 UX);
+    /// 410 → `.itemTombstoned`(Mac 端已软删,本机视图过期,swallow);其他 throw 让上层决定
+    func bumpItem(id: String) async throws {
+        let path = "/bump/\(id)"
+        let url = config.baseURL.appendingPathComponent(path)
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        // 显式 0-byte body 让 URLSession 不去 sniff 自动补 Content-Length
+        req.httpBody = Data()
+        sign(&req, method: "POST", signedPath: path, bodyHash: HMACAuth.emptyBodyHashHex)
+        let (_, resp) = try await session.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw PeerClientError.nonHTTP }
+        switch http.statusCode {
+        case 200...299: return
+        case 404: throw PeerClientError.itemNotFound
+        case 410: throw PeerClientError.itemTombstoned
+        default: throw PeerClientError.httpStatus(http.statusCode)
+        }
+    }
+
     // MARK: - 内部
 
     private func sign(
@@ -176,6 +202,8 @@ enum PeerClientError: LocalizedError {
     case nonHTTP
     case httpStatus(Int)
     case shaMismatch(expected: String, actual: String)
+    case itemNotFound      // POST /bump:server 没这条 id
+    case itemTombstoned    // POST /bump:server 上已软删
 
     var errorDescription: String? {
         switch self {
@@ -185,6 +213,10 @@ enum PeerClientError: LocalizedError {
             return "HTTP \(code)"
         case .shaMismatch(let e, let a):
             return "blob SHA 不匹配（期望 \(String(e.prefix(12)))…, 实际 \(String(a.prefix(12)))…）"
+        case .itemNotFound:
+            return "对端无此条目"
+        case .itemTombstoned:
+            return "对端已删除此条目"
         }
     }
 }

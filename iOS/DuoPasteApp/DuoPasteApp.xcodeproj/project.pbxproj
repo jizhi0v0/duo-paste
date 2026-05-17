@@ -22,6 +22,9 @@
 		C5EF4C3A2FB990A3004E643A /* BlobCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5EF4C372FB990A3004E643A /* BlobCache.swift */; };
 		C5EF4C3C2FB999F9004E643A /* ShareCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5EF4C3B2FB999F9004E643A /* ShareCoordinator.swift */; };
 		C5EF4D012FB9A001004E643A /* AppIconCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5EF4D002FB9A001004E643A /* AppIconCache.swift */; };
+		D1A00010000000000000A001 /* PeerDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00010000000000000B001 /* PeerDiscovery.swift */; };
+		D1A00020000000000000A002 /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00020000000000000B002 /* QRScannerView.swift */; };
+		D1A00030000000000000A003 /* BackgroundPullService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00030000000000000B003 /* BackgroundPullService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,6 +43,9 @@
 		C5EF4C372FB990A3004E643A /* BlobCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlobCache.swift; sourceTree = "<group>"; };
 		C5EF4C3B2FB999F9004E643A /* ShareCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareCoordinator.swift; sourceTree = "<group>"; };
 		C5EF4D002FB9A001004E643A /* AppIconCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIconCache.swift; sourceTree = "<group>"; };
+		D1A00010000000000000B001 /* PeerDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDiscovery.swift; sourceTree = "<group>"; };
+		D1A00020000000000000B002 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
+		D1A00030000000000000B003 /* BackgroundPullService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundPullService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -96,6 +102,9 @@
 				C502A56B2FB97CE00055B250 /* PeerWebSocket.swift */,
 				C502A56C2FB97CE00055B250 /* RootView.swift */,
 				C502A56D2FB97CE00055B250 /* SettingsView.swift */,
+				D1A00010000000000000B001 /* PeerDiscovery.swift */,
+				D1A00020000000000000B002 /* QRScannerView.swift */,
+				D1A00030000000000000B003 /* BackgroundPullService.swift */,
 			);
 			name = DuoPaste;
 			path = ../DuoPaste;
@@ -194,6 +203,9 @@
 				C502A5782FB97CE00055B250 /* HistoryCellView.swift in Sources */,
 				C502A5792FB97CE00055B250 /* HistoryStore.swift in Sources */,
 				C502A57A2FB97CE00055B250 /* Models.swift in Sources */,
+				D1A00010000000000000A001 /* PeerDiscovery.swift in Sources */,
+				D1A00020000000000000A002 /* QRScannerView.swift in Sources */,
+				D1A00030000000000000A003 /* BackgroundPullService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -332,6 +344,11 @@
 				DEVELOPMENT_TEAM = RS59HDH7Y3;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers = "io.duopaste.ios.background-pull";
+				INFOPLIST_KEY_NSBonjourServices = "_duopaste._tcp";
+				INFOPLIST_KEY_NSCameraUsageDescription = "扫描 Mac 显示的配对二维码,自动填好 peer URL + secret。";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "在同 Wi-Fi 网段发现 Mac daemon 让配对零手填。";
+				INFOPLIST_KEY_UIBackgroundModes = "fetch";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -367,6 +384,11 @@
 				DEVELOPMENT_TEAM = RS59HDH7Y3;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers = "io.duopaste.ios.background-pull";
+				INFOPLIST_KEY_NSBonjourServices = "_duopaste._tcp";
+				INFOPLIST_KEY_NSCameraUsageDescription = "扫描 Mac 显示的配对二维码,自动填好 peer URL + secret。";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "在同 Wi-Fi 网段发现 Mac daemon 让配对零手填。";
+				INFOPLIST_KEY_UIBackgroundModes = "fetch";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

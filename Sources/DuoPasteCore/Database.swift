@@ -738,4 +738,41 @@ public struct Database: Sendable {
             return true
         }
     }
+
+    /// 把单行 `captured_at_ns` 顶到 `now`(或 max+1 单增兜底)+ bump `ingested_at_ns` 让
+    /// /since cursor 推进让对端通过 PullWorker 看到这条变化。**不动 `origin_device`**——
+    /// 顶是时间属性变化,不是归属变化(剪贴板心智:任意 peer 都能把任意 origin 的行顶上去)。
+    ///
+    /// 用途:跨设备一致的"复制即顶"。iOS tap 自己历史里的某条 → POST /bump/<id> →
+    /// Mac handler 调本函数。Mac 端 capture(原始路径)走 ingestText/Blob 的 merge 分支也
+    /// 自然 bump,这里是给"非 capture 触发"路径用的独立入口。
+    ///
+    /// 不变量:
+    /// - **writer tx 内调 nextIngestNs**(同 ingestText/Blob 路径)——保 /since cursor 单增
+    /// - tombstone (deleted_at_ns 非 nil) 拒 bump,抛 `.deleted`
+    /// - 不存在的 id 抛 `.notFound`
+    /// - captured_at_ns 用 max(now, prev+1) 避免回退(now 来自 wall clock 可能漂移)
+    public func bumpCapturedAt(id: String, now: Int64) async throws -> Int64 {
+        try await pool.write { db in
+            guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
+                throw BumpError.notFound
+            }
+            if row.deletedAtNs != nil {
+                throw BumpError.deleted
+            }
+            let newCap = Swift.max(now, row.capturedAtNs &+ 1)
+            let newIngest = try Self.nextIngestNs(db, now: now)
+            try db.execute(sql: """
+                UPDATE item
+                SET captured_at_ns = ?, ingested_at_ns = ?
+                WHERE id = ?
+            """, arguments: [newCap, newIngest, id])
+            return newIngest
+        }
+    }
+}
+
+public enum BumpError: Error, Equatable {
+    case notFound
+    case deleted
 }

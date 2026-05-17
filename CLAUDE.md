@@ -1,5 +1,5 @@
 - **同步路径**：每个 peer 一对 `(PullWorker, WSNotificationClient)`。PullWorker 周期 `/since` 拉对端增量到本机 item 表（origin=对端 device_id）；WSNotificationClient 长连接订阅对端 `/sync/ws` cursor_advanced 帧 → 收到立即 `worker.wake()` 跳过 sleep（< 1s 同步延迟）。WS 断了自然退化为周期 pull
-- **HTTP routes**：仅剩 `GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /sync/ws`（HTTP Upgrade）。`POST /ingest` + `PUT/HEAD /blob` + `GET /search` 都已删（PR 4 + PR 6）
+- **HTTP routes**：`GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /sync/ws`（HTTP Upgrade）+ `GET /app_icon/<bundleID>` + `POST /bump/<id>`（plan #2，跨设备一致"复制即顶"：iOS tap → Mac DB bump captured/ingested_at_ns → broadcaster fan-out → 其他 peer 通过 PullWorker 看到）。`POST /ingest` + `PUT/HEAD /blob` + `GET /search` 都已删（PR 4 + PR 6）
 - **CaptureService**：永远走 `Database.nextIngestNs` stamp（writer tx 内）；merge candidate 查询带 `origin_device == selfDeviceID` 过滤防 bump 对端行；commit 后回调 `onCursorAdvanced` 闭包让 server 端 `WSBroadcaster` fan-out
 - **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → text-fold（跨 origin 同 text_full 折一条，pinned OR 聚合）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量
 - **SearchProvider.Mode**：仅 `.local` / `.mesh(stalenessSec:)`，删 `.remoteOK / .remoteFallback / .localMirror`。永远走本机 fold 不打远端，跨设备 chip 总数自动对齐
@@ -11,7 +11,13 @@
 - **WS auth rotation**：`mesh.ws_rotation_sec`（默 4h，0 = 关）控制 WSBroadcaster 每周期主动 close 所有连接。合法 client 走 backoff 重连 + 重 HMAC upgrade（用最新 secret），shared-secret 被窃取后能监听窗口压到 ≤ 这个值
 - **依赖**：GRDB 7.10.0 + Hummingbird 2.22.0 + HummingbirdTLS + hummingbird-websocket 2.6.0
 - **测试**：~270 个，PullWorker / BlobLazyPull 集成测试**已知偶发并发 flake**（端口/SQLite 竞争——全集跑挂、单跑必绿），用 `swift test --filter PullWorkerTests` / `--filter BlobLazyPullTests` 单独验证
-- **下一站**（plan 之外可选）：M4 导出 / pinned UI / 快捷键自定义 / 自定义时间 picker；iOS peer (M5)
+- **iOS 端**（M5）：
+  - **WS zombie 检测**：iOS URLSessionWebSocketTask 没协议层 PING 路径，走应用层 `WSMessage.ping/.pong` 心跳——`PeerWebSocket.pingLoop` 每 30s 发 ping，10s 内没 pong → 抛 `WSError.pongTimeout` 触发重连。`PeerSyncCoordinator` 加 5s tick + 90s heartbeat staleness 兜底降级到 `.error("链路无响应")`
+  - **POST /bump 客户端**：`HistoryCellView.triggerCopy` 先 `store.bumpToFront` 乐观顶 + UCB 写 pasteboard，**再** `coordinator.bumpItemOnServer` async 让 Mac DB 也顶。404/410 swallow，best-effort 跨设备一致
+  - **Bonjour 发现 + QR 配对**：Mac daemon `BonjourAdvertiser` 用 NetService publish `_duopaste._tcp` (NWListener 强制绑端口、SyncServer 已占，所以走 NetService) + Settings 显示二维码（60s 倒计时，QR 含 url + secret hex）；iOS `PeerDiscovery` NWBrowser + `QRScannerView` AVCaptureSession 扫码自动填字段。Info.plist 需配 `NSBonjourServices=_duopaste._tcp` / `NSCameraUsageDescription` / `NSLocalNetworkUsageDescription`
+  - **BlobCache 磁盘 + LRU**：`Caches/Blobs/v1/<ab>/<cd>/<sha>.bin` 三层目录持久化跨启动。500MB cap 按 mtime 升序 evict。Detached IO 避免大图同步读卡 main actor
+  - **后台 pull**：`BackgroundPullService` 用 BGAppRefreshTask（identifier `io.duopaste.ios.background-pull`，Info.plist `BGTaskSchedulerPermittedIdentifiers` + `UIBackgroundModes=fetch`），系统 best-effort 唤醒拉 /since 几页 + 持久化到 `Caches/HistoryStore/items.json`。app `scenePhase=.active` 时 merge 磁盘内容到 store。WS 后台不能跑（iOS 限制），降级周期 HTTP pull
+- **下一站**（plan 之外可选）：M4 导出 / pinned UI / 快捷键自定义 / 自定义时间 picker
 
 ## 架构与 Non-Goals
 

@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import Vision
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import DuoPasteCore
 import DuoPasteSync
 
@@ -528,6 +530,8 @@ private struct GeneralPane: View {
                 }
                 SettingsNoteRow(text: "超过上限时 capture 跳过入库，剪贴板本身仍可 Cmd+V 粘贴。")
             }
+
+            IOSPairingGroup(model: model)
         }
     }
 
@@ -1311,5 +1315,167 @@ private struct GlassActionButton: View {
         } else {
             shape.fill(isProminent ? Color.accentColor : Color.primary.opacity(0.1))
         }
+    }
+}
+
+// MARK: - iOS 配对(Bonjour + QR)
+
+/// daemon 在 serve=true 时通过 BonjourAdvertiser 广播 `_duopaste._tcp`,iOS Settings
+/// 端 NWBrowser 浏到本机后用户 tap → 弹 QR 扫描。Mac 这边需要 user 主动展开 QR 才显示
+/// (含 shared-secret hex)——默认隐藏防止 secret 长期在屏幕上裸奔。60s 自动隐藏。
+@MainActor
+private struct IOSPairingGroup: View {
+    @Bindable var model: SettingsModel
+    @State private var showQR: Bool = false
+
+    var body: some View {
+        SettingsGroup(title: "iOS 配对") {
+            SettingsRow(title: "广播状态", subtitle: model.config.serve
+                        ? "本机 daemon serve=true → Bonjour 广播 _duopaste._tcp · iOS Settings 可见"
+                        : "未开启 serve → iOS 看不到本机。先开 serve 再来配对",
+                        isFirst: true) {
+                Text(model.config.serve ? "ON" : "OFF")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(model.config.serve ? Color.green : Color.secondary)
+            }
+            SettingsRow(title: "二维码配对") {
+                Button("显示二维码") {
+                    showQR = true
+                }
+                .controlSize(.small)
+                .disabled(!model.config.serve)
+            }
+            SettingsNoteRow(text: "QR 含 baseURL + shared-secret hex。iOS Settings 的「扫描 QR」对准 → 自动填好。窗口 60s 后自动消失防 secret 暴露。")
+        }
+        .sheet(isPresented: $showQR) {
+            IOSPairingQRSheet(model: model, isPresented: $showQR)
+        }
+    }
+}
+
+@MainActor
+private struct IOSPairingQRSheet: View {
+    let model: SettingsModel
+    @Binding var isPresented: Bool
+
+    @State private var qrImage: NSImage?
+    @State private var secondsLeft: Int = 60
+    @State private var countdownTask: Task<Void, Never>?
+    @State private var errorText: String?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("iOS 配对")
+                .font(.system(size: 18, weight: .semibold))
+            if let img = qrImage {
+                Image(nsImage: img)
+                    .interpolation(.none)
+                    .resizable()
+                    .aspectRatio(1, contentMode: .fit)
+                    .frame(width: 240, height: 240)
+            } else {
+                ProgressView().frame(width: 240, height: 240)
+            }
+            if let errorText {
+                Text(errorText)
+                    .foregroundStyle(.red)
+                    .font(.system(size: 12))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            } else {
+                Text("剩余 \(secondsLeft)s · iOS 选「扫描 QR」对准这里")
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+            }
+            HStack {
+                Button("关闭") { isPresented = false }
+                    .keyboardShortcut(.escape)
+            }
+        }
+        .padding(24)
+        .frame(width: 320)
+        .onAppear {
+            generateQR()
+            startCountdown()
+        }
+        .onDisappear {
+            countdownTask?.cancel()
+            countdownTask = nil
+            qrImage = nil  // GC secret-containing image
+        }
+    }
+
+    private func generateQR() {
+        guard let payload = makePairingPayload() else { return }
+        qrImage = QRGenerator.makeImage(from: payload, size: 240)
+    }
+
+    /// 生成 QR 内容:JSON {url, secret}。URL 用 hostname.local + port,iOS 通过 Bonjour
+    /// resolve 也走同 hostname,两路一致。secret 是 64 字符 hex。
+    /// 失败(secret 读不出 / serve_host 异常)→ errorText 显示原因
+    private func makePairingPayload() -> String? {
+        guard let deps = AppDelegate.shared?.dependencies else {
+            errorText = "daemon 未启动"
+            return nil
+        }
+        do {
+            let secretBytes = try SharedSecret.load(from: deps.paths.sharedSecretFile)
+            let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
+            let cfg = deps.config
+            let scheme = cfg.serveTLS ? "https" : "http"
+            let host = preferredHost(cfg: cfg)
+            let url = "\(scheme)://\(host):\(cfg.servePort)"
+            let payload: [String: String] = ["url": url, "secret": secretHex, "v": "1"]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            return String(data: data, encoding: .utf8)
+        } catch {
+            errorText = "读 secret 失败: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    /// 选 host 顺序:tlsCertPath 文件名(即 tailscale cert hostname,跨 LAN/WAN 通) →
+    /// .local hostname(Bonjour 路径) → serve_host(可能 0.0.0.0,fallback)
+    private func preferredHost(cfg: Config) -> String {
+        if let cert = cfg.tlsCertPath {
+            let stem = (cert as NSString).lastPathComponent
+                .replacingOccurrences(of: ".crt", with: "")
+            if !stem.isEmpty { return stem }
+        }
+        let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
+        // Host.current().name 可能是 "Bobbys-Mac.local",已含 .local——不重复加
+        return hn.hasSuffix(".local") ? hn : "\(hn).local"
+    }
+
+    private func startCountdown() {
+        countdownTask?.cancel()
+        countdownTask = Task { @MainActor in
+            for s in stride(from: 59, through: 0, by: -1) {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                self.secondsLeft = s
+                if s == 0 {
+                    self.isPresented = false
+                    return
+                }
+            }
+        }
+    }
+}
+
+/// 用 CoreImage QR generator 生成 PNG/NSImage。size 是输出像素边长,
+/// 内部 nearest-neighbor 放大让 QR 边缘锐利不糊
+enum QRGenerator {
+    static func makeImage(from string: String, size: CGFloat) -> NSImage? {
+        guard let data = string.data(using: .utf8) else { return nil }
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let ci = filter.outputImage else { return nil }
+        let scale = size / ci.extent.width
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let context = CIContext()
+        guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: size, height: size))
     }
 }

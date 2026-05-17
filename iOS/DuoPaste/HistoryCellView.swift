@@ -18,6 +18,7 @@ struct HistoryCellView: View {
     @Environment(AppIconCache.self) private var appIcons
     @Environment(HistoryStore.self) private var store
     @Environment(ShareCoordinator.self) private var shareCoord
+    @Environment(PeerSyncCoordinator.self) private var coordinator
     @State private var copyPulse: Int = 0
     @State private var copyState: CopyState = .idle
     @State private var copyBadgeTask: Task<Void, Never>?
@@ -286,6 +287,9 @@ struct HistoryCellView: View {
         UILatencyLog.mark("copy action begin", itemLogDetail())
         // 乐观顶 — 立即本机重排,不等 Mac UCB → /since 链路。详见 HistoryStore.bumpToFront
         store.bumpToFront(id: item.id)
+        // 跨设备一致:POST /bump 让 Mac DB 也顶 → 其他 peer 通过 cursor_advanced 看到。
+        // best-effort,swallow 错误(网络抖 / 404 都不影响本机已完成的复制)
+        coordinator.bumpItemOnServer(id: item.id)
 
         if item.kind == .image, let sha = item.blobSha256 {
             if let cached = blobs.cached(sha) {

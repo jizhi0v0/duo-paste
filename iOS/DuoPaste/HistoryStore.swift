@@ -76,4 +76,71 @@ final class HistoryStore {
         items = []
         query = ""
     }
+
+    // MARK: - 磁盘持久化
+
+    /// 持久化文件:Caches/HistoryStore/items.json + cursor.json。NSCachesDirectory 可被
+    /// 系统在压力下回收(可接受——下次启动 from cursor=.zero 重新拉满 history)
+    nonisolated static var persistenceDir: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent("HistoryStore", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+    nonisolated static var itemsFile: URL { persistenceDir.appendingPathComponent("items.json") }
+    nonisolated static var cursorFile: URL { persistenceDir.appendingPathComponent("cursor.json") }
+
+    /// 限 maxItems(默 1000)防文件无限增长。debounce 在调用方控制——
+    /// 每条 merge 都写盘太频繁,DuoPasteApp 控制按 scenePhase / 阶段触发
+    func persist(maxItems: Int = 1000) {
+        let snapshot = Array(items.prefix(maxItems))
+        let url = Self.itemsFile
+        Task.detached(priority: .utility) {
+            do {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(snapshot)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                FileHandle.standardError.write(Data("HistoryStore.persist failed: \(error)\n".utf8))
+            }
+        }
+    }
+
+    /// app launch 调一次:读 items.json → 填 self.items。失败/不存在 → 留空走正常 /since 拉。
+    /// **必须**在 coordinator.reconfigure 前调,否则 /since 拉的页跟磁盘已有 merge 时拿不到
+    /// 旧 cursor 之前的内容(BGAppRefreshTask 写了但 coordinator 不知道,会重 pull 大量)
+    func restore() {
+        guard let data = try? Data(contentsOf: Self.itemsFile),
+              let restored = try? JSONDecoder().decode([Item].self, from: data) else {
+            return
+        }
+        self.items = restored
+    }
+}
+
+/// 给后台 pull task 用的"上次 sync 到哪了"持久化。背景 task 在没 PeerSyncCoordinator
+/// 内存状态时也能从这恢复 cursor 继续拉,不重头 pull。
+struct PersistedCursor: Codable {
+    let ingestedAtNs: Int64
+    let id: String
+    let updatedAtUnix: Int64
+
+    static func load() -> PersistedCursor? {
+        guard let data = try? Data(contentsOf: HistoryStore.cursorFile),
+              let c = try? JSONDecoder().decode(PersistedCursor.self, from: data) else {
+            return nil
+        }
+        return c
+    }
+
+    func save() {
+        let url = HistoryStore.cursorFile
+        do {
+            let data = try JSONEncoder().encode(self)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            FileHandle.standardError.write(Data("PersistedCursor.save failed: \(error)\n".utf8))
+        }
+    }
 }

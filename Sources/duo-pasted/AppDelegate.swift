@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkey: GlobalHotKey!
     private var snapshotScheduler: SnapshotScheduler!
     private var serverTask: Task<Void, Never>?
+    private var bonjourAdvertiser: BonjourAdvertiser?
     /// Mesh peer 拉取入口。PR 2 单 peer 部署下 supervisor 内只有一个 PullWorker，行为跟原
     /// `pullWorker: PullWorker?` 等价；PR 5 mesh-init 后多 peer 列表自然 fan-out 进 N 个 worker
     private var meshSupervisor: MeshSupervisor?
@@ -241,6 +242,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // shared-secret 重新做 HMAC upgrade，secret 被窃取后能监听窗口压到 ≤ rotation interval
             let broadcaster = deps.wsBroadcaster
             Task { await broadcaster.start() }
+            // Bonjour 广播让 iOS Settings 的"发现的 Mac"列表能看见这台。secret 不在 TXT 里——
+            // 走 QR 二次配对(Mac Settings 主动展开后 60s 内显示)
+            bonjourAdvertiser = BonjourAdvertiser(
+                port: deps.config.servePort,
+                deviceID: deps.deviceID,
+                tls: deps.config.serveTLS
+            )
+            bonjourAdvertiser?.start()
         }
         // PR 3 smart transport：mesh + paste-fetcher 都先 discover 学到对端 ponte_host，
         // 再按决定建 worker / fetcher。两者共享同一 discover 结果走同一 Task 串行启动避免

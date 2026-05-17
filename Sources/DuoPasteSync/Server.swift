@@ -82,10 +82,12 @@ public struct SyncServer: Sendable {
         Self.registerRoutes(
             on: router,
             deviceID: deviceID,
+            database: database,
             blobs: blobs,
             sinceAPI: SinceAPI(database: database),
             ponteHost: pontePeerHost,
-            appIconStore: appIconStore
+            appIconStore: appIconStore,
+            broadcaster: broadcaster
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -182,11 +184,28 @@ public struct SyncServer: Sendable {
                 Task { await broadcaster.unregister(connID) }
             }
 
-            // inbound for-await：消耗 client 端发的任何帧（当前协议 client 不主动发，
-            // 但跑完 stream 让 close 帧能传播 + autoPing pong 自动处理）
+            // inbound for-await：消耗 client 端发的应用层帧。
+            // - **应用层 ping → pong**：iOS URLSessionWebSocketTask 不暴露协议层 PING（hbws
+            //   `autoPing` 在 WebSocket 协议层透明跑），iOS client 走 `WSMessage.ping` 文本帧
+            //   做 zombie 检测；这里解码 + 回 `WSMessage.pong` 让 client 看到对端活着。
+            // - 其他类型（client 不应该发，但收到 noop 兼容）
+            // - 跑完 stream 让 close 帧能传播 + autoPing pong 自动处理
             do {
-                for try await _ in inbound.messages(maxSize: 64 * 1024) {
-                    // 当前协议 client → server 无业务消息；忽略
+                for try await message in inbound.messages(maxSize: 64 * 1024) {
+                    guard case .text(let s) = message else { continue }
+                    let wsmsg: WSMessage
+                    do { wsmsg = try WSMessage.decodeJSON(s) }
+                    catch { continue }  // 未知 / 损坏帧 → noop（防止 client bug 拖垮 server）
+                    if case .ping = wsmsg {
+                        let pong = WSMessage.pong(version: WSMessage.currentVersion)
+                        do {
+                            try await outbound.write(.text(try pong.encodeJSON()))
+                        } catch {
+                            FileHandle.standardError.write(Data("ws server pong write failed: \(error)\n".utf8))
+                            return
+                        }
+                    }
+                    // .pong / .hello / .cursorAdvanced from client → 当前协议无业务用途
                 }
             } catch {
                 // inbound 抛错（连接异常 / autoPing 超时 / decode 失败）→ 让 onUpgrade 返回，
@@ -215,10 +234,12 @@ public struct SyncServer: Sendable {
     static func registerRoutes<Ctx: RequestContext>(
         on router: Router<Ctx>,
         deviceID: String,
+        database: DuoPasteCore.Database,
         blobs: BlobStore,
         sinceAPI: SinceAPI,
         ponteHost: String? = nil,
-        appIconStore: AppIconStore? = nil
+        appIconStore: AppIconStore? = nil,
+        broadcaster: WSBroadcaster? = nil
     ) {
         router.get("/health") { _, _ -> Response in
             var payload: [String: String] = [
@@ -282,6 +303,51 @@ public struct SyncServer: Sendable {
         // 按 (ingested_at_ns, id) ASC 增量返回 item 表。空 cursor → 从头全量拉。
         // 包含软删行（mirror 需要 replay deletion）；过滤 ingested_at_ns IS NULL。
         // 响应：{ ok, items:[...], next_cursor:{ingested_at_ns,id}, has_more }
+        // POST /bump/{id}:把单行 captured_at_ns + ingested_at_ns 顶到当前最大。
+        // 让"复制即顶"跨设备一致——iOS tap 自己历史里某条 → POST /bump → Mac DB 改 →
+        // broadcaster 推 cursor_advanced → 其他 peer < 1s 看到这条在最前。
+        //
+        // 不接受 body(空 body hash),id 在 path 里被 HMAC 签名所覆盖。HMAC ts 窗口
+        // (默认 30s)兜底防 replay——精确的"幂等单次 bump" 由 sender 自己决定(剪贴板
+        // 心智:同 id 多次 bump 等价单次,因为每次都把 captured_at_ns 顶到 now)
+        router.post("/bump/:id") { request, context -> Response in
+            guard let id = context.parameters.get("id"), !id.isEmpty else {
+                return errorJSON(.badRequest, "missing id")
+            }
+            // 二次校验 body 跟 header 一致——middleware 不读 body,handler 自己再 sha 比对
+            // 防"合法签名 + 任意 body"绕过(虽然这个路由不读 body,但保持跟 /blob 同款防御)
+            let bodyBuf = try await request.body.collect(upTo: 16 * 1024)
+            let bodyHash = HMACAuth.sha256Hex(Data(buffer: bodyBuf))
+            let headerHash = request.headers[HTTPField.Name(HMACAuth.bodyHashHeader)!]?.lowercased() ?? ""
+            guard headerHash == bodyHash else {
+                return errorJSON(.unauthorized, "body sha mismatch")
+            }
+            let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+            do {
+                let newIngest = try await database.bumpCapturedAt(id: id, now: now)
+                // 通知 peer:本机 cursor 推进了。fan-out 失败 swallow——bump 本身已落库
+                if let broadcaster {
+                    Task {
+                        await broadcaster.broadcastCursorAdvanced(
+                            deviceID: deviceID,
+                            latestIngestedAtNs: newIngest
+                        )
+                    }
+                }
+                let payload: [String: Any] = ["ok": true, "ingested_at_ns": newIngest]
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                resp.headers[.contentType] = "application/json"
+                return resp
+            } catch BumpError.notFound {
+                return errorJSON(.notFound, "item not found")
+            } catch BumpError.deleted {
+                return errorJSON(.gone, "item is tombstoned")
+            } catch {
+                return errorJSON(.internalServerError, "bump failed: \(error)")
+            }
+        }
+
         router.get("/since") { request, _ -> Response in
             let q = parseSinceQuery(request.uri.queryParameters)
             do {

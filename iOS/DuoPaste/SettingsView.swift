@@ -6,6 +6,10 @@ struct SettingsView: View {
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
     @State private var lastParseError: String?
 
+    @State private var discovery = PeerDiscovery()
+    @State private var showScanner = false
+    @State private var pairingErrorText: String?
+
     var body: some View {
         NavigationStack {
             Form {
@@ -53,8 +57,86 @@ struct SettingsView: View {
                             .font(.callout)
                     }
                 }
+
+                discoverySection
             }
             .navigationTitle("设置")
+            .sheet(isPresented: $showScanner) {
+                QRScannerView(onScan: handleQRScan, isPresented: $showScanner)
+            }
+            .onAppear { discovery.start() }
+            .onDisappear { discovery.stop() }
+        }
+    }
+
+    /// Bonjour 浏 _duopaste._tcp + QR 配对 section。tap peer → 弹扫描 → 解析 QR → 填字段
+    @ViewBuilder
+    private var discoverySection: some View {
+        Section {
+            HStack {
+                Image(systemName: "wifi")
+                Text("发现的 Mac")
+                Spacer()
+                Text(discoveryStatusText)
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+            if discovery.peers.isEmpty {
+                Text("正在扫描同网段的 Mac… 确保 Mac daemon serve=true + 同 Wi-Fi")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            } else {
+                ForEach(discovery.peers) { peer in
+                    HStack {
+                        Image(systemName: peer.tls ? "lock.fill" : "lock.open")
+                            .foregroundStyle(peer.tls ? .green : .orange)
+                        VStack(alignment: .leading) {
+                            Text(peer.displayName)
+                            if let did = peer.deviceID {
+                                Text(did)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .monospaced()
+                            }
+                        }
+                        Spacer()
+                        Button("扫码配对") {
+                            showScanner = true
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+            }
+            if let pairingErrorText {
+                Text(pairingErrorText)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+            }
+        } header: {
+            Text("Bonjour 配对")
+        } footer: {
+            Text("Mac Settings > iOS 配对 > 显示二维码 → 用这边扫码自动填好。或继续手填上面字段。")
+        }
+    }
+
+    private var discoveryStatusText: String {
+        switch discovery.state {
+        case .idle: "未扫描"
+        case .browsing: "扫描中"
+        case .unauthorized: "需要 Local Network 权限"
+        case .failed(let m): "失败: \(m)"
+        }
+    }
+
+    private func handleQRScan(_ raw: String) {
+        do {
+            let payload = try PairingPayload.parse(raw)
+            peerURL = payload.url
+            sharedSecretHex = payload.secret
+            pairingErrorText = nil
+            applyConfig()
+        } catch {
+            pairingErrorText = "解析失败: \(error.localizedDescription)"
         }
     }
 
