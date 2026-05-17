@@ -146,7 +146,8 @@ struct PinPairingSheet: View {
                 let client = PeerClient(config: cfg)
                 let page = try await client.fetchEndpoints()
 
-                // 让 coordinator 接管:probe + 选最快 + reconfigure + 起 WS
+                // 让 coordinator 接管:probe + 选最快 + reconfigure + 起 WS。
+                // resp.deviceID 透传给 SettingsView 持久化作为"已配对的 Mac"显示名
                 onPaired(resp.secret, resp.deviceID, page)
                 stage = .waitingConnect
 

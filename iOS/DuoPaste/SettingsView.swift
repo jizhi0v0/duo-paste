@@ -5,22 +5,40 @@ struct SettingsView: View {
     @Environment(PeerSyncCoordinator.self) private var coordinator
     @AppStorage("peerURL") private var peerURL: String = ""
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
-    /// 配对完成后持久化的 endpoint 候选 list(JSON)。重启 app 后能从这恢复 +
-    /// 网络变 / 周期 timer 时重 probe 选最快
     @AppStorage("peerEndpointsJSON") private var peerEndpointsJSON: String = ""
+    /// 配对完成时存的显示名(Bonjour 路径 = peer.displayName,QR 路径 = host),
+    /// 让"已配对的 Mac"行可读
+    @AppStorage("pairedDisplayName") private var pairedDisplayName: String = ""
+    /// 配对完成时存的对端 device_id 头 8 字符,辅助显示
+    @AppStorage("pairedDeviceID") private var pairedDeviceID: String = ""
+
     @State private var alertText: String?
     @State private var showAlert: Bool = false
-
     @State private var discovery = PeerDiscovery()
     @State private var selectedPeer: PeerDiscovery.DiscoveredPeer?
     @State private var qrPayload: QRPayload?
     @State private var showQRScanner: Bool = false
 
+    /// 是否已配对(有 secret + endpoints)。配对 ≠ 连接——可以已配对+离线
+    private var isPaired: Bool {
+        !sharedSecretHex.isEmpty && !peerEndpointsJSON.isEmpty
+    }
+
+    /// 是否真连上了
+    private var isConnected: Bool {
+        if case .connected = coordinator.status { return true }
+        return false
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                statusSection
-                pairingSection
+                if isPaired {
+                    statusSection
+                    pairedMacSection
+                } else {
+                    pairingSection
+                }
             }
             .navigationTitle("设置")
             .sheet(item: $selectedPeer) { peer in
@@ -31,8 +49,11 @@ struct SettingsView: View {
                     tls: peer.tls,
                     prefilledPIN: nil,
                     isPresented: bonjourSheetBinding
-                ) { secret, _, page in
-                    handlePairingSuccess(secret: secret, page: page)
+                ) { secret, deviceID, page in
+                    handlePairingSuccess(
+                        secret: secret, deviceID: deviceID,
+                        page: page, displayName: peer.displayName
+                    )
                 }
             }
             .sheet(item: $qrPayload) { payload in
@@ -41,10 +62,13 @@ struct SettingsView: View {
                     host: payload.host,
                     port: payload.port,
                     tls: payload.tls,
-                    prefilledPIN: nil,  // QR 不含 PIN 防泄露,用户手输
+                    prefilledPIN: nil,
                     isPresented: qrSheetBinding
-                ) { secret, _, page in
-                    handlePairingSuccess(secret: secret, page: page)
+                ) { secret, deviceID, page in
+                    handlePairingSuccess(
+                        secret: secret, deviceID: deviceID,
+                        page: page, displayName: payload.host
+                    )
                 }
             }
             .sheet(isPresented: $showQRScanner) {
@@ -57,7 +81,7 @@ struct SettingsView: View {
             } message: {
                 Text(alertText ?? "")
             }
-            .onAppear { discovery.start() }
+            .onAppear { if !isPaired { discovery.start() } }
             .onDisappear { discovery.stop() }
         }
     }
@@ -69,6 +93,8 @@ struct SettingsView: View {
     private var qrSheetBinding: Binding<Bool> {
         Binding(get: { qrPayload != nil }, set: { if !$0 { qrPayload = nil } })
     }
+
+    // MARK: - 已配对场景
 
     @ViewBuilder
     private var statusSection: some View {
@@ -91,15 +117,54 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if !sharedSecretHex.isEmpty {
+            // 连接 / 断开 切换。断开只停连接,**保留**配对信息,允许"重新连接"
+            if isConnected {
                 Button(role: .destructive) {
-                    disconnectAndForget()
+                    coordinator.stop()
                 } label: {
                     Label("断开", systemImage: "stop.circle")
+                }
+            } else {
+                Button {
+                    reconnect()
+                } label: {
+                    Label("重新连接", systemImage: "arrow.clockwise")
                 }
             }
         }
     }
+
+    @ViewBuilder
+    private var pairedMacSection: some View {
+        Section {
+            HStack {
+                Image(systemName: "checkmark.shield.fill")
+                    .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pairedDisplayName.isEmpty ? "已配对的 Mac" : pairedDisplayName)
+                    if !pairedDeviceID.isEmpty {
+                        Text(pairedDeviceID)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button(role: .destructive) {
+                    unpair()
+                } label: {
+                    Label("取消配对", systemImage: "xmark.circle")
+                }
+            }
+        } header: {
+            Text("已配对")
+        } footer: {
+            Text("左滑取消配对。取消后 secret 本地清空,需重新走 PIN 配对。Mac 端无需通知——HMAC 失效后请求自动 401。")
+        }
+    }
+
+    // MARK: - 未配对场景
 
     @ViewBuilder
     private var pairingSection: some View {
@@ -163,6 +228,8 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - 文本/颜色
+
     private var discoveryStatusText: String {
         switch discovery.state {
         case .idle: "未扫描"
@@ -172,32 +239,50 @@ struct SettingsView: View {
         }
     }
 
+    /// 状态文本——`.unconfigured / .idle` 在已配对场景下要显示"已断开"而不是
+    /// "未配置"(未配置 = 没 secret,跟"配对了但停了连接"语义不同)
     private var statusText: String {
+        if isPaired {
+            switch coordinator.status {
+            case .idle, .unconfigured: return "已断开"
+            case .connecting: return "连接中"
+            case .connected(let pid, _): return "已连接 (\(String(pid.prefix(8))))"
+            case .backoff(let f): return "重试 #\(f)"
+            case .error(let m): return "错误: \(m)"
+            }
+        }
         switch coordinator.status {
-        case .idle: "—"
-        case .unconfigured: "未配置"
-        case .connecting: "连接中"
-        case .connected(let pid, _): "已连接 (\(String(pid.prefix(8))))"
-        case .backoff(let f): "重试 #\(f)"
-        case .error(let m): "错误: \(m)"
+        case .idle: return "—"
+        case .unconfigured: return "未配置"
+        case .connecting: return "连接中"
+        case .connected(let pid, _): return "已连接 (\(String(pid.prefix(8))))"
+        case .backoff(let f): return "重试 #\(f)"
+        case .error(let m): return "错误: \(m)"
         }
     }
 
+    /// 颜色:已配对+未连接 → 红;.connecting/.backoff → 橙;.connected → 绿
     private var statusColor: Color {
         switch coordinator.status {
         case .connected: .green
         case .error: .red
         case .connecting, .backoff: .orange
-        default: .secondary
+        case .idle, .unconfigured: isPaired ? .red : .secondary
         }
     }
 
-    /// 配对成功 → 持久化 secret + endpoints + coordinator 接管 probe + 选最快
-    private func handlePairingSuccess(secret: Data, page: PeerEndpointsPage) {
+    // MARK: - 动作
+
+    /// 配对成功 → 持久化全部 + coordinator 接管 probe + 选最快
+    private func handlePairingSuccess(
+        secret: Data, deviceID: String,
+        page: PeerEndpointsPage, displayName: String
+    ) {
         let secretHex = secret.map { String(format: "%02x", $0) }.joined()
         sharedSecretHex = secretHex
+        pairedDisplayName = displayName
+        pairedDeviceID = String(deviceID.prefix(36))
         let flat = PeerSyncCoordinator.flattenEndpoints(page)
-        // 持久化让重启后能从这恢复
         if let data = try? JSONEncoder().encode(flat),
            let json = String(data: data, encoding: .utf8) {
             peerEndpointsJSON = json
@@ -205,11 +290,36 @@ struct SettingsView: View {
         coordinator.reconfigureFromPairing(secret: secret, endpoints: flat)
     }
 
-    private func disconnectAndForget() {
+    /// 重新连接——用 AppStorage 里保存的 secret + endpoints,coordinator 走 probe 选最快
+    private func reconnect() {
+        guard !sharedSecretHex.isEmpty, !peerEndpointsJSON.isEmpty else {
+            presentAlert("配对信息丢失,请重新走 PIN 配对")
+            return
+        }
+        guard let data = peerEndpointsJSON.data(using: .utf8),
+              let endpoints = try? JSONDecoder().decode([PeerEndpoint].self, from: data),
+              let secret = Data(hexString: sharedSecretHex) else {
+            presentAlert("配对数据损坏,请取消配对后重新走 PIN")
+            return
+        }
+        coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
+    }
+
+    /// 取消配对——比"断开"更彻底:清持久化 + coordinator 停 + 回到未配对界面
+    private func unpair() {
         coordinator.stop()
         sharedSecretHex = ""
         peerURL = ""
         peerEndpointsJSON = ""
+        pairedDisplayName = ""
+        pairedDeviceID = ""
+        // 重新开 Bonjour discover 让用户能立即看到 Mac 列表配新对
+        discovery.start()
+    }
+
+    private func presentAlert(_ msg: String) {
+        alertText = msg
+        showAlert = true
     }
 }
 
