@@ -79,7 +79,11 @@ final class PeerSyncCoordinator {
     }
 
     func reconfigure(_ config: PeerConfig?) {
-        stop()
+        // **不调 stop()** ——stop() 在 nil 路径已经清,reconfigure 内部 cancelRuntimeTasks
+        // 让 currentEndpointURL / availableEndpoints / currentSecret 在 URL switch 时
+        // 保留(避免 applyPick 设了 currentEndpointURL 又被 stop 清掉的 race)
+        cancelRuntimeTasks()
+        lastProbes = []
         blobCache.resetAll()
         blobCache.fetcher = nil
         appIconCache.resetAll()
@@ -272,7 +276,9 @@ final class PeerSyncCoordinator {
         }
     }
 
-    func stop() {
+    /// 仅取消运行时 task / 连接,**不动 config**(currentSecret / availableEndpoints /
+    /// currentEndpointURL)。`reconfigure(cfg)` 内部用,switch URL 时让 config 保留
+    private func cancelRuntimeTasks() {
         ws?.stop()
         ws = nil
         pullTask?.cancel()
@@ -286,7 +292,20 @@ final class PeerSyncCoordinator {
         client = nil
         pendingAdvance = false
         lastConnectedStampAt = nil
-        // 清掉 endpoint 选择状态——避免 UI 残留候选列表 / "当前 URL" 在断开后还显示
+    }
+
+    /// 断开连接但**保留配对信息**——"已配对未连接"状态,可走 reconnect 直接复用。
+    /// `currentEndpointURL` / `availableEndpoints` / `currentSecret` 都保留,UI 可以
+    /// 显示"上次连接 URL = ..."当残留。lastProbes 是临时探活结果,清掉
+    func stop() {
+        cancelRuntimeTasks()
+        lastProbes = []
+        status = .unconfigured
+    }
+
+    /// 彻底重置——unpair / 切换设备用。清掉所有 config + runtime
+    func reset() {
+        cancelRuntimeTasks()
         currentEndpointURL = nil
         availableEndpoints = []
         currentSecret = nil

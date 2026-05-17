@@ -1363,15 +1363,25 @@ private struct IOSPairingPINSheet: View {
     @State private var qrImage: NSImage?
     @State private var secondsLeft: Int = 0
     @State private var refreshTask: Task<Void, Never>?
+    @State private var pollTask: Task<Void, Never>?
+    @State private var sessionStartedAt: Date?
+    @State private var paired: Bool = false
     @State private var errorText: String?
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("iOS 配对")
+            Text(paired ? "配对成功 ✓" : "iOS 配对")
                 .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(paired ? Color.green : Color.primary)
 
-            // QR 码 — iOS 一扫就拿到 host + port + tls + pin 自动配对
-            if let qrImage {
+            // 配对成功只显示绿色 checkmark 1.5s 后自动关
+            if paired {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 80))
+                    .foregroundStyle(.green)
+                    .frame(width: 260, height: 260)
+            } else if let qrImage {
+                // QR 码 — iOS 扫这个拿 host;PIN 用户手输让 QR 泄露 ≠ 配对失守
                 Image(nsImage: qrImage)
                     .interpolation(.none)
                     .resizable()
@@ -1383,10 +1393,10 @@ private struct IOSPairingPINSheet: View {
                 ProgressView().frame(width: 260, height: 260)
             }
 
-            // PIN 文本备份(iOS 不愿用相机时手动输入)
-            if let pin {
+            // PIN 文本(成功后隐藏)
+            if !paired, let pin {
                 VStack(spacing: 4) {
-                    Text("或手动输入 PIN")
+                    Text("PIN(扫码后输入)")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     HStack(spacing: 6) {
@@ -1400,14 +1410,18 @@ private struct IOSPairingPINSheet: View {
                 }
             }
 
-            if let errorText {
+            if paired {
+                Text("iOS 已拿到 secret + endpoints,正在连接…")
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+            } else if let errorText {
                 Text(errorText)
                     .foregroundStyle(.red)
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             } else if secondsLeft > 0 {
-                Text("剩余 \(secondsLeft)s · iOS DuoPaste 扫这个 QR")
+                Text("剩余 \(secondsLeft)s · iOS DuoPaste 扫这个 QR + 输上方 PIN")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
@@ -1418,10 +1432,12 @@ private struct IOSPairingPINSheet: View {
             }
 
             HStack(spacing: 12) {
-                Button("重新生成") {
-                    generatePIN()
+                if !paired {
+                    Button("重新生成") {
+                        generatePIN()
+                    }
+                    .controlSize(.small)
                 }
-                .controlSize(.small)
                 Button("关闭") {
                     cancelPIN()
                     isPresented = false
@@ -1436,6 +1452,8 @@ private struct IOSPairingPINSheet: View {
         .onDisappear {
             refreshTask?.cancel()
             refreshTask = nil
+            pollTask?.cancel()
+            pollTask = nil
             cancelPIN()
             qrImage = nil  // 防 secret-containing image 在 onDisappear 残留 memory
         }
@@ -1485,12 +1503,41 @@ private struct IOSPairingPINSheet: View {
             return
         }
         errorText = nil
+        paired = false
         Task { @MainActor in
             let (newPin, sec) = await service.generatePIN()
             self.pin = newPin
             self.secondsLeft = sec
+            self.sessionStartedAt = Date()
             self.generateQR(pin: newPin)
             startCountdown()
+            startPollingForConsumption()
+        }
+    }
+
+    /// 周期 500ms poll PairingService.snapshot,session 没了 + 最近被消费过
+    /// → 配对成功,显示 ✓ 1.5s 后自动关 sheet
+    private func startPollingForConsumption() {
+        pollTask?.cancel()
+        let startedAt = sessionStartedAt
+        pollTask = Task { @MainActor in
+            while !Task.isCancelled, !paired {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let service = AppDelegate.shared?.pairingService else { continue }
+                let snap = await service.snapshot()
+                // session 已消失 + 这次 session 期间消费过 → 配对成功
+                if !snap.active,
+                   let consumed = snap.lastConsumed,
+                   let started = startedAt,
+                   consumed >= started {
+                    paired = true
+                    refreshTask?.cancel()
+                    refreshTask = nil
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    isPresented = false
+                    return
+                }
+            }
         }
     }
 

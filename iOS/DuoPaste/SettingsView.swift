@@ -117,12 +117,19 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            // 连接 / 断开 切换。断开只停连接,**保留**配对信息,允许"重新连接"
+            // 连接 / 断开 / 连接中 三态:断开只停连接,**保留**配对信息;连接中
+            // 显示 disabled spinner 防多次点击触发重复 reconfigureFromPairing
             if isConnected {
                 Button(role: .destructive) {
                     coordinator.stop()
                 } label: {
                     Label("断开", systemImage: "stop.circle")
+                }
+            } else if isConnecting {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("连接中…")
+                        .foregroundStyle(.secondary)
                 }
             } else {
                 Button {
@@ -131,6 +138,13 @@ struct SettingsView: View {
                     Label("重新连接", systemImage: "arrow.clockwise")
                 }
             }
+        }
+    }
+
+    private var isConnecting: Bool {
+        switch coordinator.status {
+        case .connecting, .backoff: return true
+        default: return false
         }
     }
 
@@ -305,9 +319,10 @@ struct SettingsView: View {
         coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
     }
 
-    /// 取消配对——比"断开"更彻底:清持久化 + coordinator 停 + 回到未配对界面
+    /// 取消配对——比"断开"更彻底:走 coordinator.reset() 清所有 config + runtime,
+    /// 再清 AppStorage,回到未配对界面
     private func unpair() {
-        coordinator.stop()
+        coordinator.reset()
         sharedSecretHex = ""
         peerURL = ""
         peerEndpointsJSON = ""

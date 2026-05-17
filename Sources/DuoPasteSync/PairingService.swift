@@ -33,6 +33,9 @@ public actor PairingService {
     }
 
     private var currentSession: Session?
+    /// 最近一次 validateAndConsumePIN 成功的时刻——sheet polling 用,session nil 时
+    /// 区分"用过(成功)" vs "过期/取消"
+    private var lastConsumedAt: Date?
     private let pinLifetimeSec: TimeInterval
     private let maxFailedAttempts: Int
     /// secret 读取器闭包——daemon 启动时注入(读 SharedSecret.load)。每次 validate 成功
@@ -77,6 +80,12 @@ public actor PairingService {
         return (s.pin, s.secondsLeft)
     }
 
+    /// sheet polling 用——区分"PIN 已用过(配对成功)"vs"过期 / 用户取消"。
+    /// 返回 (session 是否还在, 是否最近被消费过)
+    public func snapshot() -> (active: Bool, lastConsumed: Date?) {
+        return (currentSession != nil && (currentSession?.secondsLeft ?? 0) > 0, lastConsumedAt)
+    }
+
     /// 手动取消(用户关闭 sheet 时调)
     public func cancel() {
         currentSession = nil
@@ -106,8 +115,9 @@ public actor PairingService {
             }
             throw Error.pinMismatch
         }
-        // 成功:消费 session 拿 secret
+        // 成功:消费 session 拿 secret + stamp consumed 时间让 sheet 知道"用过了"
         currentSession = nil
+        lastConsumedAt = Date()
         do {
             return try session.secretsProvider()
         } catch {
