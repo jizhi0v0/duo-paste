@@ -520,6 +520,22 @@ public struct Database: Sendable {
             """)
         }
 
+        m.registerMigration("v10_app_icon") { db in
+            // iOS / 远端 client 通过 /app_icon/<bundleID> 拉 PNG 字节。
+            // bundleID 作 PK = 多设备各自维护一份(无法天然 dedup,但单机 ~几百 KB 可忽略)。
+            // 内容字节由 NSWorkspace.icon 算出 + PNG encode,daemon 端注入 resolver;
+            // 缺失 app(用户已卸载)→ resolver 返 nil,本表不写入(每次请求都重 miss 也 OK,
+            // 走 nonAppBundleIDs 黑名单或 in-memory negative cache 减压)。
+            try db.execute(sql: """
+                CREATE TABLE app_icon (
+                    bundle_id     TEXT PRIMARY KEY,
+                    png_bytes     BLOB NOT NULL,
+                    fetched_at_ns INTEGER NOT NULL,
+                    app_version   TEXT
+                ) STRICT;
+            """)
+        }
+
         return m
     }
 

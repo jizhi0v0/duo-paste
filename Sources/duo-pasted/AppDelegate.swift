@@ -464,6 +464,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return SyncServer.TLSPaths(certPath: cert, keyPath: key)
             }()
+            // app_icon store:bundleID → PNG bytes(SQLite + 内存 negative cache),
+            // NSWorkspace resolver 注入 AppKit 拿 icon 渲染 128px PNG。
+            // iOS client 通过 GET /app_icon/<bundleID> 拉
+            let appIconStore = AppIconStore(
+                database: deps.database,
+                resolver: AppKitAppIconResolver.resolver()
+            )
             let server = SyncServer(
                 deviceID: deviceID,
                 database: deps.database,
@@ -472,7 +479,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 port: cfg.servePort,
                 auth: auth,
                 tls: tls,
-                broadcaster: deps.wsBroadcaster
+                broadcaster: deps.wsBroadcaster,
+                appIconStore: appIconStore
             )
             serverTask = Task.detached(priority: .utility) {
                 do {

@@ -44,6 +44,10 @@ public struct SyncServer: Sendable {
     /// 测试可注入固定值（避免依赖 dev mac 是否装了 Surge / 配了 Ponte）
     public let ponteHostProvider: @Sendable () -> String?
 
+    /// `/app_icon/<bundleID>` 路由背后的 store。nil → 路由 503(daemon 没启用 icon 服务,
+    /// 比如测试环境)。daemon 启动时构造好注入,内部 resolver 闭包从 AppKit 拿 NSWorkspace.icon
+    public let appIconStore: AppIconStore?
+
     public init(
         deviceID: String,
         database: DuoPasteCore.Database,
@@ -53,7 +57,8 @@ public struct SyncServer: Sendable {
         auth: HMACAuth,
         tls: TLSPaths? = nil,
         broadcaster: WSBroadcaster? = nil,
-        ponteHostProvider: @escaping @Sendable () -> String? = { SurgePonte.discoverSelfHostname() }
+        ponteHostProvider: @escaping @Sendable () -> String? = { SurgePonte.discoverSelfHostname() },
+        appIconStore: AppIconStore? = nil
     ) {
         self.deviceID = deviceID
         self.database = database
@@ -64,6 +69,7 @@ public struct SyncServer: Sendable {
         self.tls = tls
         self.broadcaster = broadcaster
         self.ponteHostProvider = ponteHostProvider
+        self.appIconStore = appIconStore
     }
 
     public func run() async throws {
@@ -78,7 +84,8 @@ public struct SyncServer: Sendable {
             deviceID: deviceID,
             blobs: blobs,
             sinceAPI: SinceAPI(database: database),
-            ponteHost: pontePeerHost
+            ponteHost: pontePeerHost,
+            appIconStore: appIconStore
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -210,7 +217,8 @@ public struct SyncServer: Sendable {
         deviceID: String,
         blobs: BlobStore,
         sinceAPI: SinceAPI,
-        ponteHost: String? = nil
+        ponteHost: String? = nil,
+        appIconStore: AppIconStore? = nil
     ) {
         router.get("/health") { _, _ -> Response in
             var payload: [String: String] = [
@@ -243,6 +251,30 @@ public struct SyncServer: Sendable {
                 return resp
             } catch {
                 return errorJSON(.internalServerError, "blob read failed: \(error)")
+            }
+        }
+
+        // GET /app_icon/{bundleID}：返回 macOS app icon PNG 字节。
+        // bundleID 含点(com.apple.Safari),: 不含,不需要 URL 编码。
+        // 未配 appIconStore → 503;app 没装 → 404;命中 → image/png 字节
+        if let store = appIconStore {
+            router.get("/app_icon/:bundle_id") { _, context -> Response in
+                guard let bid = context.parameters.get("bundle_id"), !bid.isEmpty else {
+                    return errorJSON(.badRequest, "missing bundle_id")
+                }
+                do {
+                    guard let bytes = try await store.iconPNG(forBundleID: bid) else {
+                        return Response(status: .notFound)
+                    }
+                    var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: bytes)))
+                    resp.headers[.contentType] = "image/png"
+                    // icon 字节不常变(app 升级后才换),客户端 cache 1 天降无效请求量。
+                    // bundleID 不在 cache key 里(URL 已含),浏览器 / URLSession 自动区分
+                    resp.headers[.cacheControl] = "public, max-age=86400"
+                    return resp
+                } catch {
+                    return errorJSON(.internalServerError, "app_icon lookup failed: \(error)")
+                }
             }
         }
 

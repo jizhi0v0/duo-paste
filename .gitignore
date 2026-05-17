@@ -5,6 +5,12 @@
 Packages/
 xcuserdata/
 DerivedData/
+
+# iOS app 的 xcodeproj 走白名单(对端 clone 后要能 build)
+!iOS/DuoPasteApp/DuoPasteApp.xcodeproj/
+iOS/DuoPasteApp/DuoPasteApp.xcodeproj/xcuserdata/
+iOS/DuoPasteApp/DuoPasteApp.xcodeproj/project.xcworkspace/xcuserdata/
+
 .DS_Store
 *.sqlite
 *.sqlite-journal
