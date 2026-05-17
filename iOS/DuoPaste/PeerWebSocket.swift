@@ -50,9 +50,12 @@ final class PeerWebSocket {
     }
 
     private(set) var state: State = .idle
-    private(set) var lastAdvanceNs: Int64 = 0
-    private(set) var lastHeartbeatAt: Date?
-    private var lastPongAt: Date?
+    /// **@ObservationIgnored** —— lastHeartbeatAt 每收一帧(ping/pong/cursor_advanced)
+    /// 都更新,UI 不显示这个值,被 @Observable tracker 抓到只会让 SettingsView 每帧重渲
+    /// (6 个 WS × 频繁更新 = MainActor 队列爆)。pool 只内部读它做 zombie 检测,不参与 UI
+    @ObservationIgnored private(set) var lastHeartbeatAt: Date?
+    @ObservationIgnored private(set) var lastAdvanceNs: Int64 = 0
+    @ObservationIgnored private var lastPongAt: Date?
 
     private let config: PeerConfig
     private let auth: HMACAuth

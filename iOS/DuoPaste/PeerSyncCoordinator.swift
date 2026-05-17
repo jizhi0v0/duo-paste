@@ -78,25 +78,22 @@ final class PeerSyncCoordinator {
         }
         let url: String
         let phase: Phase
-        let lastHeartbeatAt: Date?
     }
 
-    /// 把 pool 状态扁平成 URL → phase 给 UI 渲染。pool nil → absent
+    /// 单 URL phase 查询——**只读两个 Observable**(pool.sockets + 指定 ws.state),
+    /// 不再走 pool.snapshot() 遍历全部 6 个 sub WS。避免 SettingsView 6 行 ForEach
+    /// 每渲染读 78 个 Observable 让 SwiftUI 重渲队列堆积 freeze MainActor
     func poolStatus(for url: String) -> PoolURLStatus {
-        guard let pool = wsPool else {
-            return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil)
+        guard let pool = wsPool, let ws = pool.sockets[url] else {
+            return PoolURLStatus(url: url, phase: .absent)
         }
-        let socks = pool.snapshot()
-        if let s = socks.first(where: { $0.url == url }) {
-            let phase: PoolURLStatus.Phase = switch s.state {
-            case .connected: .connected
-            case .connecting: .connecting
-            case .backoff, .failed: .backoff
-            case .idle, .stopped: .absent
-            }
-            return PoolURLStatus(url: url, phase: phase, lastHeartbeatAt: s.lastHeartbeatAt)
+        let phase: PoolURLStatus.Phase = switch ws.state {
+        case .connected: .connected
+        case .connecting: .connecting
+        case .backoff, .failed: .backoff
+        case .idle, .stopped: .absent
         }
-        return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil)
+        return PoolURLStatus(url: url, phase: phase)
     }
     /// RTT 抖动容忍——新最优比当前 RTT 差超过这个 ratio 才切。0.2 = 20%
     nonisolated let rttStableEpsilon: Double = 0.2

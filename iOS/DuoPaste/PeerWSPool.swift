@@ -32,7 +32,9 @@ final class PeerWSPool {
         case failed(String)
     }
 
-    private(set) var sockets: [String: PeerWebSocket] = [:]
+    /// **internal** —— 直接暴露给 coordinator.poolStatus(for:) 让 UI 只读单个 URL state,
+    /// 不再走 snapshot() 全 6 个 sub WS 遍历(每行渲染读 78 个 Observable 让 SwiftUI 冻僵)
+    var sockets: [String: PeerWebSocket] = [:]
     private let secret: Data
     private let onAdvance: @MainActor (Int64) -> Void
     private let onEndpointsChanged: @MainActor () -> Void
