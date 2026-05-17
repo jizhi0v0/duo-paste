@@ -69,26 +69,25 @@ struct QRScannerView: View {
     }
 }
 
-/// Mac QR payload schema:`{"host":"x.local","port":8443,"tls":true,"pin":"123456","v":1}`
+/// Mac QR payload schema:`{"host":"x.local","port":8443,"tls":true,"v":1}`。
+/// **故意不含 PIN**——QR 泄露 ≠ 配对失守,PIN 在 Mac 屏幕另一区域显示让用户手输,
+/// 两道防线分开
 struct QRPayload: Equatable {
     let host: String
     let port: Int
     let tls: Bool
-    let pin: String
 
     static func parse(_ raw: String) -> QRPayload? {
         guard let data = raw.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        guard let host = dict["host"] as? String, !host.isEmpty,
-              let pin = dict["pin"] as? String, pin.count == 6,
-              pin.allSatisfy({ $0.isNumber }) else {
+        guard let host = dict["host"] as? String, !host.isEmpty else {
             return nil
         }
         let port = (dict["port"] as? Int) ?? 8443
         let tls = (dict["tls"] as? Bool) ?? true
-        return QRPayload(host: host, port: port, tls: tls, pin: pin)
+        return QRPayload(host: host, port: port, tls: tls)
     }
 }
 

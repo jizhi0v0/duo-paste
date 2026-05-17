@@ -1455,11 +1455,14 @@ private struct IOSPairingPINSheet: View {
     private func generateQR(pin: String) {
         guard let deps = AppDelegate.shared?.dependencies else { return }
         let cfg = deps.config
+        // **故意不在 QR 里包 PIN**——QR 被截图 / 偷拍泄露 ≠ 配对失守,
+        // 攻击者还需要 PIN(60s 单次有效+5 次错锁,在 Mac 屏幕另一区域显示)
+        // 才能 POST /pair。两道防线分开是 Continuity 同款 2FA 心智
+        _ = pin  // 不入 QR,仅在下方 PIN 文字显示让用户手输
         let payload: [String: Any] = [
             "host": resolveHost(cfg: cfg),
             "port": cfg.servePort,
             "tls": cfg.serveTLS,
-            "pin": pin,
             "v": 1,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {

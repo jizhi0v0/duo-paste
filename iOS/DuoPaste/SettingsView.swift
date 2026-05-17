@@ -41,7 +41,7 @@ struct SettingsView: View {
                     host: payload.host,
                     port: payload.port,
                     tls: payload.tls,
-                    prefilledPIN: payload.pin,
+                    prefilledPIN: nil,  // QR 不含 PIN 防泄露,用户手输
                     isPresented: qrSheetBinding
                 ) { secret, _, page in
                     handlePairingSuccess(secret: secret, page: page)
