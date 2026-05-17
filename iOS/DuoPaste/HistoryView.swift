@@ -15,7 +15,7 @@ struct HistoryView: View {
                     listScroll
                 }
             }
-            .navigationTitle("剪贴板")
+            .navigationTitle("DuoPaste")
             .searchable(
                 text: $searchText,
                 placement: .navigationBarDrawer(displayMode: .always),

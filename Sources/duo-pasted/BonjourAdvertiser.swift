@@ -43,10 +43,19 @@ final class BonjourAdvertiser: NSObject {
         // domain 空 = 本网段;name 空 = 系统用 hostname
         let s = NetService(domain: "", type: Self.serviceType, name: "", port: Int32(port))
         s.delegate = self
+        // mDNS hostname(sanitized,如 "bobbys-mac-mini.local")—— iOS NWBrowser 的
+        // service.name 是 display name("Bobby's Mac mini"含空格 / 撇号),不能直接做
+        // host 拼 URL。这里广播真 hostname 让 iOS pair 路径用
+        let mdnsHost: String = {
+            let h = ProcessInfo.processInfo.hostName
+            if h.isEmpty { return "mac.local" }
+            return h.hasSuffix(".local") ? h : "\(h).local"
+        }()
         let txt: [String: Data] = [
             "device_id": Data(deviceID.utf8),
             "tls": Data((tls ? "1" : "0").utf8),
             "port": Data(String(port).utf8),
+            "host": Data(mdnsHost.utf8),
             "v": Data("1".utf8),
         ]
         let txtData = NetService.data(fromTXTRecord: txt)

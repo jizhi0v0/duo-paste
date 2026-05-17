@@ -17,6 +17,7 @@ struct PinPairingSheet: View {
     @State private var pin: String = ""
     @State private var status: Status = .input
     @State private var errorText: String?
+    @State private var showError: Bool = false
     @FocusState private var focused: Bool
 
     enum Status: Equatable {
@@ -59,13 +60,6 @@ struct PinPairingSheet: View {
                     }
                     .disabled(!canSubmit)
                 }
-                if let errorText {
-                    Section {
-                        Text(errorText)
-                            .foregroundStyle(.red)
-                            .font(.callout)
-                    }
-                }
             }
             .navigationTitle("PIN 配对")
             .navigationBarTitleDisplayMode(.inline)
@@ -73,6 +67,15 @@ struct PinPairingSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { isPresented = false }
                 }
+            }
+            // alert 弹窗 — Form inline 错误会被 iOS 软键盘遮挡,用 alert 强保证可见
+            .alert("配对失败", isPresented: $showError) {
+                Button("好") {
+                    // 错了之后重新聚焦输入框让用户改 PIN 再试
+                    focused = true
+                }
+            } message: {
+                Text(errorText ?? "未知错误")
             }
         }
         .onAppear { focused = true }
@@ -105,29 +108,27 @@ struct PinPairingSheet: View {
     private func runPairing() {
         status = .pairing
         errorText = nil
+        showError = false
+        let host = peer.host    // TXT 拿的 mDNS sanitized hostname,URL-safe
         let tls = peer.tls
         let port = peer.port
-        // peer.endpoint 是 NWBrowser 的原始 endpoint(.service 形式),pair() 内部转 .local hostname
-        let endpoint = peer.endpoint
         let pinCopy = pin
 
         Task { @MainActor in
             do {
                 // 1) POST /pair/<pin>
                 let resp = try await PinPairingClient.pair(
-                    endpoint: endpoint, port: port, tls: tls, pin: pinCopy
+                    host: host, port: port, tls: tls, pin: pinCopy
                 )
                 status = .probing
 
-                // 2) 拿 secret 构 PeerConfig 用 .local URL 临时连接拉 /endpoints
-                let host: String
-                if case .service(let name, _, _, _) = endpoint {
-                    host = "\(name).local"
-                } else {
-                    host = "\(endpoint)"
-                }
+                // 2) 拿 secret 构 PeerConfig 用 host URL 临时连接拉 /endpoints
                 let scheme = tls ? "https" : "http"
-                guard let initialURL = URL(string: "\(scheme)://\(host):\(port)") else {
+                var comp = URLComponents()
+                comp.scheme = scheme
+                comp.host = host
+                comp.port = port
+                guard let initialURL = comp.url else {
                     throw PinPairingClient.Error.badURL
                 }
                 let cfg = PeerConfig(baseURL: initialURL, sharedSecret: resp.secret)
@@ -143,6 +144,7 @@ struct PinPairingSheet: View {
             } catch {
                 status = .failed
                 errorText = error.localizedDescription
+                showError = true
             }
         }
     }

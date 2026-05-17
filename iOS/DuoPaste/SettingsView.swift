@@ -10,12 +10,12 @@ struct SettingsView: View {
     /// 配对完成后持久化的 endpoint 候选 list(JSON)。重启 app 后能从这恢复 +
     /// 网络变 / 周期 timer 时重 probe 选最快
     @AppStorage("peerEndpointsJSON") private var peerEndpointsJSON: String = ""
-    @State private var lastParseError: String?
+    @State private var alertText: String?
+    @State private var showAlert: Bool = false
     @State private var showAdvanced: Bool = false
 
     @State private var discovery = PeerDiscovery()
     @State private var selectedPeer: PeerDiscovery.DiscoveredPeer?
-    @State private var pairingError: String?
 
     var body: some View {
         NavigationStack {
@@ -30,9 +30,20 @@ struct SettingsView: View {
                     handlePairingSuccess(secret: secret, endpoints: endpoints)
                 }
             }
+            // 用 alert 避免 Form inline 错误被键盘遮挡。统一所有 Settings 错误源
+            .alert("提示", isPresented: $showAlert) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(alertText ?? "")
+            }
             .onAppear { discovery.start() }
             .onDisappear { discovery.stop() }
         }
+    }
+
+    private func presentAlert(_ msg: String) {
+        alertText = msg
+        showAlert = true
     }
 
     private var pairingSheetBinding: Binding<Bool> {
@@ -70,11 +81,6 @@ struct SettingsView: View {
                     Label("断开", systemImage: "stop.circle")
                 }
                 .disabled(disconnectDisabled)
-            }
-            if let lastParseError {
-                Text(lastParseError)
-                    .foregroundStyle(.red)
-                    .font(.callout)
             }
         }
     }
@@ -127,11 +133,6 @@ struct SettingsView: View {
                         }
                     }
                 }
-            }
-            if let pairingError {
-                Text(pairingError)
-                    .foregroundStyle(.red)
-                    .font(.caption)
             }
         } header: {
             Text("Bonjour 配对")
@@ -219,18 +220,27 @@ struct SettingsView: View {
            let json = String(data: data, encoding: .utf8) {
             peerEndpointsJSON = json
         }
-        pairingError = nil
         coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
     }
 
-    /// 高级面板手填路径——还是支持单 URL + secret 直接连
+    /// 高级面板手填路径——还是支持单 URL + secret 直接连。
+    /// **逐字段校验**:URL 跟 secret 哪个空报哪个,而不是 PeerConfig.parse 短路只报第一个
+    /// (用户填了 URL 没填 secret 时只看到"未配置 URL"会被误导)
     private func applyManualConfig() {
+        let urlTrim = peerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secretTrim = sharedSecretHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        var missing: [String] = []
+        if urlTrim.isEmpty { missing.append("URL") }
+        if secretTrim.isEmpty { missing.append("secret") }
+        if !missing.isEmpty {
+            presentAlert("未填:\(missing.joined(separator: " + "))")
+            return
+        }
         do {
-            let cfg = try PeerConfig.parse(urlString: peerURL, secretHex: sharedSecretHex)
-            lastParseError = nil
+            let cfg = try PeerConfig.parse(urlString: urlTrim, secretHex: secretTrim)
             coordinator.reconfigure(cfg)
         } catch {
-            lastParseError = error.localizedDescription
+            presentAlert(error.localizedDescription)
         }
     }
 }

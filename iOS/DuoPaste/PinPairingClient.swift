@@ -42,26 +42,18 @@ enum PinPairingClient {
         }
     }
 
-    /// 拿 NWEndpoint(从 Bonjour 发现的 Mac)+ PIN → 配对完成返 secret + deviceID
-    static func pair(endpoint: NWEndpoint, port: Int, tls: Bool, pin: String) async throws -> Response {
-        let host: String
-        switch endpoint {
-        case .service(let name, _, _, _):
-            // Bonjour service name 不是 hostname。需要 resolve 到 hostname。
-            // NWBrowser 默认 result 的 endpoint 是 .service 形式;.hostPort 是 resolved 形式
-            host = "\(name).local"
-        case .hostPort(let h, _):
-            host = "\(h)"
-        default:
-            throw Error.badURL
-        }
-        return try await pair(host: host, port: port, tls: tls, pin: pin)
-    }
-
-    /// 直接 host:port + tls → 配对。给"已知 Mac URL"路径用
+    /// host:port + tls → 配对。host 应该是 mDNS sanitized hostname(从 Bonjour TXT
+    /// 拿的 host 字段),不能用 Bonjour service.name(含空格/撇号会让 URL parse fail)
     static func pair(host: String, port: Int, tls: Bool, pin: String) async throws -> Response {
         let scheme = tls ? "https" : "http"
-        guard let url = URL(string: "\(scheme)://\(host):\(port)/pair/\(pin)") else {
+        // URLComponents 而非 URL(string:) — 让 host 即便含特殊字符也能 percent-encode。
+        // 但 host 应该已是 sanitized .local 名,不该有特殊字符;这里 defensively
+        var comp = URLComponents()
+        comp.scheme = scheme
+        comp.host = host
+        comp.port = port
+        comp.path = "/pair/\(pin)"
+        guard let url = comp.url else {
             throw Error.badURL
         }
         var req = URLRequest(url: url)

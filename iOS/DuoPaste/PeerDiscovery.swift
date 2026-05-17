@@ -19,6 +19,7 @@ final class PeerDiscovery {
         let deviceID: String?
         let tls: Bool
         let port: Int       // TXT record port=8443
+        let host: String    // TXT record host (mDNS sanitized,如 "bobbys-mac-mini.local")—— PIN /pair URL 用这个
         let endpoint: NWEndpoint
         static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     }
@@ -91,12 +92,17 @@ final class PeerDiscovery {
             // port 从 TXT 拿(BonjourAdvertiser 也设 NetService.port,但 .service endpoint
             // 客户端拿不到 port,必须走 TXT 或 resolve)。默认 8443 兜底
             let port = txt["port"].flatMap { Int($0) } ?? 8443
+            // host:Bonjour service.name 是 display name(含空格 / 撇号),不能直接拼 URL。
+            // Mac 在 TXT 广播真 mDNS hostname(sanitized);TXT 没 host 时兜底走 service.name +
+            // .local(老版本 Mac 兼容,但 PIN /pair URL 可能因含空格 fail)
+            let host: String = txt["host"] ?? "\(name).local"
             let peer = DiscoveredPeer(
                 id: "\(r.endpoint)",
                 displayName: name,
                 deviceID: txt["device_id"],
                 tls: txt["tls"] == "1",
                 port: port,
+                host: host,
                 endpoint: r.endpoint
             )
             out.append(peer)
