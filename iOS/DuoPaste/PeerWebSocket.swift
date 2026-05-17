@@ -200,42 +200,53 @@ final class PeerWebSocket {
         }
     }
 
-    /// NWConnection 启动后 race `.ready` vs `.failed/.cancelled` vs handshake timeout
+    /// NWConnection 启动后 race `.ready` vs `.failed/.cancelled` vs handshake timeout.
+    /// 用 withTaskCancellationHandler 让 group cancelAll 时主动 cancel NWConnection,
+    /// stateUpdateHandler fire `.cancelled` 解锁 continuation——否则 continuation 永远
+    /// 卡在 .ready 等待,group 死锁让外层 Task 永久 hang
     nonisolated private static func startAndAwaitReady(
         connection: NWConnection,
         timeoutSec: TimeInterval
     ) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    var resumed = false
-                    connection.stateUpdateHandler = { state in
-                        guard !resumed else { return }
-                        switch state {
-                        case .ready:
-                            resumed = true
-                            connection.stateUpdateHandler = nil
-                            cont.resume()
-                        case .failed(let err):
-                            resumed = true
-                            connection.stateUpdateHandler = nil
-                            cont.resume(throwing: WSError.connectionFailed(String(describing: err)))
-                        case .cancelled:
-                            resumed = true
-                            connection.stateUpdateHandler = nil
-                            cont.resume(throwing: CancellationError())
-                        case .waiting(let err):
-                            // .waiting = NWConnection 在等网络条件(NAT/路由不可达)
-                            resumed = true
-                            connection.stateUpdateHandler = nil
-                            cont.resume(throwing: WSError.connectionFailed("waiting: \(err)"))
-                        case .setup, .preparing:
-                            break
-                        @unknown default:
-                            break
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                        let box = ResumeBox()
+                        connection.stateUpdateHandler = { state in
+                            switch state {
+                            case .ready:
+                                if box.resume() {
+                                    connection.stateUpdateHandler = nil
+                                    cont.resume()
+                                }
+                            case .failed(let err):
+                                if box.resume() {
+                                    connection.stateUpdateHandler = nil
+                                    cont.resume(throwing: WSError.connectionFailed(String(describing: err)))
+                                }
+                            case .cancelled:
+                                if box.resume() {
+                                    connection.stateUpdateHandler = nil
+                                    cont.resume(throwing: CancellationError())
+                                }
+                            case .waiting(let err):
+                                if box.resume() {
+                                    connection.stateUpdateHandler = nil
+                                    cont.resume(throwing: WSError.connectionFailed("waiting: \(err)"))
+                                }
+                            case .setup, .preparing:
+                                break
+                            @unknown default:
+                                break
+                            }
                         }
+                        connection.start(queue: DispatchQueue.global(qos: .userInitiated))
                     }
-                    connection.start(queue: DispatchQueue.global(qos: .userInitiated))
+                } onCancel: {
+                    // group cancelAll / 外层 Task 被 cancel → cancel NWConnection,
+                    // 触发 stateUpdateHandler .cancelled 解锁 continuation
+                    connection.cancel()
                 }
             }
             group.addTask {
@@ -244,6 +255,22 @@ final class PeerWebSocket {
             }
             try await group.next()
             group.cancelAll()
+        }
+    }
+
+    /// continuation 单次 resume 保护——sec_protocol stateUpdateHandler 可能多次 fire
+    /// (.ready 后又 .failed),但 continuation.resume 只能调一次。用 class + atomic 标志位
+    /// (NSLock 包 Bool 也行,这里 final class 单一实例够用)
+    fileprivate final class ResumeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resumed = false
+        /// 返回 true = 应该 resume(头一次调);false = 已经 resume 过,skip
+        func resume() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if resumed { return false }
+            resumed = true
+            return true
         }
     }
 
