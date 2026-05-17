@@ -186,26 +186,23 @@ final class PeerSyncCoordinator {
     }
 
     private func applyPick(endpoint: PeerEndpoint, rttMs: Int, secret: Data) {
-        // 1) 同 URL + 已连接 → noop。但 status 处于 .error / .backoff 时不能 noop——
-        //    此前 probe 全失败 stamp 了 .error,这次同 URL 重新可达需要重启连接刷新 status
-        let wasHealthy: Bool = {
-            if case .connected = status { return true }
-            if case .connecting = status { return true }
-            return false
-        }()
-        if currentEndpointURL == endpoint.url, wasHealthy {
+        // **判 "已有活连接" 用 ws != nil 不用 status**——status .connecting 可能只是
+        // reconfigureFromPairing 刚设的"期望状态",WS 还没起;此时同 URL 也要走 reconfigure
+        // 真正起 WS,否则用户重连卡"连接中"永远不连上
+        let hasLiveConnection = (ws != nil)
+
+        // 1) 同 URL + 活连接 → noop(stability):正常 connected 状态下 repick 同 URL 不重启
+        if currentEndpointURL == endpoint.url, hasLiveConnection {
             return
         }
-        // 2) 不同 URL + 之前健康 + RTT 改善不显著 → 视为测量噪音不切。
-        //    `wasHealthy` 限定:之前没连上时(.error / .backoff)需要切到新 URL 恢复,
-        //    不该走稳定性 guard
+        // 2) 不同 URL + 活连接 + RTT 改善不显著 → 视为测量噪音不切防 flap。
+        //    没活连接时(刚重连 / disconnect 后)不走 guard,确保能起 WS
         if let current = currentEndpointURL,
            current != endpoint.url,
            let currentRTT = lastRTT[current],
            currentRTT > 0,
-           wasHealthy,
+           hasLiveConnection,
            Double(currentRTT - rttMs) / Double(currentRTT) < rttStableEpsilon {
-            // 新最优只比当前快 < 20% → 视为噪音不切
             FileHandle.standardError.write(Data(
                 "endpoint pick skipped: current=\(currentRTT)ms new=\(rttMs)ms (within \(Int(rttStableEpsilon*100))%)\n".utf8))
             return
@@ -216,7 +213,7 @@ final class PeerSyncCoordinator {
             return
         }
         let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
-        // reconfigure 内部 stop + 起新连接;blob/icon cache 也 resetAll
+        // reconfigure 内部 cancelRuntimeTasks + 起新连接;blob/icon cache 也 resetAll
         reconfigure(cfg)
     }
 
