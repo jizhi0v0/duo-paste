@@ -94,8 +94,12 @@ final class PeerWSPool {
         let coolStr = cooledOut.isEmpty ? "" : " cooldown=[\(cooledOut.joined(separator: ","))]"
         DebugLog.shared.append("ws-pool reconcile: keep=\(desired.count) [\(selected.map { $0.endpoint.kind.rawValue }.joined(separator: ","))]\(coolStr)")
 
-        // 1) 关掉不在选中 list 的
-        for (url, ws) in sockets where !desired.contains(url) {
+        // 1) 关掉不在选中 list 的——**先 snapshot 再删**,迭代 dict 中 removeValue
+        //    是 undefined behavior,实测会让 swift 6 strict concurrency 下偶发 EXC_BAD_ACCESS
+        let toClose: [(String, PeerWebSocket)] = sockets.compactMap { (url, ws) in
+            desired.contains(url) ? nil : (url, ws)
+        }
+        for (url, ws) in toClose {
             ws.stop()
             sockets.removeValue(forKey: url)
             DebugLog.shared.append("ws-pool drop: \(url)")
