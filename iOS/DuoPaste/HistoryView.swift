@@ -15,12 +15,6 @@ struct HistoryView: View {
                     listScroll
                 }
             }
-            // iOS 26 TabView crossfade 会让两个 tab 同时半透明叠加。
-            // 不给根视图加 opaque 底,Liquid Glass 卡片之间的缝就会漏出对面 tab 内容。
-            // ignoresSafeArea 让 opaque 底延伸到 nav bar / search drawer / tab bar 下面,
-            // 这样 Liquid Glass blur 永远只看到一个 solid color 而不是对面 tab 的内容
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(.systemBackground).ignoresSafeArea())
             .navigationTitle("DuoPaste")
             .searchable(
                 text: $searchText,
@@ -50,10 +44,6 @@ struct HistoryView: View {
             .padding(.bottom, 24)
         }
         .scrollContentBackground(.hidden)
-        // iOS 26 API:把顶/底 edge effect 从默认 soft(柔化模糊)切到 hard(硬边)。
-        // soft 模式下内容滚到 nav bar 下方会被柔化半透显示,Tab crossfade 那一帧 blur
-        // 抖一下就漏到对面 tab。hard 模式硬切,内容到 safe area 边就停,不再延伸到 bar 下
-        .scrollEdgeEffectStyle(.hard, for: .top)
     }
 
     private var emptyState: some View {

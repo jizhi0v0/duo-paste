@@ -102,17 +102,22 @@ final class PeerWebSocket {
 
     private func runLoop() async {
         var failures = 0
+        let urlStr = config.baseURL.absoluteString
+        DebugLog.shared.append("ws runLoop start: \(urlStr)")
         while !Task.isCancelled {
             do {
                 try await connectOnce()
                 failures += 1 // remote close 也算一次失败防 hot-loop
                 consecutiveFailures += 1
+                DebugLog.shared.append("ws connectOnce returned normally (remote close?) failures=\(failures) consecutive=\(consecutiveFailures)")
             } catch is CancellationError {
+                DebugLog.shared.append("ws runLoop cancelled: \(urlStr)")
                 return
             } catch {
                 failures += 1
                 consecutiveFailures += 1
                 state = .failed(String(describing: error))
+                DebugLog.shared.append("ws connectOnce failed: \(error) failures=\(failures) consecutive=\(consecutiveFailures)")
             }
             // 失败累计达阈值 → 通知 coordinator 重新探活选别的 endpoint。复位计数让
             // coordinator switch URL 后(新 PeerWebSocket 起来)从头计;旧的 runLoop
@@ -151,6 +156,7 @@ final class PeerWebSocket {
             if currentSocket === task { currentSocket = nil }
         }
         task.resume()
+        DebugLog.shared.append("ws resume: \(wsURL.absoluteString)")
 
         // receive + ping 双 task race。任一抛错 → 整组退出 → connectOnce 抛 → runLoop 进 backoff
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -168,8 +174,19 @@ final class PeerWebSocket {
     }
 
     nonisolated private func receiveLoop(task: URLSessionWebSocketTask) async throws {
+        var firstFrame = true
         while !Task.isCancelled {
-            let msg = try await task.receive()
+            let msg: URLSessionWebSocketTask.Message
+            do {
+                msg = try await task.receive()
+            } catch {
+                DebugLog.shared.append("ws receive failed (firstFrame=\(firstFrame)): \(error)")
+                throw error
+            }
+            if firstFrame {
+                DebugLog.shared.append("ws receive first frame ok")
+                firstFrame = false
+            }
             let text: String?
             switch msg {
             case .string(let s): text = s
