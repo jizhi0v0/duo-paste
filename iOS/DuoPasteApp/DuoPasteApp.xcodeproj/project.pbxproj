@@ -27,6 +27,7 @@
 		D1A00030000000000000A003 /* BackgroundPullService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A00030000000000000B003 /* BackgroundPullService.swift */; };
 /* End PBXBuildFile section */
 
+
 /* Begin PBXFileReference section */
 		C502A53B2FB97B9E0055B250 /* DuoPasteApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DuoPasteApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C502A5622FB97CE00055B250 /* DuoPasteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuoPasteApp.swift; sourceTree = "<group>"; };
@@ -343,17 +344,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = RS59HDH7Y3;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers = "io.duopaste.ios.background-pull";
-				INFOPLIST_KEY_NSBonjourServices = "_duopaste._tcp";
-				INFOPLIST_KEY_NSCameraUsageDescription = "扫描 Mac 显示的配对二维码,自动填好 peer URL + secret。";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "在同 Wi-Fi 网段发现 Mac daemon 让配对零手填。";
-				INFOPLIST_KEY_UIBackgroundModes = "fetch";
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "$(SRCROOT)/../DuoPaste/Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -383,17 +375,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = RS59HDH7Y3;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers = "io.duopaste.ios.background-pull";
-				INFOPLIST_KEY_NSBonjourServices = "_duopaste._tcp";
-				INFOPLIST_KEY_NSCameraUsageDescription = "扫描 Mac 显示的配对二维码,自动填好 peer URL + secret。";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "在同 Wi-Fi 网段发现 Mac daemon 让配对零手填。";
-				INFOPLIST_KEY_UIBackgroundModes = "fetch";
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "$(SRCROOT)/../DuoPaste/Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

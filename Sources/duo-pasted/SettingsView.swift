@@ -1358,15 +1358,41 @@ private struct IOSPairingQRSheet: View {
     let model: SettingsModel
     @Binding var isPresented: Bool
 
+    enum URLChoice: String, CaseIterable, Identifiable {
+        case tailscale, ponte, local
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .tailscale: return "Tailscale"
+            case .ponte:     return "Ponte (Surge)"
+            case .local:     return ".local (mDNS)"
+            }
+        }
+    }
+
+    @State private var urlChoice: URLChoice = .tailscale
     @State private var qrImage: NSImage?
     @State private var secondsLeft: Int = 60
     @State private var countdownTask: Task<Void, Never>?
     @State private var errorText: String?
+    @State private var currentURL: String = ""
 
     var body: some View {
         VStack(spacing: 16) {
             Text("iOS 配对")
                 .font(.system(size: 18, weight: .semibold))
+
+            // URL 候选:Tailscale 默认(cert 匹配,跨 LAN 通),Ponte 走 Surge 代理(iOS 装
+            // 了 Surge 才能用),.local mDNS(同 Wi-Fi)。每个选项重新生成 QR
+            Picker("URL 方式", selection: $urlChoice) {
+                ForEach(availableChoices, id: \.self) { c in
+                    Text(c.label).tag(c)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 280)
+            .onChange(of: urlChoice) { _, _ in regenerate() }
+
             if let img = qrImage {
                 Image(nsImage: img)
                     .interpolation(.none)
@@ -1376,6 +1402,12 @@ private struct IOSPairingQRSheet: View {
             } else {
                 ProgressView().frame(width: 240, height: 240)
             }
+            Text(currentURL)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 280)
             if let errorText {
                 Text(errorText)
                     .foregroundStyle(.red)
@@ -1383,7 +1415,7 @@ private struct IOSPairingQRSheet: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             } else {
-                Text("剩余 \(secondsLeft)s · iOS 选「扫描 QR」对准这里")
+                Text("剩余 \(secondsLeft)s · iOS Settings 选「扫描 Mac 显示的二维码」")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
             }
@@ -1395,24 +1427,37 @@ private struct IOSPairingQRSheet: View {
         .padding(24)
         .frame(width: 320)
         .onAppear {
-            generateQR()
+            regenerate()
             startCountdown()
         }
         .onDisappear {
             countdownTask?.cancel()
             countdownTask = nil
             qrImage = nil  // GC secret-containing image
+            currentURL = ""
         }
     }
 
-    private func generateQR() {
-        guard let payload = makePairingPayload() else { return }
+    /// 可选 URL 方式——ponte 没装 Surge 就隐藏(避免 user 选到无效选项)。
+    /// Tailscale + .local 永远可选
+    private var availableChoices: [URLChoice] {
+        var out: [URLChoice] = [.tailscale]
+        if SurgePonte.discoverSelfHostname() != nil {
+            out.append(.ponte)
+        }
+        out.append(.local)
+        return out
+    }
+
+    private func regenerate() {
+        guard let payload = makePairingPayload() else {
+            qrImage = nil
+            return
+        }
         qrImage = QRGenerator.makeImage(from: payload, size: 240)
     }
 
-    /// 生成 QR 内容:JSON {url, secret}。URL 用 hostname.local + port,iOS 通过 Bonjour
-    /// resolve 也走同 hostname,两路一致。secret 是 64 字符 hex。
-    /// 失败(secret 读不出 / serve_host 异常)→ errorText 显示原因
+    /// 生成 QR 内容:JSON {url, secret}。
     private func makePairingPayload() -> String? {
         guard let deps = AppDelegate.shared?.dependencies else {
             errorText = "daemon 未启动"
@@ -1423,8 +1468,10 @@ private struct IOSPairingQRSheet: View {
             let secretHex = secretBytes.map { String(format: "%02x", $0) }.joined()
             let cfg = deps.config
             let scheme = cfg.serveTLS ? "https" : "http"
-            let host = preferredHost(cfg: cfg)
+            let host = resolveHost(cfg: cfg)
             let url = "\(scheme)://\(host):\(cfg.servePort)"
+            currentURL = url
+            errorText = nil
             let payload: [String: String] = ["url": url, "secret": secretHex, "v": "1"]
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
             return String(data: data, encoding: .utf8)
@@ -1434,16 +1481,31 @@ private struct IOSPairingQRSheet: View {
         }
     }
 
-    /// 选 host 顺序:tlsCertPath 文件名(即 tailscale cert hostname,跨 LAN/WAN 通) →
-    /// .local hostname(Bonjour 路径) → serve_host(可能 0.0.0.0,fallback)
-    private func preferredHost(cfg: Config) -> String {
-        if let cert = cfg.tlsCertPath {
-            let stem = (cert as NSString).lastPathComponent
-                .replacingOccurrences(of: ".crt", with: "")
-            if !stem.isEmpty { return stem }
+    /// 按 urlChoice 解析 host。
+    /// - tailscale:从 tlsCertPath 文件名拿 stem(即 cert CN,跨 LAN 通)
+    /// - ponte:SurgePonte.discoverSelfHostname()(本机 SGCore.plist 配的 ponte 名)
+    /// - local:Host.current() hostname + .local 兜底
+    private func resolveHost(cfg: Config) -> String {
+        switch urlChoice {
+        case .tailscale:
+            if let cert = cfg.tlsCertPath {
+                let stem = (cert as NSString).lastPathComponent
+                    .replacingOccurrences(of: ".crt", with: "")
+                if !stem.isEmpty { return stem }
+            }
+            return localHostnameWithDotLocal()
+        case .ponte:
+            if let p = SurgePonte.discoverSelfHostname(), !p.isEmpty {
+                return p
+            }
+            return localHostnameWithDotLocal()
+        case .local:
+            return localHostnameWithDotLocal()
         }
+    }
+
+    private func localHostnameWithDotLocal() -> String {
         let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
-        // Host.current().name 可能是 "Bobbys-Mac.local",已含 .local——不重复加
         return hn.hasSuffix(".local") ? hn : "\(hn).local"
     }
 

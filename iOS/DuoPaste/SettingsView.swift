@@ -69,10 +69,17 @@ struct SettingsView: View {
         }
     }
 
-    /// Bonjour 浏 _duopaste._tcp + QR 配对 section。tap peer → 弹扫描 → 解析 QR → 填字段
+    /// Bonjour 浏 _duopaste._tcp + QR 配对 section。扫码按钮**独立于**发现成功——
+    /// Local Network 权限拒了 / NSBonjourServices 没生效都不挡用户扫码,扫到 QR 直接
+    /// 填字段连接,无需先看到 Mac 出现在列表里
     @ViewBuilder
     private var discoverySection: some View {
         Section {
+            Button {
+                showScanner = true
+            } label: {
+                Label("扫描 Mac 显示的二维码", systemImage: "qrcode.viewfinder")
+            }
             HStack {
                 Image(systemName: "wifi")
                 Text("发现的 Mac")
@@ -81,7 +88,17 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .font(.caption)
             }
-            if discovery.peers.isEmpty {
+            if case .unauthorized = discovery.state {
+                // Local Network 权限拒了 — 给"去设置"CTA;扫码路径仍然可用(上面按钮)
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Label("开启 Local Network 权限", systemImage: "gear")
+                        .foregroundStyle(.orange)
+                }
+            } else if discovery.peers.isEmpty {
                 Text("正在扫描同网段的 Mac… 确保 Mac daemon serve=true + 同 Wi-Fi")
                     .foregroundStyle(.secondary)
                     .font(.caption)
@@ -100,10 +117,6 @@ struct SettingsView: View {
                             }
                         }
                         Spacer()
-                        Button("扫码配对") {
-                            showScanner = true
-                        }
-                        .buttonStyle(.borderless)
                     }
                 }
             }
@@ -115,7 +128,7 @@ struct SettingsView: View {
         } header: {
             Text("Bonjour 配对")
         } footer: {
-            Text("Mac Settings > iOS 配对 > 显示二维码 → 用这边扫码自动填好。或继续手填上面字段。")
+            Text("Mac Settings > iOS 配对 > 显示二维码 → 用上面扫描按钮对准自动填好。Bonjour 发现失败也不影响扫码——找不到列表里那行直接扫即可。")
         }
     }
 
