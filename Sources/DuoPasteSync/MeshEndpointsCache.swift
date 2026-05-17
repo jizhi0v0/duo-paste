@@ -167,12 +167,18 @@ public actor MeshEndpointsCache {
                 case .success(let page) where page.deviceID == selfDeviceID:
                     log("skip self (\(url)) — same device_id")
                 case .success(let page):
+                    // 老 daemon 没 device_id → 跳过(没法 stamp 进 MeshPeerEntry,iOS
+                    // 也没法判 self 防回环)
+                    guard let peerDeviceID = page.deviceID else {
+                        log("skip \(url) — peer daemon too old, no device_id")
+                        continue
+                    }
                     // 学到这个 chosenPullURL 对应的 deviceID,下次失败时能反查
-                    urlToDeviceID[url] = page.deviceID
-                    let oldEntry = entries[page.deviceID]
+                    urlToDeviceID[url] = peerDeviceID
+                    let oldEntry = entries[peerDeviceID]
                     let oldEndpoints = oldEntry?.endpoints
                     let wasUnhealthy = oldEntry?.healthy == false
-                    entries[page.deviceID] = Entry(
+                    entries[peerDeviceID] = Entry(
                         endpoints: page.endpoints,
                         learnedAtUnix: now,
                         healthy: true,

@@ -62,12 +62,14 @@ public struct MeshPeerEntry: Codable, Equatable, Sendable, Identifiable {
 
 /// `GET /endpoints` 响应。
 /// - `device_id`:server 本机 device_id。hub Mac fetch peer 时拿到这个 stamp 进
-///   `MeshPeerEntry.peerDeviceID`,避免还得读 pull_cursor DB
+///   `MeshPeerEntry.peerDeviceID`,避免还得读 pull_cursor DB。**Optional** 兼容老
+///   daemon(没这个字段) — 新 daemon 永远写,老 daemon 不写,iOS / hub Mac decode 时
+///   None 路径走 fallback(skip self-check / 用其他方式取 deviceID)
 /// - `updated_at_unix`:server 算 endpoints 那一刻的时间戳。iOS 做 "已是最新" 比对
 /// - `mesh_peers`:hub Mac 周期 fetch 其他 mesh peer 的 /endpoints 后聚合暴露。Optional
 ///   让老 iOS / 老 Mac daemon 也能解码(缺失 = 只看 self endpoints)
 public struct PeerEndpointsPage: Codable, Equatable, Sendable {
-    public let deviceID: String
+    public let deviceID: String?
     public let endpoints: [PeerEndpoint]
     public let updatedAtUnix: Int64
     public let meshPeers: [MeshPeerEntry]?
@@ -80,7 +82,7 @@ public struct PeerEndpointsPage: Codable, Equatable, Sendable {
     }
 
     public init(
-        deviceID: String,
+        deviceID: String?,
         endpoints: [PeerEndpoint],
         updatedAtUnix: Int64,
         meshPeers: [MeshPeerEntry]? = nil
