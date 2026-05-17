@@ -14,6 +14,7 @@ struct PinPairingSheet: View {
     @Binding var isPresented: Bool
     let onPaired: (Data, String, PeerEndpointsPage) -> Void
 
+    @Environment(PeerSyncCoordinator.self) private var coordinator
     @State private var pin: String = ""
     @State private var status: Status = .input
     @State private var errorText: String?
@@ -140,8 +141,13 @@ struct PinPairingSheet: View {
                 //    扁平化后探活全部候选
                 onPaired(resp.secret, resp.deviceID, endpoints)
                 status = .done
-                // 短暂展示成功后关闭
-                try? await Task.sleep(nanoseconds: 600_000_000)
+                // 等 coordinator probe 完成(lastProbes 非空)再关 sheet,让用户看到
+                // 候选列表已经准备好的"完成"状态。5s 超时兜底防永久挂(probe 失败时)
+                let deadline = Date().addingTimeInterval(5)
+                while coordinator.lastProbes.isEmpty && Date() < deadline {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000) // 短暂展示完成
                 isPresented = false
             } catch {
                 status = .failed

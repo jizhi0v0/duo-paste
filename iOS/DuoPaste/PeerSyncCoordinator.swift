@@ -128,6 +128,9 @@ final class PeerSyncCoordinator {
             status = .error("Mac 没返回任何 endpoint 候选")
             return
         }
+        // 立刻把 status 切到 .connecting,避免 sheet 关掉后用户看到"未配置"——
+        // probe 完成才有 currentEndpointURL,这之间 3-5s 不让 UI 显示旧状态
+        self.status = .connecting
         self.currentSecret = secret
         self.availableEndpoints = endpoints
         startPeriodicRepick()

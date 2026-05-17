@@ -343,6 +343,12 @@ struct SettingsView: View {
                 let client = PeerClient(config: cfg)
                 let page = try await client.fetchEndpoints()
                 handlePairingSuccess(secret: resp.secret, page: page)
+                // 等 coordinator probe 完成再清表单 / 折叠 section,让用户看到 status
+                // 从"未配置"切到"连接中"(连接完几秒后变绿)
+                let deadline = Date().addingTimeInterval(5)
+                while coordinator.lastProbes.isEmpty && Date() < deadline {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
                 // 清空表单
                 manualHost = ""
                 manualPIN = ""
