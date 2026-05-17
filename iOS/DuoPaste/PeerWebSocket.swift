@@ -28,9 +28,11 @@ final class PeerWebSocket {
 
     enum WSError: Error, CustomStringConvertible {
         case pongTimeout(sinceSec: Int)
+        case handshakeTimeout(sinceSec: Int)
         var description: String {
             switch self {
             case .pongTimeout(let s): return "pong timeout after \(s)s"
+            case .handshakeTimeout(let s): return "handshake timeout after \(s)s"
             }
         }
     }
@@ -54,6 +56,11 @@ final class PeerWebSocket {
     nonisolated let pingIntervalSec: TimeInterval
     nonisolated let pongTimeoutSec: TimeInterval
     nonisolated let reprobeFailureThreshold: Int
+    /// `URLSessionWebSocketTask` 的致命缺陷:TLS 握手挂掉 (iOS cellular Surge MITM 链路
+    /// 的已知 bug) 时 `task.receive()` 永远阻塞,不抛错。强制 N 秒内必须收到第一帧
+    /// (hello),否则视为握手失败 → 抛 handshakeTimeout 让 runLoop 进 backoff 重连。
+    /// 默 8s——TLS 正常握手 < 1s,留出 cellular RTT 余量
+    nonisolated let handshakeTimeoutSec: TimeInterval
 
     private var runTask: Task<Void, Never>?
     private var currentSocket: URLSessionWebSocketTask?
@@ -65,6 +72,7 @@ final class PeerWebSocket {
         session: URLSession = TrustAnyHTTP.shared,
         pingIntervalSec: TimeInterval = 30,
         pongTimeoutSec: TimeInterval = 10,
+        handshakeTimeoutSec: TimeInterval = 8,
         reprobeFailureThreshold: Int = 3,
         onAdvance: @escaping @MainActor (Int64) -> Void,
         onReprobeNeeded: @escaping @MainActor (String) -> Void = { _ in },
@@ -75,6 +83,7 @@ final class PeerWebSocket {
         self.session = session
         self.pingIntervalSec = pingIntervalSec
         self.pongTimeoutSec = pongTimeoutSec
+        self.handshakeTimeoutSec = handshakeTimeoutSec
         self.reprobeFailureThreshold = reprobeFailureThreshold
         self.onAdvance = onAdvance
         self.onReprobeNeeded = onReprobeNeeded
@@ -158,7 +167,8 @@ final class PeerWebSocket {
         task.resume()
         DebugLog.shared.append("ws resume: \(wsURL.absoluteString)")
 
-        // receive + ping 双 task race。任一抛错 → 整组退出 → connectOnce 抛 → runLoop 进 backoff
+        // receive + ping + handshake-timeout 三 task race。任一抛错 → 整组退出 →
+        // connectOnce 抛 → runLoop 进 backoff
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { [weak self] in
                 try await self?.receiveLoop(task: task)
@@ -166,11 +176,31 @@ final class PeerWebSocket {
             group.addTask { [weak self] in
                 try await self?.pingLoop(task: task)
             }
+            group.addTask { [weak self] in
+                try await self?.handshakeTimeoutLoop()
+            }
             // 等第一个 task 完成/抛错——成功完成(receive loop 因 Task.isCancelled 退出)也算
             // "对端已关闭" → 让 connectOnce 自然返回进 backoff
             try await group.next()
             group.cancelAll()
         }
+    }
+
+    /// 强制 handshakeTimeoutSec 内必须收到第一帧。`URLSessionWebSocketTask.receive()`
+    /// 在 TLS 挂掉时永远阻塞(iOS cellular bug),没这个 hard timeout WS 永远卡在
+    /// "连接中"状态,backoff/cooldown 都触发不了
+    nonisolated private func handshakeTimeoutLoop() async throws {
+        let ns = UInt64(handshakeTimeoutSec * 1_000_000_000)
+        try await Task.sleep(nanoseconds: ns)
+        // sleep 到这里 = handshake 没在期限内完成。检查 lastHeartbeatAt:非 nil = 第一帧
+        // (hello) 收到过,握手成功;nil = 永远没收到,握手挂死
+        let last = await self.lastHeartbeatAt
+        if last == nil {
+            DebugLog.shared.append("ws handshake timeout (\(Int(handshakeTimeoutSec))s): \(config.baseURL.absoluteString)")
+            throw WSError.handshakeTimeout(sinceSec: Int(handshakeTimeoutSec))
+        }
+        // 握手成功:挂在这等永远(直到 group 被 cancel)。Task.sleep 永久版
+        try await Task.sleep(nanoseconds: .max)
     }
 
     nonisolated private func receiveLoop(task: URLSessionWebSocketTask) async throws {

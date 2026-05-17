@@ -48,6 +48,8 @@ struct SettingsView: View {
                 .scrollContentBackground(.hidden)
             }
             .navigationTitle("设置")
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(.visible, for: .tabBar)
             .sheet(item: $selectedPeer) { peer in
                 PinPairingSheet(
                     displayName: peer.displayName,
@@ -195,7 +197,6 @@ struct SettingsView: View {
         case .connected: return "antenna.radiowaves.left.and.right"
         case .connecting: return "arrow.triangle.2.circlepath"
         case .backoff: return "antenna.radiowaves.left.and.right.slash"
-        case .cooldown: return "snowflake"
         case .absent: return "circle"
         }
     }
@@ -204,7 +205,6 @@ struct SettingsView: View {
         case .connected: return .green
         case .connecting: return .orange
         case .backoff: return .red
-        case .cooldown: return .blue
         case .absent: return .secondary
         }
     }
@@ -213,12 +213,6 @@ struct SettingsView: View {
         case .connected: return "WS 在线"
         case .connecting: return "WS 连接中"
         case .backoff: return "WS 重试中"
-        case .cooldown:
-            if let until = s.cooldownUntil {
-                let secs = max(0, Int(until.timeIntervalSinceNow))
-                return "冷却 \(secs)s"
-            }
-            return "冷却中"
         case .absent: return "未启 WS"
         }
     }
@@ -278,7 +272,7 @@ struct SettingsView: View {
         } header: {
             Text("候选 endpoint(\(probes.count))· 调试")
         } footer: {
-            Text("★ = HTTP /since 当前用的 URL。icon 是该 URL 在 WS pool 的状态:\u{1F4F6} 在线 / \u{1F501} 连接中 / \u{274C} 重试 / \u{2744}\u{FE0F} 冷却 / \u{25CB} 未启。pool 同时开 top-2 URL,任一推 cursor_advanced 都触发拉取——单 URL 死(如 iOS cellular WS TLS bug)不影响其他 URL 工作。")
+            Text("★ = HTTP /since 当前用的 URL。WS pool 对全部 endpoint 并发开 WS,任一推 cursor_advanced 都触发拉取。每个 WS 独立 8s handshake 超时 + 指数 backoff up to 60s(URLSessionWebSocketTask TLS 挂掉会永远阻塞 receive,必须硬超时)。")
         }
         .sheet(isPresented: $showLogShare) {
             ActivityShareSheet(items: [logShareText])

@@ -68,29 +68,23 @@ final class PeerSyncCoordinator {
     /// 最近一次 probe 完整结果(含失败的) — 给 Settings UI 显示用
     private(set) var lastProbes: [EndpointPicker.Probe] = []
 
-    /// 给 Settings UI 显示 pool 里每个 URL 的 WS 状态——是 connected / connecting / backoff / cooldown
+    /// 给 Settings UI 显示 pool 里每个 URL 的 WS 状态
     struct PoolURLStatus: Equatable, Sendable {
         enum Phase: String, Sendable {
             case connected
             case connecting
             case backoff
-            case cooldown
-            case absent  // probe ok 但没在 pool 里(超出 top-K)
+            case absent
         }
         let url: String
         let phase: Phase
         let lastHeartbeatAt: Date?
-        let cooldownUntil: Date?
     }
 
-    /// 把 pool 状态扁平成 URL → phase map,给 UI 渲染。pool nil → 全 absent
+    /// 把 pool 状态扁平成 URL → phase 给 UI 渲染。pool nil → absent
     func poolStatus(for url: String) -> PoolURLStatus {
         guard let pool = wsPool else {
-            return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil, cooldownUntil: nil)
-        }
-        let cooldownMap = Dictionary(uniqueKeysWithValues: pool.cooldownSnapshot().map { ($0.url, $0.until) })
-        if let until = cooldownMap[url] {
-            return PoolURLStatus(url: url, phase: .cooldown, lastHeartbeatAt: nil, cooldownUntil: until)
+            return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil)
         }
         let socks = pool.snapshot()
         if let s = socks.first(where: { $0.url == url }) {
@@ -100,9 +94,9 @@ final class PeerSyncCoordinator {
             case .backoff, .failed: .backoff
             case .idle, .stopped: .absent
             }
-            return PoolURLStatus(url: url, phase: phase, lastHeartbeatAt: s.lastHeartbeatAt, cooldownUntil: nil)
+            return PoolURLStatus(url: url, phase: phase, lastHeartbeatAt: s.lastHeartbeatAt)
         }
-        return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil, cooldownUntil: nil)
+        return PoolURLStatus(url: url, phase: .absent, lastHeartbeatAt: nil)
     }
     /// RTT 抖动容忍——新最优比当前 RTT 差超过这个 ratio 才切。0.2 = 20%
     nonisolated let rttStableEpsilon: Double = 0.2
@@ -115,11 +109,11 @@ final class PeerSyncCoordinator {
         self.store = store
         self.blobCache = BlobCache()
         self.appIconCache = AppIconCache()
-        // 网络变化 → 清 WS pool cooldown(Wi-Fi 上 .sgponte 失败的 URL 在 cellular 上
-        // Surge 接管可能就通了,必须重试)+ 重新 probe + reselect
+        // 网络变化 → 重新 probe(给 HTTP client URL 更新最快路径)。WS 不需要触发——
+        // pool 里每个 WS 都在自己 backoff/重连,网络变了它们自然在下次 reconnect 时
+        // 用新网络重试
         NetworkChangeWatcher.shared.addListener { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.wsPool?.clearCooldowns(reason: "network changed")
                 self?.repickEndpoint(reason: "network changed")
             }
         }
@@ -166,9 +160,6 @@ final class PeerSyncCoordinator {
             secret: secret,
             onAdvance: { [weak self] _ in
                 self?.kickPull()
-            },
-            onAllDown: { [weak self] reason in
-                self?.repickEndpoint(reason: "ws-pool: \(reason)")
             },
             onEndpointsChanged: { [weak self] in
                 self?.refetchAndRepick(reason: "ws: endpoints_changed")
