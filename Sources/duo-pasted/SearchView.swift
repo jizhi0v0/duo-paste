@@ -510,6 +510,29 @@ struct SearchView: View {
         .onChange(of: state.selectedCardWindowRect) { _, _ in
             if state.previewShown { onPreviewChange(true) }
         }
+        // **P3 修复**: previewAnchorID 切换瞬间(箭头切卡 / shift-click 等)主动 reset
+        // selectedCardWindowRect = .zero——防止新选中卡还没进视口 publish frame 时,
+        // PreviewPanelController 用残留的旧 frame 把浮窗短暂锚在错误位置。
+        //
+        // 触发链(配 SearchPanelController.onPreviewChange):
+        //   1. previewAnchorID 变 → 这里 reset frame = .zero
+        //   2. 触发上面 epsilon 路径 zero ↔ nonzero 例外,selectedCardWindowRect 真写入
+        //   3. selectedCardWindowRect onChange fire → onPreviewChange(true)
+        //   4. SearchPanelController 看 .zero 走 "保持上一帧" guard(**不**调 hide,避免
+        //      alphaValue 1→0→1 闪烁)
+        //   5. 新卡 GeometryReader publish nonzero frame → epsilon 通过 → onChange fire
+        //      → onPreviewChange(true) → controller 一次性 reposition 到新位置
+        //
+        // **Corner case acknowledged**: 如果新 anchor 卡完全在 LazyHStack 视口外,
+        // GeometryReader 不挂载 → 新 frame 永不来 → 浮窗永久锚旧位置(内容已切到新 item)。
+        // 实际不发生:键盘箭头切卡走 scrollPulse → ScrollViewReader.scrollTo 把新卡滚进
+        // 视口让 GeometryReader 挂载;mouse 选中必看见卡才能点。即便理论触发,Esc / 点
+        // 空白处都能 hide 兜底,无 dead lock
+        .onChange(of: previewAnchorID) { _, _ in
+            if state.selectedCardWindowRect != .zero {
+                state.selectedCardWindowRect = .zero
+            }
+        }
         .onPreferenceChange(SelectedCardFramePreference.self) { rect in
             // PreferenceKey 在 layout 过程里多次 fire,只在值真正变化时写回,避免
             // 触发上面 onChange 死循环。
