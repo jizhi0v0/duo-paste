@@ -35,18 +35,28 @@ public actor WSNotificationClient {
         /// 网络抖动 + 给 SCDynamicStore DNS recovery 机会,持续故障才进 launchd 重启路径
         public var failureBudgetForCatastrophic: Int
 
+        /// 连接活了多久算"长连接"——长连接结束（远端 close / WSBroadcaster rotation 主动关）
+        /// reset consecutiveFailures = 0，避免合法长连接成功也按"失败"累计。秒级，默 30s。
+        ///
+        /// 旧实现无论连接多久都一律 +1，配合 WSBroadcaster 默 4h rotation，约 60h 后客户端会
+        /// 撞到 failureBudgetForCatastrophic（默 15）触发 catastrophic exit。30s 阈值远高于
+        /// "短闪连"场景但远低于 rotation 周期，能区分两者
+        public var longLivedConnectionThresholdSec: TimeInterval
+
         public init(
             heartbeatSec: TimeInterval = 30,
             reconnectInitialSec: TimeInterval = 1,
             reconnectMaxSec: TimeInterval = 60,
             maxInboundMessageBytes: Int = 64 * 1024,
-            failureBudgetForCatastrophic: Int = 15
+            failureBudgetForCatastrophic: Int = 15,
+            longLivedConnectionThresholdSec: TimeInterval = 30
         ) {
             self.heartbeatSec = heartbeatSec
             self.reconnectInitialSec = reconnectInitialSec
             self.reconnectMaxSec = reconnectMaxSec
             self.maxInboundMessageBytes = maxInboundMessageBytes
             self.failureBudgetForCatastrophic = failureBudgetForCatastrophic
+            self.longLivedConnectionThresholdSec = longLivedConnectionThresholdSec
         }
 
         public static let `default` = Config()
@@ -134,10 +144,40 @@ public actor WSNotificationClient {
     /// 只负责正确触发 transition。测试可以注入 onConnectStateChange 观察。
     public var isConnected: Bool { connectedFlag }
     private var connectedFlag: Bool = false
+    /// 本轮 connectOnce 中 setConnected(true) 的时刻。setConnected(false) 算 elapsed 后
+    /// 置 nil；runLoop 每轮开头复位由 setConnected(true) 重写。仅用于"长连接成功"判定
+    private var currentConnectionStartedAt: Date?
+    /// 本轮 connectOnce 是否触发过"长连接成功"事件——setConnected(false) 计算 elapsed >=
+    /// longLivedConnectionThresholdSec 时置 true，runLoop 跑完 connectOnce 据此决定 reset
+    /// consecutiveFailures 还是 +1。每轮 runLoop 顶部清零
+    private var longConnectionThisRound: Bool = false
 
     private func setConnected(_ v: Bool) {
         connectedFlag = v
         onConnectStateChange(v)
+        if v {
+            currentConnectionStartedAt = Date()
+        } else if let started = currentConnectionStartedAt {
+            // close 触发：算"这次连接活了多久"，达阈值标 long-lived 让 runLoop reset counter
+            let elapsed = Date().timeIntervalSince(started)
+            if elapsed >= config.longLivedConnectionThresholdSec {
+                longConnectionThisRound = true
+            }
+            currentConnectionStartedAt = nil
+        }
+    }
+
+    /// runLoop 顶部调——开始新一轮 connect 前清"long-lived" 标记
+    private func resetLongConnectionFlag() {
+        longConnectionThisRound = false
+    }
+
+    /// runLoop 跑完 connectOnce 后调——返回 true 表示本轮是"长连接成功"路径
+    /// （setConnected(true) 后存活 >= threshold），调用方应 reset consecutiveFailures
+    private func consumeLongConnectionFlag() -> Bool {
+        let v = longConnectionThisRound
+        longConnectionThisRound = false
+        return v
     }
 
     /// runLoop 必须 nonisolated 才能用 Task { await self?.runLoop() }——不，actor 方法
@@ -147,16 +187,30 @@ public actor WSNotificationClient {
         log("started \(peerURL.absoluteString)\(peerSuffix)")
         var consecutiveFailures = 0
         while !Task.isCancelled {
+            resetLongConnectionFlag()
+            var thrownError: Error?
             do {
                 try await connectOnce()
-                // 正常完结（远端 close）→ 算"短连接"也按失败计数避免 hot-loop 重连
-                consecutiveFailures += 1
             } catch is CancellationError {
                 log("stopped (cancelled)")
                 return
             } catch {
+                thrownError = error
+            }
+            // 区分"长连接成功后正常关"vs"短闪连/上线即断"：前者 reset counter（远端 rotation /
+            // 用户网络瞬抖让长连合法关闭不该累计失败），后者 +1 走指数 backoff。判定依据是
+            // setConnected(true) 触发后 connectOnce 跑了多久——transport.runOnce 内 defer
+            // 保证 onConnected(false) 总被调，所以 elapsed 总能算出来
+            if consumeLongConnectionFlag() {
+                if consecutiveFailures > 0 {
+                    log("long-lived connection ended cleanly; reset consecutiveFailures \(consecutiveFailures) → 0")
+                }
+                consecutiveFailures = 0
+            } else {
                 consecutiveFailures += 1
-                log("connect error: \(error)")
+                if let err = thrownError {
+                    log("connect error: \(err)")
+                }
             }
             if Task.isCancelled { return }
             // 连续失败到 budget → 视为 daemon 进程层故障,触发 catastrophic 回调

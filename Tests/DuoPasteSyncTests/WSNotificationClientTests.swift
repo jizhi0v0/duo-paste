@@ -213,6 +213,57 @@ struct WSNotificationClientTests {
         }
     }
 
+    /// 长连接成功后被远端 close（典型场景：WSBroadcaster rotation 默认 4h 主动关）应当 reset
+    /// consecutiveFailures——否则配合默 15 budget + 4h rotation 约 60h 触发 catastrophic exit。
+    /// 用注入的 longLivedConnectionThresholdSec=0.05s 加 budget=2 在测试时间尺度上验证
+    @Test func longLivedConnectionResetsFailureCounter() async throws {
+        let secret = Data(repeating: 0xC5, count: 32)
+        let auth = HMACAuth(secret: secret)
+        let port = PortBox2()
+        let counter = Counter()
+        let catastrophicCalled = Counter()
+
+        // server 端 hold 200ms 才 close —— elapsed 远超 0.05s threshold
+        let app = makeScriptedServer(auth: auth, port: port) { outbound in
+            let msg = WSMessage.cursorAdvanced(version: 1, deviceID: "peer", latestIngestedAtNs: 1)
+            try await outbound.write(.text(msg.encodeJSON()))
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try await outbound.close(.normalClosure, reason: nil)
+        }
+        let group = ServiceGroup(configuration: .init(
+            services: [app], gracefulShutdownSignals: [.sigterm, .sigint], logger: app.logger
+        ))
+        try await withThrowingTaskGroup(of: Void.self) { tg in
+            tg.addTask { try await group.run() }
+            let p = await port.get()
+            let url = URL(string: "http://127.0.0.1:\(p)")!
+            let client = WSNotificationClient(
+                peerURL: url, auth: auth, expectedPeerDeviceID: nil,
+                onCursorAdvanced: { ns in Task { await counter.record(ns) } },
+                // budget=2：若长连接不 reset counter，跑 3 次后即达上限 trigger catastrophic
+                onCatastrophicFailure: {
+                    Task { await catastrophicCalled.record(1) }
+                },
+                config: .init(
+                    heartbeatSec: 30,
+                    reconnectInitialSec: 0.05,
+                    reconnectMaxSec: 0.1,
+                    failureBudgetForCatastrophic: 2,
+                    longLivedConnectionThresholdSec: 0.05
+                )
+            )
+            await client.start()
+            // 让 client 至少跑 4 个完整 connect 周期 —— 每个周期 ~200ms 长连接 + ~50-100ms backoff
+            await waitUntil2(timeoutSec: 3.0) { await counter.count() >= 4 }
+            await client.stop()
+            await group.triggerGracefulShutdown()
+
+            // 4 次成功长连接 —— 若 reset 工作，catastrophic 永远不该触发
+            let cat = await catastrophicCalled.count()
+            #expect(cat == 0, "长连接成功应 reset failure counter；实际触发 catastrophic \(cat) 次")
+        }
+    }
+
     @Test func stopCancelsReconnectLoop() async throws {
         // 没起 server → 直接 stop 应当快速返回（不卡 reconnect backoff）
         let secret = Data(repeating: 0xC4, count: 32)
