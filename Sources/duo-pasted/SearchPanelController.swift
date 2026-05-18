@@ -108,13 +108,16 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     }
 
     func hide() {
-        // 收场动画:0.14s 快速淡出 + 微下沉,完成后 orderOut。比 show 短一拍——
-        // 用户主动关闭希望立即响应,长动画会拖沓
+        // **同步**先 cancel：lazy paste task / preview——动画 140ms 内 fetchBlobLazy
+        // 可能完成（30s 总超时下尤其放大），把 blob 字节写进 NSPasteboard 但 panel 已
+        // 关，用户切到其他 app 后莫名收到 paste = CLAUDE.md "孤儿写入" 现象。
+        // 视觉收场动画照常走，但 cancel paste/preview 不等动画
+        finalizeHideImmediate()
+
         guard let p = panel, p.isVisible else {
             panel?.orderOut(nil)
             removeKeyMonitor()
             removeGlobalClickMonitor()
-            finalizeHide()
             return
         }
         let currentOrigin = p.frame.origin
@@ -126,7 +129,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             p.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             // NSAnimationContext 的 completionHandler 不带 isolation——回到 main 后
-            // 才能访问 @MainActor 隔离的 panel / removeKeyMonitor / finalizeHide
+            // 才能访问 @MainActor 隔离的 panel / removeKeyMonitor
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.panel?.orderOut(nil)
@@ -134,14 +137,14 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 self.panel?.alphaValue = 1
                 self.removeKeyMonitor()
                 self.removeGlobalClickMonitor()
-                self.finalizeHide()
             }
         })
     }
 
-    /// hide 路径共用收尾——orderOut 之后必须复位 preview + 通知 caller cancel paste task。
-    /// show/hide 动画走两条 codepath,把这部分抽出来避免漏调
-    private func finalizeHide() {
+    /// hide 路径共用同步收尾——cancel preview + 通知 caller cancel paste task。
+    /// **必须**在动画**开始前**调，否则 140ms 动画期间 lazy fetch 可能完成把字节写进
+    /// NSPasteboard，导致用户切到其他 app 后莫名收到 paste
+    private func finalizeHideImmediate() {
         // preview overlay 永远不跨 panel 生命周期保留——hide 时强制复位,
         // 下次 show 看到的是干净状态。windowDidResignKey 也走这里,所以 panel
         // 失焦自动隐藏的路径同样覆盖。state.previewShown 复位还会触发 SearchView

@@ -128,7 +128,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.titlebarAppearsTransparent = true
         win.titleVisibility = .hidden
         win.setContentSize(NSSize(width: 760, height: 620))
-        win.minSize = NSSize(width: 700, height: 560)
+        // 锁固定尺寸——styleMask 没 .resizable，理论上不会有 resize 路径；min/max 都设到
+        // frame.size 让契约自证（避免之前 minSize=700×560 让阅读代码的人以为支持缩到 700）。
+        // CLAUDE.md §"Settings 窗口" 不变量：traffic lights placement 在 fixed size 下才稳
+        win.minSize = win.frame.size
         win.maxSize = win.frame.size
         win.isReleasedWhenClosed = false   // close 走 orderOut，下次直接复用
         win.delegate = self
@@ -851,13 +854,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .mergedText, .mergedFile:
             // mergedText 含跨 kind:image/file 用 preview 占位; mergedFile 是全 file 多 URL。
             // 文本/路径同步可拿,不走 lazy 拉 blob——但 watcher.pasteBack 是 actor barrier
-            // (async),包 Task 跨 main→actor→main 一圈。barrier 内串行 flush → main 写 → suppress
+            // (async),包 Task 跨 main→actor→main 一圈。barrier 内串行 flush → main 写 → suppress。
+            //
+            // **必须**存 currentPasteTask: 即便当前 body 几乎不 await（极短同步），Esc 触发
+            // panel.hide() 时 cancelLazyPasteIfAny 才能 cancel；未来谁加任何 await（多 image
+            // flatten / 大文本压缩 等）也不会因为没存 task 而留下孤儿写入路径
             let blobs = deps.blobs
-            Task { @MainActor [weak self] in
+            currentPasteTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 let wrote = await self.watcher.pasteBack {
                     Copyback.writeMerged(items: items, blobs: blobs)
                 }
+                if Task.isCancelled { return }
                 if !wrote {
                     self.state.pasteProgress = .failed(reason: "选中项无可写入内容")
                     return
@@ -881,13 +889,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if missing.isEmpty {
-            // 都在本机 → barrier 内同步 paste(actor 串行 flush → main 写 → suppress)
+            // 都在本机 → barrier 内同步 paste(actor 串行 flush → main 写 → suppress)。
+            // 同 .mergedText 路径理由：存 currentPasteTask 让 panel.hide 能 cancel，防未来
+            // 谁加 await 后这条路径变孤儿写入入口
             let blobs = deps.blobs
-            Task { @MainActor [weak self] in
+            currentPasteTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 let (wrote, _) = await self.watcher.pasteBack {
                     Copyback.writeMergedImages(items: items, blobs: blobs)
                 }
+                if Task.isCancelled { return }
                 if !wrote {
                     self.state.pasteProgress = .failed(reason: "选中图片无可写入内容")
                     return
@@ -1061,15 +1072,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// lazy GET /blob 拿字节落盘。封装 transient 重试（2 次 2s/4s backoff）+ 总体超时 5s。
-    /// 不抛错——把 GetBlobError / timeout / cancellation 统一压缩成 LazyOutcome
+    /// lazy GET /blob 拿字节落盘。封装 transient 重试（2 次 2s/4s backoff）+ 总体超时
+    /// `lazyBlobTimeoutSec`（默 30s）。不抛错——把 GetBlobError / timeout / cancellation
+    /// 统一压缩成 LazyOutcome
     private enum LazyOutcome { case success; case failure(reason: String) }
 
-    /// 用 TaskGroup 让"重试循环"跟"5s 超时"竞争——先完成的赢，另一边被 cancel。
-    /// **不能**只靠 fetchBlobLazyInner 内的 `Date() > deadline` 早退检查——URLSession
-    /// 单个 request 默认 60s timeout，如果服务端 hang 在 connection 已建立但不返回数据
-    /// 的状态，inner 循环根本没机会 check Date()。group cancel 会让 URLSession 抛
-    /// URLError.cancelled 立即返回，是唯一能保证 5s 内一定有结果的姿态
+    /// 用 TaskGroup 让"重试循环"跟"`lazyBlobTimeoutSec` 超时"竞争——先完成的赢，另一边
+    /// 被 cancel。**不能**只靠 fetchBlobLazyInner 内的 `Date() > deadline` 早退检查——
+    /// URLSession 单个 request 默认 60s timeout，如果服务端 hang 在 connection 已建立但
+    /// 不返回数据的状态，inner 循环根本没机会 check Date()。group cancel 会让 URLSession
+    /// 抛 URLError.cancelled 立即返回，是唯一能保证总超时内一定有结果的姿态
+    ///
+    /// 历史：原来 5s 总超时，Tailscale DERP 中继路径 TLS 握手本身 3s+ → 经常超时；放宽到
+    /// 30s。配合 SearchPanelController.hide 同步先调 onDismiss cancel task（PR-G）让
+    /// "panel 关 → 30s 后 blob 字节落到 NSPasteboard"的孤儿写入窗口缩到 0
     private func fetchBlobLazy(sha: String, fetcher: BlobFetcher) async -> LazyOutcome {
         do {
             return try await withThrowingTaskGroup(of: LazyOutcome.self) { group in
@@ -1092,9 +1108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 内部重试循环。`fetchBlobLazy` 外面已经用 TaskGroup 包了 5s 总超时；这里只负责
-    /// transient 错误的 2 次 backoff 重试。每次循环开头 check `Task.isCancelled`——
-    /// group cancel 时尽快退出
+    /// 内部重试循环。`fetchBlobLazy` 外面已经用 TaskGroup 包了 `lazyBlobTimeoutSec` 总超时；
+    /// 这里只负责 transient 错误的 2 次 backoff 重试。每次循环开头 check `Task.isCancelled`
+    /// ——group cancel 时尽快退出
     private func fetchBlobLazyInner(sha: String, fetcher: BlobFetcher) async -> LazyOutcome {
         let backoffs: [TimeInterval] = [0, 2, 4]  // 第 1 次立即；第 2/3 次前 sleep
         for (attempt, delay) in backoffs.enumerated() {

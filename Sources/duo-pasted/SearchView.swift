@@ -1070,11 +1070,13 @@ struct SearchView: View {
                                     let hi = max(from, to)
                                     state.selectedIDs = (lo...hi).map { state.results[$0].id }
                                 } else {
-                                    // 普通单击 → 单选 + 触发 scrollTo center,让点击 viewport
-                                    // 边缘的卡也滚到完整可见(原版只有键盘 navigate 才滚)
+                                    // 普通单击 → 仅单选。**不**递增 scrollPulse——
+                                    // CLAUDE.md §"鼠标点击不触发滚动" 不变量：scrollPulse 只
+                                    // 在键盘导航递增，鼠标点击只改 selectedID 不动滚动。
+                                    // 否则 viewport 中部已可见的卡片被点也会触发 0.12s
+                                    // withAnimation scrollTo 动画，体感"为什么我点了它还滑"
                                     state.selectedIDs = [item.id]
                                     state.anchorID = item.id
-                                    state.scrollPulse &+= 1
                                 }
                             }
                         )
