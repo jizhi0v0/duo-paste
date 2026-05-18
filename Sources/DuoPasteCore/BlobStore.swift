@@ -57,41 +57,7 @@ public struct BlobStore: Sendable {
     public func put(_ data: Data, ext: String? = nil) throws -> BlobInfo {
         let digest = SHA256.hash(data: data)
         let hex = digest.map { String(format: "%02x", $0) }.joined()
-        let target = path(for: hex, ext: ext)
-        let fm = FileManager.default
-
-        if let existing = locate(sha256: hex) {
-            let attrs = try fm.attributesOfItem(atPath: existing.path)
-            let size = (attrs[.size] as? NSNumber)?.int64Value ?? Int64(data.count)
-            return BlobInfo(sha256: hex, size: size, path: existing, wasExisting: true)
-        }
-
-        try fm.createDirectory(
-            at: target.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        // 原子写：先写临时文件再 rename
-        let tmp = target.deletingLastPathComponent()
-            .appendingPathComponent(".tmp." + UUID().uuidString)
-        try data.write(to: tmp, options: [.atomic])
-        // 目标若被竞争创建，仍认为是成功的；保留已存在文件
-        do {
-            try fm.moveItem(at: tmp, to: target)
-        } catch {
-            if fm.fileExists(atPath: target.path) {
-                try? fm.removeItem(at: tmp)
-            } else {
-                throw error
-            }
-        }
-        let written = BlobInfo(
-            sha256: hex,
-            size: Int64(data.count),
-            path: target,
-            wasExisting: false
-        )
-        notifyAdded(written.size)
-        return written
+        return try writeBlob(data: data, sha256Hex: hex, ext: ext)
     }
 
     /// `put` 的防御版本：在算 sha 之前先比对 `expectedSha`，不匹配直接 throw。
@@ -105,19 +71,26 @@ public struct BlobStore: Sendable {
         guard actualHex == expectedSha256 else {
             throw BlobStoreError.shaMismatch(expected: expectedSha256, actual: actualHex)
         }
-        // 已经算出 hex，直接走内部写盘路径避免重算
         return try writeBlob(data: data, sha256Hex: actualHex, ext: ext)
     }
 
-    /// 把 sha 已知的 data 落盘。内部使用，跳过算 sha 重复劳动。
+    /// 唯一的真写盘路径——put / putVerified 都收敛到这里。
+    ///
+    /// 并发契约（同一 sha 两个 caller 同时进来）：
+    ///   - 第一个 link 成功 → wasExisting=false + notifyAdded
+    ///   - 第二个 linkItem 失败（EEXIST，因为 target 已被赢家占）→ 视为竞态丢方，
+    ///     **返回 wasExisting=true 且不调 notifyAdded**（字节已被赢家计入，BlobStorageStats
+    ///     重复计数会让 UI 仓库占用虚增）
+    ///
+    /// 用 linkItem 而**不**用 moveItem：POSIX rename(2) 是 atomic replace，dst 已存在时
+    /// 不报错而是覆盖，竞态丢方根本没机会进 catch；linkItem 走 link(2)，dst 已存在时
+    /// 必定 EEXIST，才是真正的 "exclusive create" 语义。tmp 无论 link 成败都 cleanup
     private func writeBlob(data: Data, sha256Hex hex: String, ext: String?) throws -> BlobInfo {
         let target = path(for: hex, ext: ext)
         let fm = FileManager.default
 
         if let existing = locate(sha256: hex) {
-            let attrs = try fm.attributesOfItem(atPath: existing.path)
-            let size = (attrs[.size] as? NSNumber)?.int64Value ?? Int64(data.count)
-            return BlobInfo(sha256: hex, size: size, path: existing, wasExisting: true)
+            return try existingBlobInfo(at: existing, hex: hex, fallbackSize: Int64(data.count))
         }
         try fm.createDirectory(
             at: target.deletingLastPathComponent(),
@@ -126,14 +99,14 @@ public struct BlobStore: Sendable {
         let tmp = target.deletingLastPathComponent()
             .appendingPathComponent(".tmp." + UUID().uuidString)
         try data.write(to: tmp, options: [.atomic])
+        defer { try? fm.removeItem(at: tmp) }
         do {
-            try fm.moveItem(at: tmp, to: target)
+            try fm.linkItem(at: tmp, to: target)
         } catch {
             if fm.fileExists(atPath: target.path) {
-                try? fm.removeItem(at: tmp)
-            } else {
-                throw error
+                return try existingBlobInfo(at: target, hex: hex, fallbackSize: Int64(data.count))
             }
+            throw error
         }
         let written = BlobInfo(
             sha256: hex,
@@ -143,6 +116,15 @@ public struct BlobStore: Sendable {
         )
         notifyAdded(written.size)
         return written
+    }
+
+    /// 已存在 blob 的 BlobInfo 构造统一入口。attrs 读取失败时退化到 fallbackSize（caller
+    /// 传 data.count）以保证调用方不抛 IO 错误—— short-circuit 路径是"读 size 给 UI"的
+    /// 不严格场景
+    private func existingBlobInfo(at url: URL, hex: String, fallbackSize: Int64) throws -> BlobInfo {
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? fallbackSize
+        return BlobInfo(sha256: hex, size: size, path: url, wasExisting: true)
     }
 
     public func read(sha256: String) throws -> Data? {
