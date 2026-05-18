@@ -512,8 +512,18 @@ struct SearchView: View {
         }
         .onPreferenceChange(SelectedCardFramePreference.self) { rect in
             // PreferenceKey 在 layout 过程里多次 fire,只在值真正变化时写回,避免
-            // 触发上面 onChange 死循环
-            if rect != state.selectedCardWindowRect {
+            // 触发上面 onChange 死循环。
+            // **epsilon 1pt**:CGRect `!=` 直接比浮点会被亚像素精度震荡触发,
+            // 滑动期间反复 fire → PreviewPanelController.apply() 反复重赋 rootView
+            // → app update phase hitch。1pt 以内的微小变化吃掉,zero ↔ nonzero 状态
+            // 切换仍要 fire(reset 路径)
+            let current = state.selectedCardWindowRect
+            let isReset = (rect == .zero) != (current == .zero)
+            let dx = abs(rect.minX - current.minX)
+            let dy = abs(rect.minY - current.minY)
+            let dw = abs(rect.width - current.width)
+            let dh = abs(rect.height - current.height)
+            if isReset || dx > 1 || dy > 1 || dw > 1 || dh > 1 {
                 state.selectedCardWindowRect = rect
             }
         }
@@ -527,13 +537,14 @@ struct SearchView: View {
         // 让内容延伸到 NSPanel titlebar 区域（fullSizeContentView 把 contentView 占位让出来，
         // 但 SwiftUI 默认仍把 titlebar 计入 top safe area，所以 header 上方会留 ~28pt 空白）
         .ignoresSafeArea()
-        // debounce 100ms：用户连打 / 切 chip 时上一个 task 被 .task(id:) cancel 掉，新 task
-        // 先 sleep 100ms 再 refresh。停手 100ms 后才真正发远端请求——10 次按键的
-        // 远端 roundtrip 合并成 1 次。CancellationError 自然吞掉。
-        // id 用 filterID（query + kinds + timeRange 联合指纹），任一维度变化都触发新 fetch
+        // debounce 180ms:用户连打 / 切 chip 时上一个 task 被 .task(id:) cancel 掉,新 task
+        // 先 sleep 180ms 再 refresh。停手 180ms 后才真正发远端请求——连打事件合并率最大化。
+        // 原来 100ms 实测在快速连打时仍触发多次 refresh(每次 100-180ms app update),
+        // 拉到 180ms 后单字符快速连打几乎合并成 1 次 query。
+        // id 用 filterID(query + kinds + timeRange 联合指纹),任一维度变化都触发新 fetch
         .task(id: state.filterID) {
             do {
-                try await Task.sleep(nanoseconds: 100_000_000)
+                try await Task.sleep(nanoseconds: 180_000_000)
                 await state.refresh()
             } catch {
                 // 被取消（用户继续打字 / 改筛选）→ 让下一个 task 接手，啥也不做
@@ -973,6 +984,10 @@ struct SearchView: View {
                             storageMode: state.deps.config.mesh.storageMode,
                             blobInventoryPulse: state.blobInventoryPulse
                         )
+                        // EquatableView 包装:results 替换 / selectedIDs 变化时,只有真正
+                        // 等价比较失败的 cell 才重算 body。下方 .background GeometryReader
+                        // 是独立 modifier,不被 equatable 影响,preview 锚定仍然准
+                        .equatable()
                         // 仅 currentItem 那张卡上挂 GeometryReader 发布 frame——currentItem
                         // = selectedIDs.last,跟 PreviewPanelController 锚定逻辑一致。
                         // GeometryReader 必须在 .padding 前,读到的是 240pt 卡本身的 frame
@@ -1620,7 +1635,27 @@ private struct KindChip: View {
     }
 }
 
-private struct ItemCard: View {
+private struct ItemCard: View, Equatable {
+    /// Equatable 给 LazyHStack 加 `.equatable()` 减少 reconciliation——results 数组替换时
+    /// 同 item.id 但内容不变的 cell 跳过 body 重算。攻击 AppState.refresh() / selectedIDs
+    /// 变化引起的 100-158ms app update phase 大尖峰。
+    ///
+    /// **不参与比较**:blobs / fetcher 是 AppState 生命周期单实例 class,引用稳定;
+    /// 即使 swap 也不会真正影响 cell 显示(它们俩通过 `.task` 异步 load 缩略图,
+    /// thumbnail @State 自管,跟 blobs 的引用身份无关)
+    // nonisolated 必需:SwiftUI View 默认 @MainActor,Equatable 协议未标 isolation,
+    // Swift 6 strict concurrency 会报 "conformance crosses into main actor"。
+    // == 只读 let 字段,无线程安全风险,nonisolated 即可
+    nonisolated static func == (lhs: ItemCard, rhs: ItemCard) -> Bool {
+        lhs.item == rhs.item
+            && lhs.index == rhs.index
+            && lhs.isSelected == rhs.isSelected
+            && lhs.selfDeviceID == rhs.selfDeviceID
+            && lhs.snippet == rhs.snippet
+            && lhs.storageMode == rhs.storageMode
+            && lhs.blobInventoryPulse == rhs.blobInventoryPulse
+    }
+
     let item: Item
     /// 1-9 = 在 results 数组前 9 位,footer 右下显示 ⌘N 角标对应 ⌘1-9 快捷粘贴;
     /// nil = 位置超出快捷范围,不显示角标

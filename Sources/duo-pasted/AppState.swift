@@ -521,31 +521,68 @@ final class AppState {
             pinnedOnly: pinnedOnly,
             limit: Self.listLimit
         )
+        // **E**: 把 SearchProvider.search 整段(4 次同步 SQL + fold + 转 Item array)
+        // 搬出 main actor。SearchProvider.search 是 async 但内部全同步——`async`
+        // 只为接口稳定保留(见 SearchClient.swift:72-74 注释),实际所有工作在调用者
+        // actor 上跑。Task.detached 让这段在后台 thread 执行,main actor 只 await
+        // 结果 + 做 setter 赋值。SearchProvider 是 Sendable struct,SearchAPI 内部
+        // GRDB pool 是 thread-safe,跨 thread 调用安全。
+        // 注:detached child 不继承父 task 取消,用户连打字符触发 .task(id:) 替换时
+        // 旧 detached task 会跑完一次(单次几百 ms),CPU 浪费可接受——本来 debounce
+        // 100ms 就吃掉大部分连打事件
+        let provider = deps.searchProvider
+        let outcome: SearchProvider.Outcome
         do {
-            let outcome = try await deps.searchProvider.search(q)
-            self.results = outcome.items
-            // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
-            // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
-            ImageThumbnailCache.shared.prefetch(
-                items: outcome.items,
-                blobs: deps.blobs,
-                fetcher: pasteBlobFetcher,
-                storageMode: deps.config.mesh.storageMode
-            )
-            self.snippets = outcome.snippets
-            self.searchMode = outcome.mode
-            self.totalCount = outcome.totalCount
-            self.kindCounts = outcome.kindCounts
-            self.fileSubKindCounts = outcome.fileSubKindCounts
-            // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
-            // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）
-            self.clockSkewMs = deps.meshStatus.worstClockSkewMs()
-            updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
-            self.lastError = nil
+            outcome = try await Task.detached(priority: .userInitiated) {
+                try await provider.search(q)
+            }.value
         } catch is CancellationError {
-            // 用户在打字，新查询正在替换旧的，正常
+            // 用户在打字,新查询正在替换旧的,正常
+            return
         } catch {
             self.lastError = "\(error)"
+            return
+        }
+        // **F**: 每个 setter 前 equality guard——内容等价时直接跳过,避免 Observation
+        // 框架 didSet wave 触发下游 ForEach diff / chip 重渲。新旧 Item array 在
+        // query 没变的高频 refresh(openPulse / onAppear)场景下大概率等价,
+        // ItemCard EquatableView 已能跳 body 重算,这里再叠一层让 ForEach enumerate
+        // 都不发生
+        if self.results != outcome.items {
+            self.results = outcome.items
+        }
+        // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
+        // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
+        ImageThumbnailCache.shared.prefetch(
+            items: outcome.items,
+            blobs: deps.blobs,
+            fetcher: pasteBlobFetcher,
+            storageMode: deps.config.mesh.storageMode
+        )
+        if self.snippets != outcome.snippets {
+            self.snippets = outcome.snippets
+        }
+        if self.searchMode != outcome.mode {
+            self.searchMode = outcome.mode
+        }
+        if self.totalCount != outcome.totalCount {
+            self.totalCount = outcome.totalCount
+        }
+        if self.kindCounts != outcome.kindCounts {
+            self.kindCounts = outcome.kindCounts
+        }
+        if self.fileSubKindCounts != outcome.fileSubKindCounts {
+            self.fileSubKindCounts = outcome.fileSubKindCounts
+        }
+        // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
+        // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）
+        let newSkew = deps.meshStatus.worstClockSkewMs()
+        if self.clockSkewMs != newSkew {
+            self.clockSkewMs = newSkew
+        }
+        updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
+        if self.lastError != nil {
+            self.lastError = nil
         }
     }
 
