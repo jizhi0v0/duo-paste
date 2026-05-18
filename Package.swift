@@ -52,6 +52,10 @@ let package = Package(
             dependencies: ["DuoPasteCore"]
         ),
         .testTarget(
+            name: "DuoPasteCaptureTests",
+            dependencies: ["DuoPasteCapture"]
+        ),
+        .testTarget(
             name: "DuoPasteSyncTests",
             dependencies: [
                 "DuoPasteSync",

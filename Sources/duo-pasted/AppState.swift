@@ -299,7 +299,11 @@ final class AppState {
         let learnedPonteHost: String?
         let manualPullURL: String?
         let kind: Kind        // .ponte / .tailscale —— 给 UI 上 chip 颜色用
-        let httpRttMs: [String: Int64]   // host → RTT，>= 0 = reachable，-1 = probe 失败
+        /// host → RTT,>= 0 = reachable,-1 = probe 失败。初始来自 SmartTransport.discover
+        /// 的所有 candidate;runtime 由 PullWorker /health tick 通过 `updateChosenHostRtt`
+        /// 覆盖 chosenHost 一条让 UI 反映真实健康度。其他 candidate 行保持 discover 那次的
+        /// 快照(诚实展示——非 chosen 行 runtime 没在探,只能等下次 reconcile)
+        var httpRttMs: [String: Int64]
 
         enum Kind: Sendable { case ponte, tailscale }
 
@@ -323,10 +327,23 @@ final class AppState {
     var transports: [TransportSnapshot] = []
     var transportsUpdatedAt: Date? = nil
 
-    /// 由 AppDelegate 在 MeshSupervisor 初始化 / reconcile 完成时调（main actor）
+    /// 由 AppDelegate 在 MeshSupervisor 初始化 / reconcile 完成时调(main actor)
     func setTransports(_ decisions: [SmartTransport.PeerDecision]) {
         self.transports = decisions.map(TransportSnapshot.init)
         self.transportsUpdatedAt = Date()
+    }
+
+    /// 由 PullWorker /health tick 完成后通过 PeerBuilder.onHealthProbed 回调过来。
+    /// 只覆盖该 peer 当前 chosenHost 对应的 RTT 条目,其他 candidate 行不动——非 chosen
+    /// runtime 没在探,改了就是说谎。peerIndex 越界 silent ignore(reconcile 中途的临时态)。
+    /// 同时刷 transportsUpdatedAt 让 UI"上次决策刷新 N 秒前"也跟 runtime 健康同步,用户
+    /// 能直观看到这一行确实是新的
+    func updateChosenHostRtt(peerIndex: Int, rttMs: Int64) {
+        guard transports.indices.contains(peerIndex) else { return }
+        var snap = transports[peerIndex]
+        snap.httpRttMs[snap.chosenHost] = rttMs
+        transports[peerIndex] = snap
+        transportsUpdatedAt = Date()
     }
 
     /// 单次跳过的提示。`bytes` / `limit` 单位字节，UI 端 humanize。`kind` 决定文案。

@@ -229,11 +229,68 @@ struct MeshSupervisorReconcileTests {
     }
 
     @Test func reconcileNoOpWhenSmartDepsMissing() async throws {
-        // PR 3 兼容入口（无 smart 依赖）调 reconcile 应静默 no-op，不抛
+        // PR 3 兼容入口(无 smart 依赖)调 reconcile 应静默 no-op,不抛
         let supervisor = MeshSupervisor(workers: [makeNoopWorker(label: "x")])
         await supervisor.reconcileTransports()  // 不该挂 / 抛 / 改变 peer
         let workers = await supervisor.workers
         #expect(workers.count == 1)
+    }
+
+    @Test func periodicReconcileFiresMultipleTimes() async throws {
+        // B2:周期 timer 在 supervisor.start() 后启动,按 periodicReconcileSec 间隔
+        // 反复触发 reconcileTransports。stop() 取消 task,后续 sleep 期不再触发
+        let peer = makePeerConfig("https://x:8443")
+        let decision = makeDecision(peerIndex: 0, chosenPullURL: "https://x:8443")
+        let initialWorker = makeNoopWorker(label: "init")
+        let counter = CallCounter()
+        let discoverOverride: @Sendable () async -> [SmartTransport.PeerDecision] = { [decision] in
+            await counter.inc()
+            return [decision]
+        }
+        let supervisor = MeshSupervisor(
+            initialPeers: [MeshSupervisor.Peer(worker: initialWorker)],
+            initialDecisions: [decision],
+            smart: SmartTransport(),
+            configPeers: [peer],
+            auth: HMACAuth(secret: Data(repeating: 0xC0, count: 32)),
+            tailscaleSession: .shared,
+            buildPeer: { _ in MeshSupervisor.Peer(worker: initialWorker) },
+            discoverOverride: discoverOverride,
+            autoRecoverOnDNSChange: false,
+            periodicReconcileSec: 0.15  // 短间隔测试加速
+        )
+        await supervisor.start()
+        try? await Task.sleep(nanoseconds: 600_000_000)  // 0.6s → 应触发 3-4 次
+        await supervisor.stop()
+        let firedDuringRun = await counter.count
+        #expect(firedDuringRun >= 3, "got \(firedDuringRun) — periodic timer should have fired ≥3 times in 0.6s @ 0.15s interval")
+        // stop 后再等一会儿,确认 timer 真停了不会继续触发
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        let firedAfterStop = await counter.count
+        #expect(firedAfterStop == firedDuringRun, "got \(firedAfterStop) vs \(firedDuringRun) — timer not cancelled by stop()")
+    }
+
+    @Test func periodicReconcileDisabledWhenSecZero() async throws {
+        // periodicReconcileSec=0 → 不启动 timer
+        let peer = makePeerConfig("https://x:8443")
+        let decision = makeDecision(peerIndex: 0, chosenPullURL: "https://x:8443")
+        let counter = CallCounter()
+        let supervisor = MeshSupervisor(
+            initialPeers: [MeshSupervisor.Peer(worker: makeNoopWorker(label: "x"))],
+            initialDecisions: [decision],
+            smart: SmartTransport(),
+            configPeers: [peer],
+            auth: HMACAuth(secret: Data(repeating: 0xC0, count: 32)),
+            tailscaleSession: .shared,
+            buildPeer: { _ in MeshSupervisor.Peer(worker: makeNoopWorker(label: "x")) },
+            discoverOverride: { await counter.inc(); return [decision] },
+            autoRecoverOnDNSChange: false,
+            periodicReconcileSec: 0
+        )
+        await supervisor.start()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        await supervisor.stop()
+        #expect(await counter.count == 0)
     }
 }
 

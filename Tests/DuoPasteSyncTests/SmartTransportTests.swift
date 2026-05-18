@@ -160,4 +160,83 @@ struct SmartTransportTests {
         #expect(decisions[1].peerIndex == 1)
         #expect(decisions[1].chosenWSKind == .nio)
     }
+
+    // MARK: - B1: probeWithRetry
+
+    /// 可脚本化 probe:第 N 次调返回 modes[min(N, modes.count-1)]。计数用 actor 安全
+    private actor SequentialProbe {
+        private let modes: [(PrimaryHealthResult.Outcome, Int64)]
+        private(set) var calls: Int = 0
+        init(_ modes: [(PrimaryHealthResult.Outcome, Int64)]) { self.modes = modes }
+        func next() -> (PrimaryHealthResult.Outcome, Int64) {
+            let idx = min(calls, modes.count - 1)
+            calls += 1
+            return modes[idx]
+        }
+    }
+
+    @Test func probeWithRetryNoRetryOnOK() async {
+        let url = URL(string: "https://x:8443")!
+        let seq = SequentialProbe([
+            (.ok(deviceID: "d", nowMs: 1, ponteHost: nil), 50)
+        ])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let r = await SmartTransport.probeWithRetry(probe, url: url, retries: 1, backoffSec: 0.01)
+        #expect(r.rttMs == 50)
+        if case .ok = r.outcome {} else { Issue.record("expected .ok") }
+        #expect(await seq.calls == 1)  // 不 retry
+    }
+
+    @Test func probeWithRetryRetriesOnUnreachable() async {
+        let url = URL(string: "https://x:8443")!
+        let seq = SequentialProbe([
+            (.unreachable(reason: "first try fail"), -1),
+            (.ok(deviceID: "d", nowMs: 2, ponteHost: nil), 80)  // 第二次成功
+        ])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let r = await SmartTransport.probeWithRetry(probe, url: url, retries: 1, backoffSec: 0.01)
+        #expect(r.rttMs == 80)
+        if case .ok = r.outcome {} else { Issue.record("expected .ok after retry") }
+        #expect(await seq.calls == 2)  // 失败+重试 = 2 次
+    }
+
+    @Test func probeWithRetryGivesUpAfterAllRetriesFail() async {
+        let url = URL(string: "https://x:8443")!
+        let seq = SequentialProbe([
+            (.unreachable(reason: "always fail"), -1)
+        ])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let r = await SmartTransport.probeWithRetry(probe, url: url, retries: 2, backoffSec: 0.01)
+        if case .unreachable = r.outcome {} else { Issue.record("expected .unreachable") }
+        #expect(await seq.calls == 3)  // 初次 + retries=2 = 3 次
+    }
+
+    @Test func probeWithRetryDoesNotRetryRejected() async {
+        let url = URL(string: "https://x:8443")!
+        let seq = SequentialProbe([
+            (.rejected(reason: "401 hmac fail"), 30)
+        ])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let r = await SmartTransport.probeWithRetry(probe, url: url, retries: 2, backoffSec: 0.01)
+        if case .rejected = r.outcome {} else { Issue.record("expected .rejected") }
+        #expect(await seq.calls == 1)  // .rejected 立即返回不 retry
+    }
+
+    @Test func decideOnePonteRecoveredOnSecondTry() async {
+        // 启动竞态典型场景:tailscale C1 第一次 fail 第二次 OK(顺带学到 ponte_host),
+        // ponte C3 第一次 fail 第二次 OK → 最终选 ponte。这正是 B1 在真实环境想救的 case
+        let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
+        // C1 调用2次(第一次 unreachable retry 后 OK),C3 调用2次,共4次
+        let seq = SequentialProbe([
+            (.unreachable(reason: "tailscale cold start"), -1),
+            (.ok(deviceID: "mbp", nowMs: 1, ponteHost: "mbp.sgponte"), 100),
+            (.unreachable(reason: "ponte cold start (Surge not ready)"), -1),
+            (.ok(deviceID: "mbp", nowMs: 2, ponteHost: nil), 50),
+        ])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let d = await SmartTransport.decideOne(peerIndex: 0, peer: peer, probe: probe)
+        #expect(d.chosenPullURL.absoluteString == "https://mbp.sgponte:8443")
+        #expect(d.chosenWSKind == .urlSession)
+        #expect(d.learnedPonteHost == "mbp.sgponte")
+    }
 }

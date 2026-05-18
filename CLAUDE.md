@@ -247,7 +247,11 @@ RTF 抓取走三层降级：
 
 **不要**重新引入 `lastSelfWriteChangeCount` 静态比较方案。
 
-> 历史：曾有第二层防御——`Watcher.extract()` 顶端 `frontApp.pid == self.pid → return nil`，意在防止"搜索框 Cmd+C 污染历史"。**已撤掉**（2026-05）。撤销原因：用户实际场景里更常想把搜索框里的串作为新剪贴板项入库（剪贴板管理器本质就是"复制就该被记录"）；self-pid 跳过的副作用是把 self frontmost 期间的 changeCount 吃掉但永不补，搜索结果永远 0 条。pasteBack 已经有 suppressUpToCurrent 做隔离，self-pid 过滤是多余且有害的。不要再加回去。
+**第二层防御**：`Watcher.extract()` 顶端 `frontApp.pid == self.pid → return nil`。pasteBack 的 `suppressUpToCurrent` 只挡**程序化**写回（auto-paste 完写一次 pasteboard 后把 lastChangeCount 推到当前 cc）；用户在搜索框 / Settings 文本框里**手动** Cmd+C 时 changeCount 真实自增，suppressUpToCurrent 来不及介入——只有 self-pid 过滤能拦下来，否则 search 框 Cmd+C 会被重新入库，触发"复制 → 入库 → 又出现 → 再复制"的反复回环。
+
+已知副作用接受：self frontmost 期间所有 changeCount 自增被吃掉。这是期望行为——剪贴板管理器自己 UI 里的复制不该污染历史，跟"在 search 框敲字然后 Cmd+C 整段当新条目入库"那条产品诉求二者**只能选一**，PR 20 review 选了不污染。
+
+历史：2026-05 曾撤掉这一层（想让搜索框 Cmd+C 入库），PR 20 review 指出回退了双层防御不变量并恢复。如果未来要再次改产品语义，请同步更新本节 + `PasteboardWatcher.extract()` 注释 + 新增对应回归测试。
 
 ### SwiftUI TextField + 列表导航——NSEvent local monitor
 

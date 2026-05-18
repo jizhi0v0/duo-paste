@@ -610,4 +610,312 @@ public enum Admin {
             return conn.changesCount
         }
     }
+
+    /// OCR 范围 SQL 谓词——必须跟 `OCRWorker.fetchPending` 完全对齐:
+    /// `kind='image'` OR `kind='file' + blob_mime LIKE 'image/%' + has blob`。
+    ///
+    /// 历史踩坑(2026-05):一开始只写 `kind='image'`,导致 UI"本机索引状态"
+    /// 漏算 187 张 CleanShot screenshot——它们是 file kind 但 blob_mime=image/png,
+    /// OCRWorker 早就识别为图片在跑 OCR,我这边 stats SQL 没跟上口径就显示 0。
+    /// 任何"OCR 视角"的 SQL(stats / rebuild / abort)都必须用这条
+    static let ocrScopeSQL = """
+          AND (
+                kind = 'image'
+             OR (kind = 'file' AND blob_mime LIKE 'image/%' AND blob_sha256 IS NOT NULL)
+          )
+        """
+
+    /// 本机 OCR 队列快照。只统计 `origin_device = self AND <ocrScopeSQL> AND deleted_at_ns IS NULL`
+    /// 的行——peer 行由对端 worker 负责，文本行没有 OCR 概念。Settings UI 周期调它
+    /// 显示"剩 X 张待处理"+ 灰字"已完成 N 条使用原配置"。
+    public struct OCRStats: Sendable, Equatable {
+        public var pending: Int
+        public var done: Int
+        public var skipped: Int
+        public var failed: Int
+
+        public init(pending: Int = 0, done: Int = 0, skipped: Int = 0, failed: Int = 0) {
+            self.pending = pending
+            self.done = done
+            self.skipped = skipped
+            self.failed = failed
+        }
+
+        public var total: Int { pending + done + skipped + failed }
+    }
+
+    /// 算本机 OCR 队列分布。read tx 即可。
+    public static func ocrStats(dbPath: URL, selfDeviceID: String) throws -> OCRStats {
+        let db = try Database(path: dbPath)
+        return try db.pool.read { conn -> OCRStats in
+            var stats = OCRStats()
+            let rows = try Row.fetchAll(conn, sql: """
+                SELECT ocr_state AS s, COUNT(*) AS c
+                FROM item
+                WHERE origin_device = ?
+                  AND deleted_at_ns IS NULL
+                  \(Self.ocrScopeSQL)
+                GROUP BY ocr_state
+            """, arguments: [selfDeviceID])
+            for row in rows {
+                let s: String = row["s"] ?? ""
+                let c: Int = row["c"] ?? 0
+                switch s {
+                case "pending": stats.pending = c
+                case "done":    stats.done = c
+                case "skipped": stats.skipped = c
+                case "failed":  stats.failed = c
+                default:        break
+                }
+            }
+            return stats
+        }
+    }
+
+    /// 重建本机 OCR 索引：把 own-origin image 里 `ocr_state='done'` 行翻回 pending，
+    /// 让 OCRWorker 用当前 config（语言/精度）重跑。仅动本机 origin，跟单一归属契约对齐。
+    ///
+    /// 跟 retryFailedOCR 分开：后者只翻 failed/skipped 不动 done。用户场景不同——
+    /// 改 maxBlobMB 调大 → retryFailedOCR；改语言/精度 → rebuildOCRIndex。
+    ///
+    /// **不** bump ingested_at_ns——重置本身不改内容；worker 真跑完 markDone 时再 bump
+    /// 让对端 PullWorker 同步到新 text_full（OCR Phase 2 路径）。
+    ///
+    /// - Returns: 受影响的行数
+    public static func rebuildOCRIndex(dbPath: URL, selfDeviceID: String) throws -> Int {
+        let db = try Database(path: dbPath)
+        return try db.pool.write { conn -> Int in
+            // **必须**同时清 extracted_text / extracted_text_source:
+            // - 不清 → 旧 OCR 文本继续在 FTS 里可搜
+            // - 若后续 markSkipped / markFailed (识别失败 / 缺 blob / 超 cap) 让行卡在终态,
+            //   旧文本永久保留 → 用户改完配置点"重建"反而被骗
+            // bump ingested_at_ns 让对端 PullWorker /since 同步到清空 → 对端 FTS 也更新
+            let now = Clock.nowNs()
+            let stamp = try DuoPasteCore.Database.nextIngestNs(conn, now: now)
+            try conn.execute(sql: """
+                UPDATE item
+                SET ocr_state = 'pending',
+                    extracted_text = NULL,
+                    extracted_text_source = NULL,
+                    ingested_at_ns = ?
+                WHERE origin_device = ?
+                  AND ocr_state = 'done'
+                  AND deleted_at_ns IS NULL
+                  \(Self.ocrScopeSQL)
+            """, arguments: [stamp, selfDeviceID])
+            return conn.changesCount
+        }
+    }
+
+    /// 中止本机 OCR 队列：把 own-origin image `ocr_state='pending'` 翻成 `skipped`。
+    /// 走 skipped 而非新增 cancelled 状态——skipped 语义本就是"本次不处理"；
+    /// 用户日后想恢复直接 retryFailedOCR（`WHERE ocr_state IN ('failed','skipped')`）即可，
+    /// 不需要为 cancel 单开一个状态值。
+    ///
+    /// 用户场景：reindex 跑到一半发现配置不对，想清场重来——abort + 改配置 + rebuild。
+    ///
+    /// - Returns: 受影响的行数
+    public static func abortOCRQueue(dbPath: URL, selfDeviceID: String) throws -> Int {
+        let db = try Database(path: dbPath)
+        return try db.pool.write { conn -> Int in
+            try conn.execute(sql: """
+                UPDATE item
+                SET ocr_state = 'skipped'
+                WHERE origin_device = ?
+                  AND ocr_state = 'pending'
+                  AND deleted_at_ns IS NULL
+                  \(Self.ocrScopeSQL)
+            """, arguments: [selfDeviceID])
+            return conn.changesCount
+        }
+    }
+
+    // MARK: - 图片 file 行缺 blob 字节回填
+
+    /// 回填本机 file kind 图片扩展但 `blob_sha256 IS NULL` 行的字节。
+    ///
+    /// **场景**:CleanShot/Lightshot 把截图复制到剪贴板时,PasteboardWatcher 当时
+    /// 没读到字节(读失败 / 文件已不存在 / 超 capture cap)就只存了路径。这些行 OCR
+    /// 路径(`fetchPending` 要求 `blob_mime LIKE 'image/%' AND blob_sha256 IS NOT NULL`)
+    /// 看不到,跨设备同步也只能看到文件名搜不到内容。
+    ///
+    /// 回填策略:逐行扫描 → 读 text_full 里的本地绝对路径 → 文件存在且 ≤ maxBlobBytes →
+    /// 字节进 BlobStore(content-addressed,自动 dedup)→ UPDATE 行的
+    /// `blob_sha256/blob_size/blob_mime` + 标 `ocr_state='pending'` + 通过 nextIngestNs 单增
+    /// bump `ingested_at_ns`(同 writer tx 内,/since 才能让对端拉到 metadata)。OCRWorker
+    /// 下一 tick 自然扫到跑 OCR(Phase 2 路径再把 text_full 推给对端)。
+    ///
+    /// **只动**:`origin_device = self` + `kind='file'` + 图片扩展名 + `blob_sha256 IS NULL`
+    /// + `deleted_at_ns IS NULL`。peer 行 / 已有 blob 的行 / 非图片 file / tombstone 都不动。
+    /// **路径源**:用 `text_full`(file kind 的 authoritative path,见 CaptureService 写入
+    /// 契约 `resolvedTextFull = c.text ?? c.fileName`)。preview 是被 makePreview 截短的展示值,
+    /// 长路径会丢字节。text_full 以 `/` 开头且不含 `\n` 才尝试(排除多文件 `\n`-join)。
+    ///
+    /// 幂等:跑完后 blob_sha256 非 NULL,下次扫不到。
+    public struct RefillImageBlobsReport: Sendable, Equatable {
+        public var scanned: Int       // 候选行总数
+        public var refilled: Int      // 成功填了 blob 的
+        public var fileMissing: Int   // 路径指向的文件不存在
+        public var tooLarge: Int      // 字节数超过 maxBlobBytes
+        public var readFailed: Int    // 文件存在但读字节失败(权限/坏盘等)
+        public var nonAbsolute: Int   // text_full 不是单条绝对路径(多文件 / 相对路径 / NULL)
+
+        public init(
+            scanned: Int = 0, refilled: Int = 0, fileMissing: Int = 0,
+            tooLarge: Int = 0, readFailed: Int = 0, nonAbsolute: Int = 0
+        ) {
+            self.scanned = scanned
+            self.refilled = refilled
+            self.fileMissing = fileMissing
+            self.tooLarge = tooLarge
+            self.readFailed = readFailed
+            self.nonAbsolute = nonAbsolute
+        }
+
+        public var summary: String {
+            "scanned=\(scanned) refilled=\(refilled) missing=\(fileMissing) too_large=\(tooLarge) read_failed=\(readFailed) non_absolute=\(nonAbsolute)"
+        }
+    }
+
+    public static func refillMissingImageBlobs(
+        dbPath: URL,
+        blobsDir: URL,
+        selfDeviceID: String,
+        maxBlobBytes: Int,
+        log: (String) -> Void = { _ in }
+    ) throws -> RefillImageBlobsReport {
+        let db = try Database(path: dbPath)
+        let blobs = BlobStore(root: blobsDir)
+        var report = RefillImageBlobsReport()
+
+        // 1) 拿候选行清单。read tx,不持锁。
+        //    匹配 text_full(authoritative path)而非 preview(makePreview 截断后的展示值)
+        struct Candidate { let id: String; let textFull: String? }
+        let candidates: [Candidate] = try db.pool.read { conn -> [Candidate] in
+            let rows = try Row.fetchAll(conn, sql: """
+                SELECT id, text_full
+                FROM item
+                WHERE origin_device = ?
+                  AND kind = 'file'
+                  AND blob_sha256 IS NULL
+                  AND deleted_at_ns IS NULL
+                  AND (
+                        LOWER(IFNULL(text_full, '')) GLOB '*.png'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.jpg'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.jpeg'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.heic'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.heif'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.gif'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.webp'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.tiff'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.tif'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.bmp'
+                  )
+            """, arguments: [selfDeviceID])
+            return rows.map { Candidate(id: $0["id"] ?? "", textFull: $0["text_full"]) }
+        }
+        report.scanned = candidates.count
+        log("refill-image-blobs: 扫到 \(candidates.count) 条候选 file 行(own-origin · 图片扩展 · 无 blob · 未软删)")
+
+        // 2) 逐行处理。文件 IO 不能在 writer tx 内
+        for cand in candidates {
+            // 多文件 capture 时 text_full 是 \n-join 多路径——不在回填范畴(无法关联到单一 blob)。
+            // 相对路径 / 空 text_full 也跳过
+            guard let raw = cand.textFull,
+                  raw.hasPrefix("/"),
+                  !raw.contains("\n") else {
+                report.nonAbsolute += 1
+                log("refill-image-blobs: skip id=\(cand.id) · text_full 非单条绝对路径")
+                continue
+            }
+            let url = URL(fileURLWithPath: raw)
+            // 文件存在性
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                report.fileMissing += 1
+                log("refill-image-blobs: skip id=\(cand.id) · 原文件不存在: \(url.path)")
+                continue
+            }
+            // 大小检查(避免读 50GB)
+            let fileSize: Int
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                fileSize = (attrs[.size] as? NSNumber)?.intValue ?? 0
+            } catch {
+                report.readFailed += 1
+                log("refill-image-blobs: skip id=\(cand.id) · stat 失败: \(error)")
+                continue
+            }
+            if fileSize <= 0 || fileSize > maxBlobBytes {
+                report.tooLarge += 1
+                log("refill-image-blobs: skip id=\(cand.id) · 大小 \(fileSize) 超过上限 \(maxBlobBytes) 或为 0")
+                continue
+            }
+            // 读字节
+            let data: Data
+            do {
+                data = try Data(contentsOf: url)
+            } catch {
+                report.readFailed += 1
+                log("refill-image-blobs: skip id=\(cand.id) · 读字节失败: \(error)")
+                continue
+            }
+            let ext = url.pathExtension.lowercased()
+            let mime = Self.imageExtToMime(ext)
+            // 进 BlobStore(content-addressed,同 sha 已有则 wasExisting=true,占用安全)
+            let info: BlobInfo
+            do {
+                info = try blobs.put(data, ext: ext)
+            } catch {
+                report.readFailed += 1
+                log("refill-image-blobs: skip id=\(cand.id) · BlobStore.put 失败: \(error)")
+                continue
+            }
+            // UPDATE 行:补 blob_sha256/blob_size/blob_mime + 标 ocr_state=pending。
+            // 同 tx 内 bump ingested_at_ns(走 nextIngestNs 保单增)——blob_* / ocr_state 都属
+            // /since 同步字段,不 bump 对端拉不到 metadata;OCR 是否启用 / 是否最终成功跟 metadata
+            // 可见性独立,不能依赖 worker 后续 markDone 才推送。captured_at_ns 不动(不是新 capture)
+            do {
+                try db.pool.write { conn in
+                    let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+                    let ns = try DuoPasteCore.Database.nextIngestNs(conn, now: now)
+                    try conn.execute(sql: """
+                        UPDATE item
+                        SET blob_sha256 = ?,
+                            blob_size = ?,
+                            blob_mime = ?,
+                            ocr_state = 'pending',
+                            ingested_at_ns = ?
+                        WHERE id = ?
+                          AND origin_device = ?
+                          AND blob_sha256 IS NULL
+                          AND deleted_at_ns IS NULL
+                    """, arguments: [info.sha256, info.size, mime, ns, cand.id, selfDeviceID])
+                }
+                report.refilled += 1
+                log("refill-image-blobs: ok id=\(cand.id) · sha=\(info.sha256.prefix(8))… · size=\(info.size) · ext=\(ext)")
+            } catch {
+                report.readFailed += 1
+                log("refill-image-blobs: skip id=\(cand.id) · DB UPDATE 失败: \(error)")
+                continue
+            }
+        }
+        log("refill-image-blobs: 完成 · \(report.summary)")
+        return report
+    }
+
+    /// 同 PasteboardWatcher.imageExtToMime,本仓库内复制一份(跨模块 private),
+    /// 改的话两处一起改
+    private static func imageExtToMime(_ ext: String) -> String {
+        switch ext {
+        case "png":         return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "heic":        return "image/heic"
+        case "heif":        return "image/heif"
+        case "gif":         return "image/gif"
+        case "webp":        return "image/webp"
+        case "tiff", "tif": return "image/tiff"
+        case "bmp":         return "image/bmp"
+        default:            return "application/octet-stream"
+        }
+    }
 }

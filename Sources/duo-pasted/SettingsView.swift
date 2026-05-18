@@ -170,6 +170,17 @@ final class SettingsModel {
     var statusMessage: String?
     var statusIsError = false
     @ObservationIgnored private var dismissTask: Task<Void, Never>?
+    @ObservationIgnored private var cachedQRImage: NSImage?
+    @ObservationIgnored private var cachedQRFingerprint: String?
+    @ObservationIgnored private var qrPrewarmTask: Task<Void, Never>?
+    @ObservationIgnored private var cachedPIN: String?
+    @ObservationIgnored private var cachedPINGeneratedAt: Date?
+    @ObservationIgnored private var cachedPINLifetimeSec: Int = 0
+    @ObservationIgnored private var pinPrewarmTask: Task<Void, Never>?
+
+    /// 复用 prewarm PIN 时的安全阈值:剩 < 这个秒数就丢弃 cache,让 sheet 现场重生成。
+    /// 防"sheet 一开就过期"的糟糕体感(prewarm 跟 sheet 开启可能间隔很久)
+    private static let pinReuseFreshnessSec = 5
 
     init() {
         let paths = Paths.makeDefault()
@@ -177,6 +188,69 @@ final class SettingsModel {
         let cfg = (try? Config.load(from: paths.configFile)) ?? .default
         self.config = cfg
         self.initial = cfg
+        // Settings 窗口构造瞬间起后台 task 生成 QR/PIN cache,等用户切到 iOS 配对 tab
+        // → 点"显示配对码"时 sheet 直接拿 cache,跳过 CIContext 启动 + actor hop
+        prewarmPairingQR()
+        prewarmPIN()
+    }
+
+    /// 当前 config 对应的 QR 图。fingerprint 不匹配则现场生成 + 更新 cache(同步 ~10ms)
+    func pairingQRImage() -> NSImage? {
+        let fp = PairingQR.fingerprint(for: config)
+        if let img = cachedQRImage, cachedQRFingerprint == fp { return img }
+        let img = PairingQR.generate(config: config)
+        cachedQRImage = img
+        cachedQRFingerprint = fp
+        return img
+    }
+
+    /// 后台预生成 QR cache,非阻塞。idempotent——重复调用如果 fingerprint 一致直接返回
+    func prewarmPairingQR() {
+        let cfg = config
+        let fp = PairingQR.fingerprint(for: cfg)
+        if cachedQRFingerprint == fp, cachedQRImage != nil { return }
+        qrPrewarmTask?.cancel()
+        qrPrewarmTask = Task.detached(priority: .utility) { [weak self] in
+            let img = PairingQR.generate(config: cfg)
+            await MainActor.run {
+                guard let self else { return }
+                self.cachedQRImage = img
+                self.cachedQRFingerprint = fp
+            }
+        }
+    }
+
+    /// 后台预生成 PIN session。PairingService.generatePIN 顶掉之前 active session,
+    /// 所以重复调用安全。sheet 关掉后再 prewarm 一次让连续开关都瞬间显示
+    func prewarmPIN() {
+        pinPrewarmTask?.cancel()
+        pinPrewarmTask = Task { @MainActor [weak self] in
+            guard let service = AppDelegate.shared?.pairingService else { return }
+            let (pin, sec) = await service.generatePIN()
+            guard let self else { return }
+            self.cachedPIN = pin
+            self.cachedPINLifetimeSec = sec
+            self.cachedPINGeneratedAt = Date()
+        }
+    }
+
+    /// sheet init 时调用,一次性消费 prewarm PIN(剩余时间够新鲜才返回)。
+    /// 返回值含真实剩余秒数 + 生成时间(用作 sessionStartedAt 让 polling 配对成功判定正确)
+    func consumePrewarmedPIN() -> (pin: String, secondsLeft: Int, generatedAt: Date)? {
+        guard let pin = cachedPIN, let genAt = cachedPINGeneratedAt else { return nil }
+        let elapsed = Int(Date().timeIntervalSince(genAt))
+        let remaining = cachedPINLifetimeSec - elapsed
+        // 太接近过期就丢弃 cache,让 sheet 走 generatePIN 现场创建新 session
+        guard remaining >= Self.pinReuseFreshnessSec else {
+            cachedPIN = nil
+            cachedPINGeneratedAt = nil
+            return nil
+        }
+        let result = (pin, remaining, genAt)
+        // 一次性消费——sheet 关掉重开必须重新 prewarm
+        cachedPIN = nil
+        cachedPINGeneratedAt = nil
+        return result
     }
 
     var isDirty: Bool { config != initial }
@@ -228,6 +302,110 @@ final class SettingsModel {
 
     func restartDaemon() {
         AppDelegate.shared?.restartDaemon()
+    }
+
+    // MARK: - OCR 队列状态 + 操作
+
+    /// 本机 OCR 队列分布。nil = 还没读 / 没有 daemon 上下文。OCRPane .task 启动周期刷新
+    var ocrStats: Admin.OCRStats?
+    /// rebuild / abort 正在跑——按钮禁用,避免双击
+    var ocrActionInFlight = false
+    /// 上次操作结果(成功条数 / 失败原因);跟 statusMessage 独立,放 OCR pane 内
+    var ocrActionMessage: String?
+    var ocrActionIsError = false
+    @ObservationIgnored private var ocrStatsRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var ocrActionMessageDismissTask: Task<Void, Never>?
+
+    /// OCRPane .task { } 调起一次,popover 周期 tick 直到 view 消失
+    func startOCRStatsTicker() {
+        guard ocrStatsRefreshTask == nil else { return }
+        ocrStatsRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                self?.refreshOCRStatsSync()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    func stopOCRStatsTicker() {
+        ocrStatsRefreshTask?.cancel()
+        ocrStatsRefreshTask = nil
+    }
+
+    /// 同步读 DB ——只本机 SQLite,微秒级,不需要 await
+    private func refreshOCRStatsSync() {
+        guard let deps = AppDelegate.shared?.dependencies else {
+            ocrStats = nil
+            return
+        }
+        do {
+            ocrStats = try Admin.ocrStats(
+                dbPath: deps.paths.mainDB,
+                selfDeviceID: deps.deviceID
+            )
+        } catch {
+            // 读失败不弹错——刷新本就是 best-effort,UI 显示"--"即可
+            ocrStats = nil
+        }
+    }
+
+    /// 重建本机 OCR 索引:done → pending,worker wake 立即开扫
+    func rebuildOCRIndex() {
+        guard let deps = AppDelegate.shared?.dependencies, !ocrActionInFlight else { return }
+        ocrActionInFlight = true
+        Task { @MainActor [weak self] in
+            defer { self?.ocrActionInFlight = false }
+            do {
+                let n = try Admin.rebuildOCRIndex(
+                    dbPath: deps.paths.mainDB,
+                    selfDeviceID: deps.deviceID
+                )
+                AppDelegate.shared?.wakeOCRWorker()
+                self?.setOCRActionMessage("已翻 \(n) 条 done → pending,worker 开始重 OCR", isError: false)
+                self?.refreshOCRStatsSync()
+            } catch {
+                self?.setOCRActionMessage("重建失败:\(error)", isError: true)
+            }
+        }
+    }
+
+    /// 中止本机 OCR 队列:pending → skipped。日后想恢复跑 retry-failed-ocr 即可
+    func abortOCRQueue() {
+        guard let deps = AppDelegate.shared?.dependencies, !ocrActionInFlight else { return }
+        ocrActionInFlight = true
+        Task { @MainActor [weak self] in
+            defer { self?.ocrActionInFlight = false }
+            do {
+                let n = try Admin.abortOCRQueue(
+                    dbPath: deps.paths.mainDB,
+                    selfDeviceID: deps.deviceID
+                )
+                // worker 下一 tick 自然 fetchPending 拿到空集 → 进 idle sleep,不需要 wake
+                self?.setOCRActionMessage("已中止 \(n) 条 pending → skipped;`retry-failed-ocr` 可恢复", isError: false)
+                self?.refreshOCRStatsSync()
+            } catch {
+                self?.setOCRActionMessage("中止失败:\(error)", isError: true)
+            }
+        }
+    }
+
+    private func setOCRActionMessage(_ msg: String, isError: Bool) {
+        ocrActionMessage = msg
+        ocrActionIsError = isError
+        ocrActionMessageDismissTask?.cancel()
+        ocrActionMessageDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled else { return }
+            self.ocrActionMessage = nil
+            self.ocrActionIsError = false
+            self.ocrActionMessageDismissTask = nil
+        }
+    }
+
+    /// 当前 dirty 字段里有没有动 OCR 相关——给 ApplyBar 判断要不要弹半致警告
+    var ocrFieldsDirty: Bool {
+        guard isDirty else { return false }
+        return config.ocr != initial.ocr
     }
 
     private func scheduleStatusDismiss(skip: Bool) {
@@ -811,6 +989,18 @@ private struct OCRPane: View {
                 }
                 SettingsNoteRow(text: "来自本机 Vision 支持列表；可连续勾选多个语言，仍会自动检测语言。")
             }
+
+            OCRIndexStatusGroup(model: model)
+        }
+        .task(id: model.config.ocr.enabled) {
+            // OCRPane 进场起 ticker，离场 / 切 pane 触发 task cancel 自动 stop
+            model.startOCRStatsTicker()
+            // task closure 退出时 SwiftUI 已 cancel task；显式 stop 让重启 ticker 幂等
+            defer { model.stopOCRStatsTicker() }
+            // hold——靠 cancellation 让 closure 退出
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+            }
         }
     }
 
@@ -838,6 +1028,89 @@ private struct OCRPane: View {
             ids.append(id)
         }
         model.config.ocr.languages = ids
+    }
+}
+
+/// OCR pane 底部:本机索引状态(pending/done/skipped/failed 计数) + 重建/中止两个操作。
+///
+/// 设计选型(2026-05,跟 codex 共识):
+/// - 已 done 行换语言/精度**不会**自动重做——配置只对增量生效。这个 group 让用户**看得见**
+///   该事实(灰字"已完成 N 条使用原配置")并给"重建索引"按钮一键翻回 pending
+/// - 中途用户改设置 + 重启,worker 用新 config 跑剩下队列 → 历史库半致状态;这里
+///   显式接受,ApplyBar 在 ocr 字段 dirty + pending>0 时弹警告提示用户改完再 rebuild 对齐
+/// - 中止用 pending → skipped(而非新增 cancelled 状态)——skipped 语义就是"本次不处理",
+///   日后 `retry-failed-ocr` 一并恢复
+private struct OCRIndexStatusGroup: View {
+    @Bindable var model: SettingsModel
+
+    var body: some View {
+        SettingsGroup(title: "本机索引状态") {
+            SettingsRow(title: "队列", subtitle: subtitleForQueue, isFirst: true) {
+                Text(queueDisplay)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            SettingsBlock {
+                HStack(spacing: 8) {
+                    GlassActionButton(
+                        title: "重建本机 OCR 索引",
+                        isProminent: false,
+                        isDisabled: !canRebuild
+                    ) {
+                        model.rebuildOCRIndex()
+                    }
+                    GlassActionButton(
+                        title: "中止当前队列",
+                        isProminent: false,
+                        isDisabled: !canAbort
+                    ) {
+                        model.abortOCRQueue()
+                    }
+                    Spacer()
+                }
+                if let msg = model.ocrActionMessage {
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundStyle(model.ocrActionIsError ? Color.red : Color.green)
+                        .padding(.top, 4)
+                }
+            }
+            SettingsNoteRow(
+                text: noteText
+            )
+        }
+    }
+
+    private var queueDisplay: String {
+        guard let s = model.ocrStats else { return "--" }
+        return "pending \(s.pending) · done \(s.done) · skipped \(s.skipped) · failed \(s.failed)"
+    }
+
+    private var subtitleForQueue: String? {
+        guard let s = model.ocrStats else { return nil }
+        if s.pending > 0 { return "正在处理 \(s.pending) 张" }
+        if s.total == 0 { return "本机暂无图片" }
+        return "队列空闲"
+    }
+
+    /// 至少有 done 行才能 rebuild(否则等于空操作)
+    private var canRebuild: Bool {
+        guard !model.ocrActionInFlight else { return false }
+        guard let s = model.ocrStats else { return false }
+        return s.done > 0
+    }
+
+    /// 队列有 pending 才能 abort
+    private var canAbort: Bool {
+        guard !model.ocrActionInFlight else { return false }
+        guard let s = model.ocrStats else { return false }
+        return s.pending > 0
+    }
+
+    private var noteText: String {
+        let baseHint = "已完成 OCR 的图片使用当时的语言/精度配置;改语言或精度后需点重建,新配置才会作用到历史图片。skipped/failed 行可用 CLI `retry-failed-ocr` 恢复。"
+        guard let s = model.ocrStats, s.done > 0 else { return baseHint }
+        return "已完成 \(s.done) 条图片使用当时的语言/精度配置;改语言或精度后需点重建,新配置才会作用到这些历史图片。skipped/failed 行可用 CLI `retry-failed-ocr` 恢复。"
     }
 }
 
@@ -1248,24 +1521,53 @@ private struct ApplyBar: View {
     @Bindable var model: SettingsModel
 
     var body: some View {
-        HStack(spacing: 8) {
-            if let msg = model.statusMessage {
-                Text(msg)
+        VStack(alignment: .leading, spacing: 6) {
+            if showOCRHalfConsistencyWarning {
+                Text(ocrHalfConsistencyWarningText)
                     .font(.system(size: 11))
-                    .foregroundStyle(model.statusIsError ? Color.red : Color.green)
-                    .lineLimit(2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 4)
             }
-            if !model.isDirty && model.statusMessage != nil && needsRestartHint {
-                GlassActionButton(title: "重启", isProminent: false) { model.restartDaemon() }
+            HStack(spacing: 8) {
+                if let msg = model.statusMessage {
+                    Text(msg)
+                        .font(.system(size: 11))
+                        .foregroundStyle(model.statusIsError ? Color.red : Color.green)
+                        .lineLimit(2)
+                }
+                if !model.isDirty && model.statusMessage != nil && needsRestartHint {
+                    GlassActionButton(title: "重启", isProminent: false) { model.restartDaemon() }
+                }
+                GlassActionButton(title: "恢复", isProminent: false, isDisabled: !model.isDirty) { model.discard() }
+                GlassActionButton(title: "应用", isProminent: true, isDisabled: !model.isDirty) { model.apply() }
+                    .keyboardShortcut(.return)
             }
-            GlassActionButton(title: "恢复", isProminent: false, isDisabled: !model.isDirty) { model.discard() }
-            GlassActionButton(title: "应用", isProminent: true, isDisabled: !model.isDirty) { model.apply() }
-                .keyboardShortcut(.return)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(applyBarBackground)
         .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+    }
+
+    /// OCR 字段 dirty 且本机已有 OCR 结果(pending 在跑 / done 历史)时弹警告。
+    /// 用户改完语言/精度按"应用"前先看到提示。
+    /// **必须**也覆盖 pending=0 / done>0 这条稳态——历史 done 仍按旧配置编出来,
+    /// 改配置不会自动重 OCR,这才是 PR 要解决的核心半致状态。
+    private var showOCRHalfConsistencyWarning: Bool {
+        guard model.ocrFieldsDirty else { return false }
+        guard let s = model.ocrStats else { return false }
+        return s.pending > 0 || s.done > 0
+    }
+
+    private var ocrHalfConsistencyWarningText: String {
+        let pending = model.ocrStats?.pending ?? 0
+        let done = model.ocrStats?.done ?? 0
+        if pending > 0 {
+            return "⚠ OCR 队列剩 \(pending) 张待处理(另有 \(done) 张历史已完成)。应用后 worker 会用新配置跑剩下的图片,历史已完成的图片保持旧配置 → 半致状态。建议先到「本机索引状态」点「中止当前队列」清场,应用并重启 daemon 后再点「重建本机 OCR 索引」对齐。"
+        } else {
+            return "⚠ 本机已有 \(done) 张 OCR 结果按旧配置生成。应用后新图片走新配置,历史结果保持旧配置 → 半致状态。建议应用并重启 daemon 后到「本机索引状态」点「重建本机 OCR 索引」让历史也对齐。"
+        }
     }
 
     private var needsRestartHint: Bool {
@@ -1320,6 +1622,49 @@ private struct GlassActionButton: View {
 
 // MARK: - iOS PIN 配对(Bonjour + PIN)
 
+/// QR payload 不含 PIN(故意——QR 被截图 ≠ 配对失守,见 IOSPairingPINSheet 注释),所以
+/// QR 内容只依赖 host/port/tls,可以脱离 sheet 生命周期常驻 SettingsModel cache
+private enum PairingQR {
+    /// 复用单例:每次 new CIContext 会启动 Metal device(~50-150ms)
+    private static let ciContext = CIContext()
+
+    static func fingerprint(for cfg: Config) -> String {
+        "\(resolveHost(cfg: cfg))|\(cfg.servePort)|\(cfg.serveTLS)"
+    }
+
+    /// 选 host:tlsCertPath 文件 stem(Tailscale FQDN,跨 LAN 通) → fallback .local
+    static func resolveHost(cfg: Config) -> String {
+        if let cert = cfg.tlsCertPath {
+            let stem = (cert as NSString).lastPathComponent
+                .replacingOccurrences(of: ".crt", with: "")
+            if !stem.isEmpty { return stem }
+        }
+        let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
+        return hn.hasSuffix(".local") ? hn : "\(hn).local"
+    }
+
+    /// 同步生成 QR 图——CIContext 复用后 ~10ms,可 detached task 调
+    static func generate(config: Config) -> NSImage? {
+        let payload: [String: Any] = [
+            "host": resolveHost(cfg: config),
+            "port": config.servePort,
+            "tls": config.serveTLS,
+            "v": 1,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return nil
+        }
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let ci = filter.outputImage else { return nil }
+        let scale: CGFloat = 240 / ci.extent.width
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cg = ciContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: 240, height: 240))
+    }
+}
+
 /// daemon 在 serve=true 时通过 BonjourAdvertiser 广播 `_duopaste._tcp`,iOS Settings
 /// 端 NWBrowser 浏到本机后用户 tap → 输 6 位 PIN → POST /pair/<pin> 拿 secret + endpoints。
 /// 60s expiry + 5 次错误封锁,PIN 用过即失效
@@ -1348,7 +1693,7 @@ private struct IOSPairingGroup: View {
             SettingsNoteRow(text: "iOS Settings 选「发现的 Mac」对应一行 → 输入这边显示的 6 位数字 → 自动获取 secret + 候选 endpoints。PIN 60s 失效,错 5 次封锁")
         }
         .sheet(isPresented: $showPIN) {
-            IOSPairingPINSheet(isPresented: $showPIN)
+            IOSPairingPINSheet(model: model, isPresented: $showPIN)
         }
     }
 }
@@ -1357,6 +1702,7 @@ private struct IOSPairingGroup: View {
 
 @MainActor
 private struct IOSPairingPINSheet: View {
+    let model: SettingsModel
     @Binding var isPresented: Bool
 
     @State private var pin: String?
@@ -1367,6 +1713,21 @@ private struct IOSPairingPINSheet: View {
     @State private var sessionStartedAt: Date?
     @State private var paired: Bool = false
     @State private var errorText: String?
+
+    init(model: SettingsModel, isPresented: Binding<Bool>) {
+        self.model = model
+        self._isPresented = isPresented
+        // 关键:在 init 里给 @State 赋初值,让第一帧 body 求值时 qrImage/pin 已经有值。
+        // 不能依赖 onAppear——onAppear 在第一帧渲染之后才触发,sheet 整个 modal
+        // 动画(~350ms fade-in)过程中显示的会是 ProgressView,动画结束才"砰"出现
+        self._qrImage = State(initialValue: model.pairingQRImage())
+        // PIN cache 命中(剩余 >= 5s)就用 prewarm 的;否则保持 nil 让 onAppear 现场生成
+        if let cached = model.consumePrewarmedPIN() {
+            self._pin = State(initialValue: cached.pin)
+            self._secondsLeft = State(initialValue: cached.secondsLeft)
+            self._sessionStartedAt = State(initialValue: cached.generatedAt)
+        }
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -1389,7 +1750,8 @@ private struct IOSPairingPINSheet: View {
                     .frame(width: 260, height: 260)
                     .background(Color.white)
                     .padding(8)
-            } else if pin != nil {
+            } else {
+                // QR cache miss + 仍在生成:统一 spinner,不留空白窗格
                 ProgressView().frame(width: 260, height: 260)
             }
 
@@ -1420,26 +1782,38 @@ private struct IOSPairingPINSheet: View {
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
+            } else if pin == nil {
+                // actor hop 完成前 secondsLeft=0 + pin=nil,不能落到"已过期"分支
+                Text("正在生成…")
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
             } else if secondsLeft > 0 {
                 Text("剩余 \(secondsLeft)s · iOS DuoPaste 扫这个 QR + 输上方 PIN")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
                     .multilineTextAlignment(.center)
             } else {
-                Text("已过期 · 点重新生成")
+                // 倒计时归零的瞬间——countdown task 立刻触发 generatePIN,文案保持
+                // "正在刷新" 而非"已过期",防一帧闪烁
+                Text("正在刷新…")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
             }
 
             HStack(spacing: 12) {
                 if !paired {
+                    // 自动刷接管常规过期;按钮留给"PIN 看错想换一个"这种主动场景
                     Button("重新生成") {
                         generatePIN()
                     }
                     .controlSize(.small)
+                    .disabled(pin == nil)
                 }
                 Button("关闭") {
-                    cancelPIN()
+                    // 只 dismiss,把 cancel + prewarm 留给 onDisappear 串行执行——
+                    // 这里 fire-and-forget cancelPIN() 跟 onDisappear 起的独立 Task 同时排队到
+                    // PairingService actor,顺序无保证。旧 cancel 排到新 prewarm 之后就会
+                    // 作废刚 cache 的 PIN,下次开 sheet 可能拿到服务端已 cancel 的 PIN
                     isPresented = false
                 }
                 .controlSize(.small)
@@ -1448,53 +1822,35 @@ private struct IOSPairingPINSheet: View {
         }
         .padding(24)
         .frame(width: 320)
-        .onAppear { generatePIN() }
+        .onAppear {
+            // qrImage / pin 已在 init 从 cache 读;cache miss 时走兜底路径
+            if qrImage == nil {
+                qrImage = model.pairingQRImage()
+            }
+            if pin != nil, secondsLeft > 0 {
+                // init 已经从 cache 拿到 PIN → 直接启 countdown + polling 跳过 actor hop
+                startCountdown()
+                startPollingForConsumption()
+            } else {
+                generatePIN()
+            }
+        }
         .onDisappear {
             refreshTask?.cancel()
             refreshTask = nil
             pollTask?.cancel()
             pollTask = nil
-            cancelPIN()
             qrImage = nil  // 防 secret-containing image 在 onDisappear 残留 memory
+            // cancel + prewarm 必须串行:两者都派 Task 到 PairingService actor,
+            // 独立 Task 的 actor 入队顺序无保证,可能让新生成的 PIN 被旧 cancel 干掉。
+            // 串到一个 Task 里 await cancel 完成再 prewarm,actor 顺序自然保证
+            Task { @MainActor in
+                if let service = AppDelegate.shared?.pairingService {
+                    await service.cancel()
+                }
+                model.prewarmPIN()
+            }
         }
-    }
-
-    /// 选 host:tlsCertPath 文件 stem(Tailscale FQDN,跨 LAN 通) → fallback .local
-    private func resolveHost(cfg: Config) -> String {
-        if let cert = cfg.tlsCertPath {
-            let stem = (cert as NSString).lastPathComponent
-                .replacingOccurrences(of: ".crt", with: "")
-            if !stem.isEmpty { return stem }
-        }
-        let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
-        return hn.hasSuffix(".local") ? hn : "\(hn).local"
-    }
-
-    private func generateQR(pin: String) {
-        guard let deps = AppDelegate.shared?.dependencies else { return }
-        let cfg = deps.config
-        // **故意不在 QR 里包 PIN**——QR 被截图 / 偷拍泄露 ≠ 配对失守,
-        // 攻击者还需要 PIN(60s 单次有效+5 次错锁,在 Mac 屏幕另一区域显示)
-        // 才能 POST /pair。两道防线分开是 Continuity 同款 2FA 心智
-        _ = pin  // 不入 QR,仅在下方 PIN 文字显示让用户手输
-        let payload: [String: Any] = [
-            "host": resolveHost(cfg: cfg),
-            "port": cfg.servePort,
-            "tls": cfg.serveTLS,
-            "v": 1,
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
-            return
-        }
-        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return }
-        filter.setValue(data, forKey: "inputMessage")
-        filter.setValue("M", forKey: "inputCorrectionLevel")
-        guard let ci = filter.outputImage else { return }
-        let scale: CGFloat = 240 / ci.extent.width
-        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        let context = CIContext()
-        guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return }
-        qrImage = NSImage(cgImage: cg, size: NSSize(width: 240, height: 240))
     }
 
     private func generatePIN() {
@@ -1509,7 +1865,10 @@ private struct IOSPairingPINSheet: View {
             self.pin = newPin
             self.secondsLeft = sec
             self.sessionStartedAt = Date()
-            self.generateQR(pin: newPin)
+            // QR cache miss(prewarm 没赶上 / 配置变了)兜底现场生成
+            if qrImage == nil {
+                qrImage = model.pairingQRImage()
+            }
             startCountdown()
             startPollingForConsumption()
         }
@@ -1541,11 +1900,6 @@ private struct IOSPairingPINSheet: View {
         }
     }
 
-    private func cancelPIN() {
-        guard let service = AppDelegate.shared?.pairingService else { return }
-        Task { await service.cancel() }
-    }
-
     private func startCountdown() {
         refreshTask?.cancel()
         refreshTask = Task { @MainActor in
@@ -1553,6 +1907,11 @@ private struct IOSPairingPINSheet: View {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
                 self.secondsLeft -= 1
+            }
+            // 倒计时归零自动续 PIN——sheet 还开着 = 用户主观仍在等配对,跟
+            // Continuity 配对码语义一致;PIN 60s TTL 边界不受削弱(每个 PIN 仍 60s 后失效)
+            if !Task.isCancelled, !paired {
+                generatePIN()
             }
         }
     }

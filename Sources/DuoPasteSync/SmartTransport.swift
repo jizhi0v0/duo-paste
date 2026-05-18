@@ -111,8 +111,8 @@ public struct SmartTransport: Sendable {
         peer: Config.PeerConfig,
         probe: HealthProbe
     ) async -> PeerDecision {
-        // C1 — tailscale URL，永远先探（要拿 ponte_host 字段）
-        let (c1Outcome, c1Rtt) = await probe(peer.url)
+        // C1 — tailscale URL,永远先探(要拿 ponte_host 字段)。带 retry 防启动竞态
+        let (c1Outcome, c1Rtt) = await probeWithRetry(probe, url: peer.url)
         var rtts: [URL: Int64] = [peer.url: (isReachable(c1Outcome) ? c1Rtt : -1)]
         var learnedPonteHost: String? = nil
         if case .ok(_, _, let ponteHost) = c1Outcome { learnedPonteHost = ponteHost }
@@ -124,7 +124,7 @@ public struct SmartTransport: Sendable {
             if manualURL == peer.url {
                 manualReachable = isReachable(c1Outcome)
             } else {
-                let (c2Out, c2Rtt) = await probe(manualURL)
+                let (c2Out, c2Rtt) = await probeWithRetry(probe, url: manualURL)
                 rtts[manualURL] = isReachable(c2Out) ? c2Rtt : -1
                 manualReachable = isReachable(c2Out)
             }
@@ -136,7 +136,7 @@ public struct SmartTransport: Sendable {
         if let host = learnedPonteHost,
            let candidate = makePonteCandidateURL(forPeerURL: peer.url, ponteHost: host)
         {
-            // 不重复测：peer.url 已经是 ponte host 时 c1 就是它
+            // 不重复测:peer.url 已经是 ponte host 时 c1 就是它
             if candidate == peer.url {
                 c3URL = peer.url
                 c3Reachable = isReachable(c1Outcome)
@@ -144,7 +144,7 @@ public struct SmartTransport: Sendable {
                 c3URL = peer.pullURL
                 c3Reachable = manualReachable
             } else {
-                let (c3Out, c3Rtt) = await probe(candidate)
+                let (c3Out, c3Rtt) = await probeWithRetry(probe, url: candidate)
                 rtts[candidate] = isReachable(c3Out) ? c3Rtt : -1
                 c3URL = candidate
                 c3Reachable = isReachable(c3Out)
@@ -213,8 +213,18 @@ public struct SmartTransport: Sendable {
         public let auth: HMACAuth
         public let tailscaleSession: URLSession
         public let onCatastrophicFailure: @Sendable () -> Void
-        /// peer config 列表里的 deviceID（严格模式）。索引跟 decision.peerIndex 对齐
+        /// peer config 列表里的 deviceID(严格模式)。索引跟 decision.peerIndex 对齐
         public let expectedPeerDeviceIDs: [String?]
+        /// 每次 PullWorker /health 探测完调一次。生产路径 = AppDelegate hop @MainActor 写
+        /// AppState.transports[i].httpRttMs[chosenHost],让 UI 反映 runtime 真实健康度。
+        /// `>= 0` = . ok 响应的 RTT;`-1` = 任何失败(对齐 SmartTransport `isReachable` 语义)。
+        /// nil = 不接(测试 / PR 3 老调用点),PullWorker 内部 callback 也 nil
+        public let onHealthProbed: (@Sendable (_ peerIndex: Int, _ rttMs: Int64) -> Void)?
+        /// PullWorker 连续 transient 失败到 threshold 时调一次,生产路径 = AppDelegate →
+        /// MeshSupervisor.reconcileTransports() 触发 quick recovery 不等周期 5min。
+        /// peerIndex 让多 peer 部署能区分哪个 peer 出问题(虽然 reconcile 是全 peer 重 discover)。
+        /// nil = 不接,PullWorker 内部 callback 也 nil
+        public let onChosenLikelyDown: (@Sendable (_ peerIndex: Int) -> Void)?
 
         public init(
             database: DuoPasteCore.Database,
@@ -228,7 +238,9 @@ public struct SmartTransport: Sendable {
             auth: HMACAuth,
             tailscaleSession: URLSession,
             onCatastrophicFailure: @escaping @Sendable () -> Void,
-            expectedPeerDeviceIDs: [String?]
+            expectedPeerDeviceIDs: [String?],
+            onHealthProbed: (@Sendable (_ peerIndex: Int, _ rttMs: Int64) -> Void)? = nil,
+            onChosenLikelyDown: (@Sendable (_ peerIndex: Int) -> Void)? = nil
         ) {
             self.database = database
             self.blobs = blobs
@@ -242,6 +254,8 @@ public struct SmartTransport: Sendable {
             self.tailscaleSession = tailscaleSession
             self.onCatastrophicFailure = onCatastrophicFailure
             self.expectedPeerDeviceIDs = expectedPeerDeviceIDs
+            self.onHealthProbed = onHealthProbed
+            self.onChosenLikelyDown = onChosenLikelyDown
         }
 
         public func build(decision: PeerDecision) -> MeshSupervisor.Peer {
@@ -251,6 +265,17 @@ public struct SmartTransport: Sendable {
             let expectedPeerDeviceID = expectedPeerDeviceIDs.indices.contains(decision.peerIndex)
                 ? expectedPeerDeviceIDs[decision.peerIndex]
                 : nil
+            // peerIndex 在闭包里 capture——SmartTransport reconcile 重建 builder 时
+            // 新 decision.peerIndex 会重新 capture(MeshSupervisor 整 peer pair tear-down
+            // 重 build),不会指错
+            let probedCallback: (@Sendable (Int64) -> Void)? = onHealthProbed.map { outer in
+                let idx = decision.peerIndex
+                return { rttMs in outer(idx, rttMs) }
+            }
+            let downCallback: (@Sendable () -> Void)? = onChosenLikelyDown.map { outer in
+                let idx = decision.peerIndex
+                return { outer(idx) }
+            }
             let worker = PullWorker(
                 database: database,
                 transport: client,
@@ -261,7 +286,9 @@ public struct SmartTransport: Sendable {
                 blobFetcher: client,
                 blobs: blobs,
                 evictOnFull: evictOnFull,
-                config: pullWorkerConfig
+                config: pullWorkerConfig,
+                onHealthProbed: probedCallback,
+                onChosenLikelyDown: downCallback
             )
             let wsClient: WSNotificationClient?
             if wsEnabled {
@@ -285,6 +312,34 @@ public struct SmartTransport: Sendable {
             }
             return MeshSupervisor.Peer(worker: worker, wsClient: wsClient)
         }
+    }
+
+    /// 单 candidate probe 的 retry wrapper——专治启动竞态(Surge HTTP CONNECT 冷启动 / tailscale
+    /// DERP 抖动这种秒级瞬时不可达)。
+    /// - `.ok` 立即返回(成功不重试)
+    /// - `.rejected` 立即返回(应用层拒绝是确定性的,重来还是拒,白等)
+    /// - `.unreachable` 才 sleep + retry,共最多 `retries+1` 次。最后一次仍 unreachable 返回最后一次结果
+    /// 默认 retries=1 + backoff=1s:启动总延迟最多多 1-2s,换"启动 5s 内 Surge 才就绪"这种 case 不被永久锁死
+    static func probeWithRetry(
+        _ probe: HealthProbe,
+        url: URL,
+        retries: Int = 1,
+        backoffSec: TimeInterval = 1.0
+    ) async -> (outcome: PrimaryHealthResult.Outcome, rttMs: Int64) {
+        var last: (outcome: PrimaryHealthResult.Outcome, rttMs: Int64) = (.unreachable(reason: "no probe ran"), -1)
+        for attempt in 0...retries {
+            let r = await probe(url)
+            last = r
+            switch r.outcome {
+            case .ok, .rejected:
+                return r
+            case .unreachable:
+                if attempt < retries {
+                    try? await Task.sleep(nanoseconds: UInt64(backoffSec * 1_000_000_000))
+                }
+            }
+        }
+        return last
     }
 
     /// 默认 probe 实现——HTTPPeerClient.fetchPrimaryHealth + Date() RTT + per-probe deadline

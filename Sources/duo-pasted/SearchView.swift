@@ -438,6 +438,9 @@ struct SearchView: View {
     /// 右键 contextMenu "打开方式" 子菜单选中某 app 后触发。(item, app bundleURL)。
     /// nil = caller 不接子菜单不显示
     var onOpenWith: ((Item, URL) -> Void)? = nil
+    /// 右上角齿轮按钮触发——打开 Settings 窗口。menubar icon 可被用户隐藏,这是
+    /// 唯一可见的"回到 Settings"入口。nil 时不渲染按钮(caller 不接 = 没有这个入口)
+    var onOpenSettings: (() -> Void)? = nil
 
     @FocusState private var searchFieldFocused: Bool
 
@@ -479,6 +482,17 @@ struct SearchView: View {
             .padding(.top, 76)
             .padding(.horizontal, 14)
             .allowsHitTesting(false)  // overlay 不抢点击,user 还能点卡片
+        }
+        // 右上角齿轮入口——menubar icon 可被用户隐藏,这是唯一始终可见的"回到 Settings"
+        // 路径。绝对定位在 panel 右上(不参与 compactHeader maxWidth 800 居中),宽 panel
+        // 下也贴右边。zIndex 高于 compactHeader 的 slash 补全浮层,避免被遮
+        .overlay(alignment: .topTrailing) {
+            if onOpenSettings != nil {
+                settingsIconButton
+                    .padding(.top, 14)
+                    .padding(.trailing, 16)
+                    .zIndex(20)
+            }
         }
         .frame(minWidth: 800, minHeight: 358, idealHeight: 358, maxHeight: 358)
         // 空格预览 = 独立 NSPanel(PreviewPanelController),不在 SearchView 里渲染。
@@ -711,6 +725,23 @@ struct SearchView: View {
             .padding(.horizontal, 6)
         }
         .buttonStyle(.plain)
+    }
+
+    /// 右上角齿轮按钮——hover 时 capsule 背景轻度高亮,跟 panel 玻璃材质叠合不突兀。
+    /// 28×28 命中区,SF Symbol 14pt 跟 search 放大镜同尺寸保持视觉对齐
+    @ViewBuilder
+    private var settingsIconButton: some View {
+        Button {
+            onOpenSettings?()
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("打开设置")
     }
 
     /// qualifier 显示对应的中文提示文本（候选行右侧）
