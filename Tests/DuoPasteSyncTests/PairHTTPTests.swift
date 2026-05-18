@@ -65,7 +65,9 @@ struct PairHTTPTests {
             port: port,
             auth: auth,
             endpointsProvider: { endpoints },
-            pairingService: pairing
+            pairingService: pairing,
+            // 测试用 plain HTTP；显式 opt-out TLS 护栏（生产路径默 true）
+            requirePairingTLS: false
         )
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
@@ -105,7 +107,8 @@ struct PairHTTPTests {
         let server = SyncServer(
             deviceID: "p", database: db, blobs: blobs,
             host: "127.0.0.1", port: port, auth: auth,
-            pairingService: pairing
+            pairingService: pairing,
+            requirePairingTLS: false
         )
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
@@ -146,7 +149,8 @@ struct PairHTTPTests {
         let server = SyncServer(
             deviceID: "p", database: db, blobs: blobs,
             host: "127.0.0.1", port: port, auth: auth,
-            pairingService: pairing
+            pairingService: pairing,
+            requirePairingTLS: false
         )
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
@@ -197,6 +201,40 @@ struct PairHTTPTests {
         #expect(page.endpoints[0].url == "https://test.example:8443")
         #expect(page.endpoints[0].preferred == true)
         #expect(page.endpoints[1].kind == .local)
+    }
+
+    /// PR-E 回归：plain HTTP daemon 默认拒 /pair——secret hex 不该走未加密链路。
+    /// 不消耗 PIN（attacker 也不能通过 503 vs 401 反推 TLS 状态后再针对）
+    @Test func pairReturns503WhenTLSRequiredButMissing() async throws {
+        let (db, blobs, auth, port, secret) = try makePairServerFixture()
+        let pairing = PairingService(
+            pinLifetimeSec: 60,
+            secretsProvider: { secret },
+            pinGenerator: { "424242" }
+        )
+        _ = await pairing.generatePIN()
+        // 注意：**不**传 requirePairingTLS=false，默认 true → 必须 TLS 才允 /pair。
+        // 但本测试用 plain HTTP server（tls=nil）→ pair 路由应拒
+        let server = SyncServer(
+            deviceID: "p", database: db, blobs: blobs,
+            host: "127.0.0.1", port: port, auth: auth,
+            pairingService: pairing
+        )
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadyPair(baseURL: base, auth: auth))
+
+        var req = URLRequest(url: base.appendingPathComponent("pair/424242"))
+        req.httpMethod = "POST"
+        req.httpBody = Data()
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        let http = resp as! HTTPURLResponse
+        #expect(http.statusCode == 503, "plain HTTP /pair 必须 503，实际 \(http.statusCode)")
+
+        // 进一步验证：PIN 没被消耗。换 requirePairingTLS=false 再起一个 server 用同 pairing
+        // 服务，原 PIN 应仍有效——证明 503 路径没走 validateAndConsumePIN
+        // （注：本测试只验证 503，PIN 消耗复查留给 PairingService 自己测试）
     }
 
     @Test func endpointsRejectsWithoutHMAC() async throws {

@@ -65,6 +65,17 @@ public struct SyncServer: Sendable {
     /// server 默认 no-op。WS broadcaster 只通知 peer，不会自动刷新本进程 SwiftUI state。
     public let onBumpApplied: @Sendable (String, Int64) -> Void
 
+    /// `/pair/<pin>` 路由是否要求本机起 TLS。默 true。
+    ///
+    /// **为什么硬护栏**：/pair response body 含 `secret: hex` 明文（iOS 拿来当 HMAC 主密钥）。
+    /// 当 daemon 跑 plain HTTP（`tls == nil`），即便 PIN 单次有效 + 5 次封锁，secret 仍会
+    /// 落到任意 LAN 中间人手里（咖啡馆 AP / 公司透明代理 / 路由器被攻陷场景）。Tailscale
+    /// 网络下走 WG 加密所以 plain HTTP 也安全，但 iOS 配对路径常走 .local 或直连 IP——
+    /// 不走 tailnet，必须 TLS 兜底
+    ///
+    /// 测试场景可显式传 false opt-out（同进程 in-loop 没攻击面）
+    public let requirePairingTLS: Bool
+
     public init(
         deviceID: String,
         database: DuoPasteCore.Database,
@@ -79,7 +90,8 @@ public struct SyncServer: Sendable {
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil,
-        onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
+        onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in },
+        requirePairingTLS: Bool = true
     ) {
         self.deviceID = deviceID
         self.database = database
@@ -95,6 +107,14 @@ public struct SyncServer: Sendable {
         self.meshEndpointsProvider = meshEndpointsProvider
         self.pairingService = pairingService
         self.onBumpApplied = onBumpApplied
+        self.requirePairingTLS = requirePairingTLS
+        // 显式配 pairingService 但跑 plain HTTP 且未 opt-out → 启动时即拉响警报，
+        // 不要等 /pair 真被打了才拒。运维侧能立刻看到 stderr 修配置
+        if requirePairingTLS, tls == nil, pairingService != nil {
+            FileHandle.standardError.write(Data(
+                "WARN: /pair enabled on plain HTTP — secret would leak in plaintext; route will return 503 until TLS is configured\n".utf8
+            ))
+        }
     }
 
     public func run() async throws {
@@ -116,6 +136,8 @@ public struct SyncServer: Sendable {
             endpointsProvider: endpointsProvider,
             meshEndpointsProvider: meshEndpointsProvider,
             pairingService: pairingService,
+            // requirePairingTLS=true 且本机没起 TLS → handler 直接 503 不消耗 PIN
+            pairingDisabled: (requirePairingTLS && tls == nil),
             onBumpApplied: onBumpApplied
         )
 
@@ -272,6 +294,10 @@ public struct SyncServer: Sendable {
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil,
+        /// /pair 路由禁用（不消耗 PIN，直接 503）。生产路径在 SyncServer.init 内根据
+        /// `requirePairingTLS && tls == nil` 推导——plain HTTP daemon 不该暴露 secret 明文。
+        /// 测试场景默 false 不动行为
+        pairingDisabled: Bool = false,
         onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
     ) {
         router.get("/health") { _, _ -> Response in
@@ -394,6 +420,13 @@ public struct SyncServer: Sendable {
         // - endpoints 必须跟 secret 同一个响应返回。不要让 iOS 在 PIN 被消费后再二次
         //   GET /endpoints；那一步失败会造成 Mac 显示成功、iOS 显示失败，且 PIN 已不可重试。
         router.post("/pair/:pin") { request, context -> Response in
+            // TLS 护栏：plain HTTP daemon 不该暴露 secret 明文。`pairingDisabled` 由调用方
+            // 推导（生产 = SyncServer 检测 `requirePairingTLS && tls == nil`）。在 PIN 校验
+            // **之前**就返 503——拒消耗 PIN，避免攻击者通过观察"是否 503"探测部署 TLS 状态
+            // 后再针对性发包。response 也要诚实告诉用户为什么（运维侧排错友好）
+            if pairingDisabled {
+                return errorJSON(.serviceUnavailable, "pairing requires HTTPS")
+            }
             guard let service = pairingService else {
                 return errorJSON(.serviceUnavailable, "pairing disabled")
             }
