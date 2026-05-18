@@ -34,10 +34,36 @@ public struct HMACAuth: Sendable {
     }
 
     /// 计算签名 hex。
+    ///
+    /// `path` **必须**是 HTTP wire 上的 raw percent-encoded 形式（包含 `?query`），
+    /// 任何一侧做百分号解码都会让 client/server 签名串撕裂——见 `canonicalPath`
+    /// helper 注释。client/server 都应该用 `HMACAuth.canonicalPath` 拼接，避免不同
+    /// 调用点用不同 encoding 习惯
     public func sign(timestampMs: Int64, method: String, path: String, bodyHashHex: String) -> String {
         let canonical = "\(timestampMs)\n\(method.uppercased())\n\(path)\n\(bodyHashHex.lowercased())"
         let mac = HMAC<SHA256>.authenticationCode(for: Data(canonical.utf8), using: secret)
         return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 把签名用的 path + query 拼成 canonical 字符串。**唯一**真实来源，client / server
+    /// middleware 必须用同一份拼接。
+    ///
+    /// 契约：
+    /// - `path` 是 raw HTTP request-target 的 path 部分（如 `/since`、`/blob/<sha>`），
+    ///   **不**百分号解码
+    /// - `query` 是 raw query 部分（不含前导 `?`），如 `cursor_ns=12&cursor_id=01H...`；
+    ///   nil 或 empty 表示无 query，不拼 `?`
+    /// - 客户端用 `URLComponents.percentEncodedQuery` 取 query；服务端用 Hummingbird
+    ///   `request.uri.query`（Hummingbird URI 不 percent-decode `path/query` 字段）。
+    ///   两侧字节都应该跟 HTTP wire 上字面一致
+    ///
+    /// 如果未来引入 non-ASCII / `+` / `%20` 等用户可控字符的 cursor，调用方仍应通过这个
+    /// helper 走——单点真相让 encoding 漂移没有立足处
+    public static func canonicalPath(_ path: String, query: String? = nil) -> String {
+        if let q = query, !q.isEmpty {
+            return "\(path)?\(q)"
+        }
+        return path
     }
 
     /// 服务端校验：常量时间比较 + 时间窗口。

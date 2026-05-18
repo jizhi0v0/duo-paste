@@ -100,11 +100,12 @@ extension HTTPPeerClient: SinceTransport {
         full.path = basePath + "/since"
         full.queryItems = qi
 
-        // 签名的 path 包含 query string（同 SearchClient）
+        // 签名的 path 包含 query string——走 HMACAuth.canonicalPath 跟服务端 middleware
+        // 共用同一份拼接逻辑，杜绝 encoding 漂移
         var sigComp = URLComponents()
         sigComp.path = "/since"
         sigComp.queryItems = qi
-        let signedPath = "/since" + (sigComp.percentEncodedQuery.map { "?\($0)" } ?? "")
+        let signedPath = HMACAuth.canonicalPath("/since", query: sigComp.percentEncodedQuery)
 
         let ts = now()
         let sig = auth.sign(timestampMs: ts, method: "GET", path: signedPath,

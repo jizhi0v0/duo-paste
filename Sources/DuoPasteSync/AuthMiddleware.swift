@@ -54,8 +54,9 @@ public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
         }
 
         let method = request.method.rawValue
-        // Hummingbird 的 request.uri 是完整的 path + query
-        let path = request.uri.path + (request.uri.query.map { "?\($0)" } ?? "")
+        // Hummingbird URI 不 percent-decode path/query 字段，跟 client 端 sign 用的
+        // `HMACAuth.canonicalPath` 走同一份拼接 helper
+        let path = HMACAuth.canonicalPath(request.uri.path, query: request.uri.query)
 
         let ok = auth.verify(
             timestampMs: ts,
@@ -66,7 +67,10 @@ public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
             nowMs: now()
         )
         if !ok {
-            return Self.unauth("hmac verify failed (ts=\(ts) method=\(method) path=\(path))")
+            // 失败时 dump server 看到的 raw URI 字节 + 重组后的 path——encoding 不一致时
+            // 直接看出哪一侧解码漂移。raw URI 用 string 字段（Hummingbird 没 decode 过）
+            let rawWire = request.uri.string
+            return Self.unauth("hmac verify failed (ts=\(ts) method=\(method) path=\(path) raw_uri=\(rawWire))")
         }
         return try await next(request, context)
     }

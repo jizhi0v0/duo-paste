@@ -147,3 +147,51 @@ private let testSecret = Data(repeating: 0x42, count: 32)
         _ = try SharedSecret.load(from: nonexistent)
     }
 }
+
+// MARK: canonicalPath helper
+
+@Test func canonicalPathHandlesEmptyAndNilQuery() {
+    #expect(HMACAuth.canonicalPath("/health") == "/health")
+    #expect(HMACAuth.canonicalPath("/health", query: nil) == "/health")
+    #expect(HMACAuth.canonicalPath("/health", query: "") == "/health")
+}
+
+@Test func canonicalPathAppendsQueryVerbatim() {
+    let p = HMACAuth.canonicalPath("/since", query: "cursor_ns=12&cursor_id=01H")
+    #expect(p == "/since?cursor_ns=12&cursor_id=01H")
+}
+
+/// 关键回归：客户端走 `URLComponents.percentEncodedQuery` 构造 sign path，
+/// 服务端 middleware 走 `request.uri.query`。两侧用同一份 `canonicalPath` helper，
+/// 在含 percent-encoded 字符的 query 上签名/校验**必须**对上。
+@Test func canonicalPathRoundTripsPercentEncodedQuery() {
+    // 模拟 cursor_id 含非 ASCII / `+` / `/` / 空格 等边界字符——client 端 URLComponents
+    // 会把它们 percent-encode 后塞进 percentEncodedQuery；server 端 Hummingbird URI 收到
+    // 也是同一份 raw bytes
+    let qi: [URLQueryItem] = [
+        .init(name: "cursor_ns", value: "12345"),
+        .init(name: "cursor_id", value: "01H+ABC/中文 末尾"),
+        .init(name: "limit", value: "100"),
+    ]
+    var sigComp = URLComponents()
+    sigComp.path = "/since"
+    sigComp.queryItems = qi
+    let clientPath = HMACAuth.canonicalPath("/since", query: sigComp.percentEncodedQuery)
+
+    // server 端收到的 raw bytes —— 模拟 Hummingbird URI 不 percent-decode 行为：
+    // raw query 就是 client 拼出来的那份 percentEncodedQuery
+    let serverPath = HMACAuth.canonicalPath("/since", query: sigComp.percentEncodedQuery)
+
+    #expect(clientPath == serverPath, "encoding 漂移：client=\(clientPath) server=\(serverPath)")
+
+    // 客户端用这条 path 签名，服务端用同条 path 校验 → 必通过
+    let auth = HMACAuth(secret: testSecret)
+    let ts: Int64 = 1_700_000_000_000
+    let sig = auth.sign(timestampMs: ts, method: "GET", path: clientPath,
+                        bodyHashHex: HMACAuth.emptyBodyHashHex)
+    let ok = auth.verify(
+        timestampMs: ts, method: "GET", path: serverPath,
+        bodyHashHex: HMACAuth.emptyBodyHashHex, signatureHex: sig, nowMs: ts
+    )
+    #expect(ok)
+}

@@ -61,7 +61,7 @@ actor PeerClient {
         var sigComp = URLComponents()
         sigComp.path = "/since"
         sigComp.queryItems = qi
-        let signedPath = "/since" + (sigComp.percentEncodedQuery.map { "?\($0)" } ?? "")
+        let signedPath = HMACAuth.canonicalPath("/since", query: sigComp.percentEncodedQuery)
 
         var urlComp = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false)
             ?? URLComponents()
