@@ -995,8 +995,11 @@ struct SearchView: View {
                         .id(item.id)
                         // user 反馈不要点击放大动画 + 首卡 scale 会让左边框超出 viewport 被裁,
                         // scaleEffect 全撤掉,选中态靠 accent border + shadow 高亮即可
-                        // 双击粘贴(无视 selectedIDs)
-                        .gesture(
+                        // 双击粘贴(无视 selectedIDs)。simultaneousGesture 让 count:2 跟下面
+                        // 的 count:1 simultaneous 共存——双击时 count:1 fire 两次(改 selection
+                        // 无害,同 ID 单选) + count:2 fire 触发 paste。**不**用 `.gesture`:
+                        // `.gesture` 在 simultaneous count:1 立即识别后会被吃掉,count:2 永远凑不齐
+                        .simultaneousGesture(
                             TapGesture(count: 2).onEnded {
                                 onPaste([item])
                             }
@@ -1681,23 +1684,26 @@ private struct ItemCard: View {
                     lineWidth: isSelected ? 2 : (isRemoteMirror ? 1 : 0.5)
                 )
         )
-        // hover ring——选中前 hint 这张卡可点击。白色细描 + 模糊给"高亮"感不抢
+        // hover ring——选中前 hint 这张卡可点击。白色细描给"高亮"感不抢
         // accent 选中态。isSelected 时不显示(避免跟 accent 描边打架)
+        // 历史:这里曾叠 .blur(radius:0.5) 让 stroke 更柔——但滑动时鼠标穿很多 cell 让
+        // 大量未选中卡 hover 翻转,blur 是 GPU 合成重活,Instruments 全程 "expensive render"。
+        // 0.5 半径肉眼几乎看不出差,直接删
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(
                     Color.white.opacity(isHovered && !isSelected ? 0.22 : 0),
                     lineWidth: 1
                 )
-                .blur(radius: 0.5)
         )
-        // 选中卡 accent 辉光;hover 卡黑色 ambient shadow——两态独立动画,切换平滑
+        // 选中卡 accent 辉光。历史:这里曾给 isHovered 也挂黑色 ambient shadow——但滑动时
+        // 鼠标静止 + cell 在动 → 鼠标下方不断有新 cell isHovered=true → shadow 在 render
+        // phase 反复合成,是 hitch 主因。改成只在 isSelected 挂 shadow,hover 反馈靠
+        // 上面的白色 ring 已足够
         .shadow(
-            color: isSelected
-                ? Color.accentColor.opacity(0.4)
-                : (isHovered ? Color.black.opacity(0.18) : .clear),
-            radius: isSelected ? 14 : (isHovered ? 10 : 0),
-            x: 0, y: isSelected ? 4 : (isHovered ? 3 : 0)
+            color: isSelected ? Color.accentColor.opacity(0.4) : .clear,
+            radius: isSelected ? 14 : 0,
+            x: 0, y: isSelected ? 4 : 0
         )
         .animation(.smooth(duration: 0.22), value: isSelected)
         .animation(.smooth(duration: 0.18), value: isHovered)
