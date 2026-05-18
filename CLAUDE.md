@@ -4,7 +4,7 @@
 - **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → text-fold（跨 origin 同 text_full 折一条，pinned OR 聚合）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量
 - **SearchProvider.Mode**：仅 `.local` / `.mesh(stalenessSec:)`，删 `.remoteOK / .remoteFallback / .localMirror`。永远走本机 fold 不打远端，跨设备 chip 总数自动对齐
 - **跨设备 dedup**：两层防御。capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Continuity / ToDesk 副本通过 PullWorker `crossDeviceDedupWindowNs` (5s) + PasteSuppressionSet 拦
-- **Blob**：内容寻址 BlobStore；lazy paste-back（按需从 peer GET `/blob/<sha>`，TaskGroup 5s 超时 race）；可选 eager (`mesh.eager_blobs=true`) PullWorker 拉完元数据顺路拉字节
+- **Blob**：内容寻址 BlobStore（put / putVerified 用 linkItem 而非 moveItem——POSIX rename atomic-replace 会让竞态丢方误计 stats，详 §"BlobStore 内容寻址不变量"）；lazy paste-back（按需从 peer GET `/blob/<sha>`，TaskGroup 30s 超时 race——见下方 §"blob 懒拉的不变量" #8）；可选 eager (`mesh.eager_blobs=true`) PullWorker 拉完元数据顺路拉字节
 - **HMAC 认证**：`<ts>\n<METHOD>\n<path>\n<body_sha256_hex>` 签名。HTTP middleware 不读 body（让多 MB blob 不占内存），handler 自己读 body 后再算 sha256 比对 header。WS upgrade 用相同模板（empty body hash），upgrade 后 frame 不签
 - **OCR**：Phase 1 + Phase 2 都已落地。Phase 1 = 本机 own-origin image 跑 Vision OCR 写 `text_full` 进 FTS5；Phase 2 = OCR markDone 触发 onCursorAdvanced 让对端 < 1s 同步 OCR 结果（共享 wsBroadcaster fan-out 路径），peer FTS5 trigger 自动重 index 让对端搜索可命中
 - **mesh-doctor CLI**：探每 peer /health (deviceID + skewMs + 跟 expected 是否匹配) + 本机 pull_cursor 行 + 本机 max(ingested_at_ns) + missing blob 统计。只读不动 DB / config。退出码 0=都健康；任一 peer unreachable / device_id 不匹配 / blob 缺失 → 1
@@ -217,9 +217,35 @@ RTF 抓取走三层降级：
 
 7. **lazy 多次 Enter 自动 cancel 旧 task** —— `AppDelegate.currentPasteTask` 保存上一次 Task，`pasteBack` 调用时 `currentPasteTask?.cancel()` 再起新的。防 "拉一半再按 Enter" 重复 GET 同 sha 竞争 BlobStore.put（put 是原子 rename，重复其实安全；但避免浪费带宽 + 让 UI 状态机简单）
 
-8. **lazy 5s 总超时靠 TaskGroup race，不靠 `Date()` 检查**——P1 review fix。`fetchBlobLazy` 用 `withThrowingTaskGroup` race 两个 task：(a) `fetchBlobLazyInner` 重试循环 `backoffs=[0, 2, 4]` 处理 transient（`.transient` 进入下一轮；`.rejected`/`.shaMismatch`/`.notFound` 立即 fail），(b) `Task.sleep(5s)` 抛 timeout outcome。先完成的赢 + `group.cancelAll()`。**不要回退**——只靠 inner 循环开头 `Date() > deadline` 早退不够：URLSession 单 request 默认 60s timeout，server hang 在 connection 建立但不返回数据时，inner 根本没机会 check Date()；group cancel 让 URLSession 抛 `URLError.cancelled` 立即返回，是唯一能保证 5s 内一定有结果的姿态。`lazyBlobTimeoutSec` 必须 `nonisolated`（sleeper task capture 要求）
+8. **lazy 30s 总超时靠 TaskGroup race，不靠 `Date()` 检查**——P1 review fix（5s → 30s，DERP 中继 TLS 握手 3s+ 经常超时）。`fetchBlobLazy` 用 `withThrowingTaskGroup` race 两个 task：(a) `fetchBlobLazyInner` 重试循环 `backoffs=[0, 2, 4]` 处理 transient（`.transient` 进入下一轮；`.rejected`/`.shaMismatch`/`.notFound` 立即 fail），(b) `Task.sleep(lazyBlobTimeoutSec)` 抛 timeout outcome。先完成的赢 + `group.cancelAll()`。**不要回退**——只靠 inner 循环开头 `Date() > deadline` 早退不够：URLSession 单 request 默认 60s timeout，server hang 在 connection 建立但不返回数据时，inner 根本没机会 check Date()；group cancel 让 URLSession 抛 `URLError.cancelled` 立即返回，是唯一能保证总超时内一定有结果的姿态。`lazyBlobTimeoutSec` 必须 `nonisolated`（sleeper task capture 要求）
+
+    **配合修复**：30s 超时窗口下"panel.hide → blob 拉到 → 写入 NSPasteboard"的孤儿写入窗口被放大 6 倍；`SearchPanelController.hide` 必须**同步**先调 `onDismiss()`（cancel `currentPasteTask` + 清 preview），再走 140ms 视觉收场动画。旧实现把 cancel 塞进动画 completion 里在 140ms 后才 fire——配合 30s timeout 让用户切到目标 app 后莫名收到 paste。**不要回退**：hide 入口同步 cancel 是硬不变量
 
 9. **`pasteBlobFetcher` 跟 PullWorker 解耦**。`setupPasteBlobFetcher` 在 `applicationDidFinishLaunching` 跟 `startMeshSupervisor` 平行调用，只依赖 `peers[0] + shared-secret 可加载`，**不**依赖 `mesh.enabled` / `serve`。理由：用户配了 peers 但关掉 `mesh.enabled`（不想周期 pull、只想 paste 时按需取单个 blob）是合法配置；fetcher 绑在 PullWorker 启动里会让这种配置下 image paste 永远失败
+
+### BlobStore 并发竞态：linkItem 取代 moveItem
+
+`BlobStore.put` / `putVerified` 共享 `writeBlob` 唯一实现：先 stage 写 tmp，再 `linkItem(at: tmp, to: target)`（hard link），失败若 target 已存在 → wasExisting=true + **不**调 `notifyAdded`。`defer { removeItem(tmp) }` 保证 tmp 总被清。
+
+**不要回退到 moveItem**：`FileManager.moveItem` 走 POSIX `rename(2)` —— atomic replace，dst 已存在时**不报错而是覆盖**。竞态丢方根本进不了 catch 分支，原 catch 内的 "wasExisting + notifyAdded" 误判让 BlobStorageStats 重复计字节、UI 仓库占用虚增。`linkItem` 走 `link(2)`，dst 存在必定 EEXIST，才是真正的 exclusive create。
+
+回归测试：`concurrentPutSameShaCountsOnceInStats`（16 并发 put 同 sha 字节只算一份）。位置：`BlobStore.swift` + `BlobStoreTests.swift`。
+
+### WSNotificationClient 长连接成功 reset failureCounter
+
+`Config.longLivedConnectionThresholdSec`（默 30s）划分"短闪连失败"vs"长连接合法关"。`setConnected(true)` 记 `currentConnectionStartedAt`；`setConnected(false)` 算 elapsed，达阈值置 `longConnectionThisRound`。runLoop 跑完 `connectOnce` 后 `consume` flag——长连接路径 reset `consecutiveFailures = 0`，短闪连走原有 `+=1` + 指数 backoff。
+
+**不要回退到无条件 +1**：旧实现配合 WSBroadcaster `mesh.ws_rotation_sec`（默 4h）主动 close 所有连接，约 60h 后所有合法长连接客户端 consecutiveFailures 累到 budget=15，触发 catastrophic `exit(1)`，launchd 重启——每隔几天来一次 daemon 重启而没人知道为啥。
+
+回归测试：`longLivedConnectionResetsFailureCounter`。位置：`WSNotificationClient.swift`。
+
+### /pair TLS-only 护栏
+
+`SyncServer.requirePairingTLS`（默 true）+ `tls == nil` 时 `/pair/<pin>` handler 在 PIN 校验**之前**返 503。daemon 启动期若不满足条件且 `pairingService != nil`，stderr 立刻打 WARN 让运维侧能看到。测试用 `requirePairingTLS: false` 显式 opt-out。
+
+**为什么硬护栏**：`/pair` response body 含 `secret: hex` 明文（iOS 用作 HMAC 主密钥）。Tailscale 路径下 WG 加密兜底 OK，但 iOS 配对常走 `.local` / 直连 IP——不进 tailnet，secret 明文暴露给 LAN 中间人。PIN 单次 + 5 次封锁挡不住"监听一次成功配对"。
+
+**不要回退**：未来若 daemon 跑 plain HTTP（罕见），必须升级到 TLS 才能用 iOS 配对，不是放宽这条护栏。回归测试：`pairReturns503WhenTLSRequiredButMissing`。位置：`Server.swift` + `PairHTTPTests.swift`。
 
 ### PullWorker peer 换了的检测（reconcilePeer）
 
