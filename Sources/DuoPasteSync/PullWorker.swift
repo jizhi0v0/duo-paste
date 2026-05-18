@@ -398,7 +398,17 @@ public actor PullWorker {
             }
         } else {
             // 学习模式：只有单 peer 部署可能走这条路径（多 peer 必须传 expectedPeerDeviceID
-            // 避免多个学习 worker 抢同一行 cursor）。LIMIT 1 是历史兼容路径
+            // 避免多个学习 worker 抢同一行 cursor）。先 COUNT(*) 做安全闸：超过 1 行说明
+            // pull_cursor 表已经被多 peer 用过，LIMIT 1 拿到的行可能不属于当前 worker，
+            // 后续 DELETE 会清掉别人的 cursor + origin 行——直接 skip + log，等运维补上
+            // expectedPeerDeviceID 再进 reconcile
+            let rowCount = try await database.pool.read { db -> Int in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM pull_cursor") ?? 0
+            }
+            if rowCount > 1 {
+                log("learning-mode reconcilePeer skipped: pull_cursor has \(rowCount) rows but expectedPeerDeviceID is nil — multi-peer deployment must pass expected device_id explicitly")
+                return
+            }
             persisted = try await database.pool.read { db -> String? in
                 try String.fetchOne(db, sql: "SELECT peer_device_id FROM pull_cursor LIMIT 1")
             }

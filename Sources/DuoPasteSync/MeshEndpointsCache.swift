@@ -221,6 +221,17 @@ public actor MeshEndpointsCache {
             log("purged \(beforePurge - entries.count) stale entries")
         }
 
+        // urlToDeviceID 反查表只在 .success 路径写入，从来不主动清——peer config 切 ponte
+        // host / mesh-init 改 peer URL 后老映射会永久留。failure path 还会用过期映射把
+        // 当前 entry 标 unhealthy。reconcile 结束前 narrow 到本轮 decisions 实际用的 URL，
+        // 保证表语义跟"当前活跃 peer 配置"对齐
+        let activeURLs = Set(decisions.map(\.chosenPullURL))
+        let beforeMapPurge = urlToDeviceID.count
+        urlToDeviceID = urlToDeviceID.filter { activeURLs.contains($0.key) }
+        if urlToDeviceID.count != beforeMapPurge {
+            log("purged \(beforeMapPurge - urlToDeviceID.count) stale url→device mappings")
+        }
+
         if anyChange {
             let snap = snapshot()
             let hash = computeHash(snap)

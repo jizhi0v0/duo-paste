@@ -290,7 +290,11 @@ public actor WSNotificationClient {
                 switch m {
                 case .cursorAdvanced(_, let deviceID, let latest):
                     if let expectedPeer, deviceID != expectedPeer {
-                        logFn("cursor_advanced from unexpected peer \(deviceID), expected \(expectedPeer); ignoring")
+                        // 跟 hello 对称：peer 中途换 device_id 还推 cursor 时不能只 log 忽略
+                        // 然后继续保留连接——下一帧又会撞上同问题。set closeSignal 让外层
+                        // throw + 进 backoff 重连流程，给 reconcilePeer 机会清旧 mirror 行
+                        logFn("cursor_advanced from unexpected peer \(deviceID), expected \(expectedPeer); closing")
+                        await closeSignal.set()
                         return
                     }
                     onCursor(latest)

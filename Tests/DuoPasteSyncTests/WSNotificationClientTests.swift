@@ -145,7 +145,8 @@ struct WSNotificationClientTests {
     }
 
     @Test func unexpectedPeerDeviceIDIgnoresCursorAdvanced() async throws {
-        // 严格模式：expected="A" 但 server 报 deviceID="B" → 不触发
+        // 严格模式：expected="A" 但 server 报 deviceID="B" → 不触发 onCursor + 立即关连接
+        // 触发重连（行为跟 hello 路径对称：避免坐在错 peer 连接上反复收错消息）
         let secret = Data(repeating: 0xC2, count: 32)
         let auth = HMACAuth(secret: secret)
         let port = PortBox2()
@@ -165,11 +166,12 @@ struct WSNotificationClientTests {
             let url = URL(string: "http://127.0.0.1:\(p)")!
             let client = WSNotificationClient(
                 peerURL: url, auth: auth, expectedPeerDeviceID: "A",
-                onCursorAdvanced: { ns in Task { await counter.record(ns) } }
+                onCursorAdvanced: { ns in Task { await counter.record(ns) } },
+                config: .init(reconnectInitialSec: 0.05, reconnectMaxSec: 0.1)
             )
             await client.start()
             try await Task.sleep(nanoseconds: 700_000_000)
-            #expect(await counter.count() == 0, "expected peer 不匹配不该触发")
+            #expect(await counter.count() == 0, "expected peer 不匹配不该触发 onCursor")
             await client.stop()
             await group.triggerGracefulShutdown()
         }
