@@ -448,10 +448,14 @@ final class AppState {
         )
     }
 
-    /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断，无业务语义——稀疏类型
-    /// （比如图片只有 19 条，文本却几百条）必须 limit 够大才能滚到底找到。LazyVStack 渲
-    /// 染千行不卡，SQLite 拉千行 row ~10ms 内
-    static let listLimit = 1000
+    /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断,无业务语义——稀疏类型
+    /// (比如图片只有 19 条,文本却几百条)必须 limit 够大才能滚到底找到。
+    /// **200 不是 1000**:Instruments 验证 1000 时 LazyHStack/LazyHVStack reconciliation
+    /// (LazyLayoutViewCache + GraphHost.flushTransactions + AG::Graph::UpdateState)
+    /// 在 results 替换时占用 main thread 100-158ms,触发 expensive app update hitch。
+    /// 砍到 200 让 lazy 容器 diff 成本压一档,剪贴板搜索场景"看最近 + top 命中"几乎
+    /// 完全覆盖。totalCount 仍走独立 SQL COUNT(query)不受 limit 影响,chip 数仍真实
+    static let listLimit = 200
 
     /// 当前应该粘贴的项：优先选中项(取 selectedIDs 末位 = 最后一次 cmd+点 / 单击的那个),
     /// 否则取列表首项兜底。**注**:多项 paste 用 `selectedItems`,这里只是单项 fallback
