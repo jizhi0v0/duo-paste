@@ -286,6 +286,11 @@ final class AppState {
     /// nil = 没配 peer / shared-secret 加载失败，UI 缺 blob 时显占位即可。
     /// 跟 AppDelegate.pasteBlobFetcher 同一份引用——paste 路径 + UI 路径共用一个 fetcher
     /// 让 keep-alive 连接池命中率高
+    ///
+    /// **生命周期硬契约**: daemon 单 instance,AppDelegate 启动期设置一次。
+    /// `ItemCard.==` 不比较 fetcher 引用,依赖此契约——任何未来引入的 hot reload
+    /// 路径(config 在线 reload / secret 轮换 rebuild)必须同步更新 ItemCard equality,
+    /// 否则 fetcher 换实例后 cell 仍认为 equal,thumbnail 不会重 load
     var pasteBlobFetcher: (any BlobFetcher)?
 
     /// SmartTransport 当前每个 peer 的决策快照——SettingsView 订阅展示。
@@ -448,10 +453,19 @@ final class AppState {
         )
     }
 
-    /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断，无业务语义——稀疏类型
-    /// （比如图片只有 19 条，文本却几百条）必须 limit 够大才能滚到底找到。LazyVStack 渲
-    /// 染千行不卡，SQLite 拉千行 row ~10ms 内
-    static let listLimit = 1000
+    /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断,无业务语义——稀疏类型
+    /// (比如图片只有 19 条,文本却几百条)必须 limit 够大才能滚到底找到。
+    /// **200 不是 1000**:Instruments 验证 1000 时 LazyHStack/LazyHVStack reconciliation
+    /// (LazyLayoutViewCache + GraphHost.flushTransactions + AG::Graph::UpdateState)
+    /// 在 results 替换时占用 main thread 100-158ms,触发 expensive app update hitch。
+    /// 砍到 200 让 lazy 容器 diff 成本压一档,剪贴板搜索场景"看最近 + top 命中"几乎
+    /// 完全覆盖。totalCount 仍走独立 SQL COUNT(query)不受 limit 影响,chip 数仍真实
+    static let listLimit = 200
+
+    /// 上一次 refresh 起的 detached fetch Task。新一轮 refresh 开头 cancel 它,
+    /// 防止快速连打 query 时 N 个 detached SQL read 堆在 GRDB pool reader 队列。
+    /// @ObservationIgnored:这是内部并发状态,UI 不依赖也不应触发 SwiftUI 重渲
+    @ObservationIgnored private var currentSearchTask: Task<SearchProvider.Outcome, Error>?
 
     /// 当前应该粘贴的项：优先选中项(取 selectedIDs 末位 = 最后一次 cmd+点 / 单击的那个),
     /// 否则取列表首项兜底。**注**:多项 paste 用 `selectedItems`,这里只是单项 fallback
@@ -521,31 +535,83 @@ final class AppState {
             pinnedOnly: pinnedOnly,
             limit: Self.listLimit
         )
+        // **E**: 把 SearchProvider.search 整段(4 次同步 SQL + fold + 转 Item array)
+        // 搬出 main actor。SearchProvider.search 是 async 但内部全同步——`async`
+        // 只为接口稳定保留(见 SearchClient.swift:72-74 注释),实际所有工作在调用者
+        // actor 上跑。Task.detached 让这段在后台 thread 执行,main actor 只 await
+        // 结果 + 做 setter 赋值。SearchProvider 是 Sendable struct,SearchAPI 内部
+        // GRDB pool 是 thread-safe,跨 thread 调用安全。
+        //
+        // **P1/P2 cancel 协议**:
+        // - detached child 不继承父 .task(id:) 的 cancel——父被替换时 detached
+        //   仍跑完,`try await task.value` 不会主动抛
+        // - cancel 旧 currentSearchTask:防止快速连打堆 N 个 detached read 占满
+        //   GRDB reader 池;detached body 入口 checkCancellation 能在 SQL 开始前
+        //   早退,SQL 已开始的 cancel 不掉(SQLite 同步调用),但结果会被 .value
+        //   throw + Task.isCancelled check 双层拦截不落地
+        // - await 后显式 check Task.isCancelled:父 .task(id:) cancel 时 await
+        //   不主动抛,这里挡住 stale outcome 写进 self.results 让 UI 闪旧 query
+        self.currentSearchTask?.cancel()
+        let provider = deps.searchProvider
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try await provider.search(q)
+        }
+        self.currentSearchTask = task
+        let outcome: SearchProvider.Outcome
         do {
-            let outcome = try await deps.searchProvider.search(q)
-            self.results = outcome.items
-            // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
-            // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
-            ImageThumbnailCache.shared.prefetch(
-                items: outcome.items,
-                blobs: deps.blobs,
-                fetcher: pasteBlobFetcher,
-                storageMode: deps.config.mesh.storageMode
-            )
-            self.snippets = outcome.snippets
-            self.searchMode = outcome.mode
-            self.totalCount = outcome.totalCount
-            self.kindCounts = outcome.kindCounts
-            self.fileSubKindCounts = outcome.fileSubKindCounts
-            // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
-            // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）
-            self.clockSkewMs = deps.meshStatus.worstClockSkewMs()
-            updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
-            self.lastError = nil
+            outcome = try await task.value
         } catch is CancellationError {
-            // 用户在打字，新查询正在替换旧的，正常
+            // detached 内 checkCancellation 早退,或者 .value 在父 cancel 后 throw
+            return
         } catch {
             self.lastError = "\(error)"
+            return
+        }
+        // 父 .task(id:) 被 cancel 时 await .value 不抛,这里硬挡 stale 写入
+        if Task.isCancelled {
+            return
+        }
+        // **F**: 每个 setter 前 equality guard——内容等价时直接跳过,避免 Observation
+        // 框架 didSet wave 触发下游 ForEach diff / chip 重渲。新旧 Item array 在
+        // query 没变的高频 refresh(openPulse / onAppear)场景下大概率等价,
+        // ItemCard EquatableView 已能跳 body 重算,这里再叠一层让 ForEach enumerate
+        // 都不发生
+        if self.results != outcome.items {
+            self.results = outcome.items
+        }
+        // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
+        // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
+        ImageThumbnailCache.shared.prefetch(
+            items: outcome.items,
+            blobs: deps.blobs,
+            fetcher: pasteBlobFetcher,
+            storageMode: deps.config.mesh.storageMode
+        )
+        if self.snippets != outcome.snippets {
+            self.snippets = outcome.snippets
+        }
+        if self.searchMode != outcome.mode {
+            self.searchMode = outcome.mode
+        }
+        if self.totalCount != outcome.totalCount {
+            self.totalCount = outcome.totalCount
+        }
+        if self.kindCounts != outcome.kindCounts {
+            self.kindCounts = outcome.kindCounts
+        }
+        if self.fileSubKindCounts != outcome.fileSubKindCounts {
+            self.fileSubKindCounts = outcome.fileSubKindCounts
+        }
+        // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
+        // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）
+        let newSkew = deps.meshStatus.worstClockSkewMs()
+        if self.clockSkewMs != newSkew {
+            self.clockSkewMs = newSkew
+        }
+        updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
+        if self.lastError != nil {
+            self.lastError = nil
         }
     }
 

@@ -432,13 +432,21 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             },
             onPreviewChange: { [weak self] shown in
                 guard let self else { return }
-                if shown,
-                   let item = self.state.currentItem,
-                   self.state.selectedCardWindowRect != .zero {
-                    preview.show(item: item, cardRectInGlobal: self.state.selectedCardWindowRect)
-                } else {
+                if !shown {
                     preview.hide()
+                    return
                 }
+                guard let item = self.state.currentItem else {
+                    preview.hide()
+                    return
+                }
+                // **P3 修复**: shown=true 但 selectedCardWindowRect == .zero 时不主动 hide——
+                // 这通常发生在 previewAnchorID 切换(箭头切卡)瞬间,SearchView 主动 reset
+                // 让新卡 frame 到位时再统一 reposition。如果这里走 hide() 浮窗会
+                // alphaValue 1→0→1 闪烁;改成保持上一帧状态等新 frame nonzero 时一次性
+                // 切换到新 item + 新位置,视觉无中断
+                guard self.state.selectedCardWindowRect != .zero else { return }
+                preview.show(item: item, cardRectInGlobal: self.state.selectedCardWindowRect)
             },
             // contextMenu "在 Finder 显示" + ⌘Return 走同一 onReveal handler
             onReveal: onReveal,
