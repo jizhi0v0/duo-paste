@@ -74,15 +74,20 @@ public enum Snapshot {
 
         var keptDayKeys = Set<String>()    // 在 24h~30d 段，已经为这一天保留过
         var keptMonthKeys = Set<String>()  // 在 30d+ 段，已经为这一月保留过
+        // locale=en_US_POSIX 与 nameFormatter 对齐，杜绝极端 locale + 自定义 calendar
+        // 配置下 yyyy-MM-dd / yyyy-MM 输出走非公历（如 ja_JP 配 Japanese calendar）导致
+        // 同一日期产出不同 key
         let dayKeyFmt: DateFormatter = {
             let f = DateFormatter()
             f.calendar = calendar
+            f.locale = Locale(identifier: "en_US_POSIX")
             f.dateFormat = "yyyy-MM-dd"
             return f
         }()
         let monthKeyFmt: DateFormatter = {
             let f = DateFormatter()
             f.calendar = calendar
+            f.locale = Locale(identifier: "en_US_POSIX")
             f.dateFormat = "yyyy-MM"
             return f
         }()

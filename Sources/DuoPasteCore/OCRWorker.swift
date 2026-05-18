@@ -146,6 +146,11 @@ public actor OCRWorker {
                 self.currentSleep = task
                 _ = try? await task.value    // wake() 取消 → 抛 CancellationError，忽略
                 self.currentSleep = nil
+            } else {
+                // backlog 满 batch 紧接下一 tick——cooperatively yield 让 Database reader /
+                // 其他 actor 不会被 OCR worker 占满 actor executor。大批 backfill 场景下
+                // 用户 search / Settings 读 DB 不会被 OCR 把整个串行 reader pool 占住
+                await Task.yield()
             }
         }
         log("worker stopped")

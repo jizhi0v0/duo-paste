@@ -120,6 +120,14 @@ final class BlobCache {
             inflight.removeValue(forKey: sha)
             cancelled.insert(sha)
             throw CancellationError()
+        } catch let urlErr as URLError where urlErr.code == .cancelled {
+            // URLSession invalidateAndCancel / reconfigure 路径下 fetcher 抛
+            // URLError.cancelled 而非 CancellationError；视同用户主动 cancel 进黑名单，
+            // 而不是 generic 失败写 failedReasons。resetAll 会清 cancelled，让重连后能重拉
+            loadingShas.remove(sha)
+            inflight.removeValue(forKey: sha)
+            cancelled.insert(sha)
+            throw CancellationError()
         } catch {
             loadingShas.remove(sha)
             inflight.removeValue(forKey: sha)

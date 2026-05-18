@@ -374,10 +374,16 @@ public struct SyncServer: Sendable {
                 return errorJSON(.badRequest, "missing id")
             }
             // 二次校验 body 跟 header 一致——middleware 不读 body,handler 自己再 sha 比对
-            // 防"合法签名 + 任意 body"绕过(虽然这个路由不读 body,但保持跟 /blob 同款防御)
+            // 防"合法签名 + 任意 body"绕过(虽然这个路由不读 body,但保持纵深防御)
             let bodyBuf = try await request.body.collect(upTo: 16 * 1024)
             let bodyHash = HMACAuth.sha256Hex(Data(buffer: bodyBuf))
-            let headerHash = request.headers[HTTPField.Name(HMACAuth.bodyHashHeader)!]?.lowercased() ?? ""
+            // HTTPField.Name 失败仅当 header name 含非法字符——`X-DP-Body-SHA256` 是
+            // 编译时常量串, init 不该 fail。但用 guard let 替 force unwrap 让 future-self
+            // 改常量名时不至于 daemon 启动 crash
+            guard let bodyHashHeaderName = HTTPField.Name(HMACAuth.bodyHashHeader) else {
+                return errorJSON(.internalServerError, "invalid body-hash header name constant")
+            }
+            let headerHash = request.headers[bodyHashHeaderName]?.lowercased() ?? ""
             guard headerHash == bodyHash else {
                 return errorJSON(.unauthorized, "body sha mismatch")
             }

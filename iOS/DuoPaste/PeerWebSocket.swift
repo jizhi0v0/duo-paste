@@ -132,7 +132,13 @@ final class PeerWebSocket {
                 DebugLog.shared.append("ws connectOnce failed: \(error) failures=\(failures) url=\(urlStr)")
             }
             if Task.isCancelled { return }
-            let backoff = min(pow(2.0, Double(max(failures - 1, 0))), 60.0)
+            // backoff 封顶：2^(failures-1) 但 failures 在 backoff 计算上 clamp 到 6
+            // → 最大 sleep 32s（之前 60s）。`failures` 字段本身仍单调增让 UI / 日志能看到
+            // 真实失败次数，只是 backoff 不会让"网络刚恢复但当前还在 backoff 60s 里"的
+            // UX 拉长。reconnectPreservingBackoff 不 reset failures（保前一段抖动学到的
+            // 教训），但 clamp 让 max wait 较合理
+            let clampedFailures = min(failures, 6)
+            let backoff = min(pow(2.0, Double(max(clampedFailures - 1, 0))), 32.0)
             state = .backoff(failures: failures)
             do {
                 try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))

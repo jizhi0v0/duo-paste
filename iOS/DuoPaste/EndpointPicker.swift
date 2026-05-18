@@ -103,20 +103,16 @@ enum EndpointPicker {
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
 
-        // TrustAnyDelegate 接受任何 cert——.local / *.sgponte hostname 跟 Tailscale cert
-        // 不匹配需要 bypass(HMAC 签名兜底防 MitM)。Tailscale FQDN 走默认信任也通过
-        let delegate = TrustAnyDelegate()
-        let cfg = URLSessionConfiguration.ephemeral
-        // request + resource 双层 timeout 都设到 timeoutSec,避免 DNS 阻塞早早超时但
-        // resource 长 timeout 让总体等更久
-        cfg.timeoutIntervalForRequest = timeoutSec
-        cfg.timeoutIntervalForResource = timeoutSec + 2
-        cfg.urlCache = nil
-        let session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
+        // 复用 TrustAnyHTTP.shared（接受任何 cert + HMAC 兜底 MitM）。旧实现每次 probe
+        // 都新建 URLSession + invalidateAndCancel，cellular 抖动期 repick 6 个 endpoint
+        // 同时跑会让 6 个 session/delegate 短暂同时存活；shared session 走 task-level
+        // cancellation（Task.cancel 让 URLSession 自己 cancel 底层连接），不需要 invalidate
+        let session = TrustAnyHTTP.shared
+        // URLRequest.timeoutInterval 覆盖 session 默认 timeout，shared session resource
+        // timeout 是 20s，probe timeoutSec 通常 1-3s 远低于上限不会冲突
         let started = Date()
         do {
-            let (_, resp) = try await session.data(for: req, delegate: delegate)
+            let (_, resp) = try await session.data(for: req)
             let rtt = Int(Date().timeIntervalSince(started) * 1000)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? -1

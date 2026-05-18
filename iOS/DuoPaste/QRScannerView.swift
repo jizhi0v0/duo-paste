@@ -85,9 +85,24 @@ struct QRPayload: Equatable {
         guard let host = dict["host"] as? String, !host.isEmpty else {
             return nil
         }
+        // 防御性 host 校验：恶意 QR 让 host 含控制字符 / 空格 / ":" / "/" 等，
+        // URLComponents 兜底会拒大部分，但显式 reject 让攻击面更小（payload 落入
+        // PinPairingClient.pair 前就拦下）
+        guard Self.isValidHostString(host) else { return nil }
         let port = (dict["port"] as? Int) ?? 8443
+        guard (1..<65536).contains(port) else { return nil }
         let tls = (dict["tls"] as? Bool) ?? true
         return QRPayload(host: host, port: port, tls: tls)
+    }
+
+    /// host 合法字符：a-z / A-Z / 0-9 / `.` / `-` / `:`（IPv6 wrapper bracketed 用）。
+    /// 不允许空格、控制字符、`/`、`?`、`#` 等 URL-special。长度上限 253 (RFC 1035)
+    private static func isValidHostString(_ host: String) -> Bool {
+        guard host.count <= 253 else { return false }
+        let allowed = CharacterSet(charactersIn:
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:_[]"
+        )
+        return host.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }
 

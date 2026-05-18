@@ -107,7 +107,7 @@ public final class PasteSuppressionSet: @unchecked Sendable {
             entry.anchors.removeFirst(overflow)
         }
         entries[fingerprint] = entry
-        pruneExpiredLocked(now: now)
+        maybePruneExpiredLocked(now: now)
     }
 
     /// 是否应当抑制候选行。候选 captured_at_ns 命中 **任意一个** 活跃锚点的窗口
@@ -125,8 +125,16 @@ public final class PasteSuppressionSet: @unchecked Sendable {
     ) -> Bool {
         let now = nowNs()
         lock.lock(); defer { lock.unlock() }
-        pruneExpiredLocked(now: now)
-        guard let entry = entries[fingerprint] else { return false }
+        maybePruneExpiredLocked(now: now)
+        // inline 清当前 entry 的过期 anchor——节流的全局 prune 可能 skip 这条 entry，
+        // 但 shouldSuppress 必须立刻看到正确的 anchor 列表（过期 anchor 不该再 suppress）
+        guard var entry = entries[fingerprint] else { return false }
+        entry.anchors.removeAll { $0.expireAtNs <= now }
+        if entry.anchors.isEmpty {
+            entries.removeValue(forKey: fingerprint)
+            return false
+        }
+        entries[fingerprint] = entry
         for a in entry.anchors {
             let lo = a.recordedAtNs - skewNs
             let hi = a.recordedAtNs + echoWindowNs
@@ -145,6 +153,8 @@ public final class PasteSuppressionSet: @unchecked Sendable {
         return entries.count
     }
 
+    /// 全量扫 entries 把过期的 anchor 清掉。O(N × avgAnchors) 不便宜——hot path
+    /// 通过 `maybePruneExpiredLocked` 节流降频跑
     private func pruneExpiredLocked(now: Int64) {
         for (k, var entry) in entries {
             entry.anchors.removeAll { $0.expireAtNs <= now }
@@ -154,7 +164,26 @@ public final class PasteSuppressionSet: @unchecked Sendable {
                 entries[k] = entry
             }
         }
+        lastGlobalPruneAtNs = now
     }
+
+    /// 节流版本：record / shouldSuppress hot path 通过这条。entries 少于阈值或距上次
+    /// 全量 prune 不够久 → 跳过；否则跑一次全量。当前 entry 的过期 anchor 已经在
+    /// record 内 inline 清掉，全局延迟 prune 最多让"其他完全过期的 entry" 多占内存
+    /// 一会儿——entries 数有上界（用户活跃指纹集 + 300s TTL），总不会爆
+    private func maybePruneExpiredLocked(now: Int64) {
+        guard entries.count >= Self.globalPruneEntryThreshold else { return }
+        guard now - lastGlobalPruneAtNs >= Self.globalPruneIntervalNs else { return }
+        pruneExpiredLocked(now: now)
+    }
+
+    /// 距上次全量 prune 的时刻（ns）。0 = 从未跑过
+    private var lastGlobalPruneAtNs: Int64 = 0
+    /// 全量 prune 最小间隔——30s
+    private static let globalPruneIntervalNs: Int64 = 30_000_000_000
+    /// entries 数低于此阈值，全量 prune 无意义跳过——record 路径已 inline 清当前 entry，
+    /// 老 entry 数量 < 50 不会让总内存膨胀到看得见
+    private static let globalPruneEntryThreshold: Int = 50
 
     // MARK: - Fingerprint helpers
 
