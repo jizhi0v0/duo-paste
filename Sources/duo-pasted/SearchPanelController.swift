@@ -23,6 +23,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// task + 重置 state.pasteProgress。覆盖三条触发点：Esc 键 / windowDidResignKey
     /// （焦点切走）/ 主动调 hide() 的其它入口
     private let onDismiss: () -> Void
+    /// 右上角齿轮按钮触发——AppDelegate 用它 hide() panel + 打开 Settings 窗口。
+    /// menubar icon 可被用户隐藏,这是唯一始终可见的"回到 Settings"路径
+    private let onOpenSettings: (() -> Void)?
     private var panel: NSPanel?
     /// 标记 ensurePanel 是否刚创建了新 panel(冷启动首次 show)。show() 路径用它决定是否
     /// defer 一个 runloop tick 让 SwiftUI 完成 .glassEffect / .ultraThickMaterial 首帧渲染,
@@ -44,12 +47,14 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     init(state: AppState, onPaste: @escaping ([Item]) -> Void,
          onReveal: ((Item) -> Void)? = nil,
          onOpenWith: ((Item, URL) -> Void)? = nil,
-         onDismiss: @escaping () -> Void = {}) {
+         onDismiss: @escaping () -> Void = {},
+         onOpenSettings: (() -> Void)? = nil) {
         self.state = state
         self.onPaste = onPaste
         self.onReveal = onReveal
         self.onOpenWith = onOpenWith
         self.onDismiss = onDismiss
+        self.onOpenSettings = onOpenSettings
     }
 
     var isVisible: Bool {
@@ -438,7 +443,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // contextMenu "在 Finder 显示" + ⌘Return 走同一 onReveal handler
             onReveal: onReveal,
             // contextMenu "打开方式" 子菜单。nil 时 SearchView 自动隐藏该项
-            onOpenWith: onOpenWith
+            onOpenWith: onOpenWith,
+            // 右上角齿轮按钮 → AppDelegate hide panel + showSettings。nil 时 SearchView 不渲染按钮
+            onOpenSettings: onOpenSettings
         )
         let hosting = NSHostingView(rootView: root)
         hosting.frame = contentRect

@@ -249,11 +249,16 @@ private func seedOCRItem(
     let tmpPNG = dir.appendingPathComponent("CleanShot.png")
     let payload = Data("fake-png-bytes-for-test-\(UUID().uuidString)".utf8)
     try payload.write(to: tmpPNG)
-    // 种子行:本机 file + 图片扩展 + 无 blob
+    // 种子行:本机 file + 图片扩展 + 无 blob。preview 是 makePreview 截短的展示值(只放
+    // 文件名,模拟生产形态);text_full 才是 authoritative path
     let it = Item(id: "row-x", originDevice: "me",
                   capturedAtNs: 1000, kind: .file,
-                  preview: tmpPNG.path)
+                  preview: tmpPNG.lastPathComponent,
+                  textFull: tmpPNG.path)
     try db.pool.write { try it.insert($0) }
+    let beforeIngest = try db.pool.read { conn -> Int64? in
+        try Int64.fetchOne(conn, sql: "SELECT MAX(ingested_at_ns) FROM item")
+    }
 
     let report = try Admin.refillMissingImageBlobs(
         dbPath: paths.mainDB,
@@ -272,6 +277,9 @@ private func seedOCRItem(
     #expect(after?.blobSize == Int64(payload.count))
     #expect(after?.blobMime == "image/png")
     #expect(after?.ocrState == .pending)
+    // ingested_at_ns 必须被 bump——peer 通过 /since cursor 才能拉到 metadata
+    #expect(after?.ingestedAtNs != nil)
+    #expect((after?.ingestedAtNs ?? 0) > (beforeIngest ?? 0))
     // BlobStore 里字节确实在
     let store = BlobStore(root: paths.blobsDir)
     #expect(store.locate(sha256: after?.blobSha256 ?? "") != nil)
@@ -287,24 +295,26 @@ private func seedOCRItem(
 
     // peer 行 + 同条件 → 不该 refill(只动 own-origin)
     let peer = Item(id: "peer", originDevice: "other",
-                    capturedAtNs: 1000, kind: .file, preview: tmp.path)
+                    capturedAtNs: 1000, kind: .file,
+                    preview: tmp.lastPathComponent, textFull: tmp.path)
     try db.pool.write { try peer.insert($0) }
     // own 行但已有 blob → 不该再 refill
     let already = Item(id: "already", originDevice: "me",
                        capturedAtNs: 1001, kind: .file,
-                       preview: tmp.path,
+                       preview: tmp.lastPathComponent, textFull: tmp.path,
                        blobSha256: String(repeating: "0", count: 64),
                        blobMime: "image/png")
     try db.pool.write { try already.insert($0) }
     // 软删行 → 不该 refill
     let del = Item(id: "del", originDevice: "me",
                    capturedAtNs: 1002, kind: .file,
-                   preview: tmp.path, deletedAtNs: 1)
+                   preview: tmp.lastPathComponent, textFull: tmp.path,
+                   deletedAtNs: 1)
     try db.pool.write { try del.insert($0) }
     // 非图片扩展(.txt) → 不该 refill
     let txt = Item(id: "txt", originDevice: "me",
                    capturedAtNs: 1003, kind: .file,
-                   preview: "/tmp/foo.txt")
+                   preview: "foo.txt", textFull: "/tmp/foo.txt")
     try db.pool.write { try txt.insert($0) }
 
     let report = try Admin.refillMissingImageBlobs(
@@ -323,9 +333,11 @@ private func seedOCRItem(
     paths.ensureExists()
     let db = try DuoPasteCore.Database(path: paths.mainDB)
     // 路径指向不存在的文件
+    let ghostPath = "/tmp/never-existed-\(UUID().uuidString).png"
     let it = Item(id: "ghost", originDevice: "me",
                   capturedAtNs: 1000, kind: .file,
-                  preview: "/tmp/never-existed-\(UUID().uuidString).png")
+                  preview: (ghostPath as NSString).lastPathComponent,
+                  textFull: ghostPath)
     try db.pool.write { try it.insert($0) }
 
     let report = try Admin.refillMissingImageBlobs(
@@ -353,7 +365,8 @@ private func seedOCRItem(
     let tmp = dir.appendingPathComponent("x.png")
     try Data("png-bytes".utf8).write(to: tmp)
     let it = Item(id: "row", originDevice: "me",
-                  capturedAtNs: 1000, kind: .file, preview: tmp.path)
+                  capturedAtNs: 1000, kind: .file,
+                  preview: tmp.lastPathComponent, textFull: tmp.path)
     try db.pool.write { try it.insert($0) }
 
     let r1 = try Admin.refillMissingImageBlobs(
@@ -375,15 +388,16 @@ private func seedOCRItem(
     #expect(r2.refilled == 0)
 }
 
-@Test func refillSkipsMultilinePreview() throws {
-    // PasteboardWatcher 多文件 capture 时 preview 是 \n-join 多路径——单 sha 无法对应,跳过
+@Test func refillSkipsMultilinePath() throws {
+    // PasteboardWatcher 多文件 capture 时 text_full 是 \n-join 多路径——单 sha 无法对应,跳过
     let dir = tempDir()
     let paths = Paths(root: dir)
     paths.ensureExists()
     let db = try DuoPasteCore.Database(path: paths.mainDB)
     let it = Item(id: "multi", originDevice: "me",
                   capturedAtNs: 1000, kind: .file,
-                  preview: "/tmp/a.png\n/tmp/b.png")
+                  preview: nil,
+                  textFull: "/tmp/a.png\n/tmp/b.png")
     try db.pool.write { try it.insert($0) }
 
     let report = try Admin.refillMissingImageBlobs(
@@ -405,7 +419,8 @@ private func seedOCRItem(
     let tmp = dir.appendingPathComponent("big.png")
     try Data(repeating: 0xAA, count: 4096).write(to: tmp)
     let it = Item(id: "big", originDevice: "me",
-                  capturedAtNs: 1000, kind: .file, preview: tmp.path)
+                  capturedAtNs: 1000, kind: .file,
+                  preview: tmp.lastPathComponent, textFull: tmp.path)
     try db.pool.write { try it.insert($0) }
 
     // cap 设 1KB,4KB 文件超 cap

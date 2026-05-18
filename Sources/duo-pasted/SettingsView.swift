@@ -1824,11 +1824,16 @@ private struct IOSPairingPINSheet: View {
             refreshTask = nil
             pollTask?.cancel()
             pollTask = nil
-            cancelPIN()
             qrImage = nil  // 防 secret-containing image 在 onDisappear 残留 memory
-            // 重新 prewarm PIN,下次开 sheet 仍能瞬间显示(cancelPIN 刚清了 session,
-            // prewarm 会创建新的)
-            model.prewarmPIN()
+            // cancel + prewarm 必须串行:两者都派 Task 到 PairingService actor,
+            // 独立 Task 的 actor 入队顺序无保证,可能让新生成的 PIN 被旧 cancel 干掉。
+            // 串到一个 Task 里 await cancel 完成再 prewarm,actor 顺序自然保证
+            Task { @MainActor in
+                if let service = AppDelegate.shared?.pairingService {
+                    await service.cancel()
+                }
+                model.prewarmPIN()
+            }
         }
     }
 

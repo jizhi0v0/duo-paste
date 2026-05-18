@@ -729,14 +729,17 @@ public enum Admin {
     /// 路径(`fetchPending` 要求 `blob_mime LIKE 'image/%' AND blob_sha256 IS NOT NULL`)
     /// 看不到,跨设备同步也只能看到文件名搜不到内容。
     ///
-    /// 回填策略:逐行扫描 → 读 preview 里的本地路径 → 文件存在且 ≤ maxBlobBytes →
+    /// 回填策略:逐行扫描 → 读 text_full 里的本地绝对路径 → 文件存在且 ≤ maxBlobBytes →
     /// 字节进 BlobStore(content-addressed,自动 dedup)→ UPDATE 行的
-    /// `blob_sha256/blob_size/blob_mime` + 标 `ocr_state='pending'`。OCRWorker 下一 tick
-    /// 自然扫到跑 OCR(Phase 2 路径再把 text_full 推给对端)。
+    /// `blob_sha256/blob_size/blob_mime` + 标 `ocr_state='pending'` + 通过 nextIngestNs 单增
+    /// bump `ingested_at_ns`(同 writer tx 内,/since 才能让对端拉到 metadata)。OCRWorker
+    /// 下一 tick 自然扫到跑 OCR(Phase 2 路径再把 text_full 推给对端)。
     ///
     /// **只动**:`origin_device = self` + `kind='file'` + 图片扩展名 + `blob_sha256 IS NULL`
     /// + `deleted_at_ns IS NULL`。peer 行 / 已有 blob 的行 / 非图片 file / tombstone 都不动。
-    /// preview 路径以 `/` 开头才尝试(避免 PasteboardWatcher 多文件路径用 `\n` join 入库的边界)。
+    /// **路径源**:用 `text_full`(file kind 的 authoritative path,见 CaptureService 写入
+    /// 契约 `resolvedTextFull = c.text ?? c.fileName`)。preview 是被 makePreview 截短的展示值,
+    /// 长路径会丢字节。text_full 以 `/` 开头且不含 `\n` 才尝试(排除多文件 `\n`-join)。
     ///
     /// 幂等:跑完后 blob_sha256 非 NULL,下次扫不到。
     public struct RefillImageBlobsReport: Sendable, Equatable {
@@ -745,7 +748,7 @@ public enum Admin {
         public var fileMissing: Int   // 路径指向的文件不存在
         public var tooLarge: Int      // 字节数超过 maxBlobBytes
         public var readFailed: Int    // 文件存在但读字节失败(权限/坏盘等)
-        public var nonAbsolute: Int   // preview 不是单条绝对路径(多文件 / 相对路径)
+        public var nonAbsolute: Int   // text_full 不是单条绝对路径(多文件 / 相对路径 / NULL)
 
         public init(
             scanned: Int = 0, refilled: Int = 0, fileMissing: Int = 0,
@@ -775,43 +778,44 @@ public enum Admin {
         let blobs = BlobStore(root: blobsDir)
         var report = RefillImageBlobsReport()
 
-        // 1) 拿候选行清单。read tx,不持锁
-        struct Candidate { let id: String; let preview: String? }
+        // 1) 拿候选行清单。read tx,不持锁。
+        //    匹配 text_full(authoritative path)而非 preview(makePreview 截断后的展示值)
+        struct Candidate { let id: String; let textFull: String? }
         let candidates: [Candidate] = try db.pool.read { conn -> [Candidate] in
             let rows = try Row.fetchAll(conn, sql: """
-                SELECT id, preview
+                SELECT id, text_full
                 FROM item
                 WHERE origin_device = ?
                   AND kind = 'file'
                   AND blob_sha256 IS NULL
                   AND deleted_at_ns IS NULL
                   AND (
-                        LOWER(IFNULL(preview, '')) GLOB '*.png'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.jpg'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.jpeg'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.heic'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.heif'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.gif'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.webp'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.tiff'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.tif'
-                     OR LOWER(IFNULL(preview, '')) GLOB '*.bmp'
+                        LOWER(IFNULL(text_full, '')) GLOB '*.png'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.jpg'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.jpeg'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.heic'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.heif'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.gif'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.webp'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.tiff'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.tif'
+                     OR LOWER(IFNULL(text_full, '')) GLOB '*.bmp'
                   )
             """, arguments: [selfDeviceID])
-            return rows.map { Candidate(id: $0["id"] ?? "", preview: $0["preview"]) }
+            return rows.map { Candidate(id: $0["id"] ?? "", textFull: $0["text_full"]) }
         }
         report.scanned = candidates.count
         log("refill-image-blobs: 扫到 \(candidates.count) 条候选 file 行(own-origin · 图片扩展 · 无 blob · 未软删)")
 
         // 2) 逐行处理。文件 IO 不能在 writer tx 内
         for cand in candidates {
-            // 多文件 capture 时 preview 是 \n-join 多路径——不在回填范畴(无法关联到单一 blob)。
-            // 相对路径 / 空 preview 也跳过
-            guard let raw = cand.preview,
+            // 多文件 capture 时 text_full 是 \n-join 多路径——不在回填范畴(无法关联到单一 blob)。
+            // 相对路径 / 空 text_full 也跳过
+            guard let raw = cand.textFull,
                   raw.hasPrefix("/"),
                   !raw.contains("\n") else {
                 report.nonAbsolute += 1
-                log("refill-image-blobs: skip id=\(cand.id) · preview 非单条绝对路径")
+                log("refill-image-blobs: skip id=\(cand.id) · text_full 非单条绝对路径")
                 continue
             }
             let url = URL(fileURLWithPath: raw)
@@ -857,20 +861,25 @@ public enum Admin {
                 continue
             }
             // UPDATE 行:补 blob_sha256/blob_size/blob_mime + 标 ocr_state=pending。
-            // 不动 ingested_at_ns / captured_at_ns —— 回填不是新 capture,worker 真跑 OCR 时再 bump
+            // 同 tx 内 bump ingested_at_ns(走 nextIngestNs 保单增)——blob_* / ocr_state 都属
+            // /since 同步字段,不 bump 对端拉不到 metadata;OCR 是否启用 / 是否最终成功跟 metadata
+            // 可见性独立,不能依赖 worker 后续 markDone 才推送。captured_at_ns 不动(不是新 capture)
             do {
                 try db.pool.write { conn in
+                    let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+                    let ns = try DuoPasteCore.Database.nextIngestNs(conn, now: now)
                     try conn.execute(sql: """
                         UPDATE item
                         SET blob_sha256 = ?,
                             blob_size = ?,
                             blob_mime = ?,
-                            ocr_state = 'pending'
+                            ocr_state = 'pending',
+                            ingested_at_ns = ?
                         WHERE id = ?
                           AND origin_device = ?
                           AND blob_sha256 IS NULL
                           AND deleted_at_ns IS NULL
-                    """, arguments: [info.sha256, info.size, mime, cand.id, selfDeviceID])
+                    """, arguments: [info.sha256, info.size, mime, ns, cand.id, selfDeviceID])
                 }
                 report.refilled += 1
                 log("refill-image-blobs: ok id=\(cand.id) · sha=\(info.sha256.prefix(8))… · size=\(info.size) · ext=\(ext)")

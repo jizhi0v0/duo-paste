@@ -30,6 +30,11 @@ public final class MeshSupervisor: @unchecked Sendable {
     /// 系统 DNS / 网络接口变化时让所有 WS client 立即重连(绕过 backoff sleep)。
     /// supervisor.start() 时启动,stop() 时停。nil = 禁用自动恢复(测试场景)
     private var dnsMonitor: DNSChangeMonitor?
+    /// 周期 reconcile 兜底——非 DNS 触发的环境恢复(Surge 重启 / ponte 隧道重连 / 对端
+    /// daemon 重启等)。<= 0 = 禁用(测试 / 兼容路径)。默认 300s = 5min,跟 PullWorker B5
+    /// 失败计数触发的 quick recovery 协同覆盖(B5 ~14s 内反应,B2 5min 兜底)
+    private let periodicReconcileSec: TimeInterval
+    private var periodicReconcileTask: Task<Void, Never>?
 
     // PR 4 reconcile 依赖。全 nil 表示 "纯 PullWorker / 测试模式 / 老调用点"——这种模式
     // reconcileTransports() no-op，DNS 变化仍调 wakeAllWS()
@@ -60,6 +65,7 @@ public final class MeshSupervisor: @unchecked Sendable {
         discoverOverride: (@Sendable () async -> [SmartTransport.PeerDecision])? = nil,
         onDecisionsUpdated: (@Sendable ([SmartTransport.PeerDecision]) -> Void)? = nil,
         autoRecoverOnDNSChange: Bool = true,
+        periodicReconcileSec: TimeInterval = 300,
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("mesh: \(msg)\n".utf8))
         }
@@ -74,6 +80,7 @@ public final class MeshSupervisor: @unchecked Sendable {
         self.discoverOverride = discoverOverride
         self.onDecisionsUpdated = onDecisionsUpdated
         self.reconcileGate = ReconcileGate()
+        self.periodicReconcileSec = periodicReconcileSec
         if autoRecoverOnDNSChange {
             // WakeBox 桥接：闭包不能直接 capture self（初始化未完），用一个 box 占位
             let wakeBox = WakeBox()
@@ -101,12 +108,13 @@ public final class MeshSupervisor: @unchecked Sendable {
         self.init(
             initialPeers: peers,
             autoRecoverOnDNSChange: autoRecoverOnDNSChange,
+            periodicReconcileSec: 0,
             log: log
         )
     }
 
-    /// PR 2 兼容入口：只有 PullWorker 列表 → 自动包成 Peer 对（wsClient = nil）。
-    /// 旧调用点（如 PR 2 时期 AppDelegate）和单 peer 测试可以继续 work。
+    /// PR 2 兼容入口:只有 PullWorker 列表 → 自动包成 Peer 对(wsClient = nil)。
+    /// 旧调用点(如 PR 2 时期 AppDelegate)和单 peer 测试可以继续 work。
     /// 这条路径**默认禁用** DNS monitor——纯 PullWorker 不需要,测试不希望
     /// supervisor.start() 走系统 SCDynamicStore 交互
     public convenience init(
@@ -118,6 +126,7 @@ public final class MeshSupervisor: @unchecked Sendable {
         self.init(
             initialPeers: workers.map { Peer(worker: $0) },
             autoRecoverOnDNSChange: false,
+            periodicReconcileSec: 0,
             log: log
         )
     }
@@ -165,11 +174,33 @@ public final class MeshSupervisor: @unchecked Sendable {
         // DNS / 网络接口 SCDynamicStore 监听放在 ws 启动后:Tailscale up/down 时立即
         // 让所有 WS client 跳过 backoff 重连
         dnsMonitor?.start()
+        // 周期 reconcile timer:DNS 没变 + chosen 仍勉强活着但更优 transport 已恢复
+        // 时兜底切回(典型场景:Surge 启动慢于 daemon → ponte 探测失败 → 5min 后周期
+        // reconcile 看到 ponte 通了切回去)。smart 依赖任意为 nil 时 reconcileTransports
+        // 自动 no-op,timer 也不必启动
+        if periodicReconcileSec > 0, smart != nil, auth != nil, tailscaleSession != nil, buildPeer != nil {
+            startPeriodicReconcile()
+        }
     }
 
-    /// 停所有 peer。WS client 先停（cancel 长连接 task），PullWorker 后停——避免
+    private func startPeriodicReconcile() {
+        let interval = periodicReconcileSec
+        let logFn = log
+        logFn("periodic reconcile started · interval=\(Int(interval))s")
+        periodicReconcileTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                if Task.isCancelled { return }
+                await self?.reconcileTransports()
+            }
+        }
+    }
+
+    /// 停所有 peer。WS client 先停(cancel 长连接 task),PullWorker 后停——避免
     /// WS 在停 worker 期间还触发 wake()。
     public func stop() async {
+        periodicReconcileTask?.cancel()
+        periodicReconcileTask = nil
         dnsMonitor?.stop()
         let snapshot = await slots.snapshot()
         for p in snapshot {

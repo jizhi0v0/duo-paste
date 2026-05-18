@@ -39,9 +39,15 @@ public actor PullWorker {
         /// lazy 路径（缩略图 / 预览 / paste）。失败不抛、不阻塞 cursor 推进——下次 tick
         /// 拉同样的 sha 再试。
         ///
-        /// 替代老 `eagerBlobs: Bool` 字段（plan cloudy-mirroring-walnut）——默认翻成
-        /// 「完整 mirror」对齐 mesh 字面语义；想节省存储的设备显式配 .optimized opt-in
+        /// 替代老 `eagerBlobs: Bool` 字段(plan cloudy-mirroring-walnut)——默认翻成
+        /// 「完整 mirror」对齐 mesh 字面语义;想节省存储的设备显式配 .optimized opt-in
         public var storageMode: StorageMode
+
+        /// 连续 transient tick 失败几次后认为"chosen URL 烂了"触发 supervisor reconcile。
+        /// <= 0 = 禁用。默认 3:跟 backoff 序列 2+4+8=14s 对齐,既不太敏感(单次抖动不触发)
+        /// 又不太迟(周期 reconcile 5min 之外的快速自愈)。触发只发一次(==threshold 时),
+        /// 下次 .ok reset 计数后再积累到 threshold 才再次触发,避免连续狂触发
+        public var reconcileFailureThreshold: Int
 
         public init(
             intervalSec: TimeInterval = 30,
@@ -50,7 +56,8 @@ public actor PullWorker {
             maxBackoffSec: TimeInterval = 120,
             crossDeviceDedupWindowNs: Int64 = 5_000_000_000,
             clockSkewWarnMs: Int64 = 30_000,
-            storageMode: StorageMode = .default
+            storageMode: StorageMode = .default,
+            reconcileFailureThreshold: Int = 3
         ) {
             self.intervalSec = intervalSec
             self.batchLimit = batchLimit
@@ -59,6 +66,7 @@ public actor PullWorker {
             self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
             self.clockSkewWarnMs = clockSkewWarnMs
             self.storageMode = storageMode
+            self.reconcileFailureThreshold = reconcileFailureThreshold
         }
 
         public static let `default` = Config()
@@ -88,6 +96,17 @@ public actor PullWorker {
     private let config: Config
     private let nowNs: @Sendable () -> Int64
     private let log: @Sendable (String) -> Void
+    /// 每次 /health 探测完调一次。`>= 0` = 当前 transport 真正可拉同步(. ok 响应);`-1` =
+    /// 任何失败(网络层 throw / `.unreachable` / `.rejected` / 空 device_id / 严格模式
+    /// expected mismatch)——UI 视角这些都意味着"这个 chosen URL 不能用",对齐 SmartTransport
+    /// `isReachable` 的"只有 .ok 算 reachable"语义。
+    /// nil = 没接 callback(测试 / 单独跑 PullWorker 模式),no-op。生产路径由 PeerBuilder
+    /// 注入 → AppDelegate hop @MainActor 写 AppState 让 Settings UI 反映 runtime 健康度
+    private let onHealthProbed: (@Sendable (Int64) -> Void)?
+    /// 连续 transient 失败达到 `config.reconcileFailureThreshold` 时调一次。生产路径 =
+    /// PeerBuilder 注入 → MeshSupervisor.reconcileTransports()(自带 ReconcileGate 防 storm),
+    /// 让 chosen URL 烂掉时 quick recovery 不必等周期 5min reconcile。nil = 不接 → no-op
+    private let onChosenLikelyDown: (@Sendable () -> Void)?
 
     private var runTask: Task<Void, Never>?
     private var currentSleep: Task<Void, Error>?
@@ -110,7 +129,9 @@ public actor PullWorker {
         nowNs: @escaping @Sendable () -> Int64 = { Clock.nowNs() },
         log: @escaping @Sendable (String) -> Void = { msg in
             FileHandle.standardError.write(Data("pull: \(msg)\n".utf8))
-        }
+        },
+        onHealthProbed: (@Sendable (Int64) -> Void)? = nil,
+        onChosenLikelyDown: (@Sendable () -> Void)? = nil
     ) {
         self.database = database
         self.transport = transport
@@ -124,6 +145,8 @@ public actor PullWorker {
         self.config = config
         self.nowNs = nowNs
         self.log = log
+        self.onHealthProbed = onHealthProbed
+        self.onChosenLikelyDown = onChosenLikelyDown
     }
 
     public func start() {
@@ -166,6 +189,13 @@ public actor PullWorker {
 
             if r.hadTransient {
                 consecutiveTransientFailures += 1
+                // ==threshold 时触发一次,跨过去继续失败不再触发(防 callback 风暴)。
+                // .ok 把 consecutiveTransientFailures reset 到 0,下次再积累到 threshold 才再触发
+                if config.reconcileFailureThreshold > 0,
+                   consecutiveTransientFailures == config.reconcileFailureThreshold {
+                    log("consecutive transient failures hit \(consecutiveTransientFailures),trigger reconcile")
+                    onChosenLikelyDown?()
+                }
             } else {
                 consecutiveTransientFailures = 0
             }
@@ -212,14 +242,19 @@ public actor PullWorker {
     private func tick() async -> TickResult {
         var result = TickResult()
 
-        // 1. /health：拿当前 peer device_id
+        // 1. /health:拿当前 peer device_id + 测 RTT 回调给 UI
+        // RTT 用 Date() wall-clock 跟 SmartTransport.defaultProbe 对齐(对齐口径让初始
+        // discover 数字和 runtime 数字直接可比)。任何失败 → callback 收 -1 让 UI 立刻反映
+        let healthStart = Date()
         let healthRes: PrimaryHealthResult
         do {
             healthRes = try await transport.fetchPrimaryHealth()
         } catch is CancellationError {
+            // 取消不算"探测到不可达"——不打 callback,让 UI 保持上次状态
             return result
         } catch {
             log("health threw: \(error)")
+            onHealthProbed?(-1)
             result.hadTransient = true
             return result
         }
@@ -227,30 +262,36 @@ public actor PullWorker {
         let peerNowMs: Int64
         switch healthRes.outcome {
         case .ok(let id, let nowMs, _):
-            // 第三个位置参数是 ponteHost，PullWorker 不消费——SmartTransport 在 reconcile 时单独 discover
-            // 拒绝空 device_id：会污染 pull_cursor.peer_device_id 主键 + 在 reconcile 里假阳性
-            // 触发清行。理论上 server 永远不会返回空（DeviceID.loadOrCreate 保证），但万一旧版
-            // / 篡改 / 网络中间件改包，guard 在这里。
+            // 第三个位置参数是 ponteHost,PullWorker 不消费——SmartTransport 在 reconcile 时单独 discover
+            // 拒绝空 device_id:会污染 pull_cursor.peer_device_id 主键 + 在 reconcile 里假阳性
+            // 触发清行。理论上 server 永远不会返回空(DeviceID.loadOrCreate 保证),但万一旧版
+            // / 篡改 / 网络中间件改包,guard 在这里。
             guard !id.isEmpty else {
-                log("health 返回空 device_id，当 transient 跳过")
+                log("health 返回空 device_id,当 transient 跳过")
+                onHealthProbed?(-1)
                 result.hadTransient = true
                 return result
             }
-            // 严格模式：expectedPeerDeviceID 非 nil 时校验。对不上 = 配置错（peer URL 指错机器
-            // / DNS 漂移指到别人 mesh），不该写本机 DB——transient skip 让 backoff 上去
+            // 严格模式:expectedPeerDeviceID 非 nil 时校验。对不上 = 配置错(peer URL 指错机器
+            // / DNS 漂移指到别人 mesh),不该写本机 DB——transient skip 让 backoff 上去
             if let expected = expectedPeerDeviceID, expected != id {
-                log("expected peer=\(expected) but /health returned \(id)，transient skip")
+                log("expected peer=\(expected) but /health returned \(id),transient skip")
+                onHealthProbed?(-1)
                 result.hadTransient = true
                 return result
             }
+            let rttMs = Int64(Date().timeIntervalSince(healthStart) * 1000)
+            onHealthProbed?(rttMs)
             currentPeerID = id
             peerNowMs = nowMs
         case .unreachable(let r):
             log("health unreachable: \(r)")
+            onHealthProbed?(-1)
             result.hadTransient = true
             return result
         case .rejected(let r):
             log("health rejected: \(r)")
+            onHealthProbed?(-1)
             result.hadTransient = true
             return result
         }

@@ -12,11 +12,24 @@ private let skipMarkerTypes: Set<String> = [
     "Pasteboard generator type",          // 老式应用偶尔用
 ]
 
-@MainActor
-public final class PasteboardWatcher {
-    public typealias Callback = @MainActor (CapturedPasteboard) -> Void
+/// 调用 tick 之前在 main actor 上 snapshot 一下 frontApp——NSWorkspace.frontmostApplication
+/// 是 UI 状态,后台读不保证准。frontApp 信息只在 main 短一瞥(几个属性 + pid),不卡。
+private struct FrontAppSnapshot: Sendable {
+    let bundleID: String?
+    let localizedName: String?
+    let pid: pid_t?
+}
 
-    private let pasteboard: NSPasteboard
+/// 后台 actor 轮询 NSPasteboard。原本是 @MainActor + RunLoop.main Timer——macOS Universal
+/// Clipboard 同步卡住时 pasteboardd IPC 阻塞 main thread,搜索框 / 状态栏 / hotkey 一起冻。
+/// 改 actor 后所有 NSPasteboard 同步调用都跑在 actor 自家 executor 上,main 不再被牵连。
+public actor PasteboardWatcher {
+    public typealias Callback = @MainActor @Sendable (CapturedPasteboard) -> Void
+
+    /// NSPasteboard 单例 thread-safe（pasteboardd IPC client 内部加锁）。
+    /// actor 后台读 + main 写都通过同一进程内代理,无并发问题。
+    /// nonisolated(unsafe) 让 actor 外（barrier 拿来给 @MainActor 写回）也能引用同一实例。
+    nonisolated(unsafe) private let pasteboard: NSPasteboard
     private let pollInterval: TimeInterval
     /// debounce 窗口（纳秒）。changeCount 跳变后等这么久没新跳变才真正 capture。
     ///
@@ -33,7 +46,12 @@ public final class PasteboardWatcher {
     /// 进入 debounce 等待时记录的触发时刻。0 = 当前没 pending capture。
     /// 每次 changeCount 跳变都重置为 `now + debounceNs`，直到稳定一整个窗口才触发
     private var pendingDeadlineNs: Int64 = 0
-    private var timer: Timer?
+    /// pollLoop 跑在自己的 Task 里;start/stop 跟 cancel 它配对
+    private var pollTask: Task<Void, Never>?
+    /// barrier 在跑——`pasteBack` 期间 await MainActor.run 会释放 actor isolation,
+    /// 让别的 actor 方法插入。tick 看到这个 flag 直接 return 跳过那一拍,
+    /// 防止 self-write 的 changeCount 跳变被并发 tick 当成新 capture
+    private var isPasteBackInFlight: Bool = false
     private let onCapture: Callback
     /// 仅 RTF 路径用于解码前 raw-size 守门，避免 50MB RTF source 被 NSAttributedString 同步
     /// 解析后才走到 CaptureService 的 text byte cap。raw RTF 字节 > 该上限时跳过 decode，
@@ -61,89 +79,100 @@ public final class PasteboardWatcher {
         self.onCapture = onCapture
     }
 
-    /// 由"自己写回剪贴板"的代码在写完后调用，把内部 lastChangeCount 推到当前值，
-    /// 让接下来一次或多次 tick 不会把自己的写入误当作用户复制。
-    ///
-    /// 同时清空 `pendingDeadlineNs`：write back 路径完成后任何 pending debounce 都失效，
-    /// 否则会在 deadline 到期时把自己刚 suppress 的写回当成 capture 重新触发 callback。
-    ///
-    /// **注意**：若 paste-back 发生时刚好处在某次真实复制的 debounce 窗口内，那条真实
-    /// 复制会被本方法连同 pending 一起丢弃 —— 调用方应当在写回 pasteboard **之前**先调
-    /// `flushPendingIfAny()` 把真实复制提交掉，再调本方法做 self-write 抑制。
-    public func suppressUpToCurrent() {
+    public func start() {
+        guard pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            await self?.pollLoop()
+        }
+    }
+
+    public func stop() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
+    /// 唯一对外的 paste-back 入口。actor 串行保证 flush → main 写回 → suppress
+    /// 三步之间不会被并发的 polling tick 插入。
+    /// `write` 闭包跑在 @MainActor 上(NSPasteboard 写入习惯让 main 做),返回值原样透传给调用方
+    public func pasteBack<R: Sendable>(
+        _ write: @MainActor @Sendable () -> R
+    ) async -> R {
+        isPasteBackInFlight = true
+        defer { isPasteBackInFlight = false }
+
+        // 1. flush:窗口内 pending 的真实复制 / tick 未观察到的跳变都先 capture,
+        //    防 step 2 的 pb 覆写把用户的复制吞掉
+        await flushPendingIfAny()
+
+        // 2. hop main 同步写 pasteboard——actor isolation 释放,但 isPasteBackInFlight=true
+        //    让 tick 跳过这一拍。Copyback 内部全是同步的 setData/writeObjects
+        let result = await MainActor.run { write() }
+
+        // 3. suppress:把 lastChangeCount 推到当前 cc,下次 tick 看到不变 → 跳过
+        suppressUpToCurrent()
+
+        return result
+    }
+
+    /// 内部 fast-path:把当前 pb.changeCount 推给 lastChangeCount,清空 pending,
+    /// 让后续 tick 不把 self-write 那次跳变当成新 capture
+    private func suppressUpToCurrent() {
         lastChangeCount = pasteboard.changeCount
         pendingDeadlineNs = 0
     }
 
-    /// 在 paste-back 写回 pasteboard **之前**调：若 debounce 窗口里有 pending 的真实
-    /// 复制，立刻 capture 一次（此刻 pasteboard 还是用户复制的原始内容），让那条真实
-    /// 复制不会被随后的 suppressUpToCurrent 静默丢弃。
-    ///
-    /// 覆盖两条路径：
-    /// 1. `pendingDeadlineNs > 0`：tick 已经观察到 changeCount 变化、正在 debounce
-    /// 2. `pasteboard.changeCount != lastChangeCount`：用户在两次 tick 间隔（≤200ms）
-    ///    刚复制完就立刻按 Enter，tick 还没轮到、`pendingDeadlineNs` 还是 0。此时
-    ///    必须也 flush，否则随后的 Copyback.write 会覆盖未观察到的真实复制
-    ///
-    /// 没有任何变化 → no-op。
-    public func flushPendingIfAny() {
+    /// 内部 flush:若 debounce 窗口里有 pending 的真实复制 (`pendingDeadlineNs > 0`)
+    /// 或两次 tick 间用户刚复制完(`pasteboard.changeCount != lastChangeCount`),
+    /// 立刻 capture 一次。没有任何变化 → no-op。
+    /// pasteBack barrier 调用,完成后才让 main 写 pb 覆盖。
+    private func flushPendingIfAny() async {
         let cc = pasteboard.changeCount
         if cc != lastChangeCount {
-            // 未观察到的真实复制 —— 先 stamp lastChangeCount 让 capture 不再被 tick 重复抓
             lastChangeCount = cc
             pendingDeadlineNs = 0
-            capture()
+            await capture()
             return
         }
         guard pendingDeadlineNs > 0 else { return }
         pendingDeadlineNs = 0
-        capture()
+        await capture()
     }
 
-    public func start() {
-        guard timer == nil else { return }
-        let t = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.tick()
-            }
+    private func pollLoop() async {
+        let intervalNs = UInt64(max(0.01, pollInterval) * 1_000_000_000)
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: intervalNs)
+            if Task.isCancelled { return }
+            await tick()
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
     }
 
-    public func stop() {
-        timer?.invalidate()
-        timer = nil
-    }
+    private func tick() async {
+        // pasteBack 正在 main hop——self-write 那次 cc 跳变不要被这一拍当成 capture
+        if isPasteBackInFlight { return }
 
-    private func tick() {
-        let cc = pasteboard.changeCount
+        let cc = pasteboard.changeCount  // ← UC pending 时这里在 actor 后台阻塞,main 不受影响
         if cc != lastChangeCount {
             lastChangeCount = cc
             if debounceNs > 0 {
-                // 进入或重置 debounce 等待窗口。这一 tick 不 capture——等下次 tick
-                // 看 cc 是否还稳定（用户没继续写）才触发。app 在窗口内再次写剪贴板
-                // （如 CleanShot 100ms 后改写 iCloud 路径）→ 重新走到这里 → deadline 刷新
                 pendingDeadlineNs = Clock.nowNs() + debounceNs
                 return
             }
-            // 显式关 debounce → 立即 capture（测试 / 调试可用，零回归）
-            capture()
+            await capture()
             return
         }
-        // cc 稳定（这一 tick 没人写）。看 pending 窗口是否已过期 → 触发 capture
         guard pendingDeadlineNs > 0,
               Clock.nowNs() >= pendingDeadlineNs
         else { return }
         pendingDeadlineNs = 0
-        capture()
+        await capture()
     }
 
     /// 真正读 pasteboard 提取内容并回调。从 tick() 拆出来——debounce 路径在 deadline
     /// 到期时调；零 debounce 路径在 changeCount 跳变时立刻调。
     /// 注意：skipMarkerTypes 检测放在这里（不是 changeCount 跳变时刻），因为
     /// debounce 窗口内 app 可能还没写完所有 type marker
-    private func capture() {
+    private func capture() async {
         let capturedAtNs = Clock.nowNs()
 
         // 跳过特殊标记类型
@@ -153,15 +182,15 @@ public final class PasteboardWatcher {
             }
         }
 
-        guard let captured = extract(capturedAtNs: capturedAtNs) else {
+        // frontApp 是 UI 状态——必须 main 取。actor 后台读的是 stale snapshot 不可信。
+        // 一次轻 hop（几个属性 read,不阻塞 main runloop）后回 actor 继续提取
+        let frontApp = await MainActor.run { Self.snapshotFrontApp() }
+
+        guard let captured = extract(capturedAtNs: capturedAtNs, frontApp: frontApp) else {
             return
         }
-        // 诊断：可疑 capture 把 NSPasteboard types 全打出来。三种触发：
-        // (1) ≤8 字符的短文本——「Paste.app 跳过但我们 capture」的不对称定位
-        // (2) RTF kind——常见误抓自 Telegram/Notes/Mail 这类 styled-text app 的后台写入
-        // (3) HTML kind——本应被 looksLikeWebViewHTML 降级，真走到 .html 的都是值得记
-        //     的反例（原生富文本 app 或我们漏掉的 web view 写入形态）
-        // 用途：识别漏配的 type marker（应进 skipMarkerTypes），或定位 frontmost 时序错位
+        // 诊断:可疑 capture 把 NSPasteboard types 全打出来(短文本/RTF/HTML 三类)。
+        // 用途:识别漏配的 type marker(应进 skipMarkerTypes),或定位 frontmost 时序错位
         let shouldLog: Bool
         if let t = captured.text, t.count <= 8, captured.kind == .text {
             shouldLog = true
@@ -178,11 +207,23 @@ public final class PasteboardWatcher {
             let prevSlice = (captured.text ?? "").prefix(40)
             fputs("capture suspect kind=\(captured.kind.rawValue) bundle=\(captured.sourceAppBundleID ?? "?") name=\(captured.sourceAppName ?? "?") len=\(textLen) types=[\(types)] preview=\(String(prevSlice).debugDescription)\n", stderr)
         }
-        onCapture(captured)
+        // hop 回 main 投递给 handleCapture——onCapture 是 @MainActor callback
+        let payload = captured
+        let cb = onCapture
+        await MainActor.run { cb(payload) }
     }
 
-    private func extract(capturedAtNs: Int64) -> CapturedPasteboard? {
-        let frontApp = NSWorkspace.shared.frontmostApplication
+    @MainActor
+    private static func snapshotFrontApp() -> FrontAppSnapshot {
+        let app = NSWorkspace.shared.frontmostApplication
+        return FrontAppSnapshot(
+            bundleID: app?.bundleIdentifier,
+            localizedName: app?.localizedName,
+            pid: app?.processIdentifier
+        )
+    }
+
+    private func extract(capturedAtNs: Int64, frontApp: FrontAppSnapshot) -> CapturedPasteboard? {
         // 注：早期版本会在 frontApp.pid == self.pid 时直接 return nil，理由是"搜索框
         // Cmd+C 不污染历史"。但实测用户更常的诉求是把搜索框里的串作为新剪贴板项入库
         // （剪贴板管理器本质就是"复制就该被记录"）。self-pid 跳过的副作用：那次
@@ -194,9 +235,9 @@ public final class PasteboardWatcher {
         // kind fallback symbol（一条三横线 text.alignleft）跟"frontmost app 没报 bundleID"
         // 那类条目视觉上没法区分。这里 self 命中时强制写 sentinel + 友好名，UI 据此走
         // 专门的 self badge。
-        let isSelfCapture = frontApp?.processIdentifier == ProcessInfo.processInfo.processIdentifier
-        let bundleID = isSelfCapture ? Item.selfSourceAppSentinel : frontApp?.bundleIdentifier
-        let appName = isSelfCapture ? "duo-paste" : frontApp?.localizedName
+        let isSelfCapture = frontApp.pid == ProcessInfo.processInfo.processIdentifier
+        let bundleID = isSelfCapture ? Item.selfSourceAppSentinel : frontApp.bundleID
+        let appName = isSelfCapture ? "duo-paste" : frontApp.localizedName
 
         // 1) 文件 URL
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [
