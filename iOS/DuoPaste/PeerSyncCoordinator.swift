@@ -110,6 +110,10 @@ final class PeerSyncCoordinator {
     private var periodicRepickTask: Task<Void, Never>?
     nonisolated let periodicRepickIntervalSec: TimeInterval = 300
 
+    /// NetworkChangeWatcher listener token——用于在 stop / dealloc 时 removeListener,
+    /// 避免 SwiftUI @State 重建 PeerSyncCoordinator 实例时旧 listener 永久留在 watcher
+    private var networkListenerToken: UUID?
+
     init(store: HistoryStore) {
         self.store = store
         self.blobCache = BlobCache()
@@ -117,10 +121,20 @@ final class PeerSyncCoordinator {
         // 网络变化 → 重新 probe(给 HTTP client URL 更新最佳路径)。WS 不需要触发——
         // pool 里每个 WS 都在自己 backoff/重连,网络变了它们自然在下次 reconnect 时
         // 用新网络重试
-        NetworkChangeWatcher.shared.addListener { [weak self] _ in
+        networkListenerToken = NetworkChangeWatcher.shared.addListener { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.handleNetworkChange()
             }
+        }
+    }
+
+    deinit {
+        // deinit 默认 nonisolated；refcount=0 时读 stored property 无 race。
+        // 局部 token 是 Sendable (UUID)，capture 进 detached MainActor task 安全
+        let token = networkListenerToken
+        guard let token else { return }
+        Task.detached { @MainActor in
+            NetworkChangeWatcher.shared.removeListener(token)
         }
     }
 
@@ -481,8 +495,13 @@ final class PeerSyncCoordinator {
     func bumpItemOnServer(id: String) {
         guard let secret = currentSecret else { return }
         var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
-        if urls.isEmpty, let currentEndpointURL {
-            urls = [currentEndpointURL]
+        // **无条件** union currentEndpointURL——pool.connected 只返回 WS state==.connected
+        // 的路径，currentEndpointURL 的 WS 可能正在 connecting；HTTP /since 走它意味着 Mac DB
+        // 上有 baseline cursor，bump 必须打到那台。set dedup 保证字符串重复不会双发；指向
+        // 同一台 Mac 的不同物理路径（罕见）即便双发也 idempotent 安全（POST /bump 是
+        // UPDATE 同 ID）
+        if let currentEndpointURL {
+            urls.append(currentEndpointURL)
         }
         urls = Array(Set(urls)).sorted { a, b in
             if a == currentEndpointURL { return true }

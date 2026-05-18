@@ -309,24 +309,38 @@ final class PeerWebSocket {
 
     /// receive 一个完整 message——NWProtocolWebSocket 已经把 frame 拼好,我们拿 (data, context).
     /// context.metadata 含 WS opcode (text/binary/close/etc)
+    ///
+    /// **withTaskCancellationHandler 必须包**: NWConnection.receiveMessage 在 `connection.cancel()`
+    /// 后**不保证** callback 被 fire——文档未承诺，实测有 callback 静默丢的情况。外层 group
+    /// cancelAll 后这个 continuation 会永远不 resume，task 挂死。模式跟 startAndAwaitReady
+    /// 对齐：cancel 时主动 cancel connection 让 callback 走 error 路径；ResumeBox 防 cancel
+    /// 跟正常 callback race 时 continuation 被 double-resume
     nonisolated private static func receiveMessage(
         connection: NWConnection
     ) async throws -> (data: Data, opcode: NWProtocolWebSocket.Opcode) {
-        try await withCheckedThrowingContinuation { cont in
-            connection.receiveMessage { content, context, _, error in
-                if let error {
-                    cont.resume(throwing: WSError.connectionFailed(String(describing: error)))
-                    return
+        let box = ResumeBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                connection.receiveMessage { content, context, _, error in
+                    guard box.resume() else { return }
+                    if let error {
+                        cont.resume(throwing: WSError.connectionFailed(String(describing: error)))
+                        return
+                    }
+                    guard let context else {
+                        cont.resume(throwing: WSError.connectionFailed("nil context"))
+                        return
+                    }
+                    let wsMeta = context.protocolMetadata(definition: NWProtocolWebSocket.definition)
+                        as? NWProtocolWebSocket.Metadata
+                    let opcode = wsMeta?.opcode ?? .text
+                    cont.resume(returning: (content ?? Data(), opcode))
                 }
-                guard let context else {
-                    cont.resume(throwing: WSError.connectionFailed("nil context"))
-                    return
-                }
-                let wsMeta = context.protocolMetadata(definition: NWProtocolWebSocket.definition)
-                    as? NWProtocolWebSocket.Metadata
-                let opcode = wsMeta?.opcode ?? .text
-                cont.resume(returning: (content ?? Data(), opcode))
             }
+        } onCancel: {
+            // 主动 cancel 让 connection.receiveMessage 的 callback 沿 error 路径 fire；
+            // 即便没 fire（NW 罕见路径），下次外层 group 已 cancel 整轮，task 退出
+            connection.cancel()
         }
     }
 

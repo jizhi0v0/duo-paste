@@ -105,7 +105,11 @@ final class PeerWSPool {
         for ws in sockets.values {
             ws.reconnectPreservingBackoff(reason: reason)
         }
-        reconcile(endpoints: lastEndpoints)
+        // **不调** reconcile(endpoints: lastEndpoints)——
+        // reconcile 的"sockets[ep.url] == nil 才开"分支在这里永远 no-op（reconnectPreservingBackoff
+        // 不删 socket），白消耗。更糟的边界：如果 `lastEndpoints` 跟 endpoints_changed 帧同时
+        // 到达（一个改 lastEndpoints，一个走 restartAll），reconcile 会用 stale lastEndpoints
+        // 关掉新 endpoint 的 ws。endpoints 真变化走 reconcile(endpoints:) 自己的路径
     }
 
     var state: State {
