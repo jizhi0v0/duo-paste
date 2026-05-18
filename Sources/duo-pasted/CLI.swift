@@ -19,6 +19,8 @@ enum CLI {
             runInitSecret(force: force)
         case "retry-failed-ocr":
             runRetryFailedOCR(args: rest)
+        case "refill-image-blobs":
+            runRefillImageBlobs(args: rest)
         case "mesh-init":
             runMeshInit(args: rest)
         case "mesh-doctor":
@@ -51,6 +53,15 @@ enum CLI {
                                   ocr_state IN ('failed', 'skipped') 的行（done 不动）。
                                   --id 模式忽略 state 黑名单——给指定 image 行强制重
                                   OCR（如 Vision 模型升级后想刷某条 done 行）。
+
+          refill-image-blobs      回填本机 file kind 图片扩展但缺 blob 字节的行——
+                                  扫 own-origin + kind='file' + 图片扩展 + blob_sha256 IS NULL
+                                  + 未软删的行,逐条尝试读 preview 里的本地路径 →
+                                  字节进 BlobStore + UPDATE 行 blob_sha256/blob_size/blob_mime
+                                  + 标 ocr_state=pending。下次 OCRWorker tick 自然扫到。
+                                  文件已删 / 超 cap / 读失败 → 跳过 + stderr 详情。
+                                  daemon 启动时自动跑一遍(detached task),手动跑此命令
+                                  等价。幂等。
 
           mesh-init --peer URL[,DEVICE_ID] [--peer URL[,DEVICE_ID]]...
                     [--serve-host H] [--serve-port P]
@@ -199,6 +210,42 @@ enum CLI {
             FileHandle.standardError.write(Data("retry-failed-ocr failed: \(error)\n".utf8))
             exit(1)
         }
+    }
+
+    private static func runRefillImageBlobs(args: [String]) {
+        let paths = Paths.makeDefault()
+        paths.ensureExists()
+        let deviceID: String
+        do {
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("refill-image-blobs: 读 device-id 失败: \(error)\n".utf8))
+            exit(1)
+        }
+        // 用 config 里的 capture.maxBlobBytes,跟 daemon 路径同一上限。config 缺失退回默认值
+        let maxBlobBytes: Int
+        if let cfg = try? Config.load(from: paths.configFile) {
+            maxBlobBytes = cfg.capture.maxBlobBytes
+        } else {
+            maxBlobBytes = 32 * 1024 * 1024
+        }
+        do {
+            let report = try Admin.refillMissingImageBlobs(
+                dbPath: paths.mainDB,
+                blobsDir: paths.blobsDir,
+                selfDeviceID: deviceID,
+                maxBlobBytes: maxBlobBytes,
+                log: { msg in
+                    FileHandle.standardError.write(Data("\(msg)\n".utf8))
+                }
+            )
+            print(report.summary)
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("refill-image-blobs failed: \(error)\n".utf8))
+            exit(1)
+        }
+        _ = args
     }
 
     private static func runMeshInit(args: [String]) {

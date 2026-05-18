@@ -15,6 +15,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState!  // SwiftUI Settings 读
     /// SwiftUI Settings 读 config / paths / device-id / blobs 路径
     var dependencies: AppDependencies? { deps }
+
+    /// SettingsView 调用：rebuild/abort OCR 索引后立刻 wake worker 缩短到下一 tick。
+    /// nonisolated wake() 内部走 actor hop，主线程调用安全。
+    func wakeOCRWorker() {
+        ocrWorker?.wake()
+    }
     private var panel: SearchPanelController!
     private var statusBar: StatusBarController!
     private var watcher: PasteboardWatcher!
@@ -213,7 +219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onPaste: { [weak self] items in self?.pasteBack(items) },
             onReveal: { [weak self] item in self?.revealInFinder(item) },
             onOpenWith: { [weak self] item, app in self?.openWith(item, app: app) },
-            onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() }
+            onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() },
+            // 搜索 panel 右上角齿轮——先 hide 搜索 panel(显式,不依赖 resignKey 自动 hide:
+            // preview 打开时 resignKey 被守卫不会触发),再打开 Settings 窗口
+            onOpenSettings: { [weak self] in
+                self?.panel.hide()
+                self?.showSettings()
+            }
         )
         statusBar = StatusBarController(hotkey: deps.config.hotkey) { [weak self] in
             self?.panel.toggle()
@@ -226,7 +238,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleCapture(captured)
             }
         )
-        watcher.start()
+        // actor 后台轮询——start() 现在 actor-isolated,fire-and-forget Task 调
+        let bgWatcher = watcher!
+        Task { await bgWatcher.start() }
 
         hotkey = GlobalHotKey()
         registerHotkeyWithFallback()
@@ -276,6 +290,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task.detached(priority: .utility) {
             let total = Volume.directorySize(at: blobsDir) ?? 0
             await blobStats.setBaseline(total)
+        }
+
+        // Lazy migration: 回填 file kind 图片扩展但无 blob 字节的本机行。
+        // 历史背景:CleanShot 等工具复制截图时,PasteboardWatcher 当时没读到字节
+        // (读失败 / 路径权限 / 旧版本) → 只存了文件路径,blob 字段空 → OCRWorker 跳过。
+        // 重启 daemon 时尝试再读一遍本地路径,把缺字节的行补上;补完 ocr_state=pending
+        // 让 OCRWorker 自然扫到。文件已删 / 超 cap 的行原样跳过,不会再尝试(下次启动
+        // 仍扫,但 fileMissing 谓词命中跳过,代价微小)。
+        // detached Task 不阻塞 UI ready 路径——OCR 不急,reads/writes 独立 DB 连接
+        let dbPath = deps.paths.mainDB
+        let blobsBaseURL = deps.paths.blobsDir
+        let selfDeviceID = deps.deviceID
+        let captureMaxBytes = deps.config.capture.maxBlobBytes
+        Task.detached(priority: .utility) {
+            do {
+                let report = try Admin.refillMissingImageBlobs(
+                    dbPath: dbPath,
+                    blobsDir: blobsBaseURL,
+                    selfDeviceID: selfDeviceID,
+                    maxBlobBytes: captureMaxBytes,
+                    log: { msg in
+                        fputs("\(msg)\n", stderr)
+                    }
+                )
+                if report.refilled > 0 {
+                    // 有新填的 blob → wake OCR worker 立即扫,避免等 idle 周期
+                    await MainActor.run { AppDelegate.shared?.wakeOCRWorker() }
+                }
+                fputs("startup-migration · refill-image-blobs · \(report.summary)\n", stderr)
+            } catch {
+                fputs("startup-migration · refill-image-blobs · 失败: \(error)\n", stderr)
+            }
         }
 
         // OCR worker：本机 own-origin image 跑 Vision OCR 把图里文字写 text_full 进 FTS5。
@@ -363,9 +409,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 让 SettingsView 一打开就能看到初始决策（reconcile 完后 onDecisionsUpdated 再刷）
         self.state.setTransports(decisions)
 
-        // 起 mesh supervisor（如果该起）
+        // 起 mesh supervisor(如果该起)
         if startMesh {
             let intervalSec = max(1, cfg.mesh.pullIntervalSec)
+            // PullWorker /health tick → AppState 的实时回写通道。weak 防 PullWorker 通过 closure
+            // 持 strong AppState(AppDelegate 也持 state),hop @MainActor 让 setter 在正确 isolation
+            let appState = self.state
+            let onHealthProbedCb: @Sendable (Int, Int64) -> Void = { [weak appState] peerIdx, rttMs in
+                Task { @MainActor in
+                    appState?.updateChosenHostRtt(peerIndex: peerIdx, rttMs: rttMs)
+                }
+            }
+            // B5 quick recovery:PullWorker 连续 transient 失败到 threshold 时调一次。
+            // closure fire 时 self.meshSupervisor 已 set(builder 之后才创建 supervisor 但
+            // closure 调用必然在 daemon 跑起来之后)。reconcileTransports 自带 ReconcileGate
+            // 防 storm,DNS / 周期 timer / B5 三路 trigger 进同一个 gate 不会重复 discover
+            let onChosenLikelyDownCb: @Sendable (Int) -> Void = { [weak self] _ in
+                Task { @MainActor in
+                    await self?.meshSupervisor?.reconcileTransports()
+                }
+            }
             let builder = SmartTransport.PeerBuilder(
                 database: deps.database,
                 blobs: deps.blobs,
@@ -386,12 +449,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ))
                     exit(1)
                 },
-                expectedPeerDeviceIDs: cfg.peers.map { $0.deviceID }
+                expectedPeerDeviceIDs: cfg.peers.map { $0.deviceID },
+                onHealthProbed: onHealthProbedCb,
+                onChosenLikelyDown: onChosenLikelyDownCb
             )
             let supervisorPeers = decisions.map { builder.build(decision: $0) }
-            // reconcile 完后 hop 回 main actor 写 AppState，SwiftUI 自动刷新 SettingsView
-            // weak appState 防 supervisor 持 strong cycle（AppDelegate 也持 supervisor）
-            let appState = self.state
+            // reconcile 完后 hop 回 main actor 写 AppState,SwiftUI 自动刷新 SettingsView
+            // weak appState 防 supervisor 持 strong cycle(AppDelegate 也持 supervisor)
             // reconcile 完成回调:既 push 到 AppState 让 Settings 显示新 transport,也踢
             // MeshEndpointsCache 立即 refreshNow——避免新发现的 peer / ponte_host 等
             // 周期 60s 才出现在 iOS 端
@@ -581,8 +645,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 await self.state.refresh()
                 // image kind 入库后 wake OCR worker 缩短延迟（避免等 5min idle）
+                // OCRWorker 可处理范围 = image kind OR (file kind + image_mime + has_blob)
+                // 同 OCRWorker.fetchPending / Admin.ocrScopeSQL 口径——CleanShot 截图走 file
+                // 路径入库,标 ocr_state=pending,但旧 wake 条件 kind==.image 不命中,worker
+                // 进 idleIntervalSec=300s sleep 让新截图卡 pending 等长时间。改用 ocr_state
+                // 直接判断,未来 OCRWorker scope 扩展时 wake 条件自动跟随
                 if case .inserted = result.outcome,
-                   result.item?.kind == .image {
+                   result.item?.ocrState == .pending {
                     self.ocrWorker?.wake()
                 }
             } catch {
@@ -781,15 +850,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case .mergedText, .mergedFile:
             // mergedText 含跨 kind:image/file 用 preview 占位; mergedFile 是全 file 多 URL。
-            // 文本/路径同步可拿,不走 lazy 拉 blob,一次性写完
-            watcher.flushPendingIfAny()
-            let wrote = Copyback.writeMerged(items: items, blobs: deps.blobs)
-            watcher.suppressUpToCurrent()
-            if !wrote {
-                state.pasteProgress = .failed(reason: "选中项无可写入内容")
-                return
+            // 文本/路径同步可拿,不走 lazy 拉 blob——但 watcher.pasteBack 是 actor barrier
+            // (async),包 Task 跨 main→actor→main 一圈。barrier 内串行 flush → main 写 → suppress
+            let blobs = deps.blobs
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let wrote = await self.watcher.pasteBack {
+                    Copyback.writeMerged(items: items, blobs: blobs)
+                }
+                if !wrote {
+                    self.state.pasteProgress = .failed(reason: "选中项无可写入内容")
+                    return
+                }
+                self.panel.hide()
             }
-            panel.hide()
         }
     }
 
@@ -807,15 +881,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if missing.isEmpty {
-            // 都在本机 → 同步 paste
-            watcher.flushPendingIfAny()
-            let (wrote, _) = Copyback.writeMergedImages(items: items, blobs: deps.blobs)
-            watcher.suppressUpToCurrent()
-            if !wrote {
-                state.pasteProgress = .failed(reason: "选中图片无可写入内容")
-                return
+            // 都在本机 → barrier 内同步 paste(actor 串行 flush → main 写 → suppress)
+            let blobs = deps.blobs
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let (wrote, _) = await self.watcher.pasteBack {
+                    Copyback.writeMergedImages(items: items, blobs: blobs)
+                }
+                if !wrote {
+                    self.state.pasteProgress = .failed(reason: "选中图片无可写入内容")
+                    return
+                }
+                self.panel.hide()
             }
-            panel.hide()
             return
         }
 
@@ -830,9 +908,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self.fetchBlobsConcurrent(shas: missing, fetcher: fetcher, timeoutSec: 10)
             if Task.isCancelled { return }
             self.state.pasteProgress = .idle
-            self.watcher.flushPendingIfAny()
-            let (wrote, stillMissing) = Copyback.writeMergedImages(items: items, blobs: self.deps.blobs)
-            self.watcher.suppressUpToCurrent()
+            let blobs = self.deps.blobs
+            let (wrote, stillMissing) = await self.watcher.pasteBack {
+                Copyback.writeMergedImages(items: items, blobs: blobs)
+            }
             if !wrote {
                 self.state.pasteProgress = .failed(reason: "未能拉到任何图片字节")
                 return
@@ -895,8 +974,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         //       跨设备同步过来的 image 文件，无路径无字节时直接粘会落到 raw 路径字符串
         //       (Copyback fallback)，看起来"粘出的是路径"。先拉字节再走 image 字节粘贴路径
         if !needsBlobFetchForPaste(item) {
-            performLocalPaste(item)
-            panel.hide()
+            // 快路径:无需拉字节,但 performLocalPaste 现在是 actor barrier (async),
+            // 包 Task 走 main → actor → main 一圈。barrier 内仍保证 flush/suppress 串行
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.performLocalPaste(item)
+                self.panel.hide()
+            }
             return
         }
 
@@ -917,7 +1001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch outcome {
             case .success:
                 self.state.pasteProgress = .idle
-                self.performLocalPaste(item)
+                await self.performLocalPaste(item)
                 self.panel.hide()
             case .failure(let reason):
                 self.state.pasteProgress = .failed(reason: reason)
@@ -964,14 +1048,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.pasteProgress = .idle
     }
 
-    /// 真正写 NSPasteboard 那一步——blob 字节已到位（或非 image kind）
-    private func performLocalPaste(_ item: Item) {
-        // 先 flush 任何 pending 的真实复制：若 debounce 窗口里正有一条用户的 Cmd+C 在
-        // 等 500ms 稳定，我们的写回会污染 pasteboard 内容并被 suppressUpToCurrent 丢掉。
-        // flush 在写回之前调，capture 读到的还是用户原始内容
-        watcher.flushPendingIfAny()
-        let wrote = Copyback.write(item: item, blobs: deps.blobs)
-        watcher.suppressUpToCurrent()
+    /// 真正写 NSPasteboard 那一步——blob 字节已到位（或非 image kind）。
+    /// 走 watcher.pasteBack barrier：actor 内串行 flush → main 写 → suppress
+    /// 之间不会被并发轮询 tick 插入(self-write 那次 cc 跳变会被 suppress 推走)
+    private func performLocalPaste(_ item: Item) async {
+        let blobs = deps.blobs
+        let wrote = await watcher.pasteBack {
+            Copyback.write(item: item, blobs: blobs)
+        }
         if wrote, let fp = PasteSuppressionSet.fingerprint(forItem: item) {
             deps.pasteSuppressions.record(fingerprint: fp, ttlSec: 300)
         }
