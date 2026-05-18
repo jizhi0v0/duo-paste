@@ -429,10 +429,14 @@ private struct SoftDeleteOnRecognize: OCRRecognizer {
         id: "tombstone-race", db: env.db,
         result: OCRResult(text: "should not land")
     )
+    let cursorRecorder = OCRCursorAdvancedRecorder()
     let w = OCRWorker(
         database: env.db, blobs: env.blobs,
         recognizer: recognizer, originDevice: env.deviceID,
-        config: fastConfig()
+        config: fastConfig(),
+        onCursorAdvanced: { ns in
+            Task { await cursorRecorder.record(ns) }
+        }
     )
     _ = await w.tick()
     let after = try fetchItem(env, id: "tombstone-race")
@@ -440,6 +444,11 @@ private struct SoftDeleteOnRecognize: OCRRecognizer {
     #expect(after?.deletedAtNs == 999)
     // markDone 的 guard 让 UPDATE 命中 0 行 —— extracted_text 没被写入
     #expect(after?.extractedText == nil)
+    // UPDATE 0 行 不应触发 cursor_advanced fan-out —— 否则对端 PullWorker 收到空帧、
+    // /since 拉空页浪费往返
+    try? await Task.sleep(nanoseconds: 100_000_000)
+    let recorded = await cursorRecorder.values()
+    #expect(recorded.isEmpty, "UPDATE 0 行不应 broadcast，实际收到 \(recorded.count) 帧")
 }
 
 // PR 4 删了 push_state / last_push_error 列，原 ocrWorkerMarkSkippedDoesNotClobberPushFailedLastError

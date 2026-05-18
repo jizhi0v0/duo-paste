@@ -312,7 +312,11 @@ public actor OCRWorker {
         let now = Clock.nowNs()
         var stampedNs: Int64? = nil
         do {
-            stampedNs = try await database.pool.write { db -> Int64 in
+            stampedNs = try await database.pool.write { db -> Int64? in
+                // 先算候选 stamp，但只在 UPDATE 命中（行被 guard 接受）才"认领"它返回；
+                // 0 行命中（abort 路径 / 软删并发）返 nil，调用方不 broadcast 空 cursor。
+                // 候选 stamp 没被消费，下次 nextIngestNs 仍能从 MAX+1 拿到——SQL guard
+                // 把"逻辑跳号"压在 SQL 边界，调用方语义干净
                 let stamp = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 // ocr_state = 'pending' guard：user 通过 Admin.abortOCRQueue 把队列翻成
                 // 'skipped' 之后,worker 内存里那批已 fetch 的 batch 可能仍跑完 markDone——
@@ -327,14 +331,14 @@ public actor OCRWorker {
                       AND ocr_state = 'pending'
                       AND deleted_at_ns IS NULL
                 """, arguments: [normalized, stamp, id])
-                return stamp
+                return db.changesCount > 0 ? stamp : nil
             }
         } catch {
             log("markDone failed for \(id): \(error)")
         }
         // OCR Phase 2：commit 后触发 cursor_advanced 让对端 < 1s 拿到 OCR 结果。
-        // tombstone 路径（UPDATE 0 行）也会 stamp + broadcast——浪费 1 个空 tick 不致命，
-        // PullWorker /since 拉到的也是空更新（id 已被自家 dedup / 软删），无害
+        // UPDATE 0 行（abort 后 batch 残留 / 并发软删）不触发——避免发送空帧让对端
+        // PullWorker /since 拉空页，浪费往返
         if let ns = stampedNs {
             onCursorAdvanced(ns)
         }

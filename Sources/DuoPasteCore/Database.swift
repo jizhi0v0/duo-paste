@@ -560,7 +560,10 @@ public struct Database: Sendable {
     /// 用 `MAX+1` 顶上去保证严格单增。
     public static func nextIngestNs(_ db: GRDB.Database, now: Int64) throws -> Int64 {
         let prev = try Int64.fetchOne(db, sql: "SELECT MAX(ingested_at_ns) FROM item") ?? 0
-        return Swift.max(now, prev &+ 1)
+        // 用 `+ 1` 不是 `&+ 1`：Int64 ns 在 292 年才溢出（2262 年），溢出 trap 比静默
+        // wraparound 回到 ~1970 时间戳要好——后者会让 /since cursor 永久卡死，trap 至少
+        // 让 daemon crash 在显眼处便于事后定位
+        return Swift.max(now, prev + 1)
     }
 
     /// 查本机当前 MAX(ingested_at_ns)，0 表示空表。WS hello + cursor_advanced 用——

@@ -184,19 +184,27 @@ public actor CaptureService {
         }
         let preview = c.fileName ?? "[\(c.kind.rawValue) \(humanSize(info.size))]"
         let now = c.capturedAtNs
-        let mergeFloor = now - mergeWindowNs
 
         let result: CaptureResult = try database.pool.write { db -> CaptureResult in
-            // 同 ingestText：blob 合并候选必须限定 origin=self，避免 bump peer 行
-            if let last = try Item
-                .filter(Column("kind") == c.kind.rawValue)
-                .filter(Column("blob_sha256") == info.sha256)
-                .filter(Column("origin_device") == deviceID)
-                .filter(Column("captured_at_ns") >= mergeFloor)
-                .filter(Column("deleted_at_ns") == nil)
-                .order(Column("captured_at_ns").desc)
-                .fetchOne(db)
-            {
+            // mergeWindowNs == 0 → 完全禁用合并（与 ingestText 路径语义对齐）。
+            // 不能 `mergeFloor = now - 0 = now` 再 WHERE `>= mergeFloor`——单调时钟同 ns
+            // 边界仍会命中刚 commit 的同 sha 行
+            let mergeCandidate: Item?
+            if mergeWindowNs == 0 {
+                mergeCandidate = nil
+            } else {
+                let mergeFloor = now - mergeWindowNs
+                // 同 ingestText：blob 合并候选必须限定 origin=self，避免 bump peer 行
+                mergeCandidate = try Item
+                    .filter(Column("kind") == c.kind.rawValue)
+                    .filter(Column("blob_sha256") == info.sha256)
+                    .filter(Column("origin_device") == deviceID)
+                    .filter(Column("captured_at_ns") >= mergeFloor)
+                    .filter(Column("deleted_at_ns") == nil)
+                    .order(Column("captured_at_ns").desc)
+                    .fetchOne(db)
+            }
+            if let last = mergeCandidate {
                 var updated = last
                 updated.capturedAtNs = now
                 if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }

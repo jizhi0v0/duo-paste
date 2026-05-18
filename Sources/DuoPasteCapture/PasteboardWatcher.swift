@@ -46,6 +46,11 @@ public actor PasteboardWatcher {
     /// 进入 debounce 等待时记录的触发时刻。0 = 当前没 pending capture。
     /// 每次 changeCount 跳变都重置为 `now + debounceNs`，直到稳定一整个窗口才触发
     private var pendingDeadlineNs: Int64 = 0
+    /// 最近一次 cc 跳变那一刻的 frontApp。每次新跳变 main hop 一次刷新，capture 时直接
+    /// 消费而**不**再 hop——避免"cc 跳变 → debounce 等 500ms → 用户 ⌘Tab 切走 → capture
+    /// 用了新 app 的 frontmost"导致 source_app 列脏。
+    /// nil = 没 pending capture（pendingDeadlineNs == 0 时同步成 nil）
+    private var pendingFrontApp: FrontAppSnapshot?
     /// pollLoop 跑在自己的 Task 里;start/stop 跟 cancel 它配对
     private var pollTask: Task<Void, Never>?
     /// barrier 在跑——`pasteBack` 期间 await MainActor.run 会释放 actor isolation,
@@ -119,6 +124,7 @@ public actor PasteboardWatcher {
     private func suppressUpToCurrent() {
         lastChangeCount = pasteboard.changeCount
         pendingDeadlineNs = 0
+        pendingFrontApp = nil
     }
 
     /// 内部 flush:若 debounce 窗口里有 pending 的真实复制 (`pendingDeadlineNs > 0`)
@@ -130,6 +136,9 @@ public actor PasteboardWatcher {
         if cc != lastChangeCount {
             lastChangeCount = cc
             pendingDeadlineNs = 0
+            // 临门一脚的真实复制——同步 hop 一次拿 frontApp,绑定到这次 capture
+            let frontApp = await MainActor.run { Self.snapshotFrontApp() }
+            pendingFrontApp = frontApp
             await capture()
             return
         }
@@ -154,6 +163,11 @@ public actor PasteboardWatcher {
         let cc = pasteboard.changeCount  // ← UC pending 时这里在 actor 后台阻塞,main 不受影响
         if cc != lastChangeCount {
             lastChangeCount = cc
+            // 关键时机:cc 跳变的那一拍 main hop 拿 frontApp,绑定到这次 capture。
+            // 不能等到 capture() 内部 hop——debounce 500ms 期间用户可能 ⌘Tab 切走,
+            // 那时 frontmostApplication 已是另一个 app,source_app 列就写错了
+            let frontApp = await MainActor.run { Self.snapshotFrontApp() }
+            pendingFrontApp = frontApp
             if debounceNs > 0 {
                 pendingDeadlineNs = Clock.nowNs() + debounceNs
                 return
@@ -178,13 +192,17 @@ public actor PasteboardWatcher {
         // 跳过特殊标记类型
         if let types = pasteboard.types {
             for t in types where skipMarkerTypes.contains(t.rawValue) {
+                pendingFrontApp = nil
                 return
             }
         }
 
-        // frontApp 是 UI 状态——必须 main 取。actor 后台读的是 stale snapshot 不可信。
-        // 一次轻 hop（几个属性 read,不阻塞 main runloop）后回 actor 继续提取
-        let frontApp = await MainActor.run { Self.snapshotFrontApp() }
+        // frontApp 是 cc 跳变那一刻 main hop 拿到的 snapshot;capture 直接消费,
+        // 不再额外 hop——避免 debounce 期间 frontmost 切走导致 source_app 错挂。
+        // pending 异常路径（tick 看到 cc==lastCount + deadline 到期）frontApp 为 nil,
+        // extract 仍能继续(只是 bundle/name 列空)
+        let frontApp = pendingFrontApp ?? FrontAppSnapshot(bundleID: nil, localizedName: nil, pid: nil)
+        pendingFrontApp = nil
 
         guard let captured = extract(capturedAtNs: capturedAtNs, frontApp: frontApp) else {
             return

@@ -243,6 +243,35 @@ private func makeService(limits: Config.CaptureLimits) throws -> (CaptureService
     #expect(count == 2)
 }
 
+@Test func captureServiceBlobMergeWindowZeroBlocksSameNsMerge() async throws {
+    // 边界回归：mergeWindowSec=0 必须与 textMergeWindowSec=0 语义对齐——任何时间都不合并，
+    // 包括同 ns 的边界。旧代码用 `mergeFloor = now - 0 = now` + WHERE `>= mergeFloor` 仍会
+    // 命中刚 commit 的同 sha 行；测试用相同 capturedAtNs 触发该边界
+    let limits = Config.CaptureLimits(
+        maxBlobBytes: 32 * 1024 * 1024,
+        maxTextBytes: 1024,
+        mergeWindowSec: 0,
+        textMergeWindowSec: nil
+    )
+    let (service, db) = try makeService(limits: limits)
+    let bytes = Data([0xAB, 0xCD, 0xEF])
+    let sameNs: Int64 = 1_700_000_000_000_000_000
+    let r1 = try await service.ingest(CapturedPasteboard(
+        kind: .image, blob: bytes, blobExt: "png", blobMime: "image/png",
+        capturedAtNs: sameNs
+    ))
+    #expect(r1.outcome == .inserted)
+    let r2 = try await service.ingest(CapturedPasteboard(
+        kind: .image, blob: bytes, blobExt: "png", blobMime: "image/png",
+        capturedAtNs: sameNs
+    ))
+    #expect(r2.outcome == .inserted, "mergeWindowSec=0 + 同 ns 不应合并，实际 \(r2.outcome)")
+    let count = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
+    }
+    #expect(count == 2)
+}
+
 @Test func captureLimitsDecodeFromJSON() throws {
     let json = #"""
     { "max_blob_mb": 16, "max_text_kb": 256 }
