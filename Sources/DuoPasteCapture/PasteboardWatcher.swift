@@ -223,21 +223,29 @@ public actor PasteboardWatcher {
         )
     }
 
+    /// self-pid 过滤谓词:抽成 static 便于单测,详见 extract() 顶端注释
+    public static func shouldSkipFrontApp(pid: pid_t?, selfPid: pid_t) -> Bool {
+        guard let pid else { return false }
+        return pid == selfPid
+    }
+
     private func extract(capturedAtNs: Int64, frontApp: FrontAppSnapshot) -> CapturedPasteboard? {
-        // 注：早期版本会在 frontApp.pid == self.pid 时直接 return nil，理由是"搜索框
-        // Cmd+C 不污染历史"。但实测用户更常的诉求是把搜索框里的串作为新剪贴板项入库
-        // （剪贴板管理器本质就是"复制就该被记录"）。self-pid 跳过的副作用：那次
-        // changeCount 被吃掉再也不补，搜索结果永远 0 条。已取消跳过；pasteBack 路径
-        // 自己用 suppressUpToCurrent 保护，不依赖 self-pid 过滤。
+        // self-pid 过滤(双层防御之一):duo-paste 自己 frontmost 时直接 return nil。
         //
-        // self-capture sentinel：duo-paste 是 LSUIElement SwiftPM 二进制没 Info.plist，
-        // frontApp.bundleIdentifier 多半 nil，LaunchServices 查不到任何 icon，UI 永远走
-        // kind fallback symbol（一条三横线 text.alignleft）跟"frontmost app 没报 bundleID"
-        // 那类条目视觉上没法区分。这里 self 命中时强制写 sentinel + 友好名，UI 据此走
-        // 专门的 self badge。
-        let isSelfCapture = frontApp.pid == ProcessInfo.processInfo.processIdentifier
-        let bundleID = isSelfCapture ? Item.selfSourceAppSentinel : frontApp.bundleID
-        let appName = isSelfCapture ? "duo-paste" : frontApp.localizedName
+        // 为什么必须留：pasteBack 路径的 suppressUpToCurrent 只挡程序化写回(自动 paste 后
+        // 把 lastChangeCount 推到当前 cc),挡不住用户在搜索框 / Settings 文本框里手动
+        // Cmd+C——那次 changeCount 真实自增,suppressUpToCurrent 来不及调用,结果会把
+        // duo-paste 自家 UI 的复制重新入库,触发 search Cmd+C → 入库 → 又出现在结果里的
+        // 反复回环。pasteBack 的程序化 barrier 是第一层防御,self-pid 过滤是第二层。
+        //
+        // 副作用(已知接受):self frontmost 期间所有 changeCount 自增都被吃掉,nextTick
+        // cc != lastChangeCount 但被这里 return nil 拦掉,直到 user 切到别的 app。这是
+        // 期望行为——剪贴板管理器自己 UI 里的复制不该污染历史。
+        if Self.shouldSkipFrontApp(pid: frontApp.pid, selfPid: ProcessInfo.processInfo.processIdentifier) {
+            return nil
+        }
+        let bundleID = frontApp.bundleID
+        let appName = frontApp.localizedName
 
         // 1) 文件 URL
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [

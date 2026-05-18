@@ -685,14 +685,24 @@ public enum Admin {
     public static func rebuildOCRIndex(dbPath: URL, selfDeviceID: String) throws -> Int {
         let db = try Database(path: dbPath)
         return try db.pool.write { conn -> Int in
+            // **必须**同时清 extracted_text / extracted_text_source:
+            // - 不清 → 旧 OCR 文本继续在 FTS 里可搜
+            // - 若后续 markSkipped / markFailed (识别失败 / 缺 blob / 超 cap) 让行卡在终态,
+            //   旧文本永久保留 → 用户改完配置点"重建"反而被骗
+            // bump ingested_at_ns 让对端 PullWorker /since 同步到清空 → 对端 FTS 也更新
+            let now = Clock.nowNs()
+            let stamp = try DuoPasteCore.Database.nextIngestNs(conn, now: now)
             try conn.execute(sql: """
                 UPDATE item
-                SET ocr_state = 'pending'
+                SET ocr_state = 'pending',
+                    extracted_text = NULL,
+                    extracted_text_source = NULL,
+                    ingested_at_ns = ?
                 WHERE origin_device = ?
                   AND ocr_state = 'done'
                   AND deleted_at_ns IS NULL
                   \(Self.ocrScopeSQL)
-            """, arguments: [selfDeviceID])
+            """, arguments: [stamp, selfDeviceID])
             return conn.changesCount
         }
     }

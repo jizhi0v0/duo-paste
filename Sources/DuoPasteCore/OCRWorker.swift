@@ -314,6 +314,9 @@ public actor OCRWorker {
         do {
             stampedNs = try await database.pool.write { db -> Int64 in
                 let stamp = try DuoPasteCore.Database.nextIngestNs(db, now: now)
+                // ocr_state = 'pending' guard：user 通过 Admin.abortOCRQueue 把队列翻成
+                // 'skipped' 之后,worker 内存里那批已 fetch 的 batch 可能仍跑完 markDone——
+                // 不加 guard 会把刚 abort 掉的行又改回 'done',让"中止当前队列"不可靠
                 try db.execute(sql: """
                     UPDATE item
                     SET extracted_text = ?,
@@ -321,6 +324,7 @@ public actor OCRWorker {
                         ocr_state = 'done',
                         ingested_at_ns = ?
                     WHERE id = ?
+                      AND ocr_state = 'pending'
                       AND deleted_at_ns IS NULL
                 """, arguments: [normalized, stamp, id])
                 return stamp
@@ -345,10 +349,14 @@ public actor OCRWorker {
     private func markSkipped(id: String, reason: String) async {
         do {
             try await database.pool.write { db in
+                // `ocr_state = 'pending'` guard 同 markDone:abort 已经把行翻成 'skipped'
+                // 时,worker 后续 markSkipped 是 no-op。markFailed 同理(不让 worker 把
+                // abort 后的 'skipped' 覆写成 'failed')
                 try db.execute(sql: """
                     UPDATE item
                     SET ocr_state = 'skipped'
                     WHERE id = ?
+                      AND ocr_state = 'pending'
                       AND deleted_at_ns IS NULL
                 """, arguments: [id])
             }
@@ -367,6 +375,7 @@ public actor OCRWorker {
                     UPDATE item
                     SET ocr_state = 'failed'
                     WHERE id = ?
+                      AND ocr_state = 'pending'
                       AND deleted_at_ns IS NULL
                 """, arguments: [id])
             }

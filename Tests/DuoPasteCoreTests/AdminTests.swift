@@ -460,6 +460,44 @@ private func seedOCRItem(
     #expect(byID["del-done"]?.ocrState == .done)         // tombstone 不动
 }
 
+/// 重建 OCR 必须清 extracted_text/extracted_text_source 并 bump ingested_at_ns,
+/// 否则旧 OCR 文本继续在 FTS 里可搜,且后续若 markSkipped/markFailed 卡终态
+/// 旧文本永久留下 → 用户改完配置点"重建"反而被骗
+@Test func rebuildOCRIndexClearsExtractedTextAndBumpsIngested() throws {
+    let dir = tempDir()
+    let paths = Paths(root: dir)
+    paths.ensureExists()
+    let db = try DuoPasteCore.Database(path: paths.mainDB)
+    let baseIngest: Int64 = 12345
+    let it = Item(
+        id: "row", originDevice: "me",
+        capturedAtNs: 1000, kind: .image,
+        preview: "p",
+        blobSha256: String(repeating: "a", count: 64),
+        ocrState: .done,
+        extractedText: "stale ocr text",
+        extractedTextSource: .ocr
+    )
+    try db.pool.write { conn in
+        try it.insert(conn)
+        try conn.execute(sql: "UPDATE item SET ingested_at_ns = ? WHERE id = ?",
+                         arguments: [baseIngest, "row"])
+    }
+
+    let n = try Admin.rebuildOCRIndex(dbPath: paths.mainDB, selfDeviceID: "me")
+    #expect(n == 1)
+
+    let after = try db.pool.read { try Item.filter(Column("id") == "row").fetchOne($0) }
+    #expect(after?.ocrState == .pending)
+    #expect(after?.extractedText == nil)
+    #expect(after?.extractedTextSource == nil)
+    let ingested: Int64 = try db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?",
+                           arguments: ["row"]) ?? 0
+    }
+    #expect(ingested > baseIngest)
+}
+
 @Test func abortOCRQueueTurnsPendingIntoSkippedOnlyForOwnImage() throws {
     let dir = tempDir()
     let paths = Paths(root: dir)

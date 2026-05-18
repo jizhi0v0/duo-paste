@@ -1523,7 +1523,7 @@ private struct ApplyBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if showOCRHalfConsistencyWarning {
-                Text("⚠ OCR 队列剩 \(model.ocrStats?.pending ?? 0) 张待处理。应用后 worker 会用新配置跑剩下的图片,历史已完成的图片保持旧配置 → 半致状态。建议先到「本机索引状态」点「中止当前队列」清场,应用并重启 daemon 后再点「重建本机 OCR 索引」对齐。")
+                Text(ocrHalfConsistencyWarningText)
                     .font(.system(size: 11))
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1550,11 +1550,24 @@ private struct ApplyBar: View {
         .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
     }
 
-    /// OCR 字段 dirty 且本机队列非空时弹警告。用户改完语言/精度按"应用"前先看到提示
+    /// OCR 字段 dirty 且本机已有 OCR 结果(pending 在跑 / done 历史)时弹警告。
+    /// 用户改完语言/精度按"应用"前先看到提示。
+    /// **必须**也覆盖 pending=0 / done>0 这条稳态——历史 done 仍按旧配置编出来,
+    /// 改配置不会自动重 OCR,这才是 PR 要解决的核心半致状态。
     private var showOCRHalfConsistencyWarning: Bool {
         guard model.ocrFieldsDirty else { return false }
         guard let s = model.ocrStats else { return false }
-        return s.pending > 0
+        return s.pending > 0 || s.done > 0
+    }
+
+    private var ocrHalfConsistencyWarningText: String {
+        let pending = model.ocrStats?.pending ?? 0
+        let done = model.ocrStats?.done ?? 0
+        if pending > 0 {
+            return "⚠ OCR 队列剩 \(pending) 张待处理(另有 \(done) 张历史已完成)。应用后 worker 会用新配置跑剩下的图片,历史已完成的图片保持旧配置 → 半致状态。建议先到「本机索引状态」点「中止当前队列」清场,应用并重启 daemon 后再点「重建本机 OCR 索引」对齐。"
+        } else {
+            return "⚠ 本机已有 \(done) 张 OCR 结果按旧配置生成。应用后新图片走新配置,历史结果保持旧配置 → 半致状态。建议应用并重启 daemon 后到「本机索引状态」点「重建本机 OCR 索引」让历史也对齐。"
+        }
     }
 
     private var needsRestartHint: Bool {
@@ -1797,7 +1810,10 @@ private struct IOSPairingPINSheet: View {
                     .disabled(pin == nil)
                 }
                 Button("关闭") {
-                    cancelPIN()
+                    // 只 dismiss,把 cancel + prewarm 留给 onDisappear 串行执行——
+                    // 这里 fire-and-forget cancelPIN() 跟 onDisappear 起的独立 Task 同时排队到
+                    // PairingService actor,顺序无保证。旧 cancel 排到新 prewarm 之后就会
+                    // 作废刚 cache 的 PIN,下次开 sheet 可能拿到服务端已 cancel 的 PIN
                     isPresented = false
                 }
                 .controlSize(.small)
@@ -1882,11 +1898,6 @@ private struct IOSPairingPINSheet: View {
                 }
             }
         }
-    }
-
-    private func cancelPIN() {
-        guard let service = AppDelegate.shared?.pairingService else { return }
-        Task { await service.cancel() }
     }
 
     private func startCountdown() {
