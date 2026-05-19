@@ -109,9 +109,12 @@
 
 | 内容 | 路径 |
 |---|---|
-| release 二进制 | `~/Applications/duo-paste/duo-pasted` |
+| release bundle | `~/Applications/DuoPaste.app` |
+| release 二进制 | `~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted` |
 | LaunchAgent plist | `~/Library/LaunchAgents/io.duopaste.agent.plist` |
 | 日志 | `~/Library/Logs/duo-paste/duo-pasted.{out,err}.log` |
+
+签名:Developer ID Application: BO LI (`RS59HDH7Y3`) + hardened runtime。Bundle ID = `io.duopaste.daemon`。macOS TCC 按 Team ID + Bundle ID 判 Accessibility 权限保留——`install-agent.sh` 重装时 cdhash 变但 DR 不变,权限自动跟 app 走。**禁止回退 adhoc 签名**:adhoc 让 Accessibility 列表里旧 cdhash 失效,每次 install 都得重勾,体验崩盘
 
 ### launchctl 速查
 
@@ -278,6 +281,46 @@ RTF 抓取走三层降级：
 已知副作用接受：self frontmost 期间所有 changeCount 自增被吃掉。这是期望行为——剪贴板管理器自己 UI 里的复制不该污染历史，跟"在 search 框敲字然后 Cmd+C 整段当新条目入库"那条产品诉求二者**只能选一**，PR 20 review 选了不污染。
 
 历史：2026-05 曾撤掉这一层（想让搜索框 Cmd+C 入库），PR 20 review 指出回退了双层防御不变量并恢复。如果未来要再次改产品语义，请同步更新本节 + `PasteboardWatcher.extract()` 注释 + 新增对应回归测试。
+
+### 自动粘贴 (PasteInjector) 的不变量
+
+panel `.nonactivatingPanel` styleMask + `HUDPanel.canBecomeKey = true` 让 panel 拿键盘焦点但**不抢** app activation——目标输入框仍是 first responder。paste 完成后 `PasteInjector.injectCmdV` 合成 Cmd+V CGEvent 让目标 app 自己读 NSPasteboard,内容直接落到原 caret 位置。
+
+**硬不变量**(每条都踩过坑/影响多个文件,不要回退):
+
+1. **`SearchPanelController.show()` 永远不调 `NSApp.activate(ignoringOtherApps:)`**——这一行单独存在就让 duo-paste 切到 frontmost 破坏整条 nonactivating 路径(panel 一旦抢 activation,目标输入框 first responder 状态丢,后续 Cmd+V 落不到原 caret)。即便有人想"调试时让 panel 更显眼"也**不能**加。位置:`SearchPanelController.swift` show() 路径
+
+2. **`previousFrontmostApp` 必须 `panel.show` 之前抓 `NSWorkspace.frontmostApplication`**——`makeKeyAndOrderFront` 之后语义会受 AppKit 实现细节影响,绝对**不**在 `pasteBack` 时刻再读。self pid 直接排掉留 nil(menubar/Settings 触发场景),让 PasteInjector graceful 退化只写 pb
+
+3. **AXIsProcessTrusted=false 时 graceful degradation,不阻塞 paste 主路径**——`CGEvent.post` 静默失败,pasteboard 已写,用户切回去 Cmd+V 仍能粘。**不**主动弹 `AXIsProcessTrustedWithOptions` 那个系统 prompt(体验糟糕且不一定到位),通过 Settings "自动粘贴权限" section 引导。Settings 用户授权完没实时回调,提供"重新检查"按钮 + 重启 daemon 两条路径
+
+4. **50ms `Task.sleep` 不可省**——NSPasteboard 写入到所有 app 可见有 ~30ms 同步窗口(尤其 Electron/web 输入框),50ms 是 Paste.app 经验值。少数 IME composing 中输入框可能丢首字符,文档化不修。**不**用 `usleep` block main——panel hide 动画 140ms 同步跑,会卡 UI
+
+5. **CGEvent 用 `.cghidEventTap` 不是 `.cgSessionEventTap`**——HID 流最顶端系统看到的就是用户真按了 Cmd+V,部分 sandboxed app 收不到 session-tap 注入的事件
+
+### 空格预览 + PreviewPanel rect 上报路径(三层修复,删 NSApp.activate 后暴露的 race)
+
+`PreviewPanelController` 的 cardRectInGlobal 通过这条链路上报:`LazyHStack` 中 anchor 卡的 `.background { GeometryReader { ... .preference(SelectedCardFramePreference, geo.frame(in: .global)) } }` → SwiftUI 内部 PreferenceKey cache → `.onPreferenceChange` → `state.selectedCardWindowRect` → `.onChange` → `onPreviewChange(true)` → `preview.show(cardRectInGlobal:)`。
+
+这条链路有**三个 latent race**,删 `NSApp.activate(ignoringOtherApps:)` 之前都被 app-wide layout flush 掩盖,删除后浮出来:
+
+1. **anchor (`selectedIDs.last`) vs scrollTo (`results.first`) 不一致**——panel show 时 `state.openPulse++` 触发 `proxy.scrollTo(results.first?.id, anchor: .leading)` 滚回视口起点,但 `previewAnchorID = selectedIDs.last ?? results.first?.id` 仍指向用户上次选的卡(在视口外)。LazyHStack 不渲染视口外 cell,GeometryReader 不挂载,永远不 publish frame。**修法**:`SearchPanelController.show()` 入口 `state.selectedIDs = []`,让 anchor 自然落到 results.first 跟 scrollTo 对齐
+
+2. **SwiftUI PreferenceKey cache vs 外部 @Observable state 不同步**——SwiftUI 只在 GeometryReader publish value 跟内部 cache 不同时 fire `onPreferenceChange`。任何手动 reset 外部 `state.selectedCardWindowRect = .zero` 都不会影响 SwiftUI cache。同 anchor 卡再 publish 同样的 frame → cache 没变 → 不 fire → state 永久 stuck 在 .zero。**修法**:GeometryReader 上挂 `.id(state.openPulse)` 让每次 panel show 强制重新实例化,SwiftUI 把它当新 view → cache 清空 → 新实例 publish 必定 fire
+
+3. **anchor 切换时 P3 reset 跟 onPreferenceChange fire 时序撞车**——历史 P3 修复(防新卡未进视口 preview 用旧 rect 错位)在 `.onChange(previewAnchorID)` 里 reset state.rect=.zero。但 SwiftUI 异步事件顺序常常是:新卡 GeometryReader publish → onPreferenceChange 写 state=新 rect → **之后** P3 reset fire 把 state 抹回 .zero。写入立刻被覆盖。**修法**:删 P3 reset 整段。新卡不在视口的边角 case 退化成"短暂错位一帧"——scrollPulse 会把新卡滚进视口,GeometryReader 挂载 publish,rect 自动修正,可接受
+
+**不要回退任何一层**:三个修复互补缺一不可。任何一层回退都让空格预览在某些场景下死锁("必须按 ←/→ 才能触发")。
+
+**教训**:依赖 framework 隐式副作用做"自然 fix" 是定时炸弹。历史 P3 修复 + NSApp.activate 副作用互相掩盖了 ~1 年,删 activate 一行就触发三层叠加 bug。审 PreferenceKey / Observable 跨边界路径时,如果某条 fix 路径依赖"反正某地方会再 fire 一次"——立刻警觉,显式 trigger 比依赖隐式好。
+
+5b. **paste 路径调 `panel.hide(immediate: true)` 同步 orderOut,不走 140ms 淡出动画**——动画期间 panel 仍在 windowserver 的 window list 中,系统把 panel 当 key window,CGEvent Cmd+V 被路由到 panel 而不是目标 app,paste 完全失效。问题首次在 Zed Preview / Claude for Desktop 复现(2026-05-19),用 `immediate: true` 同步 orderOut + alpha 复位修复。Esc / 点空白处 / windowDidResignKey 这些非 paste 关闭路径默认 `immediate=false` 保留淡出动画。**不要回退**:任何把 paste 路径改回 `hide()` 默认动画的改动会立刻让 Cmd+V 注入失效
+
+6. **self-write 防回环不需改动**——`CGEvent.post` Cmd+V 让目标 app 自己读 pb,`pasteboard.changeCount` 不会变,watcher 轮询看到 cc 不变直接跳过;`pasteBack` barrier 内 `suppressUpToCurrent` 已把 lastChangeCount 推过 self-write 那次跳变;self-pid 过滤这次根本不触发(frontmost 不是 self)。**不要**为了"以防万一"叠新防御层
+
+7. **macOS 钥匙串密码框被 Secure Event Input 拦 CGEvent 是期望行为**——密码框本来就不该被剪贴板管理器自动粘,这是安全特性不是 bug。文档化不修
+
+回归测试位置:`SearchPanelControllerTests`(暂未加,manual smoke 覆盖:Safari 地址栏 / VS Code / 终端 / 钥匙串密码框 / Accessibility 关闭 fallback)。
 
 ### SwiftUI TextField + 列表导航——NSEvent local monitor
 

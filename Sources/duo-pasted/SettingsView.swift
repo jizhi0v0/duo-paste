@@ -655,6 +655,10 @@ private struct GeneralPane: View {
                 }
             }
 
+            if let appState {
+                AccessibilityPermissionGroup(appState: appState)
+            }
+
             SettingsGroup(title: "存储模式") {
                 SettingsRow(title: "blob 同步策略", isFirst: true) {
                     Picker("", selection: $model.config.mesh.storageMode) {
@@ -725,6 +729,46 @@ private struct GeneralPane: View {
             get: { model.config.capture.maxTextBytes / 1024 },
             set: { model.config.capture.maxTextBytes = max(1, $0) * 1024 }
         )
+    }
+}
+
+/// Accessibility 权限引导块。daemon 启动时 AppDelegate 抓一次 AXIsProcessTrusted 写到
+/// appState.accessibilityTrusted;这里渲染状态 + "打开系统设置" + "重新检查" 按钮。
+/// AX 没 KVO,用户去系统设置勾完得回到这点 "重新检查",或者重启 daemon
+private struct AccessibilityPermissionGroup: View {
+    @Bindable var appState: AppState
+
+    var body: some View {
+        SettingsGroup(title: "自动粘贴权限") {
+            SettingsRow(title: "Accessibility",
+                        subtitle: appState.accessibilityTrusted
+                            ? "已授予 — 双击条目可直接粘到上一个输入框"
+                            : "未授予 — pasteboard 仍会写好,需要切回原 app 自己 Cmd+V",
+                        isFirst: true) {
+                HStack(spacing: 8) {
+                    if appState.accessibilityTrusted {
+                        Text("✓")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.green)
+                    } else {
+                        GlassActionButton(title: "打开系统设置", isProminent: true) {
+                            openAccessibilityPane()
+                        }
+                    }
+                    GlassActionButton(title: "重新检查", isProminent: false) {
+                        AppDelegate.shared?.refreshAccessibilityTrusted()
+                    }
+                }
+            }
+            SettingsNoteRow(text: "授权后 panel 会用 .nonactivatingPanel 保留你原来的输入框焦点,双击条目自动模拟 Cmd+V 粘进去。未授权时不阻塞,只是要自己 Cmd+V。")
+        }
+    }
+
+    /// 打开"系统设置 → 隐私与安全性 → 辅助功能"。URL scheme 在 macOS 13+ 稳定;
+    /// 即便系统设置 UI 改版,这个 URL 都跳到正确面板
+    private func openAccessibilityPane() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
     }
 }
 

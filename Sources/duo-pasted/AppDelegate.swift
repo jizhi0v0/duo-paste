@@ -68,6 +68,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    /// 抓一次 AXIsProcessTrusted 写进 state。启动末尾 + SettingsView "刷新"按钮调。
+    /// AX 没有 KVO/通知,用户在系统设置里勾完没办法立即知道,只能让用户主动触发刷新
+    func refreshAccessibilityTrusted() {
+        let trusted = AXIsProcessTrusted()
+        state.accessibilityTrusted = trusted
+        if !trusted {
+            fputs("accessibility · not trusted — PasteInjector 静默退化,用户需手动 Cmd+V\n", stderr)
+        }
+    }
+
     /// StatusBarController 触发的「设置…」入口。accessory app 没 Dock + 无主菜单，
     /// SwiftUI Settings scene 不响应 `showSettingsWindow:` —— 自管 NSWindow 绕开整个机制
     /// SettingsView apply 后调用——重读 config.hotkey 把 GlobalHotKey 重 register 到新组合。
@@ -334,6 +344,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if deps.config.ocr.enabled {
             startOCRWorker()
         }
+
+        // Accessibility 权限快照——PasteInjector.injectCmdV 需要(CGEvent.post 不走
+        // accessibility 静默失败,pasteboard 已写用户可以自己 Cmd+V,但用户不知道为
+        // 什么没"自动落到 caret")。Settings 里"自动粘贴权限"行用这个 flag 显示状态
+        // + 引导用户去系统设置勾选。授权完用户手动按 Settings 的"刷新"或者重启
+        // daemon 才会更新这个值——AX 没有 KVO/通知
+        refreshAccessibilityTrusted()
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · storage_mode=\(deps.config.mesh.storageMode.rawValue) · db=\(deps.paths.mainDB.path)\n", stderr)
         if Self.consumeReopenSettingsFlag() {
@@ -870,7 +887,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.state.pasteProgress = .failed(reason: "选中项无可写入内容")
                     return
                 }
-                self.panel.hide()
+                let target = self.panel.previousFrontmostApp
+                // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
+                // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
+                self.panel.hide(immediate: true)
+                PasteInjector.injectCmdV(into: target)
             }
         }
     }
@@ -903,7 +924,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.state.pasteProgress = .failed(reason: "选中图片无可写入内容")
                     return
                 }
-                self.panel.hide()
+                let target = self.panel.previousFrontmostApp
+                // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
+                // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
+                self.panel.hide(immediate: true)
+                PasteInjector.injectCmdV(into: target)
             }
             return
         }
@@ -931,7 +956,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let got = items.count - stillMissing.count
                 self.state.postNotice("已 paste \(got) 张图（共 \(items.count)，余 \(stillMissing.count) 张未拉到）")
             }
-            self.panel.hide()
+            let target = self.panel.previousFrontmostApp
+            // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
+            // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
+            self.panel.hide(immediate: true)
+            PasteInjector.injectCmdV(into: target)
         }
     }
 
@@ -990,7 +1019,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.performLocalPaste(item)
-                self.panel.hide()
+                let target = self.panel.previousFrontmostApp
+                // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
+                // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
+                self.panel.hide(immediate: true)
+                PasteInjector.injectCmdV(into: target)
             }
             return
         }
@@ -1013,7 +1046,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .success:
                 self.state.pasteProgress = .idle
                 await self.performLocalPaste(item)
-                self.panel.hide()
+                let target = self.panel.previousFrontmostApp
+                // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
+                // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
+                self.panel.hide(immediate: true)
+                PasteInjector.injectCmdV(into: target)
             case .failure(let reason):
                 self.state.pasteProgress = .failed(reason: reason)
                 // 保持 panel 显示让用户看错误——Esc 关、Enter 重试都由现有 key monitor 处理

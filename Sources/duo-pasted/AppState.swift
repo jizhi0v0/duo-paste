@@ -261,6 +261,13 @@ final class AppState {
     /// `.failed` 时 banner 显示错误文案 + 用户 Esc 或 Enter 重试
     var pasteProgress: PasteProgress = .idle
 
+    /// macOS Accessibility (AXIsProcessTrusted) 权限是否已授予。
+    /// 启动时 AppDelegate 抓一次刷进来,SettingsView 显示状态 + "打开系统设置"按钮。
+    /// false 时 PasteInjector.injectCmdV graceful degradation:pasteboard 已写,用户
+    /// 自己切回去 Cmd+V 仍能粘——**不阻塞** paste 主路径。Settings 用户授权完后没
+    /// 实时回调,需要重新启动 daemon 或手动调 refreshAccessibilityTrusted() 才会刷
+    var accessibilityTrusted: Bool = true
+
     /// Quick Look 风格的空格预览开关。true 时由 SearchPanelController 创建/显示独立
     /// 浮窗(PreviewPanelController)挂在搜索 panel 上方;内容跟随 currentItem 实时
     /// 刷新(箭头导航能切换被预览的项)。

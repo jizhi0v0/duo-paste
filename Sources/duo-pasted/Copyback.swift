@@ -45,13 +45,30 @@ enum Copyback {
         case .file:
             guard let raw = item.textFull else { return false }
             // text_full 里是 \n 分隔的多条路径
-            let urls = raw.split(separator: "\n").compactMap { (s: Substring) -> NSURL? in
+            let paths = raw.split(separator: "\n").compactMap { (s: Substring) -> String? in
                 let path = String(s).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { return nil }
-                return NSURL(fileURLWithPath: path)
+                return path
             }
-            if !urls.isEmpty {
+            if !paths.isEmpty {
+                let urls = paths.map { NSURL(fileURLWithPath: $0) }
                 _ = pb.writeObjects(urls)
+                // **多 representation 兜底**:.fileURL 之外显式写 .string + 图片字节,让不
+                // 同 app 的 paste handler 各取所需:
+                // - Finder / 邮件附件框 / 上传控件 → .fileURL ✓
+                // - terminal (iTerm2 / Terminal.app 部分能转字符串,Zed terminal /
+                //   Claude Code 不处理 fileURL paste) → .string 路径字符串
+                // - 聊天软件 (飞书 / 微信 / Notes 等图片接收器) → image bytes 直接粘图
+                // 没这个兜底之前 CleanShot 截图(本机有文件 + image blob)在 terminal
+                // 双击 paste 完全没反应 — 因为只写了 fileURL
+                pb.setString(paths.joined(separator: "\n"), forType: .string)
+                if paths.count == 1,
+                   isImageMime(item.blobMime),
+                   let sha = item.blobSha256,
+                   let data = try? blobs.read(sha256: sha) ?? nil
+                {
+                    writeImageData(data, mime: item.blobMime, to: pb)
+                }
                 return true
             }
             // 本机没有可用的文件路径——通常是跨设备同步过来的 file item（对端用户从

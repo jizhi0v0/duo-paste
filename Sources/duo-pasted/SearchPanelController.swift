@@ -27,11 +27,24 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// menubar icon 可被用户隐藏,这是唯一始终可见的"回到 Settings"路径
     private let onOpenSettings: (() -> Void)?
     private var panel: NSPanel?
+    /// panel show **之前**的 frontmost app 快照。PasteInjector 用它在 paste 完成
+    /// 后把焦点拉回去 + 注入 Cmd+V。**必须**在 makeKeyAndOrderFront 之前抓——
+    /// panel 拿到 key window 状态后 NSWorkspace.frontmostApplication 仍是目标 app
+    /// (.nonactivatingPanel 不切 frontmost),但万一未来谁误加了 NSApp.activate
+    /// 调用,这个快照能兜底拿到正确目标。**绝不**在 paste 时刻才读 frontmost。
+    /// self pid 直接排掉 (用户从 menubar / Settings 触发的入口),避免把自己当目标
+    private(set) var previousFrontmostApp: NSRunningApplication?
     /// 标记 ensurePanel 是否刚创建了新 panel(冷启动首次 show)。show() 路径用它决定是否
     /// defer 一个 runloop tick 让 SwiftUI 完成 .glassEffect / .ultraThickMaterial 首帧渲染,
     /// 否则黑影会出现在 alpha fadein 期间。复用 panel 时这个标记是 false 直接动画
     private var freshlyCreated: Bool = false
     private var localKeyMonitor: Any?
+    /// 方向键 NSEvent.isARepeat=true(长按 keyboard repeat 触发的事件) 节流时间戳。
+    /// macOS 默认 key repeat ~30/s 太快用户觉得"闪现",throttle 到 80ms/次 (~12fps)
+    /// 看起来"一张一张滑过去"。**只 throttle 长按 repeat**:首次按下(isARepeat=false)
+    /// 永远立刻 fire,体感跟单击一样灵敏
+    private var lastNavigateRepeatTime: TimeInterval = 0
+    private static let navigateRepeatMinIntervalSec: TimeInterval = 0.08
     /// 全局鼠标监听器——抓"用户点了我们 app 之外区域"的事件,触发自动 hide。
     /// 解决 preview 打开时 windowDidResignKey 被守卫(防 TCC alert)的副作用:
     /// 单纯 resign-key 不区分键盘切走/系统 alert/鼠标点外面,无法只关心后者;
@@ -78,12 +91,28 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         let startOrigin = NSPoint(x: targetOrigin.x, y: targetOrigin.y - 14)
         p.setFrameOrigin(startOrigin)
         p.alphaValue = 0
-        NSApp.activate(ignoringOtherApps: true)
+        // makeKeyAndOrderFront 之前快照 frontmost app —— panel 用 .nonactivatingPanel
+        // styleMask + HUDPanel.canBecomeKey 拿键盘焦点,**不**抢 app activation,所以
+        // 目标 app 仍是 frontmost。但 NSWorkspace.frontmostApplication 在 panel 已经
+        // 是 key window 之后语义会变模糊(取决于 AppKit 实现细节),提前抓最稳。
+        // self pid 排除:menubar / Settings 触发时 frontmost 是自己,这种情况下没有
+        // "回填目标",previousFrontmostApp 留 nil 让 PasteInjector graceful 退化
+        let front = NSWorkspace.shared.frontmostApplication
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        previousFrontmostApp = (front?.processIdentifier != selfPid) ? front : nil
+        // **不**调 NSApp.activate(ignoringOtherApps:) —— 这会把 duo-paste 切到 frontmost,
+        // 破坏 .nonactivatingPanel 的整条产品意图(panel 显示时目标输入框仍是 first
+        // responder,paste 完 Cmd+V 直接落在原 caret 处)。makeKeyAndOrderFront 单独
+        // 工作只让 panel 拿 key 状态,不切 frontmost
         p.makeKeyAndOrderFront(nil)
         installKeyMonitor()
         installGlobalClickMonitor()
         // 触发 SearchView 重新抢焦点 + kick refresh（panel 被复用，onAppear 不再 fire）
         state.openPulse &+= 1
+        // **保留 selectedIDs**:用户上次翻到第 N 张关 panel,再开 panel 应该回到第 N 张
+        // (产品需求"保留 index")。anchor/scrollTo 的同步由 SearchView 端的 scrollTo 跟
+        // 随 anchor 实现(scrollTo 用 selectedIDs.last ?? results.first?.id),保证 anchor
+        // 卡始终在视口内 GeometryReader 能挂载 publish frame
         // 冷启动首次 show 时 SwiftUI .glassEffect / .ultraThickMaterial 渲染是 async 的,
         // ensurePanel 的 layoutSubtreeIfNeeded 只保证 AppKit 层 layout pass 跑过,SwiftUI 的
         // material 子层仍可能落后一帧。defer 一个 main runloop tick 让 render server 接管
@@ -107,7 +136,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    func hide() {
+    /// `immediate=true` 跳过 140ms 淡出动画**同步** orderOut——专给 paste 路径用:
+    /// PasteInjector post Cmd+V 时如果 panel 仍在 window list(动画期间 isVisible=true),
+    /// windowserver 把 panel 当 key window,Cmd+V 投到 panel 被吞,目标 app 收不到。
+    /// 默认 `false` 保留淡出动画给 Esc / 点空白 / windowDidResignKey 这些路径
+    func hide(immediate: Bool = false) {
         // **同步**先 cancel：lazy paste task / preview——动画 140ms 内 fetchBlobLazy
         // 可能完成（30s 总超时下尤其放大），把 blob 字节写进 NSPasteboard 但 panel 已
         // 关，用户切到其他 app 后莫名收到 paste = CLAUDE.md "孤儿写入" 现象。
@@ -120,6 +153,19 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             removeGlobalClickMonitor()
             return
         }
+
+        if immediate {
+            // 同步 orderOut:从 windowserver 的 window list 摘下,key window 立即让给
+            // 底下的 target app。alpha 复位让下次 show 不会因为残留 alpha=0 被中断。
+            // 视觉损失:无淡出。paste 心智下用户期望的就是"内容立即出现",animation
+            // 反而碍事——Paste.app 实测也是 instant close
+            p.orderOut(nil)
+            p.alphaValue = 1
+            removeKeyMonitor()
+            removeGlobalClickMonitor()
+            return
+        }
+
         let currentOrigin = p.frame.origin
         let exitOrigin = NSPoint(x: currentOrigin.x, y: currentOrigin.y - 8)
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -170,6 +216,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // MainActor 闭包，避免 NSEvent 非 Sendable 进入隔离边界。
             let keyCode = Int(event.keyCode)
             let isCmd = event.modifierFlags.contains(.command)
+            // isARepeat = NSEvent 标记本事件是 keyboard repeat(长按持续触发)非首次按下。
+            // 方向键路径用它做节流,避免 macOS 默认 ~30/s 重复速率让卡片闪现而非平滑滑过
+            let isARepeat = event.isARepeat
             // 横向卡片布局:←/→ 切换选中(123/124);↑/↓(126/125)继续兼容老用户 muscle memory
             // (TextField 横向单行,↑/↓ 移光标无意义,可吞掉重定向到 navigate)。
             // 51 = Backspace,仅在 query 为空 + activeQualifiers 非空时拦截弹最后一个 chip,
@@ -261,6 +310,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 }
                 switch keyCode {
                 case 49:                                        // Space — Quick Look 风格预览
+                    FileHandle.standardError.write(Data("preview-debug: SPACE pressed · inputFocused=\(inputFocused) · previewShown=\(self.state.previewShown) · currentItem=\(self.state.currentItem?.id ?? "nil") · rect=\(self.state.selectedCardWindowRect) · query='\(self.state.query)'\n".utf8))
                     if self.state.previewShown {
                         // preview 已开,空格关闭(同时也响应 Esc 路径,但这里更明确)
                         self.state.previewShown = false
@@ -285,10 +335,19 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                         return true
                     }
                     return false                               // 无选中项(结果空) → 透传
-                case 123: self.state.navigate(by: -1)           // ← 上一项
-                case 124: self.state.navigate(by: 1)            // → 下一项
-                case 126: self.state.navigate(by: -1)           // ↑ alias
-                case 125: self.state.navigate(by: 1)            // ↓ alias
+                case 123, 124, 125, 126:                        // ←/→/↑/↓ 切卡
+                    // 长按节流:isARepeat=true 事件按 80ms 间隔放行 (~12fps),首次按下
+                    // 总是立刻 fire。macOS 默认 key repeat ~30/s 太快卡片"闪现",节流到
+                    // ~12/s 后体感"一张一张滑过去"
+                    if isARepeat {
+                        let now = ProcessInfo.processInfo.systemUptime
+                        if now - self.lastNavigateRepeatTime < Self.navigateRepeatMinIntervalSec {
+                            return true   // 吃掉这次 repeat 不下推 navigate
+                        }
+                        self.lastNavigateRepeatTime = now
+                    }
+                    let delta = (keyCode == 124 || keyCode == 125) ? 1 : -1
+                    self.state.navigate(by: delta)
                 case 36, 76:                                    // Return / Enter
                     // preview 打开时 Enter 仍粘贴——Quick Look 心智里 Return = 选择/确认
                     // (像 Finder Quick Look: 选中再 Return 打开)。粘贴流程会自然关 panel,
@@ -435,11 +494,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             },
             onPreviewChange: { [weak self] shown in
                 guard let self else { return }
+                FileHandle.standardError.write(Data("preview-debug: onPreviewChange(\(shown)) · current=\(self.state.currentItem?.id ?? "nil") · rect=\(self.state.selectedCardWindowRect)\n".utf8))
                 if !shown {
                     preview.hide()
                     return
                 }
                 guard let item = self.state.currentItem else {
+                    FileHandle.standardError.write(Data("preview-debug: → hide (no currentItem)\n".utf8))
                     preview.hide()
                     return
                 }
@@ -448,7 +509,11 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 // 让新卡 frame 到位时再统一 reposition。如果这里走 hide() 浮窗会
                 // alphaValue 1→0→1 闪烁;改成保持上一帧状态等新 frame nonzero 时一次性
                 // 切换到新 item + 新位置,视觉无中断
-                guard self.state.selectedCardWindowRect != .zero else { return }
+                guard self.state.selectedCardWindowRect != .zero else {
+                    FileHandle.standardError.write(Data("preview-debug: → wait (rect=.zero)\n".utf8))
+                    return
+                }
+                FileHandle.standardError.write(Data("preview-debug: → show item=\(item.id) rect=\(self.state.selectedCardWindowRect)\n".utf8))
                 preview.show(item: item, cardRectInGlobal: self.state.selectedCardWindowRect)
             },
             // contextMenu "在 Finder 显示" + ⌘Return 走同一 onReveal handler

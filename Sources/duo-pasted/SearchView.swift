@@ -502,6 +502,7 @@ struct SearchView: View {
         //   2) selectedIDs 变化(箭头切换 currentItem) → 内容跟随
         //   3) selectedCardWindowRect 变化(滚动 / 布局更新) → 浮窗 reposition
         .onChange(of: state.previewShown) { _, shown in
+            FileHandle.standardError.write(Data("preview-debug: previewShown changed → \(shown) · rect=\(state.selectedCardWindowRect) · anchor=\(previewAnchorID ?? "nil")\n".utf8))
             onPreviewChange(shown)
         }
         .onChange(of: state.selectedIDs) { _, _ in
@@ -510,29 +511,17 @@ struct SearchView: View {
         .onChange(of: state.selectedCardWindowRect) { _, _ in
             if state.previewShown { onPreviewChange(true) }
         }
-        // **P3 修复**: previewAnchorID 切换瞬间(箭头切卡 / shift-click 等)主动 reset
-        // selectedCardWindowRect = .zero——防止新选中卡还没进视口 publish frame 时,
-        // PreviewPanelController 用残留的旧 frame 把浮窗短暂锚在错误位置。
-        //
-        // 触发链(配 SearchPanelController.onPreviewChange):
-        //   1. previewAnchorID 变 → 这里 reset frame = .zero
-        //   2. 触发上面 epsilon 路径 zero ↔ nonzero 例外,selectedCardWindowRect 真写入
-        //   3. selectedCardWindowRect onChange fire → onPreviewChange(true)
-        //   4. SearchPanelController 看 .zero 走 "保持上一帧" guard(**不**调 hide,避免
-        //      alphaValue 1→0→1 闪烁)
-        //   5. 新卡 GeometryReader publish nonzero frame → epsilon 通过 → onChange fire
-        //      → onPreviewChange(true) → controller 一次性 reposition 到新位置
-        //
-        // **Corner case acknowledged**: 如果新 anchor 卡完全在 LazyHStack 视口外,
-        // GeometryReader 不挂载 → 新 frame 永不来 → 浮窗永久锚旧位置(内容已切到新 item)。
-        // 实际不发生:键盘箭头切卡走 scrollPulse → ScrollViewReader.scrollTo 把新卡滚进
-        // 视口让 GeometryReader 挂载;mouse 选中必看见卡才能点。即便理论触发,Esc / 点
-        // 空白处都能 hide 兜底,无 dead lock
-        .onChange(of: previewAnchorID) { _, _ in
-            if state.selectedCardWindowRect != .zero {
-                state.selectedCardWindowRect = .zero
-            }
-        }
+        // **历史 P3 修复已删**: previewAnchorID 切换时主动 reset selectedCardWindowRect=.zero
+        // 的路径——本意是让新卡 frame 上报之前 onPreviewChange 走 wait 分支避免短暂用旧 rect
+        // 显示新 item。但实际跟 onPreferenceChange 的 fire 时序撞车:
+        //   1. anchor 切(results refresh 异步触发) → 新卡 GeometryReader publish → onPreferenceChange
+        //      fire → state.rect = 新 nonzero rect ✓
+        //   2. **之后** .onChange(previewAnchorID) P3 reset fire → state.rect = .zero ✗(覆盖 1)
+        //   3. 用户按空格 → onPreviewChange 看到 rect=.zero → wait 死循环(SwiftUI internal
+        //      PreferenceKey cache 跟新 publish value 相等不再 fire,state 永久 stuck)
+        // 删 reset 让 SwiftUI cache + onPreferenceChange 自然同步。新卡不在视口的边角 case
+        // 退化成"短暂错位一帧"——scrollPulse 会把新卡滚进视口,GeometryReader 挂载 publish,
+        // rect 自动修正。详 CLAUDE.md "空格预览"段
         .onPreferenceChange(SelectedCardFramePreference.self) { rect in
             // PreferenceKey 在 layout 过程里多次 fire,只在值真正变化时写回,避免
             // 触发上面 onChange 死循环。
@@ -547,6 +536,7 @@ struct SearchView: View {
             let dw = abs(rect.width - current.width)
             let dh = abs(rect.height - current.height)
             if isReset || dx > 1 || dy > 1 || dw > 1 || dh > 1 {
+                FileHandle.standardError.write(Data("preview-debug: pref-change rect=\(rect) (was \(current))\n".utf8))
                 state.selectedCardWindowRect = rect
             }
         }
@@ -974,10 +964,18 @@ struct SearchView: View {
         }
     }
 
-    /// 当前预览锚点的 item id——跟 AppState.currentItem 同口径(selectedIDs.last ?? 第一个)。
-    /// 用 String? 而不是 Item? 让 ForEach 内的 `==` 比较廉价(不重比整个 Item struct)
+    /// 当前预览锚点的 item id——跟 AppState.currentItem 同口径:selectedIDs.last **且仍在
+    /// results 里**,否则 fallback 到 results.first?.id。
+    /// **必须**带 results.contains check:用户上次选的 id 在 refresh 后可能不在新 results
+    /// 里(item 被删 / 被 query/filter 滤掉),裸 `selectedIDs.last ?? ...` 会让 anchor 指向
+    /// 不存在的 cell,GeometryReader 永远不挂载,空格预览 wait 死循环
     private var previewAnchorID: String? {
-        state.selectedIDs.last ?? state.results.first?.id
+        if let last = state.selectedIDs.last,
+           state.results.contains(where: { $0.id == last })
+        {
+            return last
+        }
+        return state.results.first?.id
     }
 
     /// Paste.app 风格横向卡片滚动。LazyHStack 让千条 item 不卡——出视口的卡 unload。
@@ -999,7 +997,12 @@ struct SearchView: View {
                         ItemCard(
                             item: item,
                             index: offset < 9 ? offset + 1 : nil,
-                            isSelected: state.selectedIDs.contains(item.id),
+                            // selectedIDs 空时第一张隐式高亮(冷启动 / 用户未选过任何卡的
+                            // current item 视觉指示)。否则按 selectedIDs 严格匹配——避免
+                            // panel show 时第一张卡有"无高亮 → 一闪 → 有高亮"的视觉跳变
+                            isSelected: state.selectedIDs.isEmpty
+                                ? item.id == state.results.first?.id
+                                : state.selectedIDs.contains(item.id),
                             selfDeviceID: state.deps.deviceID,
                             snippet: state.snippets[item.id],
                             blobs: state.deps.blobs,
@@ -1024,6 +1027,13 @@ struct SearchView: View {
                                             value: geo.frame(in: .global)
                                         )
                                 }
+                                // **关键**: openPulse 变化(每次 panel show)强制重建
+                                // GeometryReader 实例,SwiftUI 内部 PreferenceKey cache 跟着
+                                // reset,新实例 publish frame 必定 fire onPreferenceChange。
+                                // 否则 P3 修复 reset state.rect=.zero 后 cache 跟新 publish
+                                // value 相等,SwiftUI 不 fire,state.rect 永远 stuck 在 .zero,
+                                // 空格预览 guard 拦下 wait 死循环。详 CLAUDE.md "空格预览"段
+                                .id(state.openPulse)
                             }
                         }
                         // 右侧 12pt slack 给 topRight icon 的 8pt 溢出留位置;.id 在 padding
@@ -1116,18 +1126,27 @@ struct SearchView: View {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
                     // 卡片已在 viewport 内不动,只在边缘部分可见才滚最少距离让它完整露出。
                     // 之前 anchor: .center 会让每次点击都把卡片硬居中,中间卡也被强滚很烦
-                    withAnimation(.linear(duration: 0.12)) {
-                        proxy.scrollTo(id)
-                    }
+                    //
+                    // **不包 withAnimation**:箭头长按时 NSEvent 重复速率 ~33ms 远快于
+                    // 0.12s linear 动画时长 → 新 scrollTo 截断旧动画 → 中间帧被跳过,
+                    // 视觉上"闪现"而非"一张一张滑过去"。即时跳变让每个 keyDown 跳一张
+                    // 距离,60fps 下长按看起来是连续平滑翻动,跟 macOS Finder 列表箭头
+                    // 行为一致
+                    proxy.scrollTo(id)
                 }
             }
-            // panel 复用——上次关 panel 时滚到 card N,SwiftUI ScrollView 持久化了那个
-            // offset。这里 openPulse 触发硬归零:anchor=.leading 让 firstID 贴左边界,
-            // 显式覆盖 stale offset。不依赖后续 navigate 的 minimal-scroll 兜底
+            // panel 复用——openPulse++ 时 scrollTo **minimal** (anchor=nil) 让 anchor 卡
+            // 可见即可,不强制贴左:
+            //   1. anchor 卡已在视口 → 不动 → 完整保留用户上次翻到的视口位置/上下文
+            //   2. anchor 卡飞出视口(refresh 让 results reshuffle / selectedIDs.last 失效
+            //      fallback 到 results.first) → 滚最少距离让它露出,避免 GeometryReader
+            //      永远不挂载导致空格预览 wait 死循环
+            //   3. 不加动画——panel 才刚 show,瞬时归位比 0.12s 滑动自然
+            // 历史上这里是 anchor=.leading 硬归零到 anchor 卡贴左,产品决策从"硬归零第 1
+            // 张"到"保留用户视野" 经过两轮迭代,详 CLAUDE.md "空格预览" 段
             .onChange(of: state.openPulse) { _, _ in
-                if let id = state.results.first?.id {
-                    // 不加动画——panel 才刚 show,瞬时归位比 0.12s 滑回去自然
-                    proxy.scrollTo(id, anchor: .leading)
+                if let id = state.selectedIDs.last ?? state.results.first?.id {
+                    proxy.scrollTo(id)
                 }
             }
         }
