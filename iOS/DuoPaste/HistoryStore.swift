@@ -10,18 +10,48 @@ import DuoPasteCore
 final class HistoryStore {
     /// 显示用,按 captured_at_ns DESC + pinned-first 排好序的列表。
     private(set) var items: [Item] = []
-    /// 搜索框文本。空 → 全列表;非空 → contains 过滤(临时,等接 GRDB+FTS5 再正经)。
+    /// 搜索框文本。空 → 全列表;非空 → 优先用 server 端 FTS5 结果,失败 fallback 本机 contains。
     var query: String = ""
 
+    /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
+    /// 跟 Mac UI 口径一致。query 切换 / coordinator 失败时清掉走 fallback。
+    /// **匹配**靠 `q` 字段判断是否对得上当前 store.query;`q != store.query` 时不用(过期)
+    struct ServerSearchResult: Equatable, Sendable {
+        let q: String
+        let items: [Item]
+        let snippets: [String: String]
+        let totalCount: Int
+    }
+    private(set) var lastServerSearch: ServerSearchResult?
+
     /// SwiftUI 直接绑这个——过滤后的列表。
+    /// - 空 query → 全列表
+    /// - query 命中最近 server 搜索 → 用 server fold-aware items
+    /// - 否则 → 本机 contains fallback(server 还在拉 / 失败 / 离线时)
     var filtered: [Item] {
         guard !query.isEmpty else { return items }
+        if let r = lastServerSearch, r.q == query {
+            return r.items
+        }
         let q = query.lowercased()
         return items.filter { item in
             (item.preview?.lowercased().contains(q) ?? false)
                 || (item.textFull?.lowercased().contains(q) ?? false)
                 || (item.extractedText?.lowercased().contains(q) ?? false)
         }
+    }
+
+    /// coordinator 拉完 /search 把结果灌进来。**只在 `q` 仍匹配当前 store.query 时**
+     /// 应用——拉结果回来时用户可能已经改了 query,旧响应丢弃避免闪现错的命中
+    func applyServerSearch(_ r: ServerSearchResult) {
+        guard r.q == query else { return }
+        lastServerSearch = r
+    }
+
+    /// query 变化时调,清掉旧 server 结果让 filtered 暂时走 contains fallback——
+    /// coordinator 异步拉新一轮 server 结果,中间这段时间用户不会看到上一轮的命中残影
+    func clearServerSearch() {
+        lastServerSearch = nil
     }
 
     /// peer 拉到一批 item 时调。按 id 去重,tombstone (deletedAtNs 非空) 直接移除。
@@ -69,6 +99,12 @@ final class HistoryStore {
             if a.pinned != b.pinned { return a.pinned && !b.pinned }
             return a.capturedAtNs > b.capturedAtNs
         }
+    }
+
+    /// 用户长按"删除"路径——本机乐观立即移除,server 端 DELETE /item/<id> 在 coordinator
+     /// 异步发。失败的话(网络抖 / Mac 不可达)下一次 /since 拉自然 re-insert,用户可重试删除。
+    func removeOptimistic(id: String) {
+        items.removeAll { $0.id == id }
     }
 
     /// 测试 / debug 用——把内存集合清空。

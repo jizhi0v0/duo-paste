@@ -1,6 +1,44 @@
 import Foundation
 import GRDB
 
+/// `GET /search` 响应的 wire 形态。iOS client `JSONDecoder().decode(SearchPageWire.self, ...)`
+/// 解。`items` 用自定义 `SearchHitWire`——每条同时含 Item 完整字段 + 可选 `snippet`
+/// (FTS5 高亮片段,STX/ETX 包围匹配词)。**Codable 复用**:Item 已经 Codable,wire 字段
+/// 直接对应 JSON 顶层(handler 走 itemToJSON 把 Item dict 跟 snippet 并平铺)
+public struct SearchPageWire: Decodable, Sendable {
+    public let ok: Bool
+    public let count: Int
+    public let items: [SearchHitWire]
+
+    public init(ok: Bool, count: Int, items: [SearchHitWire]) {
+        self.ok = ok
+        self.count = count
+        self.items = items
+    }
+}
+
+/// 单条 /search hit。Item 字段平铺 + 可选 snippet。Item 直接走自身 Codable 解 Decoder,
+/// snippet 通过同一份 container 旁路取出
+public struct SearchHitWire: Decodable, Sendable {
+    public let item: Item
+    public let snippet: String?
+
+    public init(item: Item, snippet: String?) {
+        self.item = item
+        self.snippet = snippet
+    }
+
+    private enum SnippetCodingKeys: String, CodingKey {
+        case snippet
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.item = try Item(from: decoder)
+        let c = try decoder.container(keyedBy: SnippetCodingKeys.self)
+        self.snippet = try c.decodeIfPresent(String.self, forKey: .snippet)
+    }
+}
+
 public struct SearchQuery: Sendable, Equatable {
     public var text: String?
     public var fromNs: Int64?

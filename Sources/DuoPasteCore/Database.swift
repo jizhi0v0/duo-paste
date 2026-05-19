@@ -773,9 +773,42 @@ public struct Database: Sendable {
             return newIngest
         }
     }
+
+    /// 软删单行:写 `deleted_at_ns = now` + bump `ingested_at_ns` 让对端通过 PullWorker
+    /// 看到 tombstone。**不动 captured_at_ns / origin_device / 内容字段**——删是元数据
+    /// 变化,不是归属变化(任意 peer 都能删任意 origin 的行)。
+    ///
+    /// 用途:iOS 长按"删除" → DELETE /item/<id> → handler 调本函数。Mac 端 capture 路径
+    /// 没有用户主动删除入口(M4 之前 retention sweeper 才会自动 tombstone),这是给"用户
+    /// 主动删除"路径用的独立入口。
+    ///
+    /// 不变量:
+    /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增,对端 < 1s 看到 tombstone
+    /// - 不存在的 id 抛 `.notFound`
+    /// - 已 tombstoned 抛 `.alreadyDeleted`(handler 映射 410 → iOS 当幂等成功处理)
+    /// - tombstone 跟 bump 一样走 broadcaster fan-out 让对端立刻 re-pull
+    public func softDelete(id: String, now: Int64) async throws -> Int64 {
+        try await pool.write { db in
+            guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
+                throw BumpError.notFound
+            }
+            if row.deletedAtNs != nil {
+                throw BumpError.alreadyDeleted
+            }
+            let newIngest = try Self.nextIngestNs(db, now: now)
+            try db.execute(sql: """
+                UPDATE item
+                SET deleted_at_ns = ?, ingested_at_ns = ?
+                WHERE id = ?
+            """, arguments: [now, newIngest, id])
+            return newIngest
+        }
+    }
 }
 
 public enum BumpError: Error, Equatable {
     case notFound
     case deleted
+    /// softDelete 专用——目标行已是 tombstone,handler 映射 410 → iOS 当幂等成功
+    case alreadyDeleted
 }
