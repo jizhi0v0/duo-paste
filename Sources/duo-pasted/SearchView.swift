@@ -1111,8 +1111,11 @@ struct SearchView: View {
                         }
                     }
                 }
-                // 顶部 12pt 给 icon offset(y:-8) 上溢出留 buffer + 跟 filter hairline 间距
+                // 顶部 12pt 给 icon offset(y:-9) 上溢出留 buffer + 跟 filter hairline 间距;
+                // leading 12 让最左第一张卡的 source icon offset(-9,-9) 不被 ScrollView clip
+                // (跟每张卡 .padding(.trailing, 12) trailing slack 对称)
                 .padding(.top, 12)
+                .padding(.leading, 12)
             }
             // 横向 padding 22 跟 header/filterBar 对齐,panel 左右两侧 padding 统一。
             // frame height 254 = 卡片 236 + top 12 + bottom 6 余量,ScrollView 不 fill remaining
@@ -1744,6 +1747,21 @@ private struct ItemCard: View, Equatable {
     var body: some View {
         VStack(spacing: 0) {
             contentArea       // 主区 188(image aspectFill / 文本多行 / file 图标)
+                // CloudBadge 让位给左上 app icon,挪到 contentArea 内 bottomLeading
+                // ——避开下方 footer 文字 + 不跟两个 sticker 抢右上区域
+                .overlay(alignment: .bottomLeading) {
+                    CloudBadgeView(
+                        state: CloudBadgeStateCalculator.state(
+                            storageMode: storageMode,
+                            item: item,
+                            blobs: blobs,
+                            isDownloading: cloudDownloading,
+                            lastError: cloudLastError
+                        ),
+                        onTap: { triggerCloudDownload() }
+                    )
+                    .padding(6)
+                }
             footer            // 32 (meta + 右下 ⌘N 角标)
         }
         .frame(width: 240, height: 236)
@@ -1787,34 +1805,20 @@ private struct ItemCard: View, Equatable {
         .animation(.smooth(duration: 0.22), value: isSelected)
         .animation(.smooth(duration: 0.18), value: isHovered)
         .onHover { isHovered = $0 }
-        // source app icon 钉右上**边框上**——半溢出卡片让 icon "贴"在边沿,
-        // 避免内嵌方案遮挡卡内文字。cardScroller 给每张卡 .padding(.trailing, 12) 留
-        // slack,scrollTo 最右卡时含 slack 的 padded frame 全可见 → icon 不被 clip
-        .overlay(alignment: .topTrailing) {
+        // source app icon **钉在卡左上 border 上**——sticker 半溢出风格,
+        // offset(-9,-9) 让 22×22 icon 中心 (2,2),~40% 飘在卡外 ~60% 进入卡内右下。
+        // 第一张卡靠 LazyHStack .padding(.leading, 12) 留 slack 防 ScrollView clip
+        .overlay(alignment: .topLeading) {
             topRightSourceIcon
-                .offset(x: 8, y: -8)
+                .offset(x: -9, y: -9)
         }
-        // PR cloudy-mirroring-walnut PR 4：☁️ cloud badge——optimized 模式 + 本机缺 blob 显示。
-        // 钉到右下角避免跟右上的 source app icon 打架；点击主动触发 lazy fetch
-        .overlay(alignment: .topLeading) {
-            CloudBadgeView(
-                state: CloudBadgeStateCalculator.state(
-                    storageMode: storageMode,
-                    item: item,
-                    blobs: blobs,
-                    isDownloading: cloudDownloading,
-                    lastError: cloudLastError
-                ),
-                onTap: { triggerCloudDownload() }
-            )
-            .padding(6)
-            .offset(x: item.pinned ? 30 : 0, y: 0)
-        }
-        // pin 角标内嵌左上(不溢出),克制风格区别于 source icon 的"贴纸"
-        .overlay(alignment: .topLeading) {
+        // pinned 时右上角 pin sticker——跟左上 app icon 对称的半溢出
+        // (accent 圆 + 白色 pin.fill 45° 斜插,offset 对称 +9/-9)。cardScroller
+        // .padding(.trailing, 12) 已留 slack 防 ScrollView clip
+        .overlay(alignment: .topTrailing) {
             if item.pinned {
-                pinBadge
-                    .padding(6)
+                pinSticker
+                    .offset(x: 9, y: -9)
             }
         }
         .task(id: "\(ImageThumbnailCache.cacheKey(for: item) ?? "")|\(blobInventoryPulse)") {
@@ -1866,21 +1870,6 @@ private struct ItemCard: View, Equatable {
             } catch {
                 cloudLastError = "\(error)"
             }
-        }
-    }
-
-    /// pin 角标——卡片右上角小圆,标记 pinned 状态。
-    /// macOS 26+ 走 Liquid Glass(.glassEffect 圆形),老系统 ultraThinMaterial 兜底
-    @ViewBuilder
-    private var pinBadge: some View {
-        let icon = Image(systemName: "pin.fill")
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(Color.accentColor)
-            .padding(6)
-        if #available(macOS 26.0, *) {
-            icon.glassEffect(.regular, in: Circle())
-        } else {
-            icon.background(.ultraThinMaterial, in: Circle())
         }
     }
 
@@ -1941,14 +1930,19 @@ private struct ItemCard: View, Equatable {
         } else {
             // text/url/rtf/html:多行内容。**padding 必须在 frame 之前**——SwiftUI 顺序
             // 决定 padding 加在 frame 内还是外:frame 在 padding 之前会让 padding 加到 frame
-            // 外面被外层 ItemCard 200×220 strict frame 吃掉,padding 失效文字顶到卡边
-            previewText
-                .font(.system(size: 13))
+            // 外面被外层 ItemCard 200×220 strict frame 吃掉,padding 失效文字顶到卡边。
+            //
+            // 用 NSAttributedString + paragraphStyle.firstLineHeadIndent=22:
+            // 第一行从 leading 12+22=34 起避开左上 22pt app icon,第二行起回到
+            // leading 12 充分利用宽度。Text(AttributedString) 在 macOS honor
+            // AppKit paragraphStyle。pin sticker 在右上 (212,6)~(234,28) →
+            // trailing pinned 时 32 让位
+            Text(AttributedString(previewAttributedForTextCard))
                 .lineLimit(8)
-                .lineSpacing(1.5)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .padding(.horizontal, 12)
+                .padding(.leading, 12)
+                .padding(.trailing, item.pinned ? 16 : 12)
                 .padding(.vertical, 12)
                 .frame(width: 240, height: 204)
         }
@@ -2023,6 +2017,19 @@ private struct ItemCard: View, Equatable {
             }
             .frame(width: 20, height: 20)
         }
+    }
+
+    /// pinned 卡的右上角 pin sticker——跟左上 app icon 对称的 sticker 风格,
+    /// accent 圆 + 白色 pin.fill 45° 斜插,22×22 跟 source app icon 同尺寸
+    private var pinSticker: some View {
+        ZStack {
+            Circle().fill(Color.accentColor)
+            Image(systemName: "pin.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white)
+                .rotationEffect(.degrees(45))
+        }
+        .frame(width: 22, height: 22)
     }
 
     /// 卡片底部 meta 行。规则按 kind/sub-kind 分支:
@@ -2190,6 +2197,62 @@ private struct ItemCard: View, Equatable {
             result = result + Text(String(rest))
         }
         return result
+    }
+
+    /// text/url/rtf/html 卡的 NSAttributedString 版 preview——含 bold runs +
+    /// paragraph firstLineHeadIndent 让首行避开左上 22pt app icon,后续行回到
+    /// 默认 leading(配 padding.leading=12)。文件路径不走这里(file 卡 centered 布局)
+    private var previewAttributedForTextCard: NSAttributedString {
+        let ns = NSMutableAttributedString()
+        let baseFont = NSFont.systemFont(ofSize: 13)
+        let boldFont = NSFont.boldSystemFont(ofSize: 13)
+        let color = NSColor.labelColor
+
+        func appendPlain(_ s: String) {
+            ns.append(NSAttributedString(
+                string: s, attributes: [.font: baseFont, .foregroundColor: color]
+            ))
+        }
+        func appendBold(_ s: String) {
+            ns.append(NSAttributedString(
+                string: s, attributes: [.font: boldFont, .foregroundColor: color]
+            ))
+        }
+
+        if let s = snippet, !s.isEmpty {
+            var rest = s[...]
+            while let startRange = rest.range(of: "\u{02}") {
+                appendPlain(String(rest[..<startRange.lowerBound]))
+                let afterStart = rest[startRange.upperBound...]
+                if let endRange = afterStart.range(of: "\u{03}") {
+                    appendBold(String(afterStart[..<endRange.lowerBound]))
+                    rest = afterStart[endRange.upperBound...]
+                } else {
+                    appendPlain(String(afterStart))
+                    rest = ""[...]
+                    break
+                }
+            }
+            if !rest.isEmpty {
+                appendPlain(String(rest))
+            }
+        } else {
+            appendPlain(item.preview ?? "")
+        }
+
+        let para = NSMutableParagraphStyle()
+        // sticker offset(-9,-9) 让 icon 进入卡内的右下角到 (13, 13)。文本默认
+        // padding.leading=12,首行加 8pt → 首行 leading 20 避开 icon 右下角 + 4pt 气;
+        // 后续行 leading 12 充分利用宽度
+        para.firstLineHeadIndent = 8
+        para.headIndent = 0
+        para.lineSpacing = 1.5
+        ns.addAttribute(
+            .paragraphStyle,
+            value: para,
+            range: NSRange(location: 0, length: ns.length)
+        )
+        return ns
     }
 
     private func humanSize(_ size: Int64) -> String {
