@@ -113,6 +113,39 @@ public struct SearchAPI: Sendable {
         }
     }
 
+    /// 单次 fold-aware pass 同时返回 hits + total count——给"既要 list 也要 chip 总数"的
+    /// 调用方(HTTP `/search` handler / SwiftUI 顶 chip)用。
+    ///
+    /// **性能**:跟 `searchHits + count` 分两次比起来,这里 fetchHitsFolded 只跑一次
+    /// (limit=Int.max 拿全集),再 Swift 端切片到 (offset..<offset+limit) 给 hits,
+    /// 全集 .count 直接当 total。10k 行 + FTS5 命中数千时省一倍 SQL+Swift fold 工。
+    ///
+    /// 等价性:total 跟 `count(q)` 一致(同源 fetchHitsFolded);hits 跟 `searchHits(q)`
+    /// 一致(slice 顺序跟 fetchHitsFolded 内置 limit/offset 一致)。回归测试钉死
+    public func searchHitsAndCount(_ q: SearchQuery) throws -> (hits: [(Item, String?)], total: Int) {
+        try database.pool.read { db in
+            // limit=Int.max + offset=0 → fetchHitsFolded 返回全部排序后的命中
+            // (内部 needsPostFilter 时 oversample 本来就是 Int.max,所以这一改不增加开销)
+            let allQuery = SearchQuery(
+                text: q.text,
+                fromNs: q.fromNs, toNs: q.toNs,
+                kinds: q.kinds,
+                fileSubKinds: q.fileSubKinds,
+                textFullSuffixes: q.textFullSuffixes,
+                pinnedOnly: q.pinnedOnly,
+                includeDeleted: q.includeDeleted,
+                limit: Int.max,
+                offset: 0
+            )
+            let all = try Self.fetchHitsFolded(db, query: allQuery)
+            let total = all.count
+            let start = min(q.offset, all.count)
+            let end = min(q.offset + q.limit, all.count)
+            let sliced = start < end ? Array(all[start..<end]) : []
+            return (sliced, total)
+        }
+    }
+
     /// Fold-aware fetch 内部实现：oversample raw（无 kinds/pinnedOnly 过滤）→ text-fold
     /// （跨 origin 同 text_full 折一条，pinned OR 聚合）→ 后置 kinds/pinnedOnly 过滤 →
     /// 排序契约（pinned/prefix24h/captured DESC）→ LIMIT/OFFSET。

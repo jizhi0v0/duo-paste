@@ -594,8 +594,9 @@ public struct SyncServer: Sendable {
         router.get("/search") { request, _ -> Response in
             let q = parseSearchQuery(request.uri.queryParameters)
             do {
-                let hits = try searchAPI.searchHits(q)
-                let total = try searchAPI.count(q)
+                // 单次 fold-aware pass 拿 hits + total——别走 `searchHits + count` 双跑
+                // 路径(fetchHitsFolded 跑两遍,大 DB 时浪费)。等价性靠 SearchAPI 内部保证
+                let (hits, total) = try searchAPI.searchHitsAndCount(q)
                 let items = hits.map { (item, snippet) -> [String: Any] in
                     var d = itemToJSON(item)
                     if let s = snippet { d["snippet"] = s }
