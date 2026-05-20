@@ -174,10 +174,10 @@ actor PeerClient {
     // MARK: - GET /search?q=<text>
 
     /// 委托 Mac peer 跑 fold-aware 全文搜索——iOS 本地没 GRDB/FTS5,query 非空时走这条
-     /// 拿到跨设备口径一致的命中。返回 (items, snippets, totalCount)。
-     ///
-     /// snippets: id → 含 STX/ETX(0x02/0x03) 控制字符的高亮片段;query 为空时空 map。
-     /// totalCount: fold 后 limit/offset 之前的真实总数,UI 显"共 N 条"
+    /// 拿到跨设备口径一致的命中。返回 (items, snippets, totalCount)。
+    ///
+    /// snippets: id → 含 STX/ETX(0x02/0x03) 控制字符的高亮片段;query 为空时空 map。
+    /// totalCount: fold 后 limit/offset 之前的真实总数,UI 显"共 N 条"
     func searchItems(q: String, limit: Int = 200, offset: Int = 0) async throws -> (items: [Item], snippets: [String: String], totalCount: Int) {
         // query items 顺序固定——签名 path 一致性硬不变量(跟 /since 同源)
         var qi: [URLQueryItem] = []

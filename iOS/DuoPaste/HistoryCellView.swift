@@ -339,8 +339,8 @@ struct HistoryCellView: View {
     }
 
     /// 删除路径——本机立即移除 + 后台调 DELETE /item/<id> 让 Mac DB 软删
-     /// + broadcaster 推 cursor_advanced 让其他 peer 看到 tombstone。
-     /// 失败 swallow(coordinator 内 fanout 路径已记日志);下次 /since 自然 reconcile
+    /// + broadcaster 推 cursor_advanced 让其他 peer 看到 tombstone。
+    /// 失败 swallow(coordinator 内 fanout 路径已记日志);下次 /since 自然 reconcile
     private func triggerDelete() {
         UILatencyLog.mark("delete action begin", itemLogDetail())
         store.removeOptimistic(id: item.id)

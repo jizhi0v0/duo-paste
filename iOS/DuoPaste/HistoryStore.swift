@@ -42,7 +42,7 @@ final class HistoryStore {
     }
 
     /// coordinator 拉完 /search 把结果灌进来。**只在 `q` 仍匹配当前 store.query 时**
-     /// 应用——拉结果回来时用户可能已经改了 query,旧响应丢弃避免闪现错的命中
+    /// 应用——拉结果回来时用户可能已经改了 query,旧响应丢弃避免闪现错的命中
     func applyServerSearch(_ r: ServerSearchResult) {
         guard r.q == query else { return }
         lastServerSearch = r
