@@ -222,6 +222,176 @@ struct SmartTransportTests {
         #expect(await seq.calls == 1)  // .rejected 立即返回不 retry
     }
 
+    // MARK: - candidate-level probe logging
+
+    /// 线程安全 capture——@Sendable closure 内调 `append` 走 NSLock,主线程 / probe task /
+    /// 其他并发上下文都能写。
+    private final class LogCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _lines: [String] = []
+        func append(_ s: String) { lock.lock(); defer { lock.unlock() }; _lines.append(s) }
+        var lines: [String] {
+            lock.lock(); defer { lock.unlock() }
+            return _lines
+        }
+    }
+
+    @Test func probeWithRetryLogsEveryAttempt() async {
+        let cap = LogCapture()
+        let url = URL(string: "https://x.tail.ts.net:8443")!
+        let seq = SequentialProbe([
+            (.unreachable(reason: "first try fail"), -1),
+            (.ok(deviceID: "dev-x", nowMs: 1, ponteHost: "x.sgponte"), 50)
+        ])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await SmartTransport.probeWithRetry(
+            probe, url: url, retries: 1, backoffSec: 0.01,
+            peerIndex: 0, candidate: "tailscale", logger: logger
+        )
+        let lines = cap.lines
+        #expect(lines.count == 2, "每次 attempt 都该打一行,实际 \(lines.count): \(lines)")
+        // 第一次失败行应含 reason + attempt=1/2
+        #expect(lines[0].contains("probe=unreachable"))
+        #expect(lines[0].contains("reason=\"first try fail\""))
+        #expect(lines[0].contains("attempt=1/2"))
+        #expect(lines[0].contains("candidate=tailscale"))
+        #expect(lines[0].contains("peer 0"))
+        // 第二次成功行应含 device_id + ponte_host + rtt
+        #expect(lines[1].contains("probe=ok"))
+        #expect(lines[1].contains("rtt=50ms"))
+        #expect(lines[1].contains("device_id=dev-x"))
+        #expect(lines[1].contains("ponte_host=x.sgponte"))
+        #expect(lines[1].contains("attempt=2/2"))
+    }
+
+    @Test func probeWithRetryNoAttemptSuffixWhenNoRetry() async {
+        // retries=0 时 total=1,日志不该出现 attempt= 字段(只有一次,没必要)
+        let cap = LogCapture()
+        let url = URL(string: "https://x:8443")!
+        let seq = SequentialProbe([(.ok(deviceID: "d", nowMs: 1, ponteHost: nil), 30)])
+        let probe: SmartTransport.HealthProbe = { _ in await seq.next() }
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await SmartTransport.probeWithRetry(
+            probe, url: url, retries: 0, backoffSec: 0.01, logger: logger
+        )
+        let lines = cap.lines
+        #expect(lines.count == 1)
+        #expect(!lines[0].contains("attempt="), "single-attempt 不该带 attempt= 字段")
+    }
+
+    @Test func decideOneLogsAllCandidates() async {
+        // 完整决策路径:tailscale OK + 学到 ponte_host + ponte probe OK
+        // → 应该打 2 条日志(C1 tailscale + C3 ponte),不重复 probe C1
+        let cap = LogCapture()
+        let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
+        let probe = makeFakeProbe(responses: [
+            "https://mbp.tail.ts.net:8443": (.ok(deviceID: "mbp", nowMs: 1, ponteHost: "mbp.sgponte"), 90),
+            "https://mbp.sgponte:8443": (.ok(deviceID: "mbp", nowMs: 2, ponteHost: nil), 30)
+        ])
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await SmartTransport.decideOne(peerIndex: 0, peer: peer, probe: probe, logger: logger)
+        let lines = cap.lines
+        #expect(lines.count == 2, "应有 2 条:tailscale + ponte;实际:\(lines)")
+        #expect(lines.contains { $0.contains("candidate=tailscale") })
+        #expect(lines.contains { $0.contains("candidate=ponte") })
+    }
+
+    @Test func decideOneLogsPonteFailureReason() async {
+        // ponte unreachable 时日志必须含 reason 字段——这是修复诊断盲点的核心契约
+        let cap = LogCapture()
+        let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
+        let probe = makeFakeProbe(responses: [
+            "https://mbp.tail.ts.net:8443": (.ok(deviceID: "mbp", nowMs: 1, ponteHost: "mbp.sgponte"), 90),
+            "https://mbp.sgponte:8443": (.unreachable(reason: "transport: bad URL"), -1)
+        ])
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await SmartTransport.decideOne(peerIndex: 0, peer: peer, probe: probe, logger: logger)
+        let lines = cap.lines
+        // ponte 行带 retry,unreachable 会重试一次,共 2 条 ponte
+        let ponteLines = lines.filter { $0.contains("candidate=ponte") }
+        #expect(ponteLines.count == 2, "ponte 应 retry 一次,共 2 条")
+        for line in ponteLines {
+            #expect(line.contains("probe=unreachable"))
+            #expect(line.contains("reason=\"transport: bad URL\""))
+        }
+    }
+
+    @Test func formatProbeLogHandlesReasonWithSpecialChars() async {
+        // reason 含双引号 / 换行 / 回车 → 单行 log 必须把它们 escape/折,不撕裂字段
+        let url = URL(string: "https://x:8443")!
+        let line = SmartTransport.formatProbeLog(
+            peerIndex: 0, candidate: "ponte", url: url,
+            attempt: 1, total: 2,
+            outcome: .unreachable(reason: "broken \"quote\"\nand\rnewline"),
+            rttMs: -1
+        )
+        // 不该有原生换行
+        #expect(!line.contains("\n"))
+        #expect(!line.contains("\r"))
+        // 双引号被替换成单引号
+        #expect(line.contains("reason=\"broken 'quote' and newline\""))
+    }
+
+    @Test func discoverWarnsWhenAllCandidatesUnreachable() async {
+        // Step 3 兜底:所有 peer 全部 candidate unreachable 时打 WARN
+        let cap = LogCapture()
+        let smart = SmartTransport()
+        let peers = [
+            makePeer(url: "https://a.tail.ts.net:8443"),
+            makePeer(url: "https://b.tail.ts.net:8443")
+        ]
+        let probe = makeFakeProbe(responses: [:])  // 全部 unreachable
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await smart.discover(
+            peers: peers,
+            auth: HMACAuth(secret: Data(repeating: 0xFF, count: 32)),
+            tailscaleSession: .shared,
+            probe: probe,
+            logger: logger
+        )
+        let warnLines = cap.lines.filter { $0.contains("WARN") }
+        #expect(warnLines.count == 1, "应该有且仅一条 WARN,实际:\(warnLines)")
+        #expect(warnLines[0].contains("all candidates unreachable"))
+        #expect(warnLines[0].contains("2 peer(s)"))
+    }
+
+    @Test func discoverDoesNotWarnWhenAtLeastOneCandidateReachable() async {
+        // 至少一条 candidate reachable → 不打 WARN
+        let cap = LogCapture()
+        let smart = SmartTransport()
+        let peers = [makePeer(url: "https://a.tail.ts.net:8443")]
+        let probe = makeFakeProbe(responses: [
+            "https://a.tail.ts.net:8443": (.ok(deviceID: "a", nowMs: 1, ponteHost: nil), 50)
+        ])
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await smart.discover(
+            peers: peers,
+            auth: HMACAuth(secret: Data(repeating: 0xFF, count: 32)),
+            tailscaleSession: .shared,
+            probe: probe,
+            logger: logger
+        )
+        let warnLines = cap.lines.filter { $0.contains("WARN") }
+        #expect(warnLines.isEmpty, "有可达 candidate 不该打 WARN,实际:\(warnLines)")
+    }
+
+    @Test func discoverDoesNotWarnWhenNoPeersConfigured() async {
+        // 空 peers config(standalone 模式)不打 WARN——这是合法配置不是异常
+        let cap = LogCapture()
+        let smart = SmartTransport()
+        let logger: SmartTransport.ProbeLogger = { cap.append($0) }
+        _ = await smart.discover(
+            peers: [],
+            auth: HMACAuth(secret: Data(repeating: 0xFF, count: 32)),
+            tailscaleSession: .shared,
+            probe: makeFakeProbe(responses: [:]),
+            logger: logger
+        )
+        let warnLines = cap.lines.filter { $0.contains("WARN") }
+        #expect(warnLines.isEmpty, "空 peers 不该打 WARN")
+    }
+
     @Test func decideOnePonteRecoveredOnSecondTry() async {
         // 启动竞态典型场景:tailscale C1 第一次 fail 第二次 OK(顺带学到 ponte_host),
         // ponte C3 第一次 fail 第二次 OK → 最终选 ponte。这正是 B1 在真实环境想救的 case

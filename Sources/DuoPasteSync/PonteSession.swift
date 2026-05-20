@@ -54,7 +54,12 @@ public enum PonteSession {
         private let delegate: PonteDelegate
 
         public init(proxyHost: String, proxyPort: Int) {
-            let cfg = URLSessionConfiguration.default
+            // 基底 `.ephemeral` 而不是 `.default` —— ephemeral 不持久化 cache/cookie 之外,
+            // **关键是**它是"不从 SystemConfiguration 继承 proxy"的干净起点。`.default` 上
+            // "先继承再覆盖" 在 macOS 26 Foundation 内部 cache 合并顺序有歧义 —— 实测 daemon
+            // 进程探 ponte URL 经常失败,但外部 curl `-x ...` 同 proxy host:port 工作正常。
+            // 干净基底 + 显式注入是系统性根因修复的核心姿态 (不要回退到 `.default`)
+            let cfg = URLSessionConfiguration.ephemeral
             cfg.timeoutIntervalForRequest = 30
             cfg.timeoutIntervalForResource = 120
             cfg.httpMaximumConnectionsPerHost = 6
@@ -63,7 +68,8 @@ public enum PonteSession {
             cfg.httpAdditionalHeaders = ["User-Agent": "duo-paste/sync/ponte"]
             // 强制走 Surge HTTP proxy。kCFNetworkProxies* 常量解出来其实就是这些字符串
             // ("HTTPSEnable" 等)，是 URLSessionConfiguration 公开认可的 key——HTTP / HTTPS
-            // 两套都填以防 ponte 域名上偶尔会被认作 HTTP（虽然我们只发 HTTPS）
+            // 两套都填以防 ponte 域名上偶尔会被认作 HTTP（虽然我们只发 HTTPS）。
+            // SOCKSEnable=0 显式 disable —— 避免任何 SOCKS 路径残留干扰
             cfg.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPSEnable as String: 1,
                 kCFNetworkProxiesHTTPSProxy  as String: proxyHost,
@@ -71,6 +77,7 @@ public enum PonteSession {
                 kCFNetworkProxiesHTTPEnable  as String: 1,
                 kCFNetworkProxiesHTTPProxy   as String: proxyHost,
                 kCFNetworkProxiesHTTPPort    as String: proxyPort,
+                kCFNetworkProxiesSOCKSEnable as String: 0,
             ]
             let delegate = PonteDelegate()
             self.delegate = delegate
