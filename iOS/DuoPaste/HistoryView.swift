@@ -5,6 +5,9 @@ struct HistoryView: View {
     @Environment(HistoryStore.self) private var store
     @Environment(PeerSyncCoordinator.self) private var coordinator
     @State private var searchText = ""
+    /// 搜索 debounce task。每次 query 变直接 cancel 上一个,250ms 后真正发 /search 请求。
+    /// 避免用户敲字时每个字符都打 server。Sendable 不必——只在 MainActor 改
+    @State private var searchDebounceTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -21,7 +24,21 @@ struct HistoryView: View {
                 placement: .navigationBarDrawer(displayMode: .always),
                 prompt: "搜索"
             )
-            .onChange(of: searchText) { _, new in store.query = new }
+            .onChange(of: searchText) { _, new in
+                store.query = new
+                // 清掉上一轮 server 结果让 UI 暂时 fallback 本机 contains,防止旧命中残影;
+                // 250ms debounce 后真正打 server
+                store.clearServerSearch()
+                searchDebounceTask?.cancel()
+                let trimmed = new.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                searchDebounceTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    if Task.isCancelled { return }
+                    // 用户改了 query → 上一个 task 已 cancel,这里 trimmed 是最新的
+                    coordinator.searchOnServer(q: trimmed)
+                }
+            }
             .toolbar { statusToolbar }
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarBackground(.visible, for: .tabBar)

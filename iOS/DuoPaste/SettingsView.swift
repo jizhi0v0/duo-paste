@@ -37,6 +37,11 @@ struct SettingsView: View {
                     .ignoresSafeArea()
 
                 Form {
+                    // 配对数据启动校验失败 → 红色横幅在最顶,文案说清楚为什么 + 提示"取消配对"。
+                    // try? 静默吞错让用户无从感知坏数据,这是 P0-3 修的体验
+                    if let issue = coordinator.pairingDataIssue, !issue.isEmpty {
+                        pairingIssueSection(reason: issue)
+                    }
                     if isPaired {
                         statusSection
                         pairedMacSection
@@ -101,6 +106,34 @@ struct SettingsView: View {
 
     private var qrSheetBinding: Binding<Bool> {
         Binding(get: { qrPayload != nil }, set: { if !$0 { qrPayload = nil } })
+    }
+
+    // MARK: - 配对数据校验失败横幅
+
+    @ViewBuilder
+    private func pairingIssueSection(reason: String) -> some View {
+        Section {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("配对数据无法使用")
+                        .font(.subheadline).bold()
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Button(role: .destructive) {
+                unpair()
+                coordinator.setPairingDataIssue(nil)
+            } label: {
+                Label("取消配对并重新开始", systemImage: "xmark.circle")
+            }
+        } header: {
+            Text("启动检测")
+        }
     }
 
     // MARK: - 已配对场景

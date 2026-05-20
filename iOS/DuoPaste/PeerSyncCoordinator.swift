@@ -27,6 +27,11 @@ final class PeerSyncCoordinator {
 
     private(set) var status: Status = .unconfigured
     private(set) var lastError: String?
+    /// AppStorage 配对数据启动校验的中文 reason——非 nil 时 SettingsView 红色横幅显示,
+    /// 让用户知道为什么没自动连上(否则 try? 静默吞掉,体验"app 启动后什么都不响应")。
+    /// `DuoPasteApp.task` 在 reconfigure 决策前先 setPairingDataIssue 写,
+    /// "取消配对" / "重新连接" 后清掉。空字符串视同 nil
+    private(set) var pairingDataIssue: String?
 
     let blobCache: BlobCache
     let appIconCache: AppIconCache
@@ -111,8 +116,13 @@ final class PeerSyncCoordinator {
     nonisolated let periodicRepickIntervalSec: TimeInterval = 300
 
     /// NetworkChangeWatcher listener token——用于在 stop / dealloc 时 removeListener,
-    /// 避免 SwiftUI @State 重建 PeerSyncCoordinator 实例时旧 listener 永久留在 watcher
-    private var networkListenerToken: UUID?
+    /// 避免 SwiftUI @State 重建 PeerSyncCoordinator 实例时旧 listener 永久留在 watcher。
+    /// **@ObservationIgnored + nonisolated(unsafe)**:`deinit` 默认 nonisolated 要读这个字段,
+    /// `@Observable` 宏跟纯 `nonisolated` 不兼容(无法对可变 stored property 应用);
+    /// `(unsafe)` 表明开发者保证:init / deinit 是仅有的两个访问点,refcount=0 时
+    /// 没有并发写入,UUID 是 Sendable
+    @ObservationIgnored
+    nonisolated(unsafe) private var networkListenerToken: UUID?
 
     init(store: HistoryStore) {
         self.store = store
@@ -536,6 +546,79 @@ final class PeerSyncCoordinator {
         }
     }
 
+    /// 委托 Mac peer 跑 fold-aware 全文搜索。把结果灌进 store.applyServerSearch 让 UI
+    /// 切到 FTS5 结果(跟 Mac UI 口径一致),跨设备 chip 总数对齐。
+    ///
+    /// 错误处理:失败 swallow + log——HistoryStore.filtered 自然 fallback 到本机 contains。
+    /// 单 endpoint 调用即可(不需要 fanout,搜索结果由任一 connected Mac 提供,内容一致)。
+    /// 选 currentEndpointURL 优先;不可用时取 pool 第一个 connected URL
+    func searchOnServer(q: String) {
+        guard let secret = currentSecret else { return }
+        let urls: [String] = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
+        let chosen = currentEndpointURL ?? urls.first
+        guard let urlString = chosen, let url = URL(string: urlString) else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+            do {
+                let (items, snippets, total) = try await client.searchItems(q: q, limit: 200)
+                let result = HistoryStore.ServerSearchResult(
+                    q: q, items: items, snippets: snippets, totalCount: total
+                )
+                await MainActor.run { self.store.applyServerSearch(result) }
+                DebugLog.shared.append("search ok q=\(q) hits=\(items.count) total=\(total)")
+            } catch {
+                DebugLog.shared.append("search failed q=\(q): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 跨设备删除:iOS 长按"删除" → store.removeOptimistic 已让 UI 立即消失,
+    /// 这里再 DELETE /item/<id> 让 Mac DB 落 tombstone + 推 cursor_advanced
+    /// 让其他 peer 通过 /since 看到 tombstone。
+    ///
+    /// **swallow 错误**——失败的话下一次 /since 拉自然把这条 re-insert 回来,
+    /// 用户可重试删除。常见失败:网络抖 / 410 已 tombstoned(幂等成功) / 404(罕见)。
+    /// 跟 bumpItemOnServer 同源 fanout 路径——多 endpoint 并发,best-effort
+    func deleteItemOnServer(id: String) {
+        guard let secret = currentSecret else { return }
+        var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
+        if let currentEndpointURL {
+            urls.append(currentEndpointURL)
+        }
+        urls = Array(Set(urls)).sorted { a, b in
+            if a == currentEndpointURL { return true }
+            if b == currentEndpointURL { return false }
+            return a < b
+        }
+        guard !urls.isEmpty else { return }
+        DebugLog.shared.append("delete fanout \(String(id.prefix(8))): \(urls.count) route(s)")
+        Task {
+            await withTaskGroup(of: Void.self) { group in
+                for urlString in urls {
+                    group.addTask {
+                        guard let url = URL(string: urlString) else { return }
+                        let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+                        do {
+                            try await client.deleteItem(id: id)
+                            DebugLog.shared.append("delete ok \(String(id.prefix(8))) via \(urlString)")
+                        } catch let error as PeerClientError {
+                            switch error {
+                            case .itemNotFound, .itemTombstoned:
+                                // 幂等成功:server 已是目标状态,不算失败
+                                DebugLog.shared.append("delete idempotent \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                            default:
+                                DebugLog.shared.append("delete failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                            }
+                        } catch {
+                            DebugLog.shared.append("delete failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 仅取消运行时 task / 连接,**不动 config**(currentSecret / availableEndpoints /
     /// currentEndpointURL)。`reconfigure(cfg)` 内部用,switch URL 时让 config 保留
     private func cancelRuntimeTasks() {
@@ -576,6 +659,13 @@ final class PeerSyncCoordinator {
         lastProbes = []
         lastRTT = [:]
         status = .unconfigured
+        pairingDataIssue = nil
+    }
+
+    /// 启动时 `DuoPasteApp.task` 把 PairingDataValidator 的 reason 写进来——SettingsView
+    /// 红色横幅显示。空串 / nil → 没问题(校验通过 / 全新装)
+    func setPairingDataIssue(_ reason: String?) {
+        pairingDataIssue = (reason?.isEmpty == true) ? nil : reason
     }
 
     private func kickPull() {

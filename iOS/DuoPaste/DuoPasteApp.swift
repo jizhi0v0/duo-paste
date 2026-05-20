@@ -58,17 +58,26 @@ struct DuoPasteApp: App {
                 .environment(coordinator.appIconCache)
                 .environment(shareCoord)
                 .task {
-                    // 启动恢复:优先走 endpoints+secret(PIN 配对后)→ probe + Mac hint 选最佳路线;
-                    // 没 endpoints 但有手填 URL+secret(advanced 路径)→ 直接 reconfigure
-                    if let data = peerEndpointsJSON.data(using: .utf8),
-                       let endpoints = try? JSONDecoder().decode([PeerEndpoint].self, from: data),
-                       !endpoints.isEmpty,
-                       let secret = Data(hexString: sharedSecretHex) {
+                    // 启动恢复:PairingDataValidator 把"全空 / valid PIN 配对 / valid advanced /
+                    // invalid + reason" 四态分清。invalid 时 setPairingDataIssue 写 reason 让
+                    // SettingsView 红色横幅展示——不再 try? 静默吞导致 "app 启动后什么都不响应"
+                    let status = PairingDataValidator.validate(
+                        endpointsJSON: peerEndpointsJSON,
+                        secretHex: sharedSecretHex,
+                        peerURL: peerURL
+                    )
+                    switch status {
+                    case .empty:
+                        coordinator.setPairingDataIssue(nil)
+                    case .validPaired(let secret, let endpoints):
+                        coordinator.setPairingDataIssue(nil)
                         coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
-                    } else if let cfg = try? PeerConfig.parse(
-                        urlString: peerURL, secretHex: sharedSecretHex
-                    ) {
+                    case .validAdvanced(let cfg):
+                        coordinator.setPairingDataIssue(nil)
                         coordinator.reconfigure(cfg)
+                    case .invalid(let reason):
+                        coordinator.setPairingDataIssue(reason)
+                        DebugLog.shared.append("pairing data invalid at launch: \(reason)")
                     }
                 }
                 .onChange(of: scenePhase) { _, phase in

@@ -171,6 +171,68 @@ actor PeerClient {
         }
     }
 
+    // MARK: - GET /search?q=<text>
+
+    /// 委托 Mac peer 跑 fold-aware 全文搜索——iOS 本地没 GRDB/FTS5,query 非空时走这条
+     /// 拿到跨设备口径一致的命中。返回 (items, snippets, totalCount)。
+     ///
+     /// snippets: id → 含 STX/ETX(0x02/0x03) 控制字符的高亮片段;query 为空时空 map。
+     /// totalCount: fold 后 limit/offset 之前的真实总数,UI 显"共 N 条"
+    func searchItems(q: String, limit: Int = 200, offset: Int = 0) async throws -> (items: [Item], snippets: [String: String], totalCount: Int) {
+        // query items 顺序固定——签名 path 一致性硬不变量(跟 /since 同源)
+        var qi: [URLQueryItem] = []
+        if !q.isEmpty { qi.append(URLQueryItem(name: "q", value: q)) }
+        qi.append(URLQueryItem(name: "limit", value: String(limit)))
+        if offset > 0 { qi.append(URLQueryItem(name: "offset", value: String(offset))) }
+        var sigComp = URLComponents()
+        sigComp.path = "/search"
+        sigComp.queryItems = qi
+        let signedPath = HMACAuth.canonicalPath("/search", query: sigComp.percentEncodedQuery)
+
+        var urlComp = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false) ?? URLComponents()
+        urlComp.path = (urlComp.path) + "/search"
+        urlComp.queryItems = qi
+        guard let url = urlComp.url else { throw URLError(.badURL) }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, method: "GET", signedPath: signedPath, bodyHash: HMACAuth.emptyBodyHashHex)
+        let (data, resp) = try await data(for: req)
+        try Self.requireOK(resp)
+        let page = try decoder.decode(SearchPageWire.self, from: data)
+        var snippets: [String: String] = [:]
+        for hit in page.items {
+            if let s = hit.snippet { snippets[hit.item.id] = s }
+        }
+        return (page.items.map(\.item), snippets, page.count)
+    }
+
+    // MARK: - DELETE /item/<id>
+
+    /// 软删条目:iOS 长按"删除" → Mac DB 写 deleted_at_ns + bump ingested_at_ns →
+    /// broadcaster 推 cursor_advanced → 其他 peer 通过 /since 看到 tombstone。
+    /// body 空,id 在 path 里被 HMAC 签名覆盖。
+    ///
+    /// 错误处理:404 → `.itemNotFound`(罕见,Mac 已 retention 扫了 / 本机视图 stale);
+    /// 410 → `.itemTombstoned`(Mac 已删,**幂等成功**——调用方应当 swallow,不暴露给 UI)。
+    /// 其他 throw 让上层决定(乐观删除路径默认 swallow + 等 /since 自然 reconcile)
+    func deleteItem(id: String) async throws {
+        let path = "/item/\(id)"
+        let url = config.baseURL.appendingPathComponent(path)
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.httpBody = Data()
+        sign(&req, method: "DELETE", signedPath: path, bodyHash: HMACAuth.emptyBodyHashHex)
+        let (_, resp) = try await data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw PeerClientError.nonHTTP }
+        switch http.statusCode {
+        case 200...299: return
+        case 404: throw PeerClientError.itemNotFound
+        case 410: throw PeerClientError.itemTombstoned
+        default: throw PeerClientError.httpStatus(http.statusCode)
+        }
+    }
+
     // MARK: - 内部
 
     private func sign(

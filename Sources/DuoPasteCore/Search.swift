@@ -1,6 +1,44 @@
 import Foundation
 import GRDB
 
+/// `GET /search` 响应的 wire 形态。iOS client `JSONDecoder().decode(SearchPageWire.self, ...)`
+/// 解。`items` 用自定义 `SearchHitWire`——每条同时含 Item 完整字段 + 可选 `snippet`
+/// (FTS5 高亮片段,STX/ETX 包围匹配词)。**Codable 复用**:Item 已经 Codable,wire 字段
+/// 直接对应 JSON 顶层(handler 走 itemToJSON 把 Item dict 跟 snippet 并平铺)
+public struct SearchPageWire: Decodable, Sendable {
+    public let ok: Bool
+    public let count: Int
+    public let items: [SearchHitWire]
+
+    public init(ok: Bool, count: Int, items: [SearchHitWire]) {
+        self.ok = ok
+        self.count = count
+        self.items = items
+    }
+}
+
+/// 单条 /search hit。Item 字段平铺 + 可选 snippet。Item 直接走自身 Codable 解 Decoder,
+/// snippet 通过同一份 container 旁路取出
+public struct SearchHitWire: Decodable, Sendable {
+    public let item: Item
+    public let snippet: String?
+
+    public init(item: Item, snippet: String?) {
+        self.item = item
+        self.snippet = snippet
+    }
+
+    private enum SnippetCodingKeys: String, CodingKey {
+        case snippet
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.item = try Item(from: decoder)
+        let c = try decoder.container(keyedBy: SnippetCodingKeys.self)
+        self.snippet = try c.decodeIfPresent(String.self, forKey: .snippet)
+    }
+}
+
 public struct SearchQuery: Sendable, Equatable {
     public var text: String?
     public var fromNs: Int64?
@@ -72,6 +110,39 @@ public struct SearchAPI: Sendable {
     public func searchHits(_ q: SearchQuery) throws -> [(Item, String?)] {
         try database.pool.read { db in
             try Self.fetchHitsFolded(db, query: q)
+        }
+    }
+
+    /// 单次 fold-aware pass 同时返回 hits + total count——给"既要 list 也要 chip 总数"的
+    /// 调用方(HTTP `/search` handler / SwiftUI 顶 chip)用。
+    ///
+    /// **性能**:跟 `searchHits + count` 分两次比起来,这里 fetchHitsFolded 只跑一次
+    /// (limit=Int.max 拿全集),再 Swift 端切片到 (offset..<offset+limit) 给 hits,
+    /// 全集 .count 直接当 total。10k 行 + FTS5 命中数千时省一倍 SQL+Swift fold 工。
+    ///
+    /// 等价性:total 跟 `count(q)` 一致(同源 fetchHitsFolded);hits 跟 `searchHits(q)`
+    /// 一致(slice 顺序跟 fetchHitsFolded 内置 limit/offset 一致)。回归测试钉死
+    public func searchHitsAndCount(_ q: SearchQuery) throws -> (hits: [(Item, String?)], total: Int) {
+        try database.pool.read { db in
+            // limit=Int.max + offset=0 → fetchHitsFolded 返回全部排序后的命中
+            // (内部 needsPostFilter 时 oversample 本来就是 Int.max,所以这一改不增加开销)
+            let allQuery = SearchQuery(
+                text: q.text,
+                fromNs: q.fromNs, toNs: q.toNs,
+                kinds: q.kinds,
+                fileSubKinds: q.fileSubKinds,
+                textFullSuffixes: q.textFullSuffixes,
+                pinnedOnly: q.pinnedOnly,
+                includeDeleted: q.includeDeleted,
+                limit: Int.max,
+                offset: 0
+            )
+            let all = try Self.fetchHitsFolded(db, query: allQuery)
+            let total = all.count
+            let start = min(q.offset, all.count)
+            let end = min(q.offset + q.limit, all.count)
+            let sliced = start < end ? Array(all[start..<end]) : []
+            return (sliced, total)
         }
     }
 

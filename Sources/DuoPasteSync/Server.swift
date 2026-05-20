@@ -130,6 +130,7 @@ public struct SyncServer: Sendable {
             database: database,
             blobs: blobs,
             sinceAPI: SinceAPI(database: database),
+            searchAPI: SearchAPI(database: database),
             ponteHost: pontePeerHost,
             appIconStore: appIconStore,
             broadcaster: broadcaster,
@@ -288,6 +289,11 @@ public struct SyncServer: Sendable {
         database: DuoPasteCore.Database,
         blobs: BlobStore,
         sinceAPI: SinceAPI,
+        /// PR P0-2 重新加上的 fold-aware 搜索路径,给 iOS client 用——本机 SearchAPI 走
+        /// fold-aware 算,跨 origin 同 text 折一条,口径跟本机搜索一致。
+        /// PR 6 删的是"primary 拓扑 client 走远端搜索"的语义,mesh 下这条路重新有意义:
+        /// iOS 没有自己的 GRDB/FTS5,委托给已连的 Mac peer 跑全文搜索
+        searchAPI: SearchAPI,
         ponteHost: String? = nil,
         appIconStore: AppIconStore? = nil,
         broadcaster: WSBroadcaster? = nil,
@@ -414,6 +420,53 @@ public struct SyncServer: Sendable {
             }
         }
 
+        // DELETE /item/{id}:软删单行(设 deleted_at_ns + bump ingested_at_ns 让 /since
+        // 推 tombstone 给 peer)。iOS 长按"删除"路径专用——Mac 端 capture 路径不走这里,
+        // retention sweeper 跟用户主动删除分开。
+        //
+        // 不接受 body(空 body hash),id 在 path 里被 HMAC 签名所覆盖。已 tombstoned 行
+        // 返 410(iOS 当幂等成功处理),未知 id 返 404。
+        router.delete("/item/:id") { request, context -> Response in
+            guard let id = context.parameters.get("id"), !id.isEmpty else {
+                return errorJSON(.badRequest, "missing id")
+            }
+            // 二次校验 body 跟 header 一致——middleware 不读 body,handler 自己再 sha 比对
+            // (镜像 /bump 路径,纵深防御。DELETE 通常无 body 但仍要 drain + 校验)
+            let bodyBuf = try await request.body.collect(upTo: 16 * 1024)
+            let bodyHash = HMACAuth.sha256Hex(Data(buffer: bodyBuf))
+            guard let bodyHashHeaderName = HTTPField.Name(HMACAuth.bodyHashHeader) else {
+                return errorJSON(.internalServerError, "invalid body-hash header name constant")
+            }
+            let headerHash = request.headers[bodyHashHeaderName]?.lowercased() ?? ""
+            guard headerHash == bodyHash else {
+                return errorJSON(.unauthorized, "body sha mismatch")
+            }
+            let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+            do {
+                let newIngest = try await database.softDelete(id: id, now: now)
+                onBumpApplied(id, newIngest)
+                if let broadcaster {
+                    Task {
+                        await broadcaster.broadcastCursorAdvanced(
+                            deviceID: deviceID,
+                            latestIngestedAtNs: newIngest
+                        )
+                    }
+                }
+                let payload: [String: Any] = ["ok": true, "ingested_at_ns": newIngest]
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                resp.headers[.contentType] = "application/json"
+                return resp
+            } catch BumpError.notFound {
+                return errorJSON(.notFound, "item not found")
+            } catch BumpError.alreadyDeleted {
+                return errorJSON(.gone, "item already tombstoned")
+            } catch {
+                return errorJSON(.internalServerError, "delete failed: \(error)")
+            }
+        }
+
         // POST /pair/{pin}:iOS PIN 配对入口。**无 HMAC**(AuthMiddleware 白名单跳过)。
         // 校验 PIN → 原子返回 shared-secret hex + 当前 endpoints page。
         //
@@ -530,6 +583,56 @@ public struct SyncServer: Sendable {
             }
         }
 
+        // GET /search?q=<text>&limit=<n>&offset=<n>
+        // iOS client 用——本机没有 GRDB/FTS5,委托给配对的 Mac peer 跑 fold-aware 搜索。
+        // 走 SearchAPI.searchHits + count,跟 Mac UI 用同一份逻辑,跨设备 chip 总数对齐
+        //
+        // 响应:{ ok, count, items:[{...item fields..., snippet?}] }
+        // - count:fold 后 limit/offset 之前的真实总数(UI 显"共 N 条")
+        // - items.snippet:含 STX/ETX(0x02/0x03) 控制字符的高亮片段,iOS 端切片渲染加粗。
+        //   query 为空(纯列表)时 snippet 不附,客户端按缺省处理
+        router.get("/search") { request, _ -> Response in
+            let q = parseSearchQuery(request.uri.queryParameters)
+            do {
+                // 单次 fold-aware pass 拿 hits + total——别走 `searchHits + count` 双跑
+                // 路径(fetchHitsFolded 跑两遍,大 DB 时浪费)。等价性靠 SearchAPI 内部保证
+                let (hits, total) = try searchAPI.searchHitsAndCount(q)
+                let items = hits.map { (item, snippet) -> [String: Any] in
+                    var d = itemToJSON(item)
+                    if let s = snippet { d["snippet"] = s }
+                    return d
+                }
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "count": total,
+                    "items": items,
+                ]
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                resp.headers[.contentType] = "application/json"
+                return resp
+            } catch {
+                return errorJSON(.internalServerError, "search failed: \(error)")
+            }
+        }
+
+    }
+
+    /// 把 URL query 参数转成 SearchQuery。`q` 为空 → 纯列表(按时间倒序+pinned-first);
+    /// 非空 → FTS5 全文搜索 + fold。limit clamp [1, 500] 防巨页拖垮 iOS 端解码。
+    /// **不支持** kinds / pinnedOnly / 时间范围参数(iOS 一期就只要全文搜索 + 列表);
+    /// 后续要 chip 时再加 query 参数,不破坏现有路径
+    static func parseSearchQuery(_ params: FlatDictionary<Substring, Substring>) -> SearchQuery {
+        let q = params["q"].map(String.init) ?? ""
+        let rawLimit = params["limit"].flatMap { Int($0) } ?? 200
+        let limit = max(1, min(rawLimit, 500))
+        let rawOffset = params["offset"].flatMap { Int($0) } ?? 0
+        let offset = max(0, rawOffset)
+        return SearchQuery(
+            text: q.isEmpty ? nil : q,
+            limit: limit,
+            offset: offset
+        )
     }
 
     /// 把 URL query 参数转成 SinceQuery。空 cursor_ns / 非法值 → 视作从头拉。

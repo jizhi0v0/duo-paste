@@ -184,6 +184,13 @@ struct HistoryCellView: View {
                 Label("取消下载", systemImage: "xmark.circle")
             }
         }
+        // 删除走"乐观立即消失 + 后台 DELETE"——失败时下一次 /since 拉自然 re-insert,
+        // 用户可重试。剪贴板条目不珍贵,不做二次确认,体验跟"复制"对称
+        Button(role: .destructive) {
+            triggerDelete()
+        } label: {
+            Label("删除", systemImage: "trash")
+        }
     }
 
     /// 长按预览。固定 300x300,内嵌 ScrollView 让长文本可滚不撑高度。
@@ -329,6 +336,15 @@ struct HistoryCellView: View {
             UILatencyLog.mark("copy text pasteboard set end", itemLogDetail())
             flashCopied()
         }
+    }
+
+    /// 删除路径——本机立即移除 + 后台调 DELETE /item/<id> 让 Mac DB 软删
+     /// + broadcaster 推 cursor_advanced 让其他 peer 看到 tombstone。
+     /// 失败 swallow(coordinator 内 fanout 路径已记日志);下次 /since 自然 reconcile
+    private func triggerDelete() {
+        UILatencyLog.mark("delete action begin", itemLogDetail())
+        store.removeOptimistic(id: item.id)
+        coordinator.deleteItemOnServer(id: item.id)
     }
 
     private func triggerShare() {
