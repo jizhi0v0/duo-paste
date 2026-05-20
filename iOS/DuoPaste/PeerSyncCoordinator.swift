@@ -42,6 +42,11 @@ final class PeerSyncCoordinator {
     nonisolated let heartbeatStaleTimeoutSec: TimeInterval = 90
     /// status 周期 tick 间隔。5s 足够覆盖 backoff 退避变化 + zombie 检测响应延迟
     nonisolated let statusTickIntervalSec: TimeInterval = 5
+    /// pool 全断超过这个时长 → statusTickTask 主动 repick。daemon kickstart 场景下
+    /// 远端服务死回来,本地 NWPath 不变 NetworkChangeWatcher 不 fire,WS 池各自 backoff
+    /// 但 currentEndpointURL 卡住——这条 watchdog 兜底自愈。30s 长到不会被合法快速
+    /// 重连(< 10s)误触,短到用户感知前(< 1min)就能恢复
+    nonisolated let wsStuckThresholdSec: TimeInterval = 30
 
     private let store: HistoryStore
     private var client: PeerClient?
@@ -58,6 +63,10 @@ final class PeerSyncCoordinator {
     private var pendingAdvance: Bool = false
     /// `applyConnectedStatus` 在 pull 成功时 stamp,heartbeat-stale 检测保护它不被覆盖
     private var lastConnectedStampAt: Date?
+    /// 上一次看到 pool 任意 WS .connected 的时间戳。tickStatus 用它判定"全断 > 30s"
+    /// 触发 auto-repick——daemon kickstart 后远端服务死回来本地 NWPath 不变,
+    /// NetworkChangeWatcher 不 fire,需要这条单独的 watchdog 自愈
+    private var lastPoolConnectedAt: Date?
     /// 配对完成后 Mac 暴露的 endpoint 候选 list。NetworkChangeWatcher / WS endpoints_changed
     /// 触发 repickEndpoint() 时从这 re-probe 并按 route hint 选路。nil = 未配对(走 reconfigure 单 URL 路径)
     private var availableEndpoints: [PeerEndpoint] = []
@@ -215,6 +224,8 @@ final class PeerSyncCoordinator {
         )
         self.wsPool = pool
         pool.reconcile(endpoints: endpoints)
+        // 配对/重配时先 stamp,避免 pool 还没来得及 .connected 就被 watchdog 30s 后误判 stuck
+        lastPoolConnectedAt = Date()
         startStatusTick()
         if kickInitialPull {
             kickPull()
@@ -652,6 +663,7 @@ final class PeerSyncCoordinator {
         client = nil
         pendingAdvance = false
         lastConnectedStampAt = nil
+        lastPoolConnectedAt = nil
     }
 
     /// 断开连接但**保留配对信息**——"已配对未连接"状态,可走 reconnect 直接复用。
@@ -772,6 +784,20 @@ final class PeerSyncCoordinator {
 
     private func tickStatus() {
         guard let pool = wsPool else { return }
+        // watchdog:pool 任意 WS .connected → stamp;全断 → 不动 stamp。
+        // 第一次见 pool 没人连 + 距上次 .connected > 30s + 配对仍在 + 有候选 →
+        // 触发 repick,只 fire 一次(stamp 置 nil,等下次真 connected 再开始计时)
+        let nowDate = Date()
+        if case .connected = pool.state {
+            lastPoolConnectedAt = nowDate
+        } else if let last = lastPoolConnectedAt,
+                  nowDate.timeIntervalSince(last) > wsStuckThresholdSec,
+                  currentSecret != nil,
+                  !availableEndpoints.isEmpty {
+            DebugLog.shared.append("ws watchdog: pool stuck \(Int(nowDate.timeIntervalSince(last)))s → repick")
+            lastPoolConnectedAt = nil
+            repickEndpoint(reason: "ws watchdog")
+        }
         // pool.state 聚合多 WS:任一 .connected → pool.connected,否则取最活跃子 state.
         // 单 WS 死 + 其他活 = pool.connected,UI 仍显示已连接(这正是 pool 价值)
         switch pool.state {
