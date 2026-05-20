@@ -101,7 +101,7 @@ struct BumpHTTPTests {
         let callback = BumpCallbackBox()
         let server = SyncServer(deviceID: "mac-self", database: db, blobs: blobs,
                                 host: "127.0.0.1", port: port, auth: auth, broadcaster: broadcaster,
-                                onBumpApplied: { id, ingestedAtNs in
+                                onItemMutated: { id, ingestedAtNs in
                                     callback.append(id: id, ingestedAtNs: ingestedAtNs)
                                 })
         let serverTask = Task { try? await server.run() }
