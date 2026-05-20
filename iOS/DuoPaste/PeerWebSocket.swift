@@ -251,9 +251,16 @@ final class PeerWebSocket {
                                     cont.resume(throwing: WSError.connectionFailed(String(describing: err)))
                                 }
                             case .cancelled:
+                                // NWConnection.cancel() 有两个来源:reconnectPreservingBackoff
+                                // 主动打断重连(runTask 没被 cancel),以及 onCancel 闭包响应
+                                // 外层 task cancel。前者必须让 runLoop 走 backoff 重连,不能
+                                // 让它误以为整个 task 退出;后者会通过 Task.isCancelled 在
+                                // runLoop while 头部 / Task.sleep 抛 CancellationError 自然退。
+                                // 所以这里**永远**抛 WSError 而非 CancellationError——
+                                // CancellationError 留给真正的 task 取消语义
                                 if box.resume() {
                                     connection.stateUpdateHandler = nil
-                                    cont.resume(throwing: CancellationError())
+                                    cont.resume(throwing: WSError.connectionFailed("cancelled"))
                                 }
                             case .waiting(let err):
                                 if box.resume() {
