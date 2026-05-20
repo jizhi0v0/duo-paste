@@ -120,3 +120,29 @@ public struct Item: Codable, Sendable, Identifiable, Hashable, FetchableRecord, 
         case extractedTextSource = "extracted_text_source"
     }
 }
+
+extension Item {
+    /// 卡片/历史列表 cell 用的文本源——**textFull 优先**,preview 只作为 nil 兜底。
+    ///
+    /// preview 字段是 `CaptureService.makePreview` 截到 280 字符 + `…` 的网络传输短预览
+    /// (给 server-client 列表渲染省 payload 用)。daemon 跟 macOS SearchView 同进程读
+    /// SQLite,直接拿完整的 textFull;iOS 通过 /since 也会拿到完整 textFull,只有 textFull
+    /// 全部为 nil 时才退回到截过的 preview。
+    ///
+    /// 错误用 preview 会导致卡片末尾出现 server 加的 `…` 截断符,且文本仅 280 字符
+    /// 长度时填不满卡片的 `lineLimit` 留大块空白(2026-05-20 已踩过)。
+    ///
+    /// - Parameter maxChars: 输出上限。SwiftUI Text + lineLimit 自身会按行 truncate,
+    ///   这里只做"O(n) attribute apply 防御性截断",传入应远大于卡片可视行数 × 每行字符。
+    ///   macOS 卡片 240×204 frame ≈ 11 行 × 15 字符 = 165 字符,默认 512 给 3 倍缓冲。
+    /// - Returns: 适合喂给 Text/NSAttributedString 的字符串;item 没任何文本时返回空串。
+    public func cardPreviewSource(maxChars: Int = 512) -> String {
+        if let t = textFull, !t.isEmpty {
+            return t.count <= maxChars ? t : String(t.prefix(maxChars))
+        }
+        if let p = preview, !p.isEmpty {
+            return p
+        }
+        return ""
+    }
+}

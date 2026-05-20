@@ -1937,8 +1937,13 @@ private struct ItemCard: View, Equatable {
             // leading 12 充分利用宽度。Text(AttributedString) 在 macOS honor
             // AppKit paragraphStyle。pin sticker 在右上 (212,6)~(234,28) →
             // trailing pinned 时 32 让位
+            // lineLimit(20) 给上限让 SwiftUI 自带 truncation `…` 在最后行显示;
+            // 实际填多少行靠 frame(height: 204) 物理约束(13pt font + lineSpacing 1.5
+            // ≈ 11 行容量)。原来 lineLimit(8) 是 preview 字段 280 字符容量时代的遗留,
+            // 现在改读 textFull 后 8 行偏小造成下半留白;**不能完全去掉 lineLimit**——
+            // 去掉后 SwiftUI 不知道行数闸门反而不加 ellipsis,只是物理硬切
             Text(AttributedString(previewAttributedForTextCard))
-                .lineLimit(8)
+                .lineLimit(20)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .padding(.leading, 12)
@@ -2127,7 +2132,7 @@ private struct ItemCard: View, Equatable {
         Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000)
     }
 
-    /// 优先用 snippet（FTS 命中片段，匹配词加粗），否则回退到 preview。
+    /// 优先用 snippet（FTS 命中片段，匹配词加粗），否则回退到 textFull。
     /// snippet 用 STX/ETX 做标记：拆成 plain / bold 交替的 Text 链。
     /// 注意返回类型 `Text`（不能用 @ViewBuilder 的 _ConditionalContent，要支持
     /// `.lineLimit(2)` 这类只对 Text 生效的修饰）
@@ -2149,7 +2154,9 @@ private struct ItemCard: View, Equatable {
         if let s = snippet, !s.isEmpty {
             return highlightedText(from: s)
         }
-        return Text(item.preview ?? "")
+        // 走 Item.cardPreviewSource(textFull 优先);见该函数 doc 说明 preview 为何
+        // 不能直接用作卡片源
+        return Text(item.cardPreviewSource())
     }
 
     /// 完整文件名显示，若搜索词恰好命中文件名则加粗，否则返回纯文本。
@@ -2237,7 +2244,9 @@ private struct ItemCard: View, Equatable {
                 appendPlain(String(rest))
             }
         } else {
-            appendPlain(item.preview ?? "")
+            // 走 Item.cardPreviewSource(textFull 优先);见该函数 doc 说明 preview 为何
+            // 不能直接用作卡片源。lineLimit(20) + frame(height: 204) 物理约束自然 truncate
+            appendPlain(item.cardPreviewSource())
         }
 
         let para = NSMutableParagraphStyle()
