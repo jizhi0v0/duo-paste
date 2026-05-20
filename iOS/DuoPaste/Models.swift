@@ -9,13 +9,13 @@ extension Item {
         Date(timeIntervalSince1970: TimeInterval(capturedAtNs) / 1_000_000_000)
     }
 
-    /// UI 单行预览。preview 优先(server 端已 truncate),退到 textFull 前 200 字,
-    /// 再退到占位符。
+    /// UI 卡片用预览。走 `Item.cardPreviewSource` (textFull 优先,见该函数 doc 说明
+    /// preview 为何不能直接用作卡片源)。HistoryCellView lineLimit(5) ≈ 95 中文字符,
+    /// maxChars=300 给 3 倍缓冲让 SwiftUI 行数控制截断而非 server 字符控制。
+    /// image/file kind textFull 为空时退占位符。
     var displayPreview: String {
-        if let p = preview, !p.isEmpty { return p }
-        if let t = textFull, !t.isEmpty {
-            return String(t.prefix(200))
-        }
+        let src = cardPreviewSource(maxChars: 300)
+        if !src.isEmpty { return src }
         switch kind {
         case .image: return "[image]"
         case .file:  return "[file]"

@@ -179,6 +179,29 @@ Swift 端 `fetchHitsFolded.prefixScore` 跟 SQL 端口径**必须**一致——f
 
 **不要回退到固定窗口默认值**：5 分钟窗口在 ToDesk 同步场景下两端时间错位常超窗，回退会再现"同文本并排两条"的 UI 问题。
 
+### `preview` vs `text_full` 字段语义：UI 必须读 textFull
+
+`item.preview` 字段是 `CaptureService.makePreview` 截到 **280 字符 + `…`** 的网络传输短预览，**给 server→client `/since` 列表渲染省 payload 用**。`item.text_full` 是原始可粘贴文本完整内容（受 `config.capture.max_text_kb` 字节守门，默认 512KB）。两个字段在 server 端**同时**写入 DB，client 通过 `/since` JSON 也**同时**收到（`Server.itemToJSON` 直传无截断）。
+
+**UI 端必须用 textFull,不能用 preview**——daemon SearchView 跟 SQLite 同进程,iOS 通过 /since 也拿到完整 textFull,直接 fallback 到截过的 preview 会让卡片末尾出现 server 加的 `…` 截断符,且文本短于 lineLimit 时填不满 frame 留大块空白(2026-05-20 已踩过)。
+
+**统一入口**：`Item.cardPreviewSource(maxChars:)` (Sources/DuoPasteCore/Item.swift) —— textFull 优先 + `prefix(maxChars)` 防御性截断。`maxChars` 给 SwiftUI lineLimit + frame 物理约束**之外**的兜底:macOS 卡片 240×204 ≈ 11 行 × 15 字符 = 165 字符,默认 512 给 3 倍缓冲;iOS HistoryCellView lineLimit(5) ≈ 95 字符,传 300。
+
+**规则范围 = 卡片/列表 cell 展示路径**。其它路径（详情大预览、导出 SQLite/Markdown、open-with 临时文件、paste-merge 文本比较、本地 contains 过滤等）**允许**用 `item.textFull ?? item.preview` 形态——这些是 textFull 优先 + preview 兜底的合法 fallback,**不算违反**。
+
+受规则约束的卡片/列表展示调用点(不要再添加新的 `item.preview ??` fallback)：
+- `Sources/duo-pasted/SearchView.swift` 的 `previewAttributedForTextCard` else 分支(snippet 不空时另有 FTS 高亮路径)
+- `Sources/duo-pasted/SearchView.swift` 的 `previewText` else 分支(file kind 文件名解析路径不走这条)
+- `iOS/DuoPaste/Models.swift` 的 `displayPreview`
+
+**已知边界 · iOS cold-launch 老 cache**：`BackgroundPullService` 把 item 持久化到 `Caches/HistoryStore/items.json`,app 升级后 cold-launch 读老 cache 项可能 textFull 为 nil → cardPreviewSource 退到 preview → 卡片仍带 server `…` 截断符,直到下一次 PullWorker 拉到新 item 完整 textFull 覆盖才修复。这是已知边界不修——加 cache schema version invalidate 老 entries 代价高于收益。
+
+**多段 textFull paragraphStyle 精细应用**：`previewAttributedForTextCard` 的 `firstLineHeadIndent=8` (避开左上 app icon) **必须只应用到第一个 paragraph**——NSAttributedString.firstLineHeadIndent 是 per-paragraph,整段统一设会让多段 textFull 每段首行 indent 8pt 视觉错位。代码里两个 paragraphStyle (pIndent / pPlain) + 按 `\n` 分隔的 range 精细 addAttribute,**不要回退到单一 paragraphStyle 全 range 应用**。
+
+**回归测试**：`Tests/DuoPasteCoreTests/CardPreviewSourceTests.swift` —— textFull 优先 / textFull 缺失退 preview / 都空返回空串 / maxChars 截断 / preview 路径无视 maxChars 五条契约。任一 PR 把 `cardPreviewSource()` 改回 `item.preview ??` 会让这些测试 fail。
+
+**为什么不在 `Item.preview` getter 里直接返回 textFull**：preview 字段还要喂给 FTS5 索引、`/since` JSON wire（让老 iOS 客户端没 textFull 也能展示）、搜索 prefix-boost 排序（`SearchPrefixBoostTests` 里 `pv.lowercased().hasPrefix(needle)` 算 score=2）等数据路径,这些都该保留**网络短预览**语义。坑只在 UI 卡片消费端。
+
 ### RTF 三层降级 + raw-size 守门
 
 RTF 抓取走三层降级：
