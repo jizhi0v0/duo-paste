@@ -89,9 +89,9 @@ struct HistoryCellView: View {
             TimelineView(.periodic(from: .now, by: 10)) { context in
                 Text(Self.relativeLabel(item.capturedAt, now: context.date))
             }
-            if let name = item.sourceAppName, !name.isEmpty {
+            if let size = sizeLabel {
                 Text("·")
-                Text(name)
+                Text(size)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -106,6 +106,17 @@ struct HistoryCellView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+
+    /// 卡片底部尺寸标签。image/file 走 blob 字节，text/url/rtf/html 走原文字符数。
+    /// blob 行 sourceApp icon 已在右上交代来源，左下空出位给尺寸是更有信息量的选择。
+    private var sizeLabel: String? {
+        if let bytes = item.blobSize, bytes > 0 {
+            return bytes.formatted(.byteCount(style: .file))
+        }
+        let full = item.textFull ?? item.preview ?? ""
+        if full.isEmpty { return nil }
+        return "\(full.count) 字"
     }
 
     /// 卡片右上 icon。优先级:

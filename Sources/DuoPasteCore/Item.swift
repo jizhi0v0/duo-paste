@@ -146,3 +146,53 @@ extension Item {
         return ""
     }
 }
+
+extension Item {
+    /// 跨 origin 同 `text_full` fold——剪贴板"文本永久 dedup"的单点契约定义。
+    ///
+    /// 在 Mac + iOS UI 显示之前都走这条逻辑：Continuity / ToDesk / 跨 peer pull 等链路
+    /// 会把同文本以不同 `origin_device` 重复落库，UI 展示时折叠回一条让"同内容"心智成立。
+    ///
+    /// **契约（必须与 Mac `Search.fetchHitsFolded` / iOS HistoryStore.filtered 同源）**：
+    /// - **Tombstone 永远跳过**（`deletedAtNs != nil`）——softDelete 不动 `textFull`(只动
+    ///   `deletedAtNs + ingestedAtNs`)，wire 上 tombstone 仍带原 textFull；若不防御 skip，
+    ///   tombstone 可能因 `capturedAtNs` 大于活的 sibling 成为 winner，UI 看到被删除内容。
+    ///   Mac 端走 SQL `WHERE deleted_at_ns IS NULL` 在 fold 前过滤，iOS HistoryStore.merge
+    ///   也已剔除——本函数作为 public API 不依赖 caller 记忆，自带这层兜底
+    /// - 参与：仅 `blob_sha256 == nil` 且 `text_full` 非空的行（text / url / rtf / html /
+    ///   file 文本路径都按 byte-equal 等同处理）；blob kind（image）**不**参与——同 sha
+    ///   多次复制可能是用户故意保留时间线
+    /// - Key：`text_full` 原值，大小写敏感、不 trim、不归一化空白
+    /// - Winner：`max(capturedAtNs)`；同 ns 时保留先入的（与 dict 语义一致）
+    /// - Pinned：参与行 `pinned` OR 聚合赋给 winner——"pin 是对内容的属性而非具体 row"
+    /// - **不排序**：fold 后顺序未定义，调用方自行 sort（Mac 走 prefix24h 三层契约，
+    ///   iOS 默认 list 走 pinned + captured_at_ns DESC）
+    /// - **不做 kind 白名单 / pinnedOnly 过滤**：query 维度的过滤由调用方在 fold 前/后处理
+    ///
+    /// Mac 的 `fetchHitsFolded` 因为要同时持有 FTS5 snippet，内部走自己的 tuple-aware fold
+    /// 副本——契约必须与本函数对齐，行为分叉是 bug。回归测试 `ItemFoldTests.swift`
+    /// + Mac 路径 `SearchFoldV7Tests.swift`。
+    ///
+    /// - Parameter items: 待 fold 的行列表（tombstone 由本函数 skip，caller 无需预过滤）
+    /// - Returns: fold 后的行列表（不含 tombstone），顺序未定义
+    public static func foldByTextFull(_ items: [Item]) -> [Item] {
+        var byText: [String: Item] = [:]
+        var nonText: [Item] = []
+        nonText.reserveCapacity(items.count)
+        for it in items {
+            if it.deletedAtNs != nil { continue }
+            if it.blobSha256 == nil, let tf = it.textFull, !tf.isEmpty {
+                if let existing = byText[tf] {
+                    var winner = it.capturedAtNs > existing.capturedAtNs ? it : existing
+                    winner.pinned = it.pinned || existing.pinned
+                    byText[tf] = winner
+                } else {
+                    byText[tf] = it
+                }
+            } else {
+                nonText.append(it)
+            }
+        }
+        return Array(byText.values) + nonText
+    }
+}

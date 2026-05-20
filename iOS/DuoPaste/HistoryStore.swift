@@ -24,20 +24,36 @@ final class HistoryStore {
     }
     private(set) var lastServerSearch: ServerSearchResult?
 
-    /// SwiftUI 直接绑这个——过滤后的列表。
-    /// - 空 query → 全列表
-    /// - query 命中最近 server 搜索 → 用 server fold-aware items
-    /// - 否则 → 本机 contains fallback(server 还在拉 / 失败 / 离线时)
+    /// SwiftUI 直接绑这个——过滤 + fold 后的列表。
+    /// - 空 query → 全列表(本机 fold)
+    /// - query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold)
+    /// - 否则 → 本机 contains fallback 后 fold(server 还在拉 / 失败 / 离线时)
+    ///
+    /// **Fold 契约定义在 `Item.foldByTextFull`(DuoPasteCore)**——跨 origin 同 text_full
+    /// 折一条,winner = max(captured_at_ns),pinned OR 聚合。修 Continuity / ToDesk 把同
+    /// 文本镜到两台 Mac 后 iOS 看见两张卡(两个不同 origin_device)而 Mac UI 只一张的不对齐.
+    /// 排序契约在本路径单独应用:(pinned DESC, captured_at_ns DESC)——Mac fold 多一层
+    /// prefix24h boost,iOS 列表无 query 时不需要;有 query 走 server search 路径就有了
     var filtered: [Item] {
-        guard !query.isEmpty else { return items }
+        guard !query.isEmpty else { return Self.foldAndSort(items) }
         if let r = lastServerSearch, r.q == query {
             return r.items
         }
         let q = query.lowercased()
-        return items.filter { item in
+        let matched = items.filter { item in
             (item.preview?.lowercased().contains(q) ?? false)
                 || (item.textFull?.lowercased().contains(q) ?? false)
                 || (item.extractedText?.lowercased().contains(q) ?? false)
+        }
+        return Self.foldAndSort(matched)
+    }
+
+    /// fold + iOS list 排序契约一体应用。fold 走 DuoPasteCore 单点契约,sort 本地化
+    /// (Mac 跟 iOS 排序契约不同——见 `filtered` 文档)
+    private static func foldAndSort(_ list: [Item]) -> [Item] {
+        Item.foldByTextFull(list).sorted { a, b in
+            if a.pinned != b.pinned { return a.pinned && !b.pinned }
+            return a.capturedAtNs > b.capturedAtNs
         }
     }
 

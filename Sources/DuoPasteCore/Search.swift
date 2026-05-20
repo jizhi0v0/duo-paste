@@ -177,6 +177,11 @@ public struct SearchAPI: Sendable {
         //
         // 必须在下面的 kind/pinned 后置 filter **之前**——pinned 聚合后 winner.pinned 才是
         // 正确的过滤依据。
+        //
+        // **契约定义在 `Item.foldByTextFull`(DuoPasteCore)** —— iOS HistoryStore.filtered
+        // 也按同一份契约 fold,Mac/iOS UI 跨设备 dedup 行为对齐. 本路径因为要同时携带 FTS5
+        // snippet (tuple `(Item, String?)`) 走自己的 fold 副本,逻辑必须与 `Item.foldByTextFull`
+        // 严格一致——任何分叉都是 bug. 回归测试 `SearchFoldV7Tests` (Mac) + `ItemFoldTests` (核心)
         var byText: [String: (Item, String?)] = [:]
         var nonTextFolded: [(Item, String?)] = []
         nonTextFolded.reserveCapacity(raw.count)
