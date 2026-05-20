@@ -72,6 +72,17 @@ public struct SmartTransport: Sendable {
     /// 测试注入 fake 避免起真 server
     public typealias HealthProbe = @Sendable (URL) async -> (outcome: PrimaryHealthResult.Outcome, rttMs: Int64)
 
+    /// Probe-level structured logger。每个 candidate 每次 attempt 都调一次,line 单行 grep 友好,
+    /// 形如:
+    ///
+    ///     smart-transport: peer 0 candidate=tailscale url=https://... probe=ok rtt=43ms device_id=... ponte_host=... attempt=1/2
+    ///     smart-transport: peer 0 candidate=ponte url=https://... probe=unreachable rtt=-1 reason="transport: bad URL" attempt=2/2
+    ///
+    /// 生产路径默认写 stderr(跟 daemon 其他日志同源);测试可注入 capture 验日志格式。
+    /// 在 probe 失败时**这是唯一**能看到 reason 的地方——SmartTransport.discover 把失败折成
+    /// rtts[url] = -1 + chosenPullURL fallback,reason 字符串丢了。
+    public typealias ProbeLogger = @Sendable (String) -> Void
+
     public init() {}
 
     /// 启动 / DNS 变化时调一次，每个 peer 返回一个 decision。
@@ -79,26 +90,46 @@ public struct SmartTransport: Sendable {
     /// - `probe` 默认 = 真实 `HTTPPeerClient.fetchPrimaryHealth` + Date() 测 RTT；session 路由
     ///   走 `PonteSession.session(for:fallback:)` 让 ponte URL 走 Surge proxy
     /// - `rttProbeTimeoutSec` 每个 candidate 单独的 deadline；超时算 unreachable
+    /// - `logger` 默认 = stderr 写入。测试 / mesh-doctor 等可注入 capture
     public func discover(
         peers: [Config.PeerConfig],
         auth: HMACAuth,
         tailscaleSession: URLSession,
         rttProbeTimeoutSec: TimeInterval = 3.0,
-        probe: HealthProbe? = nil
+        probe: HealthProbe? = nil,
+        logger: ProbeLogger? = nil
     ) async -> [PeerDecision] {
         let actualProbe: HealthProbe = probe ?? Self.defaultProbe(
             auth: auth, tailscaleSession: tailscaleSession, timeoutSec: rttProbeTimeoutSec
         )
+        let actualLogger: ProbeLogger = logger ?? Self.defaultStderrLogger
         var out: [PeerDecision] = []
         for (idx, peer) in peers.enumerated() {
             let decision = await Self.decideOne(
                 peerIndex: idx,
                 peer: peer,
-                probe: actualProbe
+                probe: actualProbe,
+                logger: actualLogger
             )
             out.append(decision)
         }
+        // Step 3 兜底:如果**所有 peer 的所有 candidate** 都不可达,打 WARN——这是
+        // "系统级 proxy 异常 / Surge 没启 / 网络栈崩"的特征,运维侧需要立刻看见
+        let anyReachable = out.contains { d in d.httpRttMs.values.contains(where: { $0 >= 0 }) }
+        if !anyReachable && !peers.isEmpty {
+            actualLogger(
+                "smart-transport: WARN all candidates unreachable across \(peers.count) peer(s) — " +
+                "诊断 hint: 检查 (1) Surge / proxy 是否运行 (2) 系统 HTTP/HTTPS proxy 设置 " +
+                "(3) tailnet 连通性 (`tailscale status`) (4) shared-secret 是否一致"
+            )
+        }
         return out
+    }
+
+    /// 默认 logger:写 stderr,带 newline。stderr 是全局 FILE *,POSIX 保证 fputs
+    /// 是 thread-safe(`flockfile` 隐式同步),@Sendable closure 安全持有
+    static let defaultStderrLogger: ProbeLogger = { line in
+        fputs(line + "\n", stderr)
     }
 
     /// 单 peer 决策——可测：
@@ -109,10 +140,14 @@ public struct SmartTransport: Sendable {
     static func decideOne(
         peerIndex: Int,
         peer: Config.PeerConfig,
-        probe: HealthProbe
+        probe: HealthProbe,
+        logger: ProbeLogger? = nil
     ) async -> PeerDecision {
         // C1 — tailscale URL,永远先探(要拿 ponte_host 字段)。带 retry 防启动竞态
-        let (c1Outcome, c1Rtt) = await probeWithRetry(probe, url: peer.url)
+        let (c1Outcome, c1Rtt) = await probeWithRetry(
+            probe, url: peer.url,
+            peerIndex: peerIndex, candidate: "tailscale", logger: logger
+        )
         var rtts: [URL: Int64] = [peer.url: (isReachable(c1Outcome) ? c1Rtt : -1)]
         var learnedPonteHost: String? = nil
         if case .ok(_, _, let ponteHost) = c1Outcome { learnedPonteHost = ponteHost }
@@ -124,7 +159,10 @@ public struct SmartTransport: Sendable {
             if manualURL == peer.url {
                 manualReachable = isReachable(c1Outcome)
             } else {
-                let (c2Out, c2Rtt) = await probeWithRetry(probe, url: manualURL)
+                let (c2Out, c2Rtt) = await probeWithRetry(
+                    probe, url: manualURL,
+                    peerIndex: peerIndex, candidate: "manual", logger: logger
+                )
                 rtts[manualURL] = isReachable(c2Out) ? c2Rtt : -1
                 manualReachable = isReachable(c2Out)
             }
@@ -144,7 +182,10 @@ public struct SmartTransport: Sendable {
                 c3URL = peer.pullURL
                 c3Reachable = manualReachable
             } else {
-                let (c3Out, c3Rtt) = await probeWithRetry(probe, url: candidate)
+                let (c3Out, c3Rtt) = await probeWithRetry(
+                    probe, url: candidate,
+                    peerIndex: peerIndex, candidate: "ponte", logger: logger
+                )
                 rtts[candidate] = isReachable(c3Out) ? c3Rtt : -1
                 c3URL = candidate
                 c3Reachable = isReachable(c3Out)
@@ -320,16 +361,35 @@ public struct SmartTransport: Sendable {
     /// - `.rejected` 立即返回(应用层拒绝是确定性的,重来还是拒,白等)
     /// - `.unreachable` 才 sleep + retry,共最多 `retries+1` 次。最后一次仍 unreachable 返回最后一次结果
     /// 默认 retries=1 + backoff=1s:启动总延迟最多多 1-2s,换"启动 5s 内 Surge 才就绪"这种 case 不被永久锁死
+    ///
+    /// `peerIndex` / `candidate` / `logger` 三个可选参数走"诊断盲点"修复路径——每次 attempt
+    /// (含中间 retry 的 transient 失败 + 最终成功/放弃)都打 structured 单行日志。生产路径由
+    /// `decideOne` 始终 propagate `logger`,测试路径可不传(向后兼容 SmartTransportTests)。
     static func probeWithRetry(
         _ probe: HealthProbe,
         url: URL,
         retries: Int = 1,
-        backoffSec: TimeInterval = 1.0
+        backoffSec: TimeInterval = 1.0,
+        peerIndex: Int? = nil,
+        candidate: String? = nil,
+        logger: ProbeLogger? = nil
     ) async -> (outcome: PrimaryHealthResult.Outcome, rttMs: Int64) {
         var last: (outcome: PrimaryHealthResult.Outcome, rttMs: Int64) = (.unreachable(reason: "no probe ran"), -1)
+        let totalAttempts = retries + 1
         for attempt in 0...retries {
             let r = await probe(url)
             last = r
+            if let logger = logger {
+                logger(formatProbeLog(
+                    peerIndex: peerIndex,
+                    candidate: candidate,
+                    url: url,
+                    attempt: attempt + 1,
+                    total: totalAttempts,
+                    outcome: r.outcome,
+                    rttMs: r.rttMs
+                ))
+            }
             switch r.outcome {
             case .ok, .rejected:
                 return r
@@ -340,6 +400,55 @@ public struct SmartTransport: Sendable {
             }
         }
         return last
+    }
+
+    /// 拼 candidate probe 单行日志。grep 友好的 key=value 格式,字段顺序固定:
+    /// peer / candidate / url / probe / rtt / [reason / device_id / ponte_host] / attempt
+    ///
+    /// 单元测试可直接 import 这个 helper 校验格式不漂移
+    static func formatProbeLog(
+        peerIndex: Int?,
+        candidate: String?,
+        url: URL,
+        attempt: Int,
+        total: Int,
+        outcome: PrimaryHealthResult.Outcome,
+        rttMs: Int64
+    ) -> String {
+        var parts: [String] = ["smart-transport:"]
+        if let idx = peerIndex { parts.append("peer \(idx)") }
+        if let c = candidate { parts.append("candidate=\(c)") }
+        parts.append("url=\(url.absoluteString)")
+        switch outcome {
+        case .ok(let did, _, let ph):
+            parts.append("probe=ok")
+            parts.append("rtt=\(rttMs)ms")
+            parts.append("device_id=\(did)")
+            if let ph = ph { parts.append("ponte_host=\(ph)") }
+        case .unreachable(let reason):
+            parts.append("probe=unreachable")
+            parts.append("rtt=\(rttMs)ms")
+            parts.append("reason=\(quotedReason(reason))")
+        case .rejected(let reason):
+            parts.append("probe=rejected")
+            parts.append("rtt=\(rttMs)ms")
+            parts.append("reason=\(quotedReason(reason))")
+        }
+        if total > 1 {
+            parts.append("attempt=\(attempt)/\(total)")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// reason 字符串可能含空格 / 换行 / 双引号 / tab → 单行日志 grep 时会撕裂字段。
+    /// 用引号包 + 替换内部双引号为单引号 + 把换行/回车/tab 折成空格保证单行 + tab-friendly
+    private static func quotedReason(_ s: String) -> String {
+        let safe = s
+            .replacingOccurrences(of: "\"", with: "'")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        return "\"\(safe)\""
     }
 
     /// 默认 probe 实现——HTTPPeerClient.fetchPrimaryHealth + Date() RTT + per-probe deadline

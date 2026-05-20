@@ -473,10 +473,14 @@ enum CLI {
             let auth = HMACAuth(secret: secret)
             let peers = cfg.peers
             let discoverTask: @Sendable () async throws -> [URL: String] = {
+                // mesh-doctor 是一次性 CLI 工具,自己有结构化报告(stdout)。SmartTransport
+                // 默认 stderr logger 是 daemon 长跑场景设计,这里显式 no-op 避免 probe-level
+                // 单行日志混入 stderr(干扰 `mesh-doctor 2>&1 | grep` 之类的 piped 用法)
                 let decisions = await SmartTransport().discover(
                     peers: peers,
                     auth: auth,
-                    tailscaleSession: .shared
+                    tailscaleSession: .shared,
+                    logger: { _ in }
                 )
                 var map: [URL: String] = [:]
                 for d in decisions { map[d.configuredURL] = d.transportLabel }

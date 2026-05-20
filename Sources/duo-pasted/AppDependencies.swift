@@ -99,14 +99,31 @@ final class AppDependencies {
     /// 进程级共享 URLSession，PullWorker / WSNotificationClient / paste blob fetcher 共用——
     /// 确保 keep-alive 连接池跨用例复用，避免每次新建 TLS 握手。
     /// timeoutIntervalForRequest=10s：单次 /since / /blob 不该卡用户太久。
+    ///
+    /// **proxy 隔离不变量**(系统性根因修复,不要回退):
+    /// 1. 基底 `.ephemeral` 而不是 `.default` —— ephemeral 不持久化 cookie/cache,也是
+    ///    "不从 SystemConfiguration 继承 proxy" 的更干净起点
+    /// 2. 显式 `connectionProxyDictionary` 三种 proxy 全部 `Enable=0` —— 即便 ephemeral 仍
+    ///    可能继承系统设置,这一刀显式 disable 兜底强制不走 proxy
+    ///
+    /// 背景:用户系统级 HTTP/HTTPS/SOCKS proxy 指向 Surge (127.0.0.1:6152/6153) 让 ponte
+    /// 域名能解析。`.default` 基底会自动继承这些 proxy,daemon 跑 tailscale 直连 URL 也被劫
+    /// 持到 Surge,macOS Network framework path satisfaction 检查反弹回 lo0 + EINVAL,
+    /// 表面错误是 `URLError.badURL`(NSURLErrorDomain Code=-1000)。tailnet 流量根本不需要走
+    /// 任何 proxy —— 显式 disable 让它直连
     static let syncURLSession: URLSession = {
-        let cfg = URLSessionConfiguration.default
+        let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 10
         cfg.timeoutIntervalForResource = 30
         cfg.httpMaximumConnectionsPerHost = 6
         cfg.urlCache = nil               // search 永远要最新的，不走 URL cache
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.httpAdditionalHeaders = ["User-Agent": "duo-paste/sync"]
+        cfg.connectionProxyDictionary = [
+            kCFNetworkProxiesHTTPEnable  as String: 0,
+            kCFNetworkProxiesHTTPSEnable as String: 0,
+            kCFNetworkProxiesSOCKSEnable as String: 0,
+        ]
         return URLSession(configuration: cfg)
     }()
 }
