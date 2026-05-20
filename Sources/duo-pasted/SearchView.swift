@@ -2249,18 +2249,31 @@ private struct ItemCard: View, Equatable {
             appendPlain(item.cardPreviewSource())
         }
 
-        let para = NSMutableParagraphStyle()
-        // sticker offset(-9,-9) 让 icon 进入卡内的右下角到 (13, 13)。文本默认
-        // padding.leading=12,首行加 8pt → 首行 leading 20 避开 icon 右下角 + 4pt 气;
-        // 后续行 leading 12 充分利用宽度
-        para.firstLineHeadIndent = 8
-        para.headIndent = 0
-        para.lineSpacing = 1.5
-        ns.addAttribute(
-            .paragraphStyle,
-            value: para,
-            range: NSRange(location: 0, length: ns.length)
-        )
+        // **per-paragraph 应用**:NSAttributedString.firstLineHeadIndent 是按
+        // paragraph(`\n` 分隔)算的,整段统一设会让多段 textFull 每段首行都 indent 8pt
+        // 视觉错位(2026-05-20 review 发现)。只把第一个 paragraph 的首行 indent 8pt
+        // 避开左上 app icon,后续段落 indent=0 充分利用宽度
+        let pIndent = NSMutableParagraphStyle()
+        pIndent.firstLineHeadIndent = 8
+        pIndent.headIndent = 0
+        pIndent.lineSpacing = 1.5
+
+        let pPlain = NSMutableParagraphStyle()
+        pPlain.firstLineHeadIndent = 0
+        pPlain.headIndent = 0
+        pPlain.lineSpacing = 1.5
+
+        let fullRange = NSRange(location: 0, length: ns.length)
+        ns.addAttribute(.paragraphStyle, value: pPlain, range: fullRange)
+        let firstNewline = (ns.string as NSString).range(of: "\n")
+        let firstParaLen = firstNewline.location == NSNotFound ? ns.length : firstNewline.location
+        if firstParaLen > 0 {
+            ns.addAttribute(
+                .paragraphStyle,
+                value: pIndent,
+                range: NSRange(location: 0, length: firstParaLen)
+            )
+        }
         return ns
     }
 

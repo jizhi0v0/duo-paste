@@ -48,13 +48,19 @@ struct CardPreviewSourceTests {
     }
 
     /// textFull 和 preview 都空 → 空串,让调用方加占位符(iOS displayPreview
-    /// 用 `[image]` / `[file]` / `(空)`)。
+    /// 用 `[image]` / `[file]` / `(空)`)。覆盖 nil/nil 和 ""/"" 两种 "empty"。
     @Test("都空返回空串")
     func returnsEmptyWhenBothMissing() {
-        let it = Item(
+        let bothNil = Item(
             id: "a", originDevice: "self", capturedAtNs: 1, kind: .image
         )
-        #expect(it.cardPreviewSource() == "")
+        #expect(bothNil.cardPreviewSource() == "")
+
+        let bothEmptyString = Item(
+            id: "b", originDevice: "self", capturedAtNs: 1, kind: .text,
+            preview: "", textFull: ""
+        )
+        #expect(bothEmptyString.cardPreviewSource() == "")
     }
 
     /// maxChars 防 NSAttributedString.append O(n) 大字符串攻击——textFull 几 MB

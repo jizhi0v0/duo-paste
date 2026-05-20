@@ -187,10 +187,16 @@ Swift 端 `fetchHitsFolded.prefixScore` 跟 SQL 端口径**必须**一致——f
 
 **统一入口**：`Item.cardPreviewSource(maxChars:)` (Sources/DuoPasteCore/Item.swift) —— textFull 优先 + `prefix(maxChars)` 防御性截断。`maxChars` 给 SwiftUI lineLimit + frame 物理约束**之外**的兜底:macOS 卡片 240×204 ≈ 11 行 × 15 字符 = 165 字符,默认 512 给 3 倍缓冲;iOS HistoryCellView lineLimit(5) ≈ 95 字符,传 300。
 
-**调用点**（不要再添加新的 `item.preview ??` fallback）:
+**规则范围 = 卡片/列表 cell 展示路径**。其它路径（详情大预览、导出 SQLite/Markdown、open-with 临时文件、paste-merge 文本比较、本地 contains 过滤等）**允许**用 `item.textFull ?? item.preview` 形态——这些是 textFull 优先 + preview 兜底的合法 fallback,**不算违反**。
+
+受规则约束的卡片/列表展示调用点(不要再添加新的 `item.preview ??` fallback)：
 - `Sources/duo-pasted/SearchView.swift` 的 `previewAttributedForTextCard` else 分支(snippet 不空时另有 FTS 高亮路径)
 - `Sources/duo-pasted/SearchView.swift` 的 `previewText` else 分支(file kind 文件名解析路径不走这条)
 - `iOS/DuoPaste/Models.swift` 的 `displayPreview`
+
+**已知边界 · iOS cold-launch 老 cache**：`BackgroundPullService` 把 item 持久化到 `Caches/HistoryStore/items.json`,app 升级后 cold-launch 读老 cache 项可能 textFull 为 nil → cardPreviewSource 退到 preview → 卡片仍带 server `…` 截断符,直到下一次 PullWorker 拉到新 item 完整 textFull 覆盖才修复。这是已知边界不修——加 cache schema version invalidate 老 entries 代价高于收益。
+
+**多段 textFull paragraphStyle 精细应用**：`previewAttributedForTextCard` 的 `firstLineHeadIndent=8` (避开左上 app icon) **必须只应用到第一个 paragraph**——NSAttributedString.firstLineHeadIndent 是 per-paragraph,整段统一设会让多段 textFull 每段首行 indent 8pt 视觉错位。代码里两个 paragraphStyle (pIndent / pPlain) + 按 `\n` 分隔的 range 精细 addAttribute,**不要回退到单一 paragraphStyle 全 range 应用**。
 
 **回归测试**：`Tests/DuoPasteCoreTests/CardPreviewSourceTests.swift` —— textFull 优先 / textFull 缺失退 preview / 都空返回空串 / maxChars 截断 / preview 路径无视 maxChars 五条契约。任一 PR 把 `cardPreviewSource()` 改回 `item.preview ??` 会让这些测试 fail。
 
