@@ -51,6 +51,9 @@ final class PeerSyncCoordinator {
     private var cursor: SinceCursor = .zero
     private var pullTask: Task<Void, Never>?
     private var statusTickTask: Task<Void, Never>?
+    /// in-flight `/search` 请求句柄。用户快速敲字时旧 Task 还在拉就 cancel 它,
+    /// 避免多个 search 并发飞向 Mac 浪费带宽 + Mac CPU + URLSession 连接池抖动
+    private var currentSearchTask: Task<Void, Never>?
     /// inflight pullTask 期间收到 advance → 置 true,task 结束再 kick 一轮
     private var pendingAdvance: Bool = false
     /// `applyConnectedStatus` 在 pull 成功时 stamp,heartbeat-stale 检测保护它不被覆盖
@@ -557,16 +560,26 @@ final class PeerSyncCoordinator {
         let urls: [String] = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
         let chosen = currentEndpointURL ?? urls.first
         guard let urlString = chosen, let url = URL(string: urlString) else { return }
-        Task { [weak self] in
+        // **取消上一轮**——用户敲字快时旧 Task 还在拉就废掉,只看新 q 的结果。
+        // URLSession.data(for:) 响应 cancellation,Task.cancel() 让正在跑的 HTTP 立即抛错
+        currentSearchTask?.cancel()
+        currentSearchTask = Task { [weak self] in
             guard let self else { return }
             let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
             do {
                 let (items, snippets, total) = try await client.searchItems(q: q, limit: 200)
+                if Task.isCancelled { return }
                 let result = HistoryStore.ServerSearchResult(
                     q: q, items: items, snippets: snippets, totalCount: total
                 )
                 await MainActor.run { self.store.applyServerSearch(result) }
                 DebugLog.shared.append("search ok q=\(q) hits=\(items.count) total=\(total)")
+            } catch is CancellationError {
+                // 用户改了 query 旧 search 被替——正常,不记日志
+            } catch URLError.cancelled {
+                // URLSession 抛的 cancel 同上,nop。注意:ponte / NWHTTPTransport
+                // 路径不一定响应 cancel,但上面 Task.isCancelled check 会兜底挡住
+                // 旧 task 的 applyServerSearch
             } catch {
                 DebugLog.shared.append("search failed q=\(q): \(error.localizedDescription)")
             }
