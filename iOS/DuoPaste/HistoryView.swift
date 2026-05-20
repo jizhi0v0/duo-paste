@@ -11,11 +11,16 @@ struct HistoryView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if store.items.isEmpty {
-                    emptyState
-                } else {
-                    listScroll
+            VStack(spacing: 0) {
+                if let msg = store.deleteFailureMessage {
+                    deleteFailureBanner(message: msg)
+                }
+                Group {
+                    if store.items.isEmpty {
+                        emptyState
+                    } else {
+                        listScroll
+                    }
                 }
             }
             .navigationTitle("DuoPaste")
@@ -63,6 +68,36 @@ struct HistoryView: View {
             .padding(.bottom, 24)
         }
         .scrollContentBackground(.hidden)
+    }
+
+    /// 顶部橙色 banner——`merge()` 检测到 server DELETE 没送达把行重新带回来时显示。
+    /// 5s 自动消(`.task(id:)` 让 message 变化时重置 timer)+ ✕ 按钮手动消。
+    /// 文案含具体条数让用户知道是删除问题不是其他同步故障
+    @ViewBuilder
+    private func deleteFailureBanner(message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message).font(.caption)
+            Spacer()
+            Button {
+                store.dismissDeleteFailureMessage()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("关闭")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.15))
+        .task(id: message) {
+            // 5s 自动消;期间用户点 ✕ 已经 dismiss,新一轮 message 出现时 task 重启
+            try? await Task.sleep(for: .seconds(5))
+            if !Task.isCancelled {
+                store.dismissDeleteFailureMessage()
+            }
+        }
     }
 
     private var emptyState: some View {

@@ -54,6 +54,18 @@ final class HistoryStore {
         lastServerSearch = nil
     }
 
+    // MARK: - 删除失败追踪
+
+    /// 用户 `removeOptimistic` 删除但还没收到 server tombstone 的 id → 标记时间。
+    /// `merge()` 看到非 tombstone 的 id 在这里 + 超过 grace 视为 server DELETE 未送达,
+    /// 写 `deleteFailureMessage` 让 UI 顶部 banner 提示。tombstone 行确认删除时清掉条目
+    private var pendingDeletes: [String: Date] = [:]
+
+    /// `merge()` 检测到删除未送达时写,UI 顶部 banner 显示,5s 自动消(或用户点 ✕)。
+    /// 这里只展示提示——条目本身已被 /since 重新 insert 回 `items`,无法回滚乐观删除
+    /// (内容字段已丢),用户看到提示后自行决定重试或忽略
+    private(set) var deleteFailureMessage: String?
+
     /// peer 拉到一批 item 时调。按 id 去重,tombstone (deletedAtNs 非空) 直接移除。
     /// 重排序:pinned DESC,captured_at_ns DESC。
     ///
@@ -65,10 +77,22 @@ final class HistoryStore {
         guard !incoming.isEmpty else { return }
         var byID: [String: Item] = [:]
         for it in items { byID[it.id] = it }
+        var resurrectedCount = 0
+        let now = Date()
+        // 3s grace 避免 false positive:DELETE 刚发出去,前一波 in-flight /since
+        // 还没回,带回 alive 行很正常——给端到端通路 3s buffer 真等不到 tombstone
+        // 才算 server 没删掉
+        let gracePeriod: TimeInterval = 3
         for it in incoming {
             if it.isTombstone {
                 byID.removeValue(forKey: it.id)
+                pendingDeletes.removeValue(forKey: it.id)  // server 确认删除成功
                 continue
+            }
+            // 非 tombstone 行 id 在 pendingDeletes 里 + 超 grace → 真的没删掉
+            if let pendingAt = pendingDeletes[it.id], now.timeIntervalSince(pendingAt) > gracePeriod {
+                resurrectedCount += 1
+                pendingDeletes.removeValue(forKey: it.id)
             }
             if let existing = byID[it.id], existing.capturedAtNs > it.capturedAtNs {
                 var merged = it
@@ -81,6 +105,11 @@ final class HistoryStore {
         items = byID.values.sorted { a, b in
             if a.pinned != b.pinned { return a.pinned && !b.pinned }
             return a.capturedAtNs > b.capturedAtNs
+        }
+        if resurrectedCount > 0 {
+            deleteFailureMessage = resurrectedCount == 1
+                ? "1 条删除未送达 Mac,已恢复显示——可重试"
+                : "\(resurrectedCount) 条删除未送达 Mac,已恢复显示——可重试"
         }
     }
 
@@ -102,9 +131,21 @@ final class HistoryStore {
     }
 
     /// 用户长按"删除"路径——本机乐观立即移除,server 端 DELETE /item/<id> 在 coordinator
-     /// 异步发。失败的话(网络抖 / Mac 不可达)下一次 /since 拉自然 re-insert,用户可重试删除。
+    /// 异步发。失败的话(网络抖 / Mac 不可达)下一次 /since 拉自然 re-insert——`merge()`
+    /// 通过 `pendingDeletes` 检测到 + 弹 banner 提示用户。**不**回滚乐观删除(内容字段已丢)
     func removeOptimistic(id: String) {
         items.removeAll { $0.id == id }
+        let now = Date()
+        pendingDeletes[id] = now
+        // prune > 60s 的 entry——Mac 长时间不可达后用户已经"等够久",再回来即便看到行
+        // 也不再触发 banner(假设用户已经接受这条状态)。同时防 dict 无限增长
+        let cutoff = now.addingTimeInterval(-60)
+        pendingDeletes = pendingDeletes.filter { $0.value > cutoff }
+    }
+
+    /// 用户点 banner ✕ 或 5s 自动消时调
+    func dismissDeleteFailureMessage() {
+        deleteFailureMessage = nil
     }
 
     /// 测试 / debug 用——把内存集合清空。
