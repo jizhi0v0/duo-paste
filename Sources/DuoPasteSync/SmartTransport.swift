@@ -440,13 +440,14 @@ public struct SmartTransport: Sendable {
         return parts.joined(separator: " ")
     }
 
-    /// reason 字符串可能含空格 / 换行 / 双引号 → 单行日志 grep 时会撕裂字段。
-    /// 用引号包 + 替换内部双引号为单引号 + 把换行/回车折成空格保证单行
+    /// reason 字符串可能含空格 / 换行 / 双引号 / tab → 单行日志 grep 时会撕裂字段。
+    /// 用引号包 + 替换内部双引号为单引号 + 把换行/回车/tab 折成空格保证单行 + tab-friendly
     private static func quotedReason(_ s: String) -> String {
         let safe = s
             .replacingOccurrences(of: "\"", with: "'")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
         return "\"\(safe)\""
     }
 

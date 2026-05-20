@@ -226,13 +226,19 @@ struct SmartTransportTests {
 
     /// 线程安全 capture——@Sendable closure 内调 `append` 走 NSLock,主线程 / probe task /
     /// 其他并发上下文都能写。
+    ///
+    /// `lines` getter **显式拷贝**而不是直接 `return _lines + defer unlock`——后者依赖
+    /// Swift ARC + Array COW + defer 时序的精确保证,显式拷让锁释放时机自描述,future
+    /// reader 不必推理"return 表达式跟 defer unlock 谁先发生"
     private final class LogCapture: @unchecked Sendable {
         private let lock = NSLock()
         private var _lines: [String] = []
         func append(_ s: String) { lock.lock(); defer { lock.unlock() }; _lines.append(s) }
         var lines: [String] {
-            lock.lock(); defer { lock.unlock() }
-            return _lines
+            lock.lock()
+            let copy = _lines
+            lock.unlock()
+            return copy
         }
     }
 
@@ -298,7 +304,9 @@ struct SmartTransportTests {
     }
 
     @Test func decideOneLogsPonteFailureReason() async {
-        // ponte unreachable 时日志必须含 reason 字段——这是修复诊断盲点的核心契约
+        // ponte unreachable 时日志必须含 reason 字段——这是修复诊断盲点的核心契约。
+        // 不硬编码 retry 次数(跟 probeWithRetry 默认 retries 解耦),验证"每次 attempt 都
+        // 打 unreachable + 携带 reason"
         let cap = LogCapture()
         let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
         let probe = makeFakeProbe(responses: [
@@ -308,9 +316,9 @@ struct SmartTransportTests {
         let logger: SmartTransport.ProbeLogger = { cap.append($0) }
         _ = await SmartTransport.decideOne(peerIndex: 0, peer: peer, probe: probe, logger: logger)
         let lines = cap.lines
-        // ponte 行带 retry,unreachable 会重试一次,共 2 条 ponte
         let ponteLines = lines.filter { $0.contains("candidate=ponte") }
-        #expect(ponteLines.count == 2, "ponte 应 retry 一次,共 2 条")
+        #expect(ponteLines.count >= 1, "至少打一条 ponte probe log")
+        // 关键契约:每条 ponte log 都含 unreachable + 完整 reason 字符串
         for line in ponteLines {
             #expect(line.contains("probe=unreachable"))
             #expect(line.contains("reason=\"transport: bad URL\""))
@@ -318,19 +326,20 @@ struct SmartTransportTests {
     }
 
     @Test func formatProbeLogHandlesReasonWithSpecialChars() async {
-        // reason 含双引号 / 换行 / 回车 → 单行 log 必须把它们 escape/折,不撕裂字段
+        // reason 含双引号 / 换行 / 回车 / tab → 单行 log 必须把它们 escape/折,不撕裂字段
         let url = URL(string: "https://x:8443")!
         let line = SmartTransport.formatProbeLog(
             peerIndex: 0, candidate: "ponte", url: url,
             attempt: 1, total: 2,
-            outcome: .unreachable(reason: "broken \"quote\"\nand\rnewline"),
+            outcome: .unreachable(reason: "broken \"quote\"\nand\rnewline\twith\ttab"),
             rttMs: -1
         )
-        // 不该有原生换行
+        // 不该有原生换行 / 回车 / tab
         #expect(!line.contains("\n"))
         #expect(!line.contains("\r"))
+        #expect(!line.contains("\t"))
         // 双引号被替换成单引号
-        #expect(line.contains("reason=\"broken 'quote' and newline\""))
+        #expect(line.contains("reason=\"broken 'quote' and newline with tab\""))
     }
 
     @Test func discoverWarnsWhenAllCandidatesUnreachable() async {
