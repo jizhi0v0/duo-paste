@@ -630,7 +630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 endpointsProvider: endpointsProvider,
                 meshEndpointsProvider: meshEndpointsProvider,
                 pairingService: pairingService,
-                onBumpApplied: { _, _ in
+                onItemMutated: { _, _ in
                     Task { @MainActor in
                         await AppDelegate.shared?.state.refresh()
                     }

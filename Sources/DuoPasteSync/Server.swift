@@ -61,9 +61,10 @@ public struct SyncServer: Sendable {
     /// 没启用 pairing)
     public let pairingService: PairingService?
 
-    /// 本机 HTTP `/bump` 已落库后的回调。Mac daemon 用它刷新本机 UI；测试/headless
-    /// server 默认 no-op。WS broadcaster 只通知 peer，不会自动刷新本进程 SwiftUI state。
-    public let onBumpApplied: @Sendable (String, Int64) -> Void
+    /// 本机 HTTP `/bump` 或 `DELETE /item` 落库后的回调——签名 (id, newIngestedAtNs)。
+    /// Mac daemon 用它刷新本机 UI(让 SearchView 即时反映"复制即顶"/"刚删")。
+    /// 测试/headless server 默认 no-op。WS broadcaster 只通知 peer,不会自动刷新本进程 SwiftUI state。
+    public let onItemMutated: @Sendable (String, Int64) -> Void
 
     /// `/pair/<pin>` 路由是否要求本机起 TLS。默 true。
     ///
@@ -90,7 +91,7 @@ public struct SyncServer: Sendable {
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil,
-        onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in },
+        onItemMutated: @escaping @Sendable (String, Int64) -> Void = { _, _ in },
         requirePairingTLS: Bool = true
     ) {
         self.deviceID = deviceID
@@ -106,7 +107,7 @@ public struct SyncServer: Sendable {
         self.endpointsProvider = endpointsProvider
         self.meshEndpointsProvider = meshEndpointsProvider
         self.pairingService = pairingService
-        self.onBumpApplied = onBumpApplied
+        self.onItemMutated = onItemMutated
         self.requirePairingTLS = requirePairingTLS
         // 显式配 pairingService 但跑 plain HTTP 且未 opt-out → 启动时即拉响警报，
         // 不要等 /pair 真被打了才拒。运维侧能立刻看到 stderr 修配置
@@ -139,7 +140,7 @@ public struct SyncServer: Sendable {
             pairingService: pairingService,
             // requirePairingTLS=true 且本机没起 TLS → handler 直接 503 不消耗 PIN
             pairingDisabled: (requirePairingTLS && tls == nil),
-            onBumpApplied: onBumpApplied
+            onItemMutated: onItemMutated
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -304,7 +305,7 @@ public struct SyncServer: Sendable {
         /// `requirePairingTLS && tls == nil` 推导——plain HTTP daemon 不该暴露 secret 明文。
         /// 测试场景默 false 不动行为
         pairingDisabled: Bool = false,
-        onBumpApplied: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
+        onItemMutated: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
     ) {
         router.get("/health") { _, _ -> Response in
             var payload: [String: String] = [
@@ -396,7 +397,7 @@ public struct SyncServer: Sendable {
             let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
             do {
                 let newIngest = try await database.bumpCapturedAt(id: id, now: now)
-                onBumpApplied(id, newIngest)
+                onItemMutated(id, newIngest)
                 // 通知 peer:本机 cursor 推进了。fan-out 失败 swallow——bump 本身已落库
                 if let broadcaster {
                     Task {
@@ -444,7 +445,7 @@ public struct SyncServer: Sendable {
             let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
             do {
                 let newIngest = try await database.softDelete(id: id, now: now)
-                onBumpApplied(id, newIngest)
+                onItemMutated(id, newIngest)
                 if let broadcaster {
                     Task {
                         await broadcaster.broadcastCursorAdvanced(
