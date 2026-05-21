@@ -53,11 +53,12 @@ struct HistoryCellView: View {
             .contextMenu {
                 contextMenuItems()
             } preview: {
-                // 显式 preview 锁定尺寸防止 LazyVGrid 抬卡瞬间 reflow 导致"偏移回弹"。
-                // 复用 cardSurface 不带 pin overlay,长按预览始终是干净的卡片
-                cardSurface
-                    .frame(width: 280)
-                    .padding(2)
+                // 接 previewContent 让长按看完整文本(ScrollView 可滚 4000 字符),
+                // 卡片本体保持 lineLimit(5) 等高布局。previewContent 内部显式
+                // .frame(width: 300) 锁尺寸避免渲染包围盒偏移。pin overlay 已经在
+                // body 层而非 cardSurface 上,previewContent 跟 cardSurface 一样
+                // 天然不带 pin 装饰,长按预览始终干净
+                previewContent
             }
             .sensoryFeedback(.success, trigger: copyPulse)
     }

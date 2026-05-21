@@ -818,6 +818,19 @@ final class PeerSyncCoordinator {
         var cursor = startCursor
         var pages = 0
         let maxPages = 200 // 100k items 上限,正常用例远到不了
+        // **持久化 store 到磁盘**:store.merge 只更新 actor 内存,DuoPasteApp scenePhase
+        // .background 才触发 persist 是不够的——iOS 用户右滑关 app (force quit) 系统直接
+        // kill 进程不走 .background 通知,内存里 PullWorker 拉到的 pinned/new items/
+        // soft delete 全丢。defer 让 success / throw / cancel 三条出口都 persist——
+        // 第 N 页 throw 时 catch 走 recordConnectionProblem,前 N-1 页已 store.merge 到内存
+        // 也要落盘(cursor 已每页 save,如果磁盘 items 没补上会让 UI 跟 cursor 错位,下次冷启
+        // 看到空白 + cursor 跳过那些页永远拿不回来)。
+        //
+        // 跟 BackgroundPullService.runOnce 共享 itemsFile 有理论 race,实测窗口极小:iOS
+        // 前台时 BGAppRefreshTask 不调度,只在切到 background 一段时间后才跑;两条路径都用
+        // atomic write,内容差异最多一次拉取增量,跟 NSCachesDirectory 可被系统 evict 的设计
+        // 哲学一致(cursor=.zero 全拉兜底)
+        defer { store.persist() }
         do {
             while !Task.isCancelled, pages < maxPages {
                 let page = try await client.fetchSince(cursor: cursor, limit: 500)
@@ -835,7 +848,6 @@ final class PeerSyncCoordinator {
                 ).save()
                 if !page.hasMore { break }
             }
-            // 拉完了——更新状态 + 如果中途有 advance 进来,再 kick 一轮
             DebugLog.shared.append("pull done pages=\(pages) storeItems=\(store.items.count)")
             applyConnectedStatus()
         } catch is CancellationError {

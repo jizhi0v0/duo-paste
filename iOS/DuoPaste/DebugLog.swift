@@ -29,8 +29,16 @@ final class DebugLog: @unchecked Sendable {
 
         // Xcode attached 时 stderr 可能被 Console / debugger 背压拖慢；同步写会卡住
         // MainActor。内存 ring buffer 仍同步更新，stderr 只做后台旁路诊断。
+        //
+        // **必须**走 POSIX write(2) 而不是 FileHandle.standardError.write(_:)——后者
+        // 是 ObjC -[NSFileHandle writeData:] bridge,stderr fd EPIPE/EBADF/背压时抛
+        // NSFileHandleOperationException,Swift 接不住直接 SIGABRT。release / 非 debugger
+        // attached / 沙箱里 stderr 无消费者时这条路径会随机崩,断网后日志风暴必踩
         stderrQueue.async {
-            FileHandle.standardError.write(Data((line + "\n").utf8))
+            let bytes = Array((line + "\n").utf8)
+            _ = bytes.withUnsafeBufferPointer { buf in
+                Darwin.write(2, buf.baseAddress, buf.count)
+            }
         }
     }
 
