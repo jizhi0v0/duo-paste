@@ -40,11 +40,13 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private var freshlyCreated: Bool = false
     private var localKeyMonitor: Any?
     /// 方向键 NSEvent.isARepeat=true(长按 keyboard repeat 触发的事件) 节流时间戳。
-    /// macOS 默认 key repeat ~30/s 太快用户觉得"闪现",throttle 到 80ms/次 (~12fps)
-    /// 看起来"一张一张滑过去"。**只 throttle 长按 repeat**:首次按下(isARepeat=false)
-    /// 永远立刻 fire,体感跟单击一样灵敏
+    /// macOS 默认 key repeat ~30ms (~33fps),裸放体感"闪现"无法看清滑过的卡;
+    /// 但 80ms (~12fps) 又比系统按键慢一倍多体感卡顿。45ms (~22fps) 是平衡点——
+    /// 比系统重复慢 ~50% 避免极快 reduction 让 SwiftUI scrollTo + layout 来不及绘制,
+    /// 但已接近"流畅滑动"心智 (>20fps)。
+    /// **只 throttle 长按 repeat**:首次按下(isARepeat=false)永远立刻 fire,体感跟单击一样灵敏
     private var lastNavigateRepeatTime: TimeInterval = 0
-    private static let navigateRepeatMinIntervalSec: TimeInterval = 0.08
+    private static let navigateRepeatMinIntervalSec: TimeInterval = 0.045
     /// 全局鼠标监听器——抓"用户点了我们 app 之外区域"的事件,触发自动 hide。
     /// 解决 preview 打开时 windowDidResignKey 被守卫(防 TCC alert)的副作用:
     /// 单纯 resign-key 不区分键盘切走/系统 alert/鼠标点外面,无法只关心后者;
@@ -336,9 +338,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     }
                     return false                               // 无选中项(结果空) → 透传
                 case 123, 124, 125, 126:                        // ←/→/↑/↓ 切卡
-                    // 长按节流:isARepeat=true 事件按 80ms 间隔放行 (~12fps),首次按下
-                    // 总是立刻 fire。macOS 默认 key repeat ~30/s 太快卡片"闪现",节流到
-                    // ~12/s 后体感"一张一张滑过去"
+                    // 长按节流:isARepeat=true 事件按 navigateRepeatMinIntervalSec 间隔放行,
+                    // 首次按下总是立刻 fire (跟单击一样灵敏)。macOS 默认 key repeat ~30ms
+                    // 太快卡片"闪现",节流到 ~22fps 后既流畅又能看清滑过
                     if isARepeat {
                         let now = ProcessInfo.processInfo.systemUptime
                         if now - self.lastNavigateRepeatTime < Self.navigateRepeatMinIntervalSec {

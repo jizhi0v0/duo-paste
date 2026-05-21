@@ -987,11 +987,13 @@ struct SearchView: View {
                 // alignment 让 LazyHStack 占满 ScrollView 高度但卡片靠顶——消除 user 反馈
                 // 的"第二次打开 panel 底部还有大空隙"(SwiftUI 默认 vertical centering 让卡片
                 // 在 ScrollView 内居中,下方留空白)
-                // spacing=10 + 每张卡 .padding(.trailing, 12) → 视觉间距 22pt 跟之前一致。
+                // spacing=14 + 每张卡 .padding(.trailing, 12) → 视觉间距 26pt。
+                // 从 22pt 加到 26pt 是为了平衡 leading padding 12→16 的左侧让位:
+                // 最左卡左 slack 多了 4pt,卡间距也跟着 +4pt 视觉协调
                 // trailing padding 让 card 的 frame(被 .id 标识 + 被 scrollTo 锚定的那个)
                 // 含 12pt slack,topRight icon 的 8pt 溢出落在 slack 内,scrollTo 最右卡时
                 // 不会被 ScrollView clip 切掉 icon
-                LazyHStack(alignment: .top, spacing: 10) {
+                LazyHStack(alignment: .top, spacing: 14) {
                     // 前 9 张挂 ⌘1 ~ ⌘9 序号,enumerated 拿 index;之后传 nil 不显示角标
                     ForEach(Array(state.results.enumerated()), id: \.element.id) { offset, item in
                         ItemCard(
@@ -1010,10 +1012,25 @@ struct SearchView: View {
                             storageMode: state.deps.config.mesh.storageMode,
                             blobInventoryPulse: state.blobInventoryPulse
                         )
-                        // EquatableView 包装:results 替换 / selectedIDs 变化时,只有真正
-                        // 等价比较失败的 cell 才重算 body。下方 .background GeometryReader
-                        // 是独立 modifier,不被 equatable 影响,preview 锚定仍然准
-                        .equatable()
+                        // **不再 .equatable()**:EquatableView 包装 + LazyHStack cell pool +
+                        // 长按 45ms 快速 selectedIDs 切换三者撞车,cell slot 复用时旧 view
+                        // 缓存残留跟新 mount 的 view 同帧绘制 → 用户看到 "卡中卡":image 卡
+                        // selected border 框住 + 内部叠一张文字卡的完整 view body。实测去掉
+                        // 后现象消失。
+                        //
+                        // 性能权衡:之前 EquatableView 是为减少 SwiftUI reconciliation——
+                        // selectedIDs 变化时本来要重算所有可见 ItemCard body(LazyHStack 视口
+                        // 内 ~10 张),equatable 让 isSelected 没变的卡跳过。去掉后每次箭头切
+                        // 选都全重算可见 cell。M-series 上 ~10 张卡 body 重算是毫秒级,长按
+                        // 45ms 节奏跑得稳;Intel 老机或滑动期间多源数据 churn 可能再出 100ms+
+                        // app update phase 尖峰,届时需要换 caching 手段(不是回退 equatable):
+                        // 用 SwiftUI Observation 细粒度订阅把 isSelected 拆出外层 closure 依赖
+                        // (例 ItemCard 内部 @Bindable / @Environment 读 selection state,外层
+                        // 不传 isSelected 参数,selectedIDs 变化不再 invalidate 外层 view tree)。
+                        // **不要**用 `.id(hashable)`——id 变化是触发完整 rebuild + 丢 @State,
+                        // 跟 caching 目的相反
+                        // 视觉正确性优先于 caching 优化——卡中卡是 P1 视觉 bug,性能尖峰是 P2
+                        // 性能问题且当前未实测到
                         // 仅 currentItem 那张卡上挂 GeometryReader 发布 frame——currentItem
                         // = selectedIDs.last,跟 PreviewPanelController 锚定逻辑一致。
                         // GeometryReader 必须在 .padding 前,读到的是 240pt 卡本身的 frame
@@ -1110,12 +1127,25 @@ struct SearchView: View {
                             }
                         }
                     }
+                    // 末尾透明 spacer 稳定最右真实卡的 LazyHStack mount——
+                    // anchor=nil 的 proxy.scrollTo 会让选中卡贴近 ScrollView 右缘,
+                    // SwiftUI lazy viewport 估算在边缘上有 sub-pixel 抖动,临时把最右
+                    // 那张卡判为"不在视口"unmount 一帧再 re-mount → 用户看到"消失短暂恢复"。
+                    // 24pt spacer 让最右真实卡距 ScrollView 右缘永远有 mount safe zone,
+                    // 边缘抖动落在 spacer 上不影响真实卡 mount 状态。
+                    // 不挂 .id —— scrollTo 不锚定它,纯 layout 占位
+                    Color.clear
+                        .frame(width: 24, height: 1)
                 }
                 // 顶部 12pt 给 icon offset(y:-9) 上溢出留 buffer + 跟 filter hairline 间距;
-                // leading 12 让最左第一张卡的 source icon offset(-9,-9) 不被 ScrollView clip
-                // (跟每张卡 .padding(.trailing, 12) trailing slack 对称)
+                // leading 16 让最左第一张卡的 source icon offset(-9,-9) 不被 ScrollView clip。
+                // **从 12pt 加到 16pt 的原因**:去掉 ItemCard `.equatable()` 后 SwiftUI layout
+                // 算法换了一条路径,第一张卡 icon 中心刚好落在 ScrollView 整数像素 clip 边界
+                // 上,渲染时向内取整切掉 icon 最左半像素。给 4pt buffer 把 icon 中心推离边界
+                // safe zone 内,顶住 sub-pixel rounding 振荡 + 未来 icon size 调整 / SwiftUI
+                // 升级 / HiDPI 缩放差异
                 .padding(.top, 12)
-                .padding(.leading, 12)
+                .padding(.leading, 16)
             }
             // 横向 padding 22 跟 header/filterBar 对齐,panel 左右两侧 padding 统一。
             // frame height 254 = 卡片 236 + top 12 + bottom 6 余量,ScrollView 不 fill remaining
