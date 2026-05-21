@@ -804,6 +804,49 @@ public struct Database: Sendable {
             return newIngest
         }
     }
+
+    /// 跨 origin 版 setPinned——给 `POST /pin/<id>` handler 用。**不带** own-origin guard
+    /// （`setPinned` 带；那是给 Mac 进程内 UI 路径用的）。理由：iOS 配对的 peer 上 mirror
+    /// 行占多数（origin=另一台 Mac），iOS 用户长按 pin 时若强制 own-origin 等于 90%+ 卡
+    /// 不可 pin。心智跟 `bumpCapturedAt`/`softDelete` 一致——任意 peer 都能改 pin。
+    ///
+    /// 已知 limitation：本机 mirror 行 pin 后，对端 origin 设备**不会**收到回传更新——
+    /// PullWorker.applyPage 跳过自家 origin 的行。本机 fold-aware 搜索 `pinned OR 聚合`
+    /// 让"内容 pinned"语义在本机 + 通过 /since 同步给其他 mirror peer 自然成立；
+    /// origin 设备本地仍看到非 pinned（CLAUDE.md / Database.setPinned 注释提到的
+    /// "跨设备 pin 同步留到将来 /update 路由"——本函数即雏形）。
+    ///
+    /// 不变量:
+    /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增
+    /// - tombstone (deleted_at_ns 非 nil) 拒 pin,抛 `.deleted`
+    /// - 不存在的 id 抛 `.notFound`
+    /// - 已是目标状态 = noop 不 bump cursor,返回 nil(handler 当 200 OK 处理)。**不**抛
+    ///   `.alreadyPinned` 这种独立 error —— pin 是幂等切换,"已是目标"语义跟 `bumpCapturedAt`
+    ///   的"id 还存在"一样自然,跟 `softDelete.alreadyDeleted` 不同(那里是"二次删除"明确异常)
+    /// - **不动 captured_at_ns / origin_device**:pin 是元数据切换不是顺序变化。跟
+    ///   `bumpCapturedAt`(改 captured_at_ns)/`softDelete`(写 deleted_at_ns)区别:这俩
+    ///   会让对端列表重排,pin 让对端通过 `pinned DESC` 排序自然 promote(captured_at_ns
+    ///   保留原值,unpin 后回到原位置不变)
+    ///
+    /// Returns: 新 ingested_at_ns；已是目标状态时返 nil（不 bump cursor 防止退化成无意义 fan-out）
+    public func setPinnedAny(id: String, pinned: Bool, now: Int64) async throws -> Int64? {
+        try await pool.write { db in
+            guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
+                throw BumpError.notFound
+            }
+            if row.deletedAtNs != nil {
+                throw BumpError.deleted
+            }
+            if row.pinned == pinned { return nil }
+            let newIngest = try Self.nextIngestNs(db, now: now)
+            try db.execute(sql: """
+                UPDATE item
+                SET pinned = ?, ingested_at_ns = ?
+                WHERE id = ?
+            """, arguments: [pinned ? 1 : 0, newIngest, id])
+            return newIngest
+        }
+    }
 }
 
 public enum BumpError: Error, Equatable {

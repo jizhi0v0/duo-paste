@@ -33,13 +33,28 @@ struct HistoryCellView: View {
 
     var body: some View {
         cardSurface
+            // pinned 左侧 accent gradient——从 leading 到 ~45% 处淡到透明。仅 body 路径
+            // 挂这个 overlay,**不**放进 cardSurface 自身:长按 contextMenu preview 直接
+            // 复用 cardSurface 就天然不带 pin 装饰,避免"长按时 pin 边框跟 light bg 撞色"
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [Color.accentColor.opacity(0.22), .clear],
+                        startPoint: .leading,
+                        endPoint: UnitPoint(x: 0.45, y: 0.5)
+                    ))
+                    .opacity(item.pinned ? 1 : 0)
+                    .allowsHitTesting(false)
+            }
+            // pinned 切换走 smooth 动画——gradient 渐显/渐隐 ~250ms,不"硬切"
+            .animation(.smooth(duration: 0.25), value: item.pinned)
             .contentShape(.rect(cornerRadius: 18))
             .onTapGesture { triggerCopy() }
             .contextMenu {
                 contextMenuItems()
             } preview: {
-                // 显式 preview 锁定尺寸跟卡片一致,避免 iOS 把含 overlay 溢出
-                // 的渲染包围盒整体拍下来导致 preview 位置偏移
+                // 显式 preview 锁定尺寸防止 LazyVGrid 抬卡瞬间 reflow 导致"偏移回弹"。
+                // 复用 cardSurface 不带 pin overlay,长按预览始终是干净的卡片
                 cardSurface
                     .frame(width: 280)
                     .padding(2)
@@ -47,15 +62,15 @@ struct HistoryCellView: View {
             .sensoryFeedback(.success, trigger: copyPulse)
     }
 
-    /// 卡片视觉本体——含 padding / glassEffect / 右上 app icon(或 kind 兜底) / 复制 badge
+    /// 卡片视觉本体——纯卡片 chrome + content,**不带** pin overlay。pin 装饰在 body 层
+     /// 加,这样 contextMenu preview 复用 cardSurface 就天然干净不带 pin 边框
     private var cardSurface: some View {
         cardBody
             .padding(.horizontal, 14)
             .padding(.top, 12)
             .padding(.bottom, 10)
-            .frame(maxWidth: .infinity, minHeight: 148, alignment: .topLeading)
+            .frame(maxWidth: .infinity, minHeight: 172, alignment: .topLeading)
             .glassEffect(.regular, in: .rect(cornerRadius: 18))
-            .overlay(alignment: .topTrailing) { topRightIcon.padding(10) }
             .overlay(alignment: .topLeading) { copiedBadge }
             .task(id: item.sourceApp ?? "") {
                 // sourceApp 非空 + cache 没命中 → 起拉取 task。AppIconCache 内部
@@ -73,11 +88,9 @@ struct HistoryCellView: View {
             Text(item.displayPreview)
                 .font(.subheadline)
                 .foregroundStyle(.primary)
-                .lineLimit(5, reservesSpace: true)
+                .lineLimit(6, reservesSpace: true)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                // 右上 kind icon 占 ~28pt,首行末尾留位避免压住
-                .padding(.trailing, 24)
 
             Spacer(minLength: 0)
             metaRow
@@ -86,6 +99,7 @@ struct HistoryCellView: View {
 
     private var metaRow: some View {
         HStack(spacing: 6) {
+            inlineAppIcon
             TimelineView(.periodic(from: .now, by: 10)) { context in
                 Text(Self.relativeLabel(item.capturedAt, now: context.date))
             }
@@ -100,12 +114,28 @@ struct HistoryCellView: View {
                 ProgressView().controlSize(.mini)
             }
             Spacer(minLength: 0)
-            if item.pinned {
-                Image(systemName: "pin.fill").foregroundStyle(.orange)
-            }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+
+    /// metaRow 起始 inline app icon。命中 sourceApp 显 macOS app icon(16pt 圆角矩形),
+    /// 否则 kind SF symbol 兜底。16pt 是 caption 字号 (~12pt) 的 1.3x,跟时间/大小文本
+    /// 同一视觉层级,不抢卡片主文字的注意力
+    @ViewBuilder
+    private var inlineAppIcon: some View {
+        if let bid = item.sourceApp, let img = appIcons.cached(bid) {
+            Image(uiImage: img)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 16, height: 16)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        } else {
+            Image(systemName: item.kindIconName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 16)
+        }
     }
 
     /// 卡片底部尺寸标签。image/file 走 blob 字节，text/url/rtf/html 走原文字符数。
@@ -117,25 +147,6 @@ struct HistoryCellView: View {
         let full = item.textFull ?? item.preview ?? ""
         if full.isEmpty { return nil }
         return "\(full.count) 字"
-    }
-
-    /// 卡片右上 icon。优先级:
-    /// 1. AppIconCache 命中 sourceApp → 显示 macOS app icon UIImage
-    /// 2. 命中 fetch 失败 / sourceApp 为空 → kind SF Symbol 兜底
-    @ViewBuilder
-    private var topRightIcon: some View {
-        if let bid = item.sourceApp, let img = appIcons.cached(bid) {
-            Image(uiImage: img)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: 22, height: 22)
-                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-        } else {
-            Image(systemName: item.kindIconName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 22, height: 22)
-        }
     }
 
     @ViewBuilder
@@ -182,6 +193,17 @@ struct HistoryCellView: View {
             triggerCopy()
         } label: {
             Label("复制", systemImage: "doc.on.doc")
+        }
+        // 置顶/取消置顶——乐观切 + POST /pin fan-out。已知 limitation:跨 origin pin 不
+        // 回传 origin 设备(本机 fold "pinned OR 聚合"兜底搜索语义,见 server /pin doc)
+        Button {
+            triggerTogglePin()
+        } label: {
+            if item.pinned {
+                Label("取消置顶", systemImage: "pin.slash")
+            } else {
+                Label("置顶", systemImage: "pin")
+            }
         }
         Button {
             triggerShare()
@@ -356,6 +378,14 @@ struct HistoryCellView: View {
         UILatencyLog.mark("delete action begin", itemLogDetail())
         store.removeOptimistic(id: item.id)
         coordinator.deleteItemOnServer(id: item.id)
+    }
+
+    /// 置顶/取消置顶——乐观切 store.pinned + 重排,再 POST /pin fan-out
+    /// (跟 triggerDelete 同心智:乐观立即响应,server 失败下次 /since 自然 reconcile)
+    private func triggerTogglePin() {
+        UILatencyLog.mark("pin action begin", itemLogDetail("pinned_before=\(item.pinned)"))
+        guard let newPinned = store.togglePinOptimistic(id: item.id) else { return }
+        coordinator.togglePinOnServer(id: item.id, pinned: newPinned)
     }
 
     private func triggerShare() {

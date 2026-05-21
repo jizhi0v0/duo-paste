@@ -207,6 +207,42 @@ actor PeerClient {
         return (page.items.map(\.item), snippets, page.count)
     }
 
+    // MARK: - POST /pin/<id>?pinned=1|0
+
+    /// 跨 origin 切 item.pinned。Mac server 调 `database.setPinnedAny`,本机生效 + 通过
+    /// /since 同步给其他 mirror peer(已知 limitation:不回传 origin 设备,本机 fold
+    /// "pinned OR" 让搜索语义对齐——见 server 端 `/pin/:id` 路由 doc)。
+    ///
+    /// body 空,id + query 都被 HMAC 签名所覆盖(canonicalPath 同 /search 处理 query)。
+    /// 错误处理:404 → `.itemNotFound`(本机视图比 Mac 新,swallow);410 → `.itemTombstoned`
+    /// (Mac 已删,UI 应自然 reconcile);200 noop=true 是幂等成功,跟 200 普通成功语义等价
+    func pinItem(id: String, pinned: Bool) async throws {
+        let q = pinned ? "1" : "0"
+        let qi = [URLQueryItem(name: "pinned", value: q)]
+        var sigComp = URLComponents()
+        sigComp.path = "/pin/\(id)"
+        sigComp.queryItems = qi
+        let signedPath = HMACAuth.canonicalPath("/pin/\(id)", query: sigComp.percentEncodedQuery)
+
+        var urlComp = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false) ?? URLComponents()
+        urlComp.path = urlComp.path + "/pin/\(id)"
+        urlComp.queryItems = qi
+        guard let url = urlComp.url else { throw URLError(.badURL) }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.httpBody = Data()
+        sign(&req, method: "POST", signedPath: signedPath, bodyHash: HMACAuth.emptyBodyHashHex)
+        let (_, resp) = try await data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw PeerClientError.nonHTTP }
+        switch http.statusCode {
+        case 200...299: return
+        case 404: throw PeerClientError.itemNotFound
+        case 410: throw PeerClientError.itemTombstoned
+        default: throw PeerClientError.httpStatus(http.statusCode)
+        }
+    }
+
     // MARK: - DELETE /item/<id>
 
     /// 软删条目:iOS 长按"删除" → Mac DB 写 deleted_at_ns + bump ingested_at_ns →

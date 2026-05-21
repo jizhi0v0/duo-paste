@@ -48,6 +48,12 @@ final class PeerSyncCoordinator {
     /// 重连(< 10s)误触,短到用户感知前(< 1min)就能恢复
     nonisolated let wsStuckThresholdSec: TimeInterval = 30
 
+    /// `kickPull()` 起 `pullTask` 时 true,`runPull` 完成 / 失败 / 取消时 false。UI 用它
+     /// 驱动右下角刷新按钮的旋转动画——pull 中持续转,pull 完成自动停。
+     /// 不区分"用户主动 forcePull"vs"WS advance 触发"——刷新动画是 sync activity indicator,
+     /// 任一来源 inflight 都让按钮转,语义直观
+     private(set) var isPulling: Bool = false
+
     private let store: HistoryStore
     private var client: PeerClient?
     /// 多 URL 并发 WS 池。HTTP probe 通但单 URL WS TLS 挂时(iOS cellular Surge 链路坑),
@@ -61,6 +67,12 @@ final class PeerSyncCoordinator {
     private var currentSearchTask: Task<Void, Never>?
     /// inflight pullTask 期间收到 advance → 置 true,task 结束再 kick 一轮
     private var pendingAdvance: Bool = false
+    /// 同 id 的 pin fan-out 串行化:`pinFanoutTasks[id]` 是 in-flight loop task。新 toggle 来时
+    /// 更新 `pendingPinIntent[id]` 让 in-flight loop 收尾时读到新意图再发一轮——避免 rapid
+    /// toggle (AAA→BBB→AAA) 让 fan-out race 出 server 中间态。**最终意图模型**:用户最后一次
+    /// 按 = server 最终状态。see `togglePinOnServer` doc
+    private var pinFanoutTasks: [String: Task<Void, Never>] = [:]
+    private var pendingPinIntent: [String: Bool] = [:]
     /// `applyConnectedStatus` 在 pull 成功时 stamp,heartbeat-stale 检测保护它不被覆盖
     private var lastConnectedStampAt: Date?
     /// 上一次看到 pool 任意 WS .connected 的时间戳。tickStatus 用它判定"全断 > 30s"
@@ -444,6 +456,9 @@ final class PeerSyncCoordinator {
         }
         pullTask = nil
         pendingAdvance = false
+        // 同步 cancel 路径必须在这里立刻清——若紧接 kickPull 起新 pull 它会再置 true,
+        // 中间无闪烁;若不 kick(reset / stop),UI 旋转动画也必须停下不卡 indefinite
+        isPulling = false
     }
 
     /// 当前 path 是蜂窝/expensive 时，Ponte 是更符合用户配置意图的首选。这个切换只是
@@ -597,6 +612,74 @@ final class PeerSyncCoordinator {
         }
     }
 
+    /// 跨设备 pin:iOS UI 已 store.togglePinOptimistic 立即切 + 重排,这里再 POST /pin
+    /// 让 Mac DB 落库 + 推 cursor_advanced 让其他 mirror peer 看到。
+    ///
+    /// **swallow 错误**——跟 bump / delete 同心智。失败时下一次 /since 拉 server 权威值
+    /// 自然纠回(short window 闪回是 acceptable UX,不弹 banner)。
+    ///
+    /// **rapid toggle 串行化**:同 id 已有 in-flight fan-out 时,不并发起新 task——只
+    /// 更新 `pendingPinIntent[id]` 让当前 task 收尾时检测到最新意图再发一轮。**不 cancel**
+    /// 进行中的 task:HTTP fan-out 在 cellular 上单次几百 ms~几秒,cancel + 立即再发会让
+    /// "AAA→BBB→AAA" 序列发出三个 request,网络 race ordering 可能让 server 落在中间态。
+    /// 串行 + 最终意图 pattern 保证: 用户最后一次按 = server 最终状态(同 PullWorker.wake 心智)
+    func togglePinOnServer(id: String, pinned: Bool) {
+        // 更新最终意图。task 完成收尾时读这个;若意图跟刚发的 pinned 不一致 → 再发一轮
+        pendingPinIntent[id] = pinned
+        // 已有同 id task 在跑 → 不重起,让它自己收尾时读 pendingPinIntent
+        if pinFanoutTasks[id] != nil {
+            DebugLog.shared.append("pin queued behind inflight \(String(id.prefix(8))) latestIntent=\(pinned)")
+            return
+        }
+        pinFanoutTasks[id] = Task { [weak self] in
+            await self?.runPinFanoutLoop(id: id)
+        }
+    }
+
+    /// 同 id 的 pin fan-out 串行 loop:读 pendingPinIntent → 发一轮 → 完成后再看 intent
+    /// 有没有变 → 变了就再发,没变就清 task slot 退出。
+    private func runPinFanoutLoop(id: String) async {
+        defer { pinFanoutTasks[id] = nil }
+        while !Task.isCancelled, let intent = pendingPinIntent[id] {
+            // 清意图占位——若发请求期间用户再按 toggle,会重写这个,loop 下一轮看到新值
+            pendingPinIntent.removeValue(forKey: id)
+            guard let secret = currentSecret else { return }
+            var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
+            if let currentEndpointURL {
+                urls.append(currentEndpointURL)
+            }
+            urls = Array(Set(urls)).sorted { a, b in
+                if a == currentEndpointURL { return true }
+                if b == currentEndpointURL { return false }
+                return a < b
+            }
+            guard !urls.isEmpty else { return }
+            DebugLog.shared.append("pin fanout \(String(id.prefix(8))) pinned=\(intent): \(urls.count) route(s)")
+            await withTaskGroup(of: Void.self) { group in
+                for urlString in urls {
+                    group.addTask {
+                        guard let url = URL(string: urlString) else { return }
+                        let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+                        do {
+                            try await client.pinItem(id: id, pinned: intent)
+                            DebugLog.shared.append("pin ok \(String(id.prefix(8))) pinned=\(intent) via \(urlString)")
+                        } catch let error as PeerClientError {
+                            switch error {
+                            case .itemNotFound, .itemTombstoned:
+                                DebugLog.shared.append("pin ignored \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                            default:
+                                DebugLog.shared.append("pin failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                            }
+                        } catch {
+                            DebugLog.shared.append("pin failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+            // loop 继续:若发请求期间用户再 toggle,pendingPinIntent[id] 非空再发一轮
+        }
+    }
+
     /// 跨设备删除:iOS 长按"删除" → store.removeOptimistic 已让 UI 立即消失,
     /// 这里再 DELETE /item/<id> 让 Mac DB 落 tombstone + 推 cursor_advanced
     /// 让其他 peer 通过 /since 看到 tombstone。
@@ -662,6 +745,10 @@ final class PeerSyncCoordinator {
         pendingRouteError = nil
         client = nil
         pendingAdvance = false
+        isPulling = false
+        for (_, t) in pinFanoutTasks { t.cancel() }
+        pinFanoutTasks.removeAll()
+        pendingPinIntent.removeAll()
         lastConnectedStampAt = nil
         lastPoolConnectedAt = nil
     }
@@ -704,9 +791,27 @@ final class PeerSyncCoordinator {
         pendingAdvance = false
         let startCursor = cursor
         DebugLog.shared.append("pull start cursor=(\(startCursor.ingestedAtNs),\(startCursor.id)) url=\(currentEndpointURL ?? "?")")
+        isPulling = true
         pullTask = Task { [weak self] in
             await self?.runPull(client: client, from: startCursor)
         }
+    }
+
+    /// 用户主动刷新——HistoryView 右下角浮动按钮触发。语义跟 WS advance 一致(走 kickPull
+    /// 同一路径),inflight 时 pendingAdvance 让当前 task 收尾再补一轮。pull 完成 →
+    /// `isPulling` 自动落到 false,UI 旋转动画停下。
+    ///
+    /// 未配对 / client nil 时 kickPull 会 early-return,UI 不会卡住——`forcePull` 自己
+    /// 不维护任何状态,纯转发
+    func forcePull() {
+        DebugLog.shared.append("forcePull invoked by user")
+        kickPull()
+    }
+
+    /// UI 判断 forcePull 按钮是否应启用——`client` 是 private,UI 不直接 read。
+    /// 未配对 / 配对中 / client 未装载阶段都返 false,让 FAB 灰显 + disabled
+    var canForcePull: Bool {
+        client != nil
     }
 
     private func runPull(client: PeerClient, from startCursor: SinceCursor) async {
@@ -739,6 +844,9 @@ final class PeerSyncCoordinator {
             recordConnectionProblem(error.localizedDescription)
         }
         pullTask = nil
+        // 这里**先**落 isPulling 再 kick——如果 pendingAdvance 让 kickPull 立即起新一轮,
+        // 它会自己把 isPulling 重置 true。UI 角度看是"持续转"无闪烁
+        isPulling = false
         if pendingAdvance {
             pendingAdvance = false
             kickPull()

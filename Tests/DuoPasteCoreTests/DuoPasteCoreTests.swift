@@ -381,3 +381,85 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let did = try db.setPinned(id: "ghost", pinned: true, selfDeviceID: "device-test", now: 1)
     #expect(did == false)
 }
+
+// MARK: - setPinnedAny (跨 origin 版,给 POST /pin handler 用)
+
+/// own-origin 行 pin 切换:跟 setPinned 相同效果 + bump ingested_at_ns
+@Test func setPinnedAnyFlipsOwnOriginRow() async throws {
+    let (_, db, _, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "x-any", capturedAtNs: 1_000_000_000))
+    let id = try await db.pool.read { conn in
+        try String.fetchOne(conn, sql: "SELECT id FROM item LIMIT 1") ?? ""
+    }
+    let nsBefore = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+    }
+    let newNs = try await db.setPinnedAny(id: id, pinned: true, now: nsBefore &+ 100)
+    #expect(newNs != nil)
+    #expect(newNs! > nsBefore)
+    let row = try await db.pool.read { conn -> (Int, Int64) in
+        let p = try Int.fetchOne(conn, sql: "SELECT pinned FROM item WHERE id = ?", arguments: [id]) ?? 0
+        let n = try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+        return (p, n)
+    }
+    #expect(row.0 == 1)
+    #expect(row.1 == newNs)
+}
+
+/// 关键差异 vs setPinned: mirror 行(origin != self)也能 pin。这是跨 origin 版的存在意义
+@Test func setPinnedAnyAcceptsMirrorRow() async throws {
+    let (_, db, _, _) = try makeFixture()
+    try await db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item (id, origin_device, captured_at_ns, ingested_at_ns, kind, pinned)
+            VALUES ('mirror-id', 'other-device', 1_000_000, 500_000, 'text', 0)
+        """)
+    }
+    let newNs = try await db.setPinnedAny(id: "mirror-id", pinned: true, now: 2_000_000)
+    #expect(newNs != nil)
+    let p = try await db.pool.read { conn in
+        try Int.fetchOne(conn, sql: "SELECT pinned FROM item WHERE id = ?", arguments: ["mirror-id"]) ?? -1
+    }
+    #expect(p == 1)
+}
+
+/// 目标 pinned 跟当前一致 → 返 nil,不 bump cursor 防无意义 fan-out
+@Test func setPinnedAnyNoOpWhenSameState() async throws {
+    let (_, db, _, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "y-any", capturedAtNs: 1_000_000_000))
+    let id = try await db.pool.read { conn in
+        try String.fetchOne(conn, sql: "SELECT id FROM item LIMIT 1") ?? ""
+    }
+    let nsBefore = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+    }
+    // 当前 pinned=0,再设 false → noop
+    let result = try await db.setPinnedAny(id: id, pinned: false, now: nsBefore &+ 5_000)
+    #expect(result == nil)
+    let nsAfter = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT ingested_at_ns FROM item WHERE id = ?", arguments: [id]) ?? 0
+    }
+    #expect(nsAfter == nsBefore)
+}
+
+/// 不存在的 id → 抛 .notFound(跟 softDelete / bumpCapturedAt 行为一致)
+@Test func setPinnedAnyThrowsNotFoundForGhostID() async throws {
+    let (_, db, _, _) = try makeFixture()
+    await #expect(throws: BumpError.notFound) {
+        _ = try await db.setPinnedAny(id: "ghost", pinned: true, now: 1)
+    }
+}
+
+/// tombstone 行 → 抛 .deleted(不该让用户 pin 一条已删的行)
+@Test func setPinnedAnyRejectsTombstoned() async throws {
+    let (_, db, _, _) = try makeFixture()
+    try await db.pool.write { conn in
+        try conn.execute(sql: """
+            INSERT INTO item (id, origin_device, captured_at_ns, ingested_at_ns, kind, pinned, deleted_at_ns)
+            VALUES ('dead-id', 'device-test', 1_000_000, 500_000, 'text', 0, 1_500_000)
+        """)
+    }
+    await #expect(throws: BumpError.deleted) {
+        _ = try await db.setPinnedAny(id: "dead-id", pinned: true, now: 2_000_000)
+    }
+}

@@ -10,8 +10,8 @@ extension Item {
     }
 
     /// UI 卡片用预览。走 `Item.cardPreviewSource` (textFull 优先,见该函数 doc 说明
-    /// preview 为何不能直接用作卡片源)。HistoryCellView lineLimit(5) ≈ 95 中文字符,
-    /// maxChars=300 给 3 倍缓冲让 SwiftUI 行数控制截断而非 server 字符控制。
+    /// preview 为何不能直接用作卡片源)。HistoryCellView lineLimit(6) ≈ 114 中文字符,
+    /// maxChars=300 给 2.5 倍缓冲让 SwiftUI 行数控制截断而非 server 字符控制。
     /// image/file kind textFull 为空时退占位符。
     var displayPreview: String {
         let src = cardPreviewSource(maxChars: 300)

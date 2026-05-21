@@ -61,8 +61,9 @@ public struct SyncServer: Sendable {
     /// 没启用 pairing)
     public let pairingService: PairingService?
 
-    /// 本机 HTTP `/bump` 或 `DELETE /item` 落库后的回调——签名 (id, newIngestedAtNs)。
-    /// Mac daemon 用它刷新本机 UI(让 SearchView 即时反映"复制即顶"/"刚删")。
+    /// 本机 HTTP `/bump` / `DELETE /item` / `POST /pin` 落库后的回调——签名 (id, newIngestedAtNs)。
+    /// Mac daemon 用它刷新本机 UI(让 SearchView 即时反映"复制即顶"/"刚删"/"刚切 pin")。
+    /// **noop 路径不调**:setPinnedAny 已是目标状态时返 nil,handler 不调 onItemMutated
     /// 测试/headless server 默认 no-op。WS broadcaster 只通知 peer,不会自动刷新本进程 SwiftUI state。
     public let onItemMutated: @Sendable (String, Int64) -> Void
 
@@ -465,6 +466,81 @@ public struct SyncServer: Sendable {
                 return errorJSON(.gone, "item already tombstoned")
             } catch {
                 return errorJSON(.internalServerError, "delete failed: \(error)")
+            }
+        }
+
+        // POST /pin/{id}?pinned=1|0:切换 item.pinned。跨 origin 生效(走
+        // database.setPinnedAny,不带 own-origin guard,跟 /bump /item DELETE 心智一致)。
+        // iOS 长按"置顶/取消置顶"路径专用——Mac 端 SearchView contextMenu 仍走进程内
+        // database.setPinned(带 own-origin guard,保留旧契约)。
+        //
+        // query 里读 pinned:`pinned=1` → 置顶,`pinned=0` → 取消。空 / 其它值返 400。
+        // 不接受 body(空 body hash),id 跟 query 都被 HMAC 签名所覆盖。已是目标状态返 200
+        // (handler 当幂等成功),已 tombstoned 返 410,未知 id 返 404。
+        //
+        // **已知 limitation**(写在 setPinnedAny doc):跨 origin pin 不回传 origin 设备 ——
+        // 本机 mirror 改了 pin,PullWorker.applyPage 跳过对端 own origin → origin 设备本地
+        // 仍非 pinned。本机 fold 路径"pinned OR 聚合"让搜索语义本机 + 其他 mirror peer 一致
+        router.post("/pin/:id") { request, context -> Response in
+            guard let id = context.parameters.get("id"), !id.isEmpty else {
+                return errorJSON(.badRequest, "missing id")
+            }
+            // query 解析放 body 校验之前——能在签名校验前快速 reject 明显畸形请求
+            // (签名是中间件已校验过的,handler 这里只做内容/参数校验)
+            let pinnedQ = request.uri.queryParameters.get("pinned").map { String($0) } ?? ""
+            let pinned: Bool
+            switch pinnedQ {
+            case "1": pinned = true
+            case "0": pinned = false
+            default:
+                return errorJSON(.badRequest, "pinned must be 0 or 1")
+            }
+            let bodyBuf = try await request.body.collect(upTo: 16 * 1024)
+            let bodyHash = HMACAuth.sha256Hex(Data(buffer: bodyBuf))
+            guard let bodyHashHeaderName = HTTPField.Name(HMACAuth.bodyHashHeader) else {
+                return errorJSON(.internalServerError, "invalid body-hash header name constant")
+            }
+            let headerHash = request.headers[bodyHashHeaderName]?.lowercased() ?? ""
+            guard headerHash == bodyHash else {
+                return errorJSON(.unauthorized, "body sha mismatch")
+            }
+            let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+            do {
+                // setPinnedAny 已是目标状态 → 返回 nil。当幂等成功处理：不 fan-out 也不
+                // 推 cursor_advanced(因为本机 ingested_at_ns 没动)。response 仍 200 让
+                // iOS 端把 UI 跟 server 状态对齐
+                let newIngest = try await database.setPinnedAny(id: id, pinned: pinned, now: now)
+                if let newIngest {
+                    onItemMutated(id, newIngest)
+                    if let broadcaster {
+                        Task {
+                            await broadcaster.broadcastCursorAdvanced(
+                                deviceID: deviceID,
+                                latestIngestedAtNs: newIngest
+                            )
+                        }
+                    }
+                    let payload: [String: Any] = ["ok": true, "ingested_at_ns": newIngest, "pinned": pinned]
+                    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                    var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                    resp.headers[.contentType] = "application/json"
+                    return resp
+                } else {
+                    // noop:已是目标状态。**不** onItemMutated / broadcaster fan-out ——
+                    // ingested_at_ns 没动,对端 /since 看不到新东西,推 cursor_advanced 等于
+                    // 浪费 RTT 让 peer pull 空页。响应仍带 pinned 让 client 对齐 UI
+                    let payload: [String: Any] = ["ok": true, "pinned": pinned, "noop": true]
+                    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                    var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                    resp.headers[.contentType] = "application/json"
+                    return resp
+                }
+            } catch BumpError.notFound {
+                return errorJSON(.notFound, "item not found")
+            } catch BumpError.deleted {
+                return errorJSON(.gone, "item is tombstoned")
+            } catch {
+                return errorJSON(.internalServerError, "pin failed: \(error)")
             }
         }
 

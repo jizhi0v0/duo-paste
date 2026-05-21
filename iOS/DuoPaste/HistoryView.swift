@@ -50,6 +50,26 @@ struct HistoryView: View {
         }
     }
 
+    /// toolbar trailing 刷新按钮。SF Symbol 用 `arrow.triangle.2.circlepath` 而非
+    /// `arrow.clockwise`——后者字形单箭头不中心对称(头重尾轻),无论 anchor 多准旋转
+    /// 视觉上都"飘",看起来不圆。`arrow.triangle.2.circlepath` 两个三角形对称构成完整
+    /// 圆环(Safari / Photos reload 同款),配 `.symbolEffect(.rotate)` 是真正的匀速圆周
+    ///
+    /// **不要换回** `arrow.clockwise`:用户反馈"转起来不圆"直接来源于这个图标的非对称
+    private var refreshButton: some View {
+        let canPull = coordinator.canForcePull
+        return Button {
+            coordinator.forcePull()
+        } label: {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .symbolEffect(.rotate, options: .repeating, isActive: coordinator.isPulling)
+        }
+        .disabled(!canPull)
+        .sensoryFeedback(.impact(weight: .light), trigger: coordinator.isPulling)
+        .accessibilityLabel("刷新")
+        .accessibilityValue(coordinator.isPulling ? "正在刷新" : (canPull ? "" : "未配对,无法刷新"))
+    }
+
     private var listScroll: some View {
         ScrollView {
             LazyVGrid(
@@ -139,9 +159,16 @@ struct HistoryView: View {
 
     @ToolbarContentBuilder
     private var statusToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
+        // 左上角:同步状态徽标。leading 离 nav title 远,跟用户"先看连接好不好,再看内容"
+        // 的扫视顺序一致
+        ToolbarItem(placement: .topBarLeading) {
             statusBadge
                 .accessibilityLabel("同步状态")
+        }
+        // 右上角:刷新按钮。toolbar 风格代替之前的右下角 FAB——iOS 视觉跟 Mail / Photos
+        // 等系统 app 一致,且不挡列表底部的卡片
+        ToolbarItem(placement: .topBarTrailing) {
+            refreshButton
         }
     }
 

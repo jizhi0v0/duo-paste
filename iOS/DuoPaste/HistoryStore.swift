@@ -51,10 +51,7 @@ final class HistoryStore {
     /// fold + iOS list 排序契约一体应用。fold 走 DuoPasteCore 单点契约,sort 本地化
     /// (Mac 跟 iOS 排序契约不同——见 `filtered` 文档)
     private static func foldAndSort(_ list: [Item]) -> [Item] {
-        Item.foldByTextFull(list).sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            return a.capturedAtNs > b.capturedAtNs
-        }
+        Item.foldByTextFull(list).sorted(by: iosListOrder)
     }
 
     /// coordinator 拉完 /search 把结果灌进来。**只在 `q` 仍匹配当前 store.query 时**
@@ -118,10 +115,7 @@ final class HistoryStore {
                 byID[it.id] = it
             }
         }
-        items = byID.values.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            return a.capturedAtNs > b.capturedAtNs
-        }
+        items = byID.values.sorted(by: Self.iosListOrder)
         if resurrectedCount > 0 {
             deleteFailureMessage = resurrectedCount == 1
                 ? "1 条删除未送达 Mac,已恢复显示——可重试"
@@ -140,10 +134,44 @@ final class HistoryStore {
         // 已经在第一位且不 pinned 顶 → 没必要重排
         if idx == 0 && !items[idx].pinned { return }
         items[idx].capturedAtNs = nowNs
-        items.sort { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            return a.capturedAtNs > b.capturedAtNs
+        items.sort(by: Self.iosListOrder)
+    }
+
+    /// 用户长按"置顶/取消置顶"路径——本机乐观立即切 `pinned` + 重排,coordinator 异步
+    /// POST /pin/<id>?pinned=N 让 Mac DB 落库。本机重排契约 = `merge` 路径(pinned DESC,
+    /// captured_at_ns DESC)。
+    ///
+    /// 失败兜底:下次 /since 拉 Mac 权威值时 `merge` 会用 server pinned 覆盖本机(`max`
+    /// 兜底只对 capturedAtNs),所以乐观值跟 server 不一致时最终会被纠正。中间窗口
+    /// (几百 ms 到几秒)用户视感"立即生效"
+    ///
+    /// Returns: 切换后的 pinned 值;item 不存在返 nil(调用方 swallow,不上 server)
+    @discardableResult
+    func togglePinOptimistic(id: String) -> Bool? {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return nil }
+        let newPinned = !items[idx].pinned
+        items[idx].pinned = newPinned
+        items.sort(by: Self.iosListOrder)
+        // 同步 patch `lastServerSearch.items`——非空 query 下 `filtered` 直接返 cached
+        // server-search 列表,不走 items 路径。不 patch 这里会让 search state 下 pin toggle
+        // 看不到变化,直到下一次 /since merge 才反映。删除 cache 会让 UI 闪回 contains
+        // fallback,patch 才是正确做法
+        if let r = lastServerSearch, let i = r.items.firstIndex(where: { $0.id == id }) {
+            var patched = r.items
+            patched[i].pinned = newPinned
+            patched.sort(by: Self.iosListOrder)
+            lastServerSearch = ServerSearchResult(
+                q: r.q, items: patched, snippets: r.snippets, totalCount: r.totalCount
+            )
         }
+        return newPinned
+    }
+
+    /// iOS 列表排序契约 — pinned DESC,captured_at_ns DESC。`filtered` 文档详述跟 Mac
+    /// 排序契约的差异(Mac 多 prefix24h boost)。单点定义避免三处 sort 闭包重复 + 漂移
+    nonisolated static func iosListOrder(_ a: Item, _ b: Item) -> Bool {
+        if a.pinned != b.pinned { return a.pinned && !b.pinned }
+        return a.capturedAtNs > b.capturedAtNs
     }
 
     /// 用户长按"删除"路径——本机乐观立即移除,server 端 DELETE /item/<id> 在 coordinator
