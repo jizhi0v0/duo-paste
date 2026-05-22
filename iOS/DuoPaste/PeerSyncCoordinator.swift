@@ -47,6 +47,11 @@ final class PeerSyncCoordinator {
     /// 但 currentEndpointURL 卡住——这条 watchdog 兜底自愈。30s 长到不会被合法快速
     /// 重连(< 10s)误触,短到用户感知前(< 1min)就能恢复
     nonisolated let wsStuckThresholdSec: TimeInterval = 30
+    /// 进前台后给 socket 自愈的 grace 窗。iOS 后台挂起 URLSession,WS 收不到帧 →
+    /// 回前台第一个 tickStatus 读到的 lastHeartbeatAt 是后台前的时间,会误报
+    /// "链路无响应 (180s)"。实测后台 191s 返回后 socket 在 ~2s 内 reconnect ready,
+    /// 8s 留 4x buffer 覆盖慢网。grace 期内 zombie 检测短路,过了 grace 还没新帧才是真问题
+    nonisolated let foregroundGraceSec: TimeInterval = 8
 
     /// `kickPull()` 起 `pullTask` 时 true,`runPull` 完成 / 失败 / 取消时 false。UI 用它
      /// 驱动右下角刷新按钮的旋转动画——pull 中持续转,pull 完成自动停。
@@ -79,6 +84,9 @@ final class PeerSyncCoordinator {
     /// 触发 auto-repick——daemon kickstart 后远端服务死回来本地 NWPath 不变,
     /// NetworkChangeWatcher 不 fire,需要这条单独的 watchdog 自愈
     private var lastPoolConnectedAt: Date?
+    /// 最近一次 scenePhase → .active 的时间戳。`tickStatus` 用它在 foregroundGraceSec
+    /// 内短路 zombie 检测,避免后台返回的橙字 "链路无响应 (180s)" 误报
+    private var lastForegroundEntryAt: Date?
     /// 配对完成后 Mac 暴露的 endpoint 候选 list。NetworkChangeWatcher / WS endpoints_changed
     /// 触发 repickEndpoint() 时从这 re-probe 并按 route hint 选路。nil = 未配对(走 reconfigure 单 URL 路径)
     private var availableEndpoints: [PeerEndpoint] = []
@@ -186,6 +194,14 @@ final class PeerSyncCoordinator {
         preferPonteForCurrentPath()
         wsPool?.restartAll(reason: "network changed")
         repickEndpoint(reason: "network changed")
+    }
+
+    /// scenePhase → .active 时 DuoPasteApp 调本方法。stamp `lastForegroundEntryAt`
+    /// 让 `tickStatus` 在 foregroundGraceSec 内短路 zombie 检测——iOS 后台挂起
+    /// URLSession,heartbeat 必然 stale,grace 给 socket 自愈窗口免误报橙字
+    func applicationDidBecomeActive() {
+        lastForegroundEntryAt = Date()
+        DebugLog.shared.append("foreground active: heartbeat grace \(Int(foregroundGraceSec))s")
     }
 
     /// 手填 advanced URL 路径用——单 URL 走 pool。配对路径走 `reconfigureFromPairing`
@@ -930,10 +946,16 @@ final class PeerSyncCoordinator {
         case .stopped, .idle:
             break
         case .connected(let pid):
-            // zombie 检测:pool 说 connected 但所有 sub WS 帧都太老 → 降级
+            // zombie 检测:pool 说 connected 但所有 sub WS 帧都太老 → 降级。
+            // foreground grace:刚回前台时 iOS 已暂停 URLSession 一阵子,heartbeat
+            // 必然 stale。给 socket `foregroundGraceSec` 自愈;过窗仍 stale 才算真死
             let last = pool.lastHeartbeatAt ?? lastConnectedStampAt ?? .distantPast
-            if Date().timeIntervalSince(last) > heartbeatStaleTimeoutSec {
-                recordConnectionProblem("链路无响应 (\(Int(Date().timeIntervalSince(last)))s)")
+            let nowD = Date()
+            let inForegroundGrace = lastForegroundEntryAt.map {
+                nowD.timeIntervalSince($0) < foregroundGraceSec
+            } ?? false
+            if !inForegroundGrace, nowD.timeIntervalSince(last) > heartbeatStaleTimeoutSec {
+                recordConnectionProblem("链路无响应 (\(Int(nowD.timeIntervalSince(last)))s)")
             } else if case .connected = status {
                 // 已经显 connected 保留 lastSync
             } else {

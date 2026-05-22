@@ -92,6 +92,8 @@ struct DuoPasteApp: App {
                            let restored = try? JSONDecoder().decode([Item].self, from: data) {
                             store.merge(restored)
                         }
+                        // 通知 coordinator 给 heartbeat 检测加 grace,避免后台返回橙字误报
+                        coordinator.applicationDidBecomeActive()
                     default:
                         break
                     }
