@@ -304,6 +304,7 @@ final class PeerSyncCoordinator {
             || reason == "manual refresh"
             || reason == "network changed"
             || reason.hasPrefix("ws: endpoints_changed")
+            || reason.hasPrefix("ws watchdog")
         if !userInitiated, let last = lastRepickStartedAt,
            Date().timeIntervalSince(last) < minRepickIntervalSec {
             DebugLog.shared.append("endpoint repick throttled: \(reason) (last=\(Int(Date().timeIntervalSince(last) * 1000))ms ago)")
@@ -509,8 +510,13 @@ final class PeerSyncCoordinator {
     }
 
     /// WS endpoints_changed 收到 → refetch /endpoints 拿新列表(可能 Mac 加了
-    /// peer 或学到新 ponte_host)→ re-probe
-    private func refetchAndRepick(reason: String) {
+    /// peer 或学到新 ponte_host)→ re-probe。
+    ///
+    /// `fallbackProbeOnFailure`:fetchEndpoints 失败时是否仍走一次已知候选的 repick。
+    /// endpoints_changed 路径用 false——WS 都推了帧,server 必然 alive,fetchEndpoints
+    /// 失败属偶发不需 fallback。watchdog 路径用 true——pool 全断时 /endpoints 可能也拉
+    /// 不到,但已知候选仍要重试(原 watchdog 行为)
+    private func refetchAndRepick(reason: String, fallbackProbeOnFailure: Bool = false) {
         guard let client else { return }
         Task { [weak self] in
             do {
@@ -524,6 +530,11 @@ final class PeerSyncCoordinator {
                 }
             } catch {
                 DebugLog.shared.append("refetchAndRepick failed: \(error)")
+                if fallbackProbeOnFailure {
+                    await MainActor.run { [weak self] in
+                        self?.repickEndpoint(reason: "\(reason) fallback")
+                    }
+                }
             }
         }
     }
@@ -930,9 +941,13 @@ final class PeerSyncCoordinator {
                   nowDate.timeIntervalSince(last) > wsStuckThresholdSec,
                   currentSecret != nil,
                   !availableEndpoints.isEmpty {
-            DebugLog.shared.append("ws watchdog: pool stuck \(Int(nowDate.timeIntervalSince(last)))s → repick")
+            DebugLog.shared.append("ws watchdog: pool stuck \(Int(nowDate.timeIntervalSince(last)))s → refetch + repick")
             lastPoolConnectedAt = nil
-            repickEndpoint(reason: "ws watchdog")
+            // Mac 端可能改了拓扑(mesh-init 加 peer / 换端口 / 学到新 ponte_host),
+            // 现有候选已经全断 = WS 推 endpoints_changed 推不过来。先试 fetchEndpoints
+            // 拉新 list(只要任一 HTTP 路径还通就能拿到),失败 fallback 回原 repick
+            // 重 probe 已知候选,保留原 watchdog "全断时主动 retry" 行为
+            refetchAndRepick(reason: "ws watchdog", fallbackProbeOnFailure: true)
         }
         // pool.state 聚合多 WS:任一 .connected → pool.connected,否则取最活跃子 state.
         // 单 WS 死 + 其他活 = pool.connected,UI 仍显示已连接(这正是 pool 价值)
