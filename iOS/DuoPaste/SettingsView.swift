@@ -3,6 +3,7 @@ import DuoPasteCore
 
 struct SettingsView: View {
     @Environment(PeerSyncCoordinator.self) private var coordinator
+    @Environment(ShareCoordinator.self) private var shareCoord
     @AppStorage("peerURL") private var peerURL: String = ""
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
     @AppStorage("peerEndpointsJSON") private var peerEndpointsJSON: String = ""
@@ -222,9 +223,6 @@ struct SettingsView: View {
 
     // MARK: - 候选 endpoint(调试用)
 
-    @State private var showLogShare: Bool = false
-    @State private var logShareText: String = ""
-
     private func phaseIcon(_ phase: PeerSyncCoordinator.PoolURLStatus.Phase) -> String {
         switch phase {
         case .connected: return "antenna.radiowaves.left.and.right"
@@ -297,8 +295,10 @@ struct SettingsView: View {
                 Label("刷新候选", systemImage: "arrow.clockwise")
             }
             Button {
-                logShareText = DebugLog.shared.snapshot()
-                showLogShare = true
+                // 走 ShareCoordinator UIKit 直 present,不套 SwiftUI .sheet——
+                // 后者首次挂载 UIActivityViewController 必现"弹窗自动关闭再点才出"
+                // race,见 ShareCoordinator.swift 头注释
+                shareCoord.share([DebugLog.shared.snapshot()])
             } label: {
                 Label("导出日志", systemImage: "doc.text.below.ecg")
             }
@@ -306,9 +306,6 @@ struct SettingsView: View {
             Text("候选 endpoint(\(probes.count))· 调试")
         } footer: {
             Text("★ = HTTP /since 当前用的 URL。WS pool 对全部 endpoint 并发开 WS,任一推 cursor_advanced 都触发拉取。每个 WS 独立 8s handshake 超时 + 指数 backoff up to 60s(URLSessionWebSocketTask TLS 挂掉会永远阻塞 receive,必须硬超时)。")
-        }
-        .sheet(isPresented: $showLogShare) {
-            ActivityShareSheet(items: [logShareText])
         }
     }
 
@@ -476,14 +473,3 @@ extension QRPayload: Identifiable {
     var id: String { "\(host):\(port)" }
 }
 
-/// 简易 UIActivityViewController wrapper—— "导出日志" 按钮分享 text 文件。
-/// 不复用 ShareCoordinator(那个绑了 image 字节流场景)
-private struct ActivityShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
-}
