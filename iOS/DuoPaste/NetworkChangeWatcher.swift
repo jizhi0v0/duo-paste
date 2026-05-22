@@ -17,6 +17,8 @@ final class NetworkChangeWatcher {
     /// 在 nil-self 路径上反复跑空操作
     private var listeners: [UUID: (NWPath) -> Void] = [:]
     private var started = false
+    /// 上次通知 listener 时 path 的指纹；用来在诊断日志里 diff 出"到底哪个字段变了"
+    private var lastFingerprint: String?
 
     private init() {
         self.monitor = NWPathMonitor()
@@ -56,9 +58,68 @@ final class NetworkChangeWatcher {
     }
 
     private func applyPath(_ path: NWPath) {
+        let fp = Self.fingerprint(path)
+        let prev = lastFingerprint
+        lastFingerprint = fp
         currentPath = path
+
+        // NWPathMonitor 在 iOS 上对 Tailscale/Surge NetworkExtension 这种多扩展环境会反复
+        // fire——切前台/后台、扩展内部 tick、metric 调整都触发,但实际 status/interfaces/flags
+        // 没变。这种 noise callback 不应传播,否则下游 `handleNetworkChange` 会无意义触发
+        // restartAll(砸掉刚握手成功的 WS)+ repickEndpoint(起 6 路并发 probe),造成日志里
+        // "刚 ready 又被 cancel" 的反复抖动
+        //
+        // 同样 initial callback (`.start()` 后 framework 上报当前 path) 也不是变化事件——
+        // 配对/重连等业务路径已经主动 kick 了 probe + WS pool,initial 通知没价值反而把刚
+        // 起的 socket 砸一遍。`PeerSyncCoordinator` 仍可读 `currentPath` 决策 Ponte 偏好
+        if let prev {
+            if prev == fp {
+                DebugLog.shared.append("nwpath callback (no diff, skipped): \(fp)")
+                return
+            }
+            DebugLog.shared.append("nwpath changed: \(prev) → \(fp)")
+        } else {
+            DebugLog.shared.append("nwpath initial (skipped): \(fp)")
+            return
+        }
+
         for listener in listeners.values {
             listener(path)
         }
+    }
+
+    /// 把 NWPath 压成可比较的一行字符串。覆盖真正影响连通性的字段:
+    /// - status (.satisfied / .unsatisfied / .requiresConnection)
+    /// - 可用接口类型集合(wifi/cellular/wired/loopback/other,排序后)
+    /// - isExpensive / isConstrained / supportsIPv4 / supportsIPv6 / supportsDNS
+    /// **不**包括 interface name(同 type 不同 name 像 utun0/utun1 是 NetworkExtension 内部
+    /// 重启常态,不该当作"网络变化")或 gateway/endpoint(只在已建立 NWConnection 上有意义)
+    private static func fingerprint(_ path: NWPath) -> String {
+        let status: String
+        switch path.status {
+        case .satisfied: status = "satisfied"
+        case .unsatisfied: status = "unsatisfied"
+        case .requiresConnection: status = "requiresConnection"
+        @unknown default: status = "unknown"
+        }
+        let ifaceTypes = path.availableInterfaces.map { iface -> String in
+            switch iface.type {
+            case .wifi: return "wifi"
+            case .cellular: return "cell"
+            case .wiredEthernet: return "wired"
+            case .loopback: return "loop"
+            case .other: return "other"
+            @unknown default: return "?"
+            }
+        }
+        let typesSig = Set(ifaceTypes).sorted().joined(separator: ",")
+        var flags: [String] = []
+        if path.isExpensive { flags.append("expensive") }
+        if path.isConstrained { flags.append("constrained") }
+        if !path.supportsIPv4 { flags.append("noV4") }
+        if !path.supportsIPv6 { flags.append("noV6") }
+        if !path.supportsDNS { flags.append("noDNS") }
+        let flagsSig = flags.isEmpty ? "-" : flags.joined(separator: ",")
+        return "[\(status) ifaces=\(typesSig) flags=\(flagsSig)]"
     }
 }
