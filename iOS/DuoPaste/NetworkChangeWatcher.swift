@@ -90,10 +90,16 @@ final class NetworkChangeWatcher {
 
     /// 把 NWPath 压成可比较的一行字符串。覆盖真正影响连通性的字段:
     /// - status (.satisfied / .unsatisfied / .requiresConnection)
+    /// - **primary** 接口类型(availableInterfaces.first,反映 iOS 选的 default route)
     /// - 可用接口类型集合(wifi/cellular/wired/loopback/other,排序后)
     /// - isExpensive / isConstrained / supportsIPv4 / supportsIPv6 / supportsDNS
     /// **不**包括 interface name(同 type 不同 name 像 utun0/utun1 是 NetworkExtension 内部
     /// 重启常态,不该当作"网络变化")或 gateway/endpoint(只在已建立 NWConnection 上有意义)
+    ///
+    /// **primary vs Set**:iPhone 长期 wifi+cell 并存(cell 是 backup),wifi 退化时 iOS 把
+    /// default route 从 wifi 切到 cell——`availableInterfaces` 是 `[wifi,cell]` → `[cell,wifi]`,
+    /// **Set 不变**但 first 变了。光 Set 会漏掉这种 silent route swap,导致 preferPonteForCurrentPath
+    /// 永远在 wifi 路径上跑(但实际走的是 cellular)直到 5min 周期 repick 兜底
     private static func fingerprint(_ path: NWPath) -> String {
         let status: String
         switch path.status {
@@ -102,16 +108,8 @@ final class NetworkChangeWatcher {
         case .requiresConnection: status = "requiresConnection"
         @unknown default: status = "unknown"
         }
-        let ifaceTypes = path.availableInterfaces.map { iface -> String in
-            switch iface.type {
-            case .wifi: return "wifi"
-            case .cellular: return "cell"
-            case .wiredEthernet: return "wired"
-            case .loopback: return "loop"
-            case .other: return "other"
-            @unknown default: return "?"
-            }
-        }
+        let ifaceTypes = path.availableInterfaces.map { ifaceTypeString($0.type) }
+        let primary = ifaceTypes.first ?? "none"
         let typesSig = Set(ifaceTypes).sorted().joined(separator: ",")
         var flags: [String] = []
         if path.isExpensive { flags.append("expensive") }
@@ -120,6 +118,17 @@ final class NetworkChangeWatcher {
         if !path.supportsIPv6 { flags.append("noV6") }
         if !path.supportsDNS { flags.append("noDNS") }
         let flagsSig = flags.isEmpty ? "-" : flags.joined(separator: ",")
-        return "[\(status) ifaces=\(typesSig) flags=\(flagsSig)]"
+        return "[\(status) primary=\(primary) ifaces=\(typesSig) flags=\(flagsSig)]"
+    }
+
+    private static func ifaceTypeString(_ type: NWInterface.InterfaceType) -> String {
+        switch type {
+        case .wifi: return "wifi"
+        case .cellular: return "cell"
+        case .wiredEthernet: return "wired"
+        case .loopback: return "loop"
+        case .other: return "other"
+        @unknown default: return "?"
+        }
     }
 }

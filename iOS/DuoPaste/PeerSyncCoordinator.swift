@@ -517,13 +517,29 @@ final class PeerSyncCoordinator {
     /// 失败属偶发不需 fallback。watchdog 路径用 true——pool 全断时 /endpoints 可能也拉
     /// 不到,但已知候选仍要重试(原 watchdog 行为)
     private func refetchAndRepick(reason: String, fallbackProbeOnFailure: Bool = false) {
-        guard let client else { return }
+        // client == nil 时直接 fallback——watchdog 路径下原 `repickEndpoint("ws watchdog")`
+        // 不依赖 client(只读 availableEndpoints + secret),改成 refetchAndRepick 后
+        // 若 client 为空会 silently burn 掉 watchdog single-shot(`lastPoolConnectedAt = nil`
+        // 已写,下次 tick 条件不成立)。fallback 保留原 watchdog "重 probe 已知候选" 行为
+        guard let client else {
+            if fallbackProbeOnFailure {
+                repickEndpoint(reason: "\(reason) fallback")
+            }
+            return
+        }
         Task { [weak self] in
             do {
                 let page = try await client.fetchEndpoints()
                 let flat = Self.flattenEndpoints(page)
                 await MainActor.run {
                     guard let self else { return }
+                    // race guard:fetch 期间用户 reconfigure(nil)/disconnect → status=.unconfigured。
+                    // 这条 stale Task 仍持有旧 page;若不拦,`availableEndpoints = flat` 会
+                    // resurrect 已被 reset 的候选 list,Settings UI 显示 ghost endpoints
+                    guard self.currentSecret != nil else {
+                        DebugLog.shared.append("refetchAndRepick: discarded (.unconfigured during fetch)")
+                        return
+                    }
                     self.availableEndpoints = flat
                     self.seedProbes(from: flat)
                     self.repickEndpoint(reason: reason)
@@ -531,7 +547,7 @@ final class PeerSyncCoordinator {
             } catch {
                 DebugLog.shared.append("refetchAndRepick failed: \(error)")
                 if fallbackProbeOnFailure {
-                    await MainActor.run { [weak self] in
+                    await MainActor.run {
                         self?.repickEndpoint(reason: "\(reason) fallback")
                     }
                 }
