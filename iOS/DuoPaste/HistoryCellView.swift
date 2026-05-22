@@ -33,16 +33,18 @@ struct HistoryCellView: View {
 
     var body: some View {
         cardSurface
-            // pinned 左侧 accent gradient——从 leading 到 ~45% 处淡到透明。仅 body 路径
-            // 挂这个 overlay,**不**放进 cardSurface 自身:长按 contextMenu preview 直接
-            // 复用 cardSurface 就天然不带 pin 装饰,避免"长按时 pin 边框跟 light bg 撞色"
-            .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(LinearGradient(
-                        colors: [Color.accentColor.opacity(0.22), .clear],
-                        startPoint: .leading,
-                        endPoint: UnitPoint(x: 0.45, y: 0.5)
-                    ))
+            // pinned 右上角 45° pin 图标——padding(6, 6) 让 icon 中心贴在 cornerRadius=18
+            // 的圆弧上。**不用** .offset 推出 cardSurface bounds:长按时 iOS contextMenu
+            // snapshot 只截 view frame 内容,offset 外部分会被裁掉。
+            // 仅 body 路径挂 overlay,**不**放进 cardSurface 自身:长按 contextMenu preview
+            // 复用 cardSurface 就天然不带 pin 装饰
+            .overlay(alignment: .topTrailing) {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color.accentColor)
+                    .rotationEffect(.degrees(45))
+                    .padding(.top, 6)
+                    .padding(.trailing, 6)
                     .opacity(item.pinned ? 1 : 0)
                     .allowsHitTesting(false)
             }
@@ -261,23 +263,25 @@ struct HistoryCellView: View {
             UILatencyLog.mark("context menu preview disappear", itemLogDetail())
         }
         .task {
-            if item.kind == .image,
-               let sha = item.blobSha256,
-               blobs.cached(sha) == nil,
-               !blobs.isCancelled(sha) {
-                let start = CACurrentMediaTime()
-                UILatencyLog.mark("preview image fetch begin", itemLogDetail("sha=\(shortSHA(sha))"))
-                do {
-                    let data = try await blobs.fetch(sha).value
-                    UILatencyLog.mark(
-                        "preview image fetch end",
-                        itemLogDetail("bytes=\(data.count) elapsed_ms=\(UILatencyLog.elapsedMS(since: start))")
-                    )
-                } catch {
-                    UILatencyLog.mark(
-                        "preview image fetch failed",
-                        itemLogDetail("error=\(error.localizedDescription) elapsed_ms=\(UILatencyLog.elapsedMS(since: start))")
-                    )
+            if item.kind == .image, let sha = item.blobSha256 {
+                let hasCache = blobs.cached(sha) != nil
+                let isCancelled = blobs.isCancelled(sha)
+                DebugLog.shared.append("preview .task fire sha=\(shortSHA(sha)) hasCache=\(hasCache) cancelled=\(isCancelled)")
+                if !hasCache && !isCancelled {
+                    let start = CACurrentMediaTime()
+                    UILatencyLog.mark("preview image fetch begin", itemLogDetail("sha=\(shortSHA(sha))"))
+                    do {
+                        let data = try await blobs.fetch(sha).value
+                        UILatencyLog.mark(
+                            "preview image fetch end",
+                            itemLogDetail("bytes=\(data.count) elapsed_ms=\(UILatencyLog.elapsedMS(since: start))")
+                        )
+                    } catch {
+                        UILatencyLog.mark(
+                            "preview image fetch failed",
+                            itemLogDetail("error=\(error.localizedDescription) elapsed_ms=\(UILatencyLog.elapsedMS(since: start))")
+                        )
+                    }
                 }
             }
         }
@@ -293,16 +297,26 @@ struct HistoryCellView: View {
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onAppear {
+                    DebugLog.shared.append("previewBody render=image sha=\(shortSHA(sha)) bytes=\(data.count)")
+                }
         } else if item.kind == .image {
             VStack(spacing: 12) {
                 Image(systemName: "photo")
                     .font(.system(size: 44))
                     .foregroundStyle(.secondary)
-                if let sha = item.blobSha256, blobs.isLoading(sha) {
+                if item.blobSha256 != nil {
                     ProgressView().controlSize(.regular)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onAppear {
+                let sha = item.blobSha256.map(shortSHA) ?? "nil"
+                let hasCache = item.blobSha256.flatMap(blobs.cached) != nil
+                let isLoading = item.blobSha256.map(blobs.isLoading) ?? false
+                let isCancelled = item.blobSha256.map(blobs.isCancelled) ?? false
+                DebugLog.shared.append("previewBody render=placeholder sha=\(sha) hasCache=\(hasCache) loading=\(isLoading) cancelled=\(isCancelled) hasSpinner=\(item.blobSha256 != nil)")
+            }
         } else {
             ScrollView {
                 Text(previewText)

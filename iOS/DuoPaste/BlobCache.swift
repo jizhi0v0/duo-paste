@@ -106,8 +106,10 @@ final class BlobCache {
             inflight.removeValue(forKey: sha)
             throw BlobCacheError.notConfigured
         }
+        DebugLog.shared.append("blob fetch begin sha=\(sha.prefix(8))")
         do {
             let data = try await fetcher(sha)
+            DebugLog.shared.append("blob fetch ok sha=\(sha.prefix(8)) bytes=\(data.count)")
             // 3) 落盘 + LRU 清理——同样 detach。落盘失败不影响内存 cache 返回。
             await Self.writeToDisk(path: path, data: data)
             await Self.evictIfNeeded(diskDir: diskDir, maxBytes: maxDiskBytes)
@@ -116,11 +118,13 @@ final class BlobCache {
             inflight.removeValue(forKey: sha)
             return data
         } catch is CancellationError {
+            DebugLog.shared.append("blob fetch cancelled sha=\(sha.prefix(8))")
             loadingShas.remove(sha)
             inflight.removeValue(forKey: sha)
             cancelled.insert(sha)
             throw CancellationError()
         } catch let urlErr as URLError where urlErr.code == .cancelled {
+            DebugLog.shared.append("blob fetch URLError.cancelled sha=\(sha.prefix(8))")
             // URLSession invalidateAndCancel / reconfigure 路径下 fetcher 抛
             // URLError.cancelled 而非 CancellationError；视同用户主动 cancel 进黑名单，
             // 而不是 generic 失败写 failedReasons。resetAll 会清 cancelled，让重连后能重拉
@@ -129,6 +133,7 @@ final class BlobCache {
             cancelled.insert(sha)
             throw CancellationError()
         } catch {
+            DebugLog.shared.append("blob fetch failed sha=\(sha.prefix(8)) error=\(error.localizedDescription)")
             loadingShas.remove(sha)
             inflight.removeValue(forKey: sha)
             failedReasons[sha] = error.localizedDescription
