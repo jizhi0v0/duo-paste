@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import ImageIO
 import QuartzCore
 import DuoPasteCore
 
@@ -84,20 +85,71 @@ struct HistoryCellView: View {
                     _ = await appIcons.fetch(bid).value
                 }
             }
+            .task(id: item.blobSha256 ?? "") {
+                // 图片类 cell 上视区时自动拉 blob——长按预览 / tap 复制时 cache 已热,
+                // 不再出现"首次长按 loading 不出图"。fetch 内部去重(同 sha 共享 inflight),
+                // BlobCache 64MB 软上限 + LRU 防长列表全部图片字节累积爆内存。
+                // 已 cancel 的 sha 进黑名单不重拉(用户主动点取消下载的语义)
+                guard isThumbnailable,
+                      let sha = item.blobSha256,
+                      blobs.cached(sha) == nil,
+                      !blobs.isCancelled(sha) else { return }
+                _ = try? await blobs.fetch(sha).value
+            }
     }
 
     private var cardBody: some View {
         VStack(alignment: .leading, spacing: 6) {
+            cardContent
+            Spacer(minLength: 0)
+            metaRow
+        }
+    }
+
+    /// 卡片内容区——文本卡走多行 Text,图片卡(image kind / file kind 带 image blob)
+    /// 走缩略图。缩略图未命中 cache 时显示占位 SF symbol + spinner,blob 拉回后
+    /// SwiftUI 自然 reflow 出图
+    @ViewBuilder
+    private var cardContent: some View {
+        if isThumbnailable, let sha = item.blobSha256 {
+            thumbnailContent(sha: sha)
+        } else {
             Text(item.displayPreview)
                 .font(.subheadline)
                 .foregroundStyle(.primary)
                 .lineLimit(6, reservesSpace: true)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-
-            Spacer(minLength: 0)
-            metaRow
         }
+    }
+
+    /// 卡片缩略图。降采样到 maxPx=320(2 列网格单卡 ~160pt @ 2x retina),
+    /// 字节不进 UIImage 全解避免长列表全部图片爆内存。
+    /// frame 高 ≈ Text(6 行) ≈ 110pt,跟文本卡视觉对齐
+    @ViewBuilder
+    private func thumbnailContent(sha: String) -> some View {
+        let data = blobs.cached(sha)
+        let img = data.flatMap { decodeThumbnail($0, maxPx: 320) }
+        ZStack {
+            Color.primary.opacity(0.04)
+            if let img {
+                Image(uiImage: img)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                VStack(spacing: 6) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.secondary.opacity(0.5))
+                    if blobs.isLoading(sha) {
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 110, maxHeight: 110)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var metaRow: some View {
@@ -263,7 +315,9 @@ struct HistoryCellView: View {
             UILatencyLog.mark("context menu preview disappear", itemLogDetail())
         }
         .task {
-            if item.kind == .image, let sha = item.blobSha256 {
+            // image kind + file kind 带 image blob 都触发——之前只看 .image kind
+            // 让 .png 文件长按只走 text scroll 路径,跟卡片渲染口径不齐
+            if isThumbnailable, let sha = item.blobSha256 {
                 let hasCache = blobs.cached(sha) != nil
                 let isCancelled = blobs.isCancelled(sha)
                 DebugLog.shared.append("preview .task fire sha=\(shortSHA(sha)) hasCache=\(hasCache) cancelled=\(isCancelled)")
@@ -289,7 +343,7 @@ struct HistoryCellView: View {
 
     @ViewBuilder
     private var previewBody: some View {
-        if item.kind == .image,
+        if isThumbnailable,
            let sha = item.blobSha256,
            let data = blobs.cached(sha),
            let img = decodeImage(data, reason: "preview", sha: sha) {
@@ -300,7 +354,7 @@ struct HistoryCellView: View {
                 .onAppear {
                     DebugLog.shared.append("previewBody render=image sha=\(shortSHA(sha)) bytes=\(data.count)")
                 }
-        } else if item.kind == .image {
+        } else if isThumbnailable {
             VStack(spacing: 12) {
                 Image(systemName: "photo")
                     .font(.system(size: 44))
@@ -552,6 +606,36 @@ struct HistoryCellView: View {
             itemLogDetail("reason=\(reason) success=\(image != nil) elapsed_ms=\(UILatencyLog.elapsedMS(since: start))")
         )
         return image
+    }
+
+    /// 卡片缩略图——ImageIO 降采样,只解到 maxPx,200KB 原图不进 UIImage 全解避免占内存。
+    /// nil → 解码失败(损坏字节/未知格式),caller 退占位
+    private func decodeThumbnail(_ data: Data, maxPx: Int) -> UIImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPx,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: cg)
+    }
+
+    /// 该 item 是否应该在卡片里渲染图片缩略图——
+    /// - kind=.image:必有 blob,无脑 yes
+    /// - kind=.file + blob_mime=image/*:Mac 把 .png 文件读字节当 image 副本上传(同步路径)
+    /// - kind=.file + path 后缀像图片:fileLooksLikeImage 判,且必须 blob 存在(iOS 拿不到 Mac 本机文件)
+    private var isThumbnailable: Bool {
+        guard let _ = item.blobSha256 else { return false }
+        if item.kind == .image { return true }
+        if item.kind == .file {
+            if let mime = item.blobMime, mime.hasPrefix("image/") { return true }
+            if let p = item.textFull, fileLooksLikeImage(path: p) { return true }
+        }
+        return false
     }
 
     private func itemLogDetail(_ extra: String = "") -> String {

@@ -36,6 +36,19 @@ final class BlobCache {
     /// 磁盘 cap(字节)。超 → evictIfNeeded 按 mtime 升序删旧文件。
     nonisolated let maxDiskBytes: Int
 
+    /// 内存 cache 软上限。长度按字节计 (loaded 各 Data 的 .count 之和)。
+    /// 超过 cap 时按 LRU(touchOrder)删旧条目。**仅删 loaded 字典条目,磁盘文件不动**——
+    /// 下次访问从磁盘 readFromDisk 自然恢复。
+    /// 默认 64MB:够装一屏 LazyVGrid 自动预取的 image 缩略图字节(200KB × ~300 张),
+    /// 又不会让长列表全部图片字节累积爆内存
+    nonisolated let maxMemoryBytes: Int
+
+    /// LRU 访问顺序——`cached(sha)` / `fetch` 命中时把 sha 移到末尾。
+    /// evict 从队首删。`Set` 不够:dict 的 key 顺序不稳定,显式 array 维护
+    private var touchOrder: [String] = []
+    /// 当前 loaded 字节数总和。每次 set/remove loaded 时维护,evict 时按 cap 触发删
+    private var currentMemoryBytes: Int = 0
+
     private static let diskFormatVersion = 1
     private let diskDir: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -46,11 +59,16 @@ final class BlobCache {
         return dir
     }()
 
-    init(maxDiskBytes: Int = 500 * 1024 * 1024) {
+    init(maxDiskBytes: Int = 500 * 1024 * 1024, maxMemoryBytes: Int = 64 * 1024 * 1024) {
         self.maxDiskBytes = maxDiskBytes
+        self.maxMemoryBytes = maxMemoryBytes
     }
 
-    func cached(_ sha: String) -> Data? { loaded[sha] }
+    func cached(_ sha: String) -> Data? {
+        guard let d = loaded[sha] else { return nil }
+        touchLRU(sha)
+        return d
+    }
     func isLoading(_ sha: String) -> Bool { loadingShas.contains(sha) }
     func error(_ sha: String) -> String? { failedReasons[sha] }
     func isCancelled(_ sha: String) -> Bool { cancelled.contains(sha) }
@@ -64,6 +82,33 @@ final class BlobCache {
         loadingShas.removeAll()
         failedReasons.removeAll()
         cancelled.removeAll()
+        touchOrder.removeAll()
+        currentMemoryBytes = 0
+    }
+
+    /// 把 sha 移到 LRU 末尾(最近用)。loaded 写入或读 cached() 时调
+    private func touchLRU(_ sha: String) {
+        if let i = touchOrder.firstIndex(of: sha) {
+            touchOrder.remove(at: i)
+        }
+        touchOrder.append(sha)
+    }
+
+    /// 写 loaded 的唯一入口——维护 touchOrder + currentMemoryBytes,
+    /// 超 maxMemoryBytes 时按 LRU 从队首删 loaded 条目(磁盘文件不动,下次访问从 disk 恢复)
+    private func setLoaded(_ sha: String, _ data: Data) {
+        if let old = loaded[sha] {
+            currentMemoryBytes -= old.count
+        }
+        loaded[sha] = data
+        currentMemoryBytes += data.count
+        touchLRU(sha)
+        while currentMemoryBytes > maxMemoryBytes, let oldest = touchOrder.first {
+            touchOrder.removeFirst()
+            if let removed = loaded.removeValue(forKey: oldest) {
+                currentMemoryBytes -= removed.count
+            }
+        }
     }
 
     /// 真删磁盘——测试 / debug。生产路径不调
@@ -94,7 +139,7 @@ final class BlobCache {
 
         // 1) 磁盘命中——detach 出 main actor 读字节(大图 32MB 同步读会卡 UI)
         if let data = await Self.readFromDisk(path: path) {
-            loaded[sha] = data
+            setLoaded(sha, data)
             loadingShas.remove(sha)
             inflight.removeValue(forKey: sha)
             return data
@@ -110,12 +155,21 @@ final class BlobCache {
         do {
             let data = try await fetcher(sha)
             DebugLog.shared.append("blob fetch ok sha=\(sha.prefix(8)) bytes=\(data.count)")
-            // 3) 落盘 + LRU 清理——同样 detach。落盘失败不影响内存 cache 返回。
-            await Self.writeToDisk(path: path, data: data)
-            await Self.evictIfNeeded(diskDir: diskDir, maxBytes: maxDiskBytes)
-            loaded[sha] = data
+            // 内存 cache 必须**先**填，再 fire-and-forget 落盘 + LRU。
+            // 旧版 await writeToDisk + await evictIfNeeded 串行进 hot path，evictIfNeeded
+            // 会枚举整个磁盘 cache 目录读每文件 resourceValues（数千文件时 3-4s），
+            // 让 loaded[sha] = data 的 Observation 更新被拖在 SwiftUI 视图外。直接表现：
+            // 长按图片首次预览要等几秒才出图，第二次（cache 命中）才秒开。
+            setLoaded(sha, data)
             loadingShas.remove(sha)
             inflight.removeValue(forKey: sha)
+            let pathForBg = path
+            let dirForBg = diskDir
+            let maxForBg = maxDiskBytes
+            Task.detached(priority: .utility) {
+                await Self.writeToDisk(path: pathForBg, data: data)
+                await Self.evictIfNeeded(diskDir: dirForBg, maxBytes: maxForBg)
+            }
             return data
         } catch is CancellationError {
             DebugLog.shared.append("blob fetch cancelled sha=\(sha.prefix(8))")
