@@ -461,7 +461,13 @@ public struct SyncServer: Sendable {
                         )
                     }
                 }
-                let payload: [String: Any] = ["ok": true, "ingested_at_ns": maxIngest]
+                // payload schema:`ok + ingested_at_ns` 兼容老 iOS;`deleted_count` 让
+                // CLI / admin-soft-delete 展示 cascade 范围(新增字段,iOS 不读不报错)
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "ingested_at_ns": maxIngest,
+                    "deleted_count": results.count,
+                ]
                 let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
                 var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
                 resp.headers[.contentType] = "application/json"

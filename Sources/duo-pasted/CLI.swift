@@ -27,6 +27,8 @@ enum CLI {
             runMeshDoctor(args: rest)
         case "mesh-fetch-missing":
             runMeshFetchMissing(args: rest)
+        case "admin-soft-delete":
+            runAdminSoftDelete(args: rest)
         case "ponte-self":
             runPonteSelf(args: rest)
         case "--help", "-h", "help":
@@ -568,6 +570,112 @@ enum CLI {
             lines.append("blobs: ✓ 本机 image/file 行的 sha 全部在 BlobStore")
         }
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    /// admin-soft-delete <id> [--direct]
+    /// plan hashed-allen §F:清存量孤儿 / Mac UI 没法删的远端行。
+    /// 优先 HTTP localhost(daemon 跑完整 broadcaster fan-out);daemon offline 降级直 DB。
+    private static func runAdminSoftDelete(args: [String]) {
+        var id: String? = nil
+        var forceDirect = false
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--direct":
+                forceDirect = true
+            case let arg where !arg.hasPrefix("-"):
+                if id != nil {
+                    FileHandle.standardError.write(Data(
+                        "admin-soft-delete: 多个 id 参数,只接受一个\n".utf8
+                    ))
+                    exit(1)
+                }
+                id = arg
+            default:
+                FileHandle.standardError.write(Data(
+                    "admin-soft-delete: 未知参数 \(args[i])\n".utf8
+                ))
+                exit(1)
+            }
+            i += 1
+        }
+        guard let id else {
+            FileHandle.standardError.write(Data(
+                "admin-soft-delete: 缺 <id> 参数\n用法: admin-soft-delete <id> [--direct]\n".utf8
+            ))
+            exit(1)
+        }
+
+        let paths = Paths.makeDefault()
+        paths.ensureExists()
+        let cfg: Config
+        do {
+            cfg = try Config.load(from: paths.configFile)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "admin-soft-delete: 读 config 失败:\(error)\n".utf8
+            ))
+            exit(1)
+        }
+        let secret: Data
+        do {
+            secret = try SharedSecret.load(from: paths.sharedSecretFile)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "admin-soft-delete: 加载 shared-secret 失败:\(error)\n".utf8
+            ))
+            exit(1)
+        }
+        // 本机 daemon 地址:scheme 跟 cfg.serveTLS 走;host 永远 127.0.0.1
+        // (cfg.serveHost 可能 0.0.0.0,localhost loopback 才稳)
+        let scheme = cfg.serveTLS ? "https" : "http"
+        let baseURLString = "\(scheme)://127.0.0.1:\(cfg.servePort)"
+        guard let baseURL = URL(string: baseURLString) else {
+            FileHandle.standardError.write(Data(
+                "admin-soft-delete: 构造 baseURL 失败:\(baseURLString)\n".utf8
+            ))
+            exit(1)
+        }
+
+        let result: Admin.AdminSoftDeleteResult
+        let capturedID = id
+        let capturedForceDirect = forceDirect
+        let capturedDBPath = paths.mainDB
+        do {
+            result = try runBlocking { @Sendable in
+                try await Admin.softDelete(
+                    id: capturedID,
+                    sharedSecret: secret,
+                    baseURL: baseURL,
+                    dbPath: capturedDBPath,
+                    forceDirect: capturedForceDirect
+                )
+            }
+        } catch Admin.AdminSoftDeleteError.notFound {
+            FileHandle.standardError.write(Data(
+                "admin-soft-delete: id=\(id) 不存在\n".utf8
+            ))
+            exit(1)
+        } catch Admin.AdminSoftDeleteError.alreadyDeleted {
+            // 410 / DB alreadyDeleted = 幂等成功
+            print("admin-soft-delete: id=\(id) 已 tombstone(幂等成功)")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "admin-soft-delete failed:\(error)\n".utf8
+            ))
+            exit(1)
+        }
+
+        switch result {
+        case .viaHTTP(let r):
+            print("admin-soft-delete: ✓ 通过 daemon HTTP 删除 · cascade=\(r.deletedCount) 条 · max_ingested_at_ns=\(r.maxIngestedNs)")
+            print("  broadcaster 已 fan-out — peers < 1s 看到 tombstone")
+        case .directDB(let r, let warn):
+            print("admin-soft-delete: ✓ 直 DB 删除 · ids=\(r.ids.joined(separator: ",")) · max_ingested_at_ns=\(r.maxIngestedNs)")
+            print("  ⚠️  \(warn)")
+        }
+        exit(0)
     }
 
     private static func runMeshFetchMissing(args: [String]) {

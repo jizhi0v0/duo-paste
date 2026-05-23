@@ -918,4 +918,163 @@ public enum Admin {
         default:            return "application/octet-stream"
         }
     }
+
+    // MARK: - admin-soft-delete (plan hashed-allen §F)
+
+    public struct AdminSoftDeleteHTTPResult: Sendable, Equatable {
+        /// Server cascade 实际 tombstone 的 row 数(从 response.deleted_count 读)
+        public let deletedCount: Int
+        public let maxIngestedNs: Int64
+    }
+
+    public struct AdminSoftDeleteDirectDBResult: Sendable, Equatable {
+        public let ids: [String]
+        public let maxIngestedNs: Int64
+    }
+
+    public enum AdminSoftDeleteResult: Sendable, Equatable {
+        case viaHTTP(AdminSoftDeleteHTTPResult)
+        case directDB(AdminSoftDeleteDirectDBResult, warning: String)
+    }
+
+    public enum AdminSoftDeleteError: Error, CustomStringConvertible, Sendable, Equatable {
+        case notFound
+        case alreadyDeleted
+        case httpFailed(statusCode: Int, body: String)
+        case badResponse(String)
+
+        public var description: String {
+            switch self {
+            case .notFound: return "item id 不存在"
+            case .alreadyDeleted: return "item 已 tombstone(幂等成功)"
+            case .httpFailed(let code, let body): return "HTTP delete 失败 status=\(code): \(body)"
+            case .badResponse(let s): return "HTTP response 解析失败: \(s)"
+            }
+        }
+    }
+
+    /// HTTP DELETE 请求 sender(测试可注入 mock,生产用 URLSession.shared.data(for:))
+    public typealias AdminHTTPSender = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+    /// 清存量孤儿 / Mac UI 没法删的远端行(plan hashed-allen §F)。
+    ///
+    /// 路径:
+    /// 1. **HTTP localhost 优先**:DELETE baseURL/item/<id> 让 daemon 跑 softDelete cascade +
+    ///    broadcaster fan-out → peers < 1s 看到 tombstone
+    /// 2. **daemon offline 降级**:直 DB softDelete cascade(不发 broadcaster);
+    ///    peers 等下次 PullWorker tick(默 30s)自然兜底
+    ///
+    /// `forceDirect=true` 跳过 HTTP path(用户明确不想走 daemon,如 daemon 卡死时)。
+    ///
+    /// HTTP 错误处理:
+    /// - 404 → AdminSoftDeleteError.notFound (不降级)
+    /// - 410 → AdminSoftDeleteError.alreadyDeleted (不降级,等价幂等成功)
+    /// - cannotConnectToHost / timedOut → 降级直 DB
+    /// - 其他 HTTP 错误 → throw httpFailed(不降级,避免静默继续)
+    public static func softDelete(
+        id: String,
+        sharedSecret: Data,
+        baseURL: URL,
+        dbPath: URL,
+        forceDirect: Bool = false,
+        httpSender: AdminHTTPSender? = nil
+    ) async throws -> AdminSoftDeleteResult {
+        if !forceDirect {
+            do {
+                let r = try await deleteViaHTTP(
+                    id: id, secret: sharedSecret, baseURL: baseURL, httpSender: httpSender
+                )
+                return .viaHTTP(r)
+            } catch let urlErr as URLError where Self.isDaemonOffline(urlErr) {
+                // 降级到下面 direct DB 路径
+                FileHandle.standardError.write(Data(
+                    "admin-soft-delete: HTTP 不可达 (\(urlErr.code)),降级直 DB\n".utf8
+                ))
+            }
+            // 其他错误(notFound/alreadyDeleted/httpFailed/badResponse)沿用 throw
+        }
+        let db = try Database(path: dbPath)
+        let now = Clock.nowNs()
+        let results: [(id: String, ingestedAtNs: Int64)]
+        do {
+            results = try await db.softDelete(id: id, now: now)
+        } catch BumpError.notFound {
+            throw AdminSoftDeleteError.notFound
+        } catch BumpError.alreadyDeleted {
+            throw AdminSoftDeleteError.alreadyDeleted
+        }
+        return .directDB(
+            AdminSoftDeleteDirectDBResult(
+                ids: results.map(\.id),
+                maxIngestedNs: results.map(\.ingestedAtNs).max() ?? 0
+            ),
+            warning: "daemon offline,broadcaster 未 fan-out;peers 等下次 PullWorker tick(默 30s)兜底"
+        )
+    }
+
+    private static func isDaemonOffline(_ e: URLError) -> Bool {
+        switch e.code {
+        case .cannotConnectToHost, .timedOut, .networkConnectionLost,
+             .notConnectedToInternet, .cannotFindHost:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func deleteViaHTTP(
+        id: String,
+        secret: Data,
+        baseURL: URL,
+        httpSender: AdminHTTPSender?
+    ) async throws -> AdminSoftDeleteHTTPResult {
+        // canonicalPath 不百分号解码——id 在 path 里被签名覆盖。生产 id 是 UUID 形态
+        // 无需 encoding;为安全起见 baseURL.appendingPathComponent 让 URL 自己 encode
+        let url = baseURL.appendingPathComponent("item").appendingPathComponent(id)
+        let canonical = HMACAuth.canonicalPath("/item/\(id)")
+        let auth = HMACAuth(secret: secret)
+        let ts = Int64(Date().timeIntervalSince1970 * 1000)
+        let sig = auth.sign(
+            timestampMs: ts,
+            method: "DELETE",
+            path: canonical,
+            bodyHashHex: HMACAuth.emptyBodyHashHex
+        )
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
+        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
+        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+
+        let sender = httpSender ?? { req in try await URLSession.shared.data(for: req) }
+        let (data, response) = try await sender(req)
+        guard let http = response as? HTTPURLResponse else {
+            throw AdminSoftDeleteError.badResponse("non-HTTP response")
+        }
+        switch http.statusCode {
+        case 200:
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw AdminSoftDeleteError.badResponse("non-JSON 200 body")
+            }
+            guard let ok = json["ok"] as? Bool, ok else {
+                throw AdminSoftDeleteError.badResponse("ok!=true: \(json)")
+            }
+            // ingested_at_ns 可能是 NSNumber 或 Int — 都接
+            let maxIngest: Int64 = {
+                if let n = json["ingested_at_ns"] as? NSNumber { return n.int64Value }
+                if let i = json["ingested_at_ns"] as? Int { return Int64(i) }
+                return 0
+            }()
+            // deleted_count 是新加字段;老 daemon 不返,fallback 1(至少删了目标自己)
+            let count: Int = (json["deleted_count"] as? Int) ?? 1
+            return AdminSoftDeleteHTTPResult(deletedCount: count, maxIngestedNs: maxIngest)
+        case 404:
+            throw AdminSoftDeleteError.notFound
+        case 410:
+            throw AdminSoftDeleteError.alreadyDeleted
+        default:
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw AdminSoftDeleteError.httpFailed(statusCode: http.statusCode, body: body)
+        }
+    }
 }
