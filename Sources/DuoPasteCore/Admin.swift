@@ -1022,16 +1022,29 @@ public enum Admin {
         }
     }
 
+    /// 200 OK body schema:`{"ok": true, "ingested_at_ns": Int64, "deleted_count": Int}`。
+    /// `deleted_count` 是 PR #32 新加,老 daemon 不返 → init 给 default 1。`ingested_at_ns`
+    /// 跨平台 JSON 数值可能是 Int / Int64 / Double,JSONDecoder 自动 widen 到 Int64
+    private struct DeleteResponseBody: Decodable {
+        let ok: Bool
+        let ingested_at_ns: Int64?
+        let deleted_count: Int?
+    }
+
     private static func deleteViaHTTP(
         id: String,
         secret: Data,
         baseURL: URL,
         httpSender: AdminHTTPSender?
     ) async throws -> AdminSoftDeleteHTTPResult {
-        // canonicalPath 不百分号解码——id 在 path 里被签名覆盖。生产 id 是 UUID 形态
-        // 无需 encoding;为安全起见 baseURL.appendingPathComponent 让 URL 自己 encode
-        let url = baseURL.appendingPathComponent("item").appendingPathComponent(id)
-        let canonical = HMACAuth.canonicalPath("/item/\(id)")
+        // **HMAC canonical path 必须跟 wire path 字节一致**:server middleware 校签时用
+        // `request.uri.path`(Hummingbird 不 percent-decode),client 这边 wire path 是
+        // URLSession 实际发出去的字节。生产 id 是 UUID(0-9a-fA-F + `-`)在 .urlPathAllowed
+        // 范围内,encoding 是 no-op;但 future id 含 `/` `%` `#` 时,显式 encode + 用
+        // encoded 形式签名才能两端对齐,避免静默 401
+        let encodedID = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let path = "/item/\(encodedID)"
+        let canonical = HMACAuth.canonicalPath(path)
         let auth = HMACAuth(secret: secret)
         let ts = Int64(Date().timeIntervalSince1970 * 1000)
         let sig = auth.sign(
@@ -1040,6 +1053,18 @@ public enum Admin {
             path: canonical,
             bodyHashHex: HMACAuth.emptyBodyHashHex
         )
+        // 用 URLComponents 拼装,直接写 percentEncodedPath 不走 appendingPathComponent
+        // 二次 encoding。base 的现有 path(可能为空 / "/" / "/api" 等)trim 尾斜杠后跟
+        // path 字面拼接,保 wire path 跟 canonical 字节一致
+        guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw AdminSoftDeleteError.badResponse("URLComponents init failed from base=\(baseURL)")
+        }
+        let basePath = comps.percentEncodedPath
+        let trimmedBase = basePath.hasSuffix("/") ? String(basePath.dropLast()) : basePath
+        comps.percentEncodedPath = trimmedBase + path
+        guard let url = comps.url else {
+            throw AdminSoftDeleteError.badResponse("URL compose failed from base=\(baseURL) path=\(path)")
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
         req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
@@ -1053,21 +1078,19 @@ public enum Admin {
         }
         switch http.statusCode {
         case 200:
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw AdminSoftDeleteError.badResponse("non-JSON 200 body")
+            let decoded: DeleteResponseBody
+            do {
+                decoded = try JSONDecoder().decode(DeleteResponseBody.self, from: data)
+            } catch {
+                throw AdminSoftDeleteError.badResponse("decode 200 body failed: \(error)")
             }
-            guard let ok = json["ok"] as? Bool, ok else {
-                throw AdminSoftDeleteError.badResponse("ok!=true: \(json)")
+            guard decoded.ok else {
+                throw AdminSoftDeleteError.badResponse("ok!=true: \(String(data: data, encoding: .utf8) ?? "")")
             }
-            // ingested_at_ns 可能是 NSNumber 或 Int — 都接
-            let maxIngest: Int64 = {
-                if let n = json["ingested_at_ns"] as? NSNumber { return n.int64Value }
-                if let i = json["ingested_at_ns"] as? Int { return Int64(i) }
-                return 0
-            }()
-            // deleted_count 是新加字段;老 daemon 不返,fallback 1(至少删了目标自己)
-            let count: Int = (json["deleted_count"] as? Int) ?? 1
-            return AdminSoftDeleteHTTPResult(deletedCount: count, maxIngestedNs: maxIngest)
+            return AdminSoftDeleteHTTPResult(
+                deletedCount: decoded.deleted_count ?? 1,
+                maxIngestedNs: decoded.ingested_at_ns ?? 0
+            )
         case 404:
             throw AdminSoftDeleteError.notFound
         case 410:
