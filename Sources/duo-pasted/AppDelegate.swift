@@ -912,6 +912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
                 self.panel.hide(immediate: true)
                 PasteInjector.injectCmdV(into: target)
+                await self.bumpUsedItems(items)
             }
         }
     }
@@ -949,6 +950,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
                 self.panel.hide(immediate: true)
                 PasteInjector.injectCmdV(into: target)
+                await self.bumpUsedItems(items)
             }
             return
         }
@@ -981,6 +983,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
             self.panel.hide(immediate: true)
             PasteInjector.injectCmdV(into: target)
+            // 部分拉到也算"用过"——`writeMergedImages` 已经把拿到字节的几张写进了 pb,
+            // 这些就是用户视觉上看到的 paste 结果,全顶比"细分谁拉到了"心智更一致
+            await self.bumpUsedItems(items)
         }
     }
 
@@ -1044,6 +1049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
                 self.panel.hide(immediate: true)
                 PasteInjector.injectCmdV(into: target)
+                await self.bumpUsedItems([item])
             }
             return
         }
@@ -1071,6 +1077,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
                 self.panel.hide(immediate: true)
                 PasteInjector.injectCmdV(into: target)
+                await self.bumpUsedItems([item])
             case .failure(let reason):
                 self.state.pasteProgress = .failed(reason: reason)
                 // 保持 panel 显示让用户看错误——Esc 关、Enter 重试都由现有 key monitor 处理
@@ -1114,6 +1121,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentPasteTask?.cancel()
         currentPasteTask = nil
         state.pasteProgress = .idle
+    }
+
+    /// paste 成功后顶 used items:bump captured_at_ns + ingested_at_ns 让列表里浮到最前 +
+    /// fan-out 给对端 peer。镜像 iOS HistoryCellView.triggerCopy → POST /bump/<id> 心智,
+    /// 让 Mac/iOS 两端"用过即顶"行为对称。
+    ///
+    /// 为什么 Mac 端 paste 不会自然 bump:`watcher.pasteBack` 写完 pb 立刻 `suppressUpToCurrent()`
+    /// 把 lastChangeCount 推齐,下次 tick changeCount 没跳变 → watcher 跳过 → CaptureService
+    /// 的"同 origin 同 text dedup merge bump"分支永远不会进。这是双层防御的副作用而非有意,
+    /// 这里显式补一刀走"非 capture 触发"的独立入口 `Database.bumpCapturedAt`。
+    ///
+    /// 不变量:
+    /// - **只在 paste 真正成功后调用**(wrote==true / PasteInjector 已注入之后)——避免按
+    ///   Enter 但 blob 拉不到/取消时也顶,导致列表错乱
+    /// - tombstone / notFound 用 `try?` swallow——bump 失败不影响 paste 已经完成的事实,
+    ///   也不该 surface 给用户(他能粘出来就完了)
+    /// - 一次 paste 一次 broadcast:用 maxIngest 一次性 fan-out,减少 WS 噪声
+    /// - 多选场景全部顶(用户拍板):涉及的每条都算"用过",跟单选心智一致
+    private func bumpUsedItems(_ items: [Item]) async {
+        guard !items.isEmpty else { return }
+        let nowNs = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+        var maxIngest: Int64 = 0
+        for item in items {
+            if let newIngest = try? await deps.database.bumpCapturedAt(id: item.id, now: nowNs) {
+                maxIngest = Swift.max(maxIngest, newIngest)
+            }
+        }
+        guard maxIngest > 0 else { return }
+        await deps.wsBroadcaster.broadcastCursorAdvanced(
+            deviceID: deps.deviceID,
+            latestIngestedAtNs: maxIngest
+        )
+        await state.refresh()
     }
 
     /// 真正写 NSPasteboard 那一步——blob 字节已到位（或非 image kind）。
