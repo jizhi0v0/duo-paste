@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: PasteboardWatcher!
     private var hotkey: GlobalHotKey!
     private var snapshotScheduler: SnapshotScheduler!
+    private var memorySampler: MemorySampler!
     private var serverTask: Task<Void, Never>?
     private var bonjourAdvertiser: BonjourAdvertiser?
     /// daemon 启动时构造一份。Mac Settings"显示配对码"调它 generatePIN(),
@@ -260,6 +261,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         snapshotScheduler = SnapshotScheduler(deps: deps)
         snapshotScheduler.start()
+
+        memorySampler = MemorySampler(deps: deps)
+        memorySampler.start()
 
         // "打开方式" 临时文件清理:删 24h 以上旧 staging 子目录。挂在 detached low-priority
         // 队列,不阻塞 launch。staging 目录不存在直接 no-op,首次运行无副作用
