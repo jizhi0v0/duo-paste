@@ -464,7 +464,7 @@ struct HistoryCellView: View {
     /// 失败 swallow(coordinator 内 fanout 路径已记日志);下次 /since 自然 reconcile
     private func triggerDelete() {
         UILatencyLog.mark("delete action begin", itemLogDetail())
-        store.removeOptimistic(id: item.id)
+        store.removeOptimistic(item: item)
         coordinator.deleteItemOnServer(id: item.id)
     }
 
