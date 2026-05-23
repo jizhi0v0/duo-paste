@@ -479,8 +479,28 @@ public actor PullWorker {
             var mirroredShas: Set<String> = []
             for item in page.items {
                 // 跳过自家 origin —— 本机 own 行已在 item 表，回推会被 INSERT OR IGNORE 兜底但
-                // 防御性 early continue 节省一次查询
-                if item.originDevice == device { continue }
+                // 防御性 early continue 节省一次查询。
+                //
+                // **例外:incoming own tombstone**(plan hashed-allen §B)。
+                // softDelete cascade 在另一台 Mac 触发会 tombstone 本机 own 行的 mirror →
+                // 通过 /since 推回自家 → 必须能写入本机 own 行,否则三端不一致。
+                // 仅 incoming=tombstone + local=active + ingested 严格单增才 UPDATE;
+                // 不动 captured_at_ns / 内容字段;不进 INSERT OR REPLACE 主路径
+                if item.originDevice == device {
+                    if let deletedAt = item.deletedAtNs,
+                       let incomingIngest = item.ingestedAtNs,
+                       let local = try Item.filter(Column("id") == item.id).fetchOne(db),
+                       local.deletedAtNs == nil,
+                       incomingIngest > (local.ingestedAtNs ?? 0)
+                    {
+                        try db.execute(sql: """
+                            UPDATE item SET deleted_at_ns = ?, ingested_at_ns = ?
+                            WHERE id = ?
+                        """, arguments: [deletedAt, incomingIngest, item.id])
+                        written += 1
+                    }
+                    continue
+                }
                 // Paste-echo 抑制（PasteSuppressionSet）：本机刚 pasteBack 写过的内容，被对端通过
                 // Universal Clipboard 同步走 + 对端 watcher capture，再通过 /since 推回来。
                 // 这条理应不入表（避免历史里出现一条"我刚 paste 的副本"）。
