@@ -199,9 +199,18 @@ final class PeerSyncCoordinator {
     /// scenePhase → .active 时 DuoPasteApp 调本方法。stamp `lastForegroundEntryAt`
     /// 让 `tickStatus` 在 foregroundGraceSec 内短路 zombie 检测——iOS 后台挂起
     /// URLSession,heartbeat 必然 stale,grace 给 socket 自愈窗口免误报橙字
+    ///
+    /// **立刻 tick + kickPull**(Issue #35):iOS app suspended 期间 `statusTickTask`
+    /// 自身的 `Task.sleep(5s)` 也冻结,resume 后下一个自然 tick 可能要等几秒.直接同步
+    /// 调 `tickStatus` 让 watchdog 用现有"全断 > 30s → refetch + repick"路径立刻收尸
+    /// (pool 健康时 no-op,无副作用).顺手 `kickPull` 拉 suspend 期间对端攒的 advance,
+    /// 不等下一轮 ws cursor_advanced 通知;已 inflight 时 kickPull 自动 pendingAdvance
+    /// 排队不会并发
     func applicationDidBecomeActive() {
         lastForegroundEntryAt = Date()
         DebugLog.shared.append("foreground active: heartbeat grace \(Int(foregroundGraceSec))s")
+        tickStatus()
+        kickPull()
     }
 
     /// 手填 advanced URL 路径用——单 URL 走 pool。配对路径走 `reconfigureFromPairing`
