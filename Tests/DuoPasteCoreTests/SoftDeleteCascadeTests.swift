@@ -151,3 +151,128 @@ private func insertImage(
         _ = try await db.softDelete(id: "dead", now: 5_000_000_000_000_000_000)
     }
 }
+
+// MARK: - 补加回归 (PR review follow-up)
+
+@Test func cascadeHandlesManySiblings() async throws {
+    // N>3 stress:50 个跨 origin sibling 同 text_full,一次 softDelete 应全部 tombstone +
+    // ingested_at_ns 严格单增。压一下 v12 partial index 路径
+    let db = try makeCascadeDB()
+    let n = 50
+    for i in 0..<n {
+        try await insertText(
+            db,
+            id: "row-\(i)",
+            origin: "origin-\(i % 5)",     // 5 个不同 origin 模拟 cross-device 副本
+            text: "shared-text",
+            capturedNs: Int64(100 + i),
+            ingestedNs: Int64(100 + i)
+        )
+    }
+    // 干扰行 - 不该被波及
+    try await insertText(db, id: "noise-1", origin: "mbp", text: "other", capturedNs: 999, ingestedNs: 999)
+
+    let now: Int64 = 5_000_000_000_000_000_000
+    let results = try await db.softDelete(id: "row-0", now: now)
+    #expect(results.count == n, "应 tombstone 所有 \(n) 条 sibling")
+
+    // ingested 严格单增
+    var prev: Int64 = 0
+    for r in results {
+        #expect(r.ingestedAtNs > prev, "ingested_at_ns 必须严格单增")
+        prev = r.ingestedAtNs
+    }
+
+    // 全部 tombstone
+    for i in 0..<n {
+        let row = try await db.pool.read {
+            try Item.filter(Column("id") == "row-\(i)").fetchOne($0)!
+        }
+        #expect(row.deletedAtNs == now)
+    }
+    // 干扰行不动
+    let noise = try await db.pool.read {
+        try Item.filter(Column("id") == "noise-1").fetchOne($0)!
+    }
+    #expect(noise.deletedAtNs == nil)
+}
+
+@Test func cascadeSkipsBlobSiblingsWithSameTextFull() async throws {
+    // 边角:同 text_full 但 blob-kind sibling(理论上不该出现,但 schema 不禁止——比如
+    // OCR worker 把图片 text_full 写到了相同字符串)。cascade SQL 的 `blob_sha256 IS NULL`
+    // filter 应当排除它们,只 cascade 纯 text-kind
+    let db = try makeCascadeDB()
+    try await insertText(db, id: "t1", origin: "mbp", text: "shared", capturedNs: 100, ingestedNs: 100)
+    try await insertText(db, id: "t2", origin: "mini", text: "shared", capturedNs: 200, ingestedNs: 200)
+    // 假装 blob-kind 行也有 text_full=shared(OCR 路径可能写入)
+    let imgRow = Item(
+        id: "img-1",
+        originDevice: "mbp",
+        capturedAtNs: 300,
+        ingestedAtNs: 300,
+        kind: .image,
+        preview: "shared",
+        textFull: "shared",
+        blobSha256: "deadbeef",
+        blobSize: 1024,
+        blobMime: "image/png"
+    )
+    try await db.pool.write { try imgRow.insert($0) }
+
+    let now: Int64 = 5_000_000_000_000_000_000
+    let results = try await db.softDelete(id: "t1", now: now)
+    let deletedIDs = Set(results.map(\.id))
+    #expect(deletedIDs == ["t1", "t2"], "cascade 只该带 text-kind sibling,不该波及 blob-kind")
+
+    let img = try await db.pool.read { try Item.filter(Column("id") == "img-1").fetchOne($0)! }
+    #expect(img.deletedAtNs == nil, "blob-kind 同 text_full 不该被 cascade")
+}
+
+@Test func cascadeMatchesFoldPredicate() async throws {
+    // 不变量:softDelete cascade 选 sibling 的范围必须跟 Item.foldByTextFull 一致——
+    // UI 看到的 fold group 全部 tombstone。fold 跳过 deleted_at_ns 非空 + 要 blob_sha256
+    // IS NULL + textFull 非空;cascade SQL 同口径。两边 byte-equal text_full 比较
+    let db = try makeCascadeDB()
+
+    // 准备 6 行混合 case:
+    // - alive_text_a (text=A) <- target
+    // - alive_text_a_mini (text=A)
+    // - alive_text_a_ios (text=A)
+    // - dead_text_a (text=A 但 deleted)        ← fold 跳过 / cascade 跳过
+    // - alive_blob_a (text=A 但 blob-kind)     ← fold 跳过 / cascade 跳过
+    // - alive_text_b (text=B)                  ← fold 不同桶 / cascade 不 match
+    try await insertText(db, id: "alive_text_a", origin: "mbp", text: "A", capturedNs: 100, ingestedNs: 100)
+    try await insertText(db, id: "alive_text_a_mini", origin: "mini", text: "A", capturedNs: 200, ingestedNs: 200)
+    try await insertText(db, id: "alive_text_a_ios", origin: "ios", text: "A", capturedNs: 300, ingestedNs: 300)
+    try await insertText(db, id: "dead_text_a", origin: "mbp", text: "A", capturedNs: 50, ingestedNs: 50, deletedNs: 49)
+    let blobA = Item(
+        id: "alive_blob_a", originDevice: "mbp", capturedAtNs: 400, ingestedAtNs: 400,
+        kind: .image, preview: "A", textFull: "A",
+        blobSha256: "sha-a", blobSize: 10, blobMime: "image/png"
+    )
+    try await db.pool.write { try blobA.insert($0) }
+    try await insertText(db, id: "alive_text_b", origin: "mbp", text: "B", capturedNs: 500, ingestedNs: 500)
+
+    // fold 视角:active rows 跑 foldByTextFull,找跟 target 同 text_full 的 fold group ids
+    let allItems: [Item] = try await db.pool.read { conn in
+        try Item.fetchAll(conn)
+    }
+    let activeForFold = allItems.filter { $0.deletedAtNs == nil }
+    let folded = Item.foldByTextFull(activeForFold)
+    // 找出 fold 后跟 target 同桶的所有 active 行 ids(target text=A 的纯 text-kind 兄弟)
+    let targetText = "A"
+    let foldSiblingIDs: Set<String> = Set(activeForFold.filter {
+        $0.blobSha256 == nil && $0.textFull == targetText
+    }.map(\.id))
+
+    // cascade 视角:跑 softDelete 拿实际 tombstone 的 ids
+    let results = try await db.softDelete(id: "alive_text_a", now: 5_000_000_000_000_000_000)
+    let cascadeIDs = Set(results.map(\.id))
+
+    // 两边必须一致 — fold 把 A 桶认作一组,cascade 也只删 A 桶里所有 active text-kind
+    #expect(cascadeIDs == foldSiblingIDs,
+        "cascade(\(cascadeIDs)) 跟 fold sibling set(\(foldSiblingIDs)) 不一致")
+    // smoke:fold 后 winner 应当是 captured_at_ns 最大的(alive_text_a_ios=300)
+    let aWinner = folded.first(where: { $0.textFull == "A" })
+    #expect(aWinner?.id == "alive_text_a_ios")
+}

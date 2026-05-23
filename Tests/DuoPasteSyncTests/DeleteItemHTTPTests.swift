@@ -172,4 +172,91 @@ struct DeleteItemHTTPTests {
         }
         #expect(after.deletedAtNs == nil)
     }
+
+    // PR review:DELETE handler 必须像 /bump 一样 read body + 校验 sha 跟 header 一致
+    // (middleware 不读 body 防 MB 级 payload 占内存,handler 自己负责)。即使签名正确,
+    // body sha header 跟实际 body sha 对不上也得 401
+    @Test func deleteHTTPRejectsBodySHAMismatch() async throws {
+        let (db, blobs, auth, port) = try makeDeleteServerFixture(items: [delItem(id: "row-sha")])
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadyDel(baseURL: base, auth: auth))
+
+        // body 是空(空 hash);header 故意填非空字符串的 hash,签名仍跟 header 一致——
+        // middleware 校签通过 → handler 内部 body-sha check 应 reject
+        let id = "row-sha"
+        let path = "/item/\(id)"
+        let url = base.appendingPathComponent(path)
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.httpBody = Data()  // empty body
+        let ts = Int64(Date().timeIntervalSince1970 * 1000)
+        // 故意用非空字符串的 hash 作 header,跟实际 body(空) 的 hash 对不上
+        let fakeHash = HMACAuth.sha256Hex(Data("fake".utf8))
+        let sig = auth.sign(timestampMs: ts, method: "DELETE", path: path, bodyHashHex: fakeHash)
+        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
+        req.setValue(fakeHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
+        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        let http = resp as! HTTPURLResponse
+        #expect(http.statusCode == 401, "body sha mismatch 应 reject 即使签名匹配 header")
+
+        // DB 不动
+        let after = try await db.pool.read { conn in
+            try Item.filter(Column("id") == "row-sha").fetchOne(conn)!
+        }
+        #expect(after.deletedAtNs == nil)
+    }
+
+    // PR review:cascade 删 N 行 fold group 时,onItemMutated 应当合并 fire 一次(target
+    // id + max ingested),避免 UI N 次 refresh 风暴。跟 pin/bump 单 fire 心智一致
+    @Test func deleteHTTPCallbackCoalescesAcrossCascadeSiblings() async throws {
+        let text = "shared-text"
+        func textRow(_ id: String, origin: String, captured: Int64) -> Item {
+            Item(id: id, originDevice: origin,
+                 capturedAtNs: captured, ingestedAtNs: captured,
+                 kind: .text, preview: text, textFull: text)
+        }
+        let items = [
+            textRow("target", origin: "mbp", captured: 100),
+            textRow("sib-1", origin: "mini", captured: 200),
+            textRow("sib-2", origin: "ios", captured: 300),
+        ]
+        let (db, blobs, auth, port) = try makeDeleteServerFixture(items: items)
+        let broadcaster = WSBroadcaster(rotationIntervalSec: 0)
+        let callback = DeleteCallbackBox()
+        let server = SyncServer(deviceID: "mac-self", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth, broadcaster: broadcaster,
+                                onItemMutated: { id, ingestedAtNs in
+                                    callback.append(id: id, ingestedAtNs: ingestedAtNs)
+                                })
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadyDel(baseURL: base, auth: auth))
+
+        let (status, body) = try await deleteItem(baseURL: base, auth: auth, id: "target")
+        #expect(status == 200)
+        #expect(body["deleted_count"] as? Int == 3, "cascade 应删 3 行")
+
+        // DB 状态:三条都 tombstone
+        let allDead = try await db.pool.read { conn -> Bool in
+            let dead = try Int.fetchOne(conn,
+                sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NOT NULL") ?? 0
+            return dead == 3
+        }
+        #expect(allDead)
+
+        // 关键不变量:回调只 fire 一次(target id),不是 cascade 行数次
+        let events = callback.snapshot()
+        #expect(events.count == 1, "onItemMutated 应合并一次 fire,实际 \(events.count) 次")
+        #expect(events.first?.0 == "target", "fire 的 id 应为 target,实际 \(events.first?.0 ?? "nil")")
+        // max ingested 应该是三条里最大那个
+        let maxIngest = (body["ingested_at_ns"] as? Int64) ?? Int64(body["ingested_at_ns"] as? Int ?? 0)
+        #expect(events.first?.1 == maxIngest)
+    }
 }

@@ -187,6 +187,56 @@ private func seedTextItem(
     }
 }
 
+// PR review:HMAC canonical path 必须跟 wire path 字节一致——id 含特殊字符时
+// (URL path 不允许的 `/` `%` `#` 等),client 必须显式 percent-encode + 用 encoded
+// 形式签名,否则跟 server 的 request.uri.path(raw bytes)对不上 → 静默 401。
+// 生产 id 是 UUID 不会触发,但 future 校验防回归
+@Test func adminSoftDeleteHMACCanonicalMatchesWirePath() async throws {
+    // id 含 `%` 触发 percent-encoding(`%` → `%25`);wire path 必须用 encoded 形式,
+    // 签名的 canonical 必须用同 encoded 形式
+    let weirdID = "id-with-%-sign"
+    let secret = Data(repeating: 0xAB, count: 32)
+    let baseURL = URL(string: "http://127.0.0.1:8443")!
+
+    // sender 拿到 request 后:从 URL 取 encoded path,自己用同 secret 重算签名,
+    // 跟 header 里的签名比对——一致则说明 client 签的 canonical 跟 wire 的 path 对齐
+    let sender: Admin.AdminHTTPSender = { req in
+        let auth = HMACAuth(secret: secret)
+        // 从 URL 取**实际发出去的** encoded path
+        let comps = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!
+        let wirePath = comps.percentEncodedPath
+        // server middleware 视角:用 wirePath 当 canonical 算签名
+        let canonical = HMACAuth.canonicalPath(wirePath)
+        let ts = Int64(req.value(forHTTPHeaderField: HMACAuth.timestampHeader)!)!
+        let recomputed = auth.sign(
+            timestampMs: ts,
+            method: "DELETE",
+            path: canonical,
+            bodyHashHex: HMACAuth.emptyBodyHashHex
+        )
+        let headerSig = req.value(forHTTPHeaderField: HMACAuth.signatureHeader)!
+        #expect(recomputed == headerSig,
+            "client canonical 跟 wire path 应对齐:wire=\(wirePath) header_sig=\(headerSig) recomputed=\(recomputed)")
+        // wire path 必须包含 encoded `%25`,**不**含 raw `%`(后者会让 URL 解析二义)
+        #expect(wirePath.contains("%25"), "wire path 应已 percent-encode `%` → `%25`,实际 wire=\(wirePath)")
+        let payload: [String: Any] = ["ok": true, "ingested_at_ns": 1, "deleted_count": 1]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let resp = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+        return (body, resp)
+    }
+
+    let result = try await Admin.softDelete(
+        id: weirdID,
+        sharedSecret: secret,
+        baseURL: baseURL,
+        dbPath: tempDir().appendingPathComponent("x.sqlite"),
+        httpSender: sender
+    )
+    if case .directDB = result {
+        Issue.record("expected HTTP path")
+    }
+}
+
 // 帮助 actor:验证 sender 是否被调
 private actor SenderCounter {
     var value: Bool = false
