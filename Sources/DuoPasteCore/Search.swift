@@ -278,8 +278,10 @@ public struct SearchAPI: Sendable {
         }
 
         let join = useFTS ? "JOIN item_fts ON item_fts.rowid = item.rowid" : ""
+        // snippet 窗口 = match 前后各 N 个 token。FTS5 硬限 1..64,取上限 64
+        // 让卡片尽量多带上下文;物理截断由 `lineLimit(20) + frame(height: 204)` 兜底
         let snippetCol = useFTS
-            ? ", snippet(item_fts, -1, char(2), char(3), '…', 8) AS _snippet"
+            ? ", snippet(item_fts, -1, char(2), char(3), '…', 64) AS _snippet"
             : ""
         let prefixCol: String
         let needsPrefix = q.text != nil && ftsQuery(from: q.text!) != nil
