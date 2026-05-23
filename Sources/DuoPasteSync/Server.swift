@@ -450,9 +450,11 @@ public struct SyncServer: Sendable {
                 // ingest 喂 broadcaster + response payload,iOS 无 schema 改动
                 let results = try await database.softDelete(id: id, now: now)
                 let maxIngest = results.map(\.ingestedAtNs).max() ?? 0
-                // onItemMutated 对每条 tombstone 都 fire(下游 SearchProvider 等可能
-                // 监听单 id 变化);广播仍合并一次,语义跟单 id tombstone 等价
-                for r in results { onItemMutated(r.id, r.ingestedAtNs) }
+                // onItemMutated 合并 fire 一次(target id + max ingested):cascade 删 20
+                // 行 fold group 时,逐条 fire 会让 UI refresh 风暴(每条 SwiftUI tick)。
+                // 下游 SearchProvider 拿到 max ingested 后下次 refresh 会自然看到所有
+                // tombstone 一起消失,跟 pin/bump 单 fire 路径心智一致
+                onItemMutated(id, maxIngest)
                 if let broadcaster {
                     Task {
                         await broadcaster.broadcastCursorAdvanced(

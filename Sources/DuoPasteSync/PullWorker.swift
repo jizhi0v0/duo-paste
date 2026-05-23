@@ -498,6 +498,12 @@ public actor PullWorker {
                             WHERE id = ?
                         """, arguments: [deletedAt, incomingIngest, item.id])
                         written += 1
+                        // 观测性 log:扩大了信任面(任意 HMAC-authed peer 现在可 tombstone
+                        // 本机 own 行)。mesh-doctor / 异常溯源时通过 stderr 知道哪条 own
+                        // 行被 peer cascade 删了
+                        FileHandle.standardError.write(Data(
+                            "PullWorker.applyPage: accepted own-origin tombstone from peer=\(peerID) id=\(item.id) ingested=\(incomingIngest)\n".utf8
+                        ))
                     }
                     continue
                 }
