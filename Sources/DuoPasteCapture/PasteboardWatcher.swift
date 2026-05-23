@@ -358,16 +358,24 @@ public actor PasteboardWatcher {
             // 轮询路径上同步分配巨大 attributed string。decoded plain ≤ raw rtf，所以这种 case
             // 解出来也大概率仍超 cap，让 CaptureService 拦 raw 即可
             if rtf.utf8.count <= maxRawRTFBytes,
-               let plain = Self.decodeRTFToPlain(rtf),
-               !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+               let plain = Self.decodeRTFToPlain(rtf)
             {
-                return Self.plainTextOrURL(
-                    plain,
-                    sourceAppBundleID: bundleID,
-                    sourceAppName: appName,
-                    capturedAtNs: capturedAtNs
-                )
+                let trimmed = plain.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return Self.plainTextOrURL(
+                        plain,
+                        sourceAppBundleID: bundleID,
+                        sourceAppName: appName,
+                        capturedAtNs: capturedAtNs
+                    )
+                }
+                // decode 成功但全空白 = 空壳 RTF（只有 \rtf1\ansi 元数据头 + 空 \fonttbl /
+                // \colortbl 没有任何 text run）。典型源：Notes/Mail 在选择折叠到光标位置
+                // 时仍写一份元数据 RTF 到 pasteboard。raw markup 既搜不到也填不出 preview，
+                // 跟 step 6 纯文本 trim 空一样直接 return nil 跳过，不污染历史。
+                return nil
             }
+            // 兜底：decode 失败 / raw 超 cap → 留 raw RTF 给 CaptureService 字节守门拦
             return CapturedPasteboard(
                 kind: .rtf,
                 text: rtf,
@@ -465,7 +473,8 @@ public actor PasteboardWatcher {
     }
 
     /// 用 NSAttributedString 把 RTF source 解成纯文本。失败返回 nil，调用方走兜底。
-    private static func decodeRTFToPlain(_ rtf: String) -> String? {
+    /// internal 让 `@testable import DuoPasteCapture` 可直接覆盖 decode 行为
+    static func decodeRTFToPlain(_ rtf: String) -> String? {
         guard let data = rtf.data(using: .utf8),
               let attr = try? NSAttributedString(
                 data: data,
@@ -474,6 +483,21 @@ public actor PasteboardWatcher {
               )
         else { return nil }
         return attr.string
+    }
+
+    /// RTF 降级判定:raw 字节 ≤ cap 且 decode 成功但 trim 后全空白 → 视为空壳 RTF。
+    /// extract() 看到 true 直接 return nil 跳过 capture,不入库 / 不污染历史。
+    ///
+    /// 抽 static 让单测可直接驱动判定逻辑(extract 是 actor 内 private)。
+    /// 跟 shouldSkipFrontApp 的测试风格对齐:把判定谓词抽出便于单测。
+    ///
+    /// 返回 false 的两种 case 调用方继续走原兜底:
+    /// - raw 超 cap → 不解析,raw RTF 兜底让 CaptureService 字节守门拦
+    /// - decode 失败 → raw RTF 兜底
+    static func decodedRTFIsAllWhitespace(_ rtf: String, maxRawBytes: Int) -> Bool {
+        guard rtf.utf8.count <= maxRawBytes else { return false }
+        guard let plain = decodeRTFToPlain(rtf) else { return false }
+        return plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// 图片文件后缀 → MIME type。未知格式返回通用二进制流类型。
