@@ -1125,6 +1125,13 @@ struct SearchView: View {
                             Button(item.pinned ? "取消置顶" : "置顶") {
                                 state.togglePin(item)
                             }
+                            Divider()
+                            // plan hashed-allen §E:role: .destructive 让 SwiftUI 自动
+                            // 红字 + 默认放菜单底部。⌘Backspace 通过 SearchPanelController
+                            // 路由独立处理(menu shortcut 在 panel 非 keyWindow 时可能丢)
+                            Button("删除", role: .destructive) {
+                                state.deleteItem(item)
+                            }
                         }
                     }
                     // 末尾透明 spacer 稳定最右真实卡的 LazyHStack mount——

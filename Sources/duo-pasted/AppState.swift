@@ -462,6 +462,80 @@ final class AppState {
         }
     }
 
+    /// Mac UI 删除入口(plan hashed-allen §E):⌘Backspace / contextMenu "删除"调用。
+    /// 复用 togglePin 的 broadcaster fire-and-forget pattern:softDelete cascade
+    /// 删 fold group + 多 sibling 取 max(ingested) 喂 broadcaster + refresh + 3s banner。
+    ///
+    /// 不弹二次确认 alert(剪贴板心智下删除高频);误删要 undo 走未来的 admin-undelete CLI。
+    ///
+    /// **多选**:转发到 [deleteItems];单 contextMenu 的"删除"按钮永远只传单条
+    /// (跟 Finder 右键单张文件不改多选心智一致,见 SearchView contextMenu 注释)
+    func deleteItem(_ item: Item) {
+        deleteItems([item])
+    }
+
+    /// 多选删除:⌘Backspace 从 SearchPanelController 走这里,传整个 selectedItems。
+    /// 对每个 id 跑 cascade,合并 max(ingested) 一次喂 broadcaster + 单次 refresh +
+    /// 累加 banner 总数。
+    ///
+    /// 错误处理:逐条独立 try/catch——某条 alreadyDeleted/notFound 不该让其他 id
+    /// 失败。其他错误累加到 banner;成功条数也累加,让用户看到"删了 N 条(M 条失败)"
+    func deleteItems(_ items: [Item]) {
+        guard !items.isEmpty else { return }
+        let ids = items.map(\.id)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var deletedCount = 0
+            var maxIngest: Int64 = 0
+            var failedCount = 0
+            for id in ids {
+                do {
+                    let results = try await self.deps.database.softDelete(
+                        id: id,
+                        now: Clock.nowNs()
+                    )
+                    deletedCount += results.count
+                    if let m = results.map(\.ingestedAtNs).max() {
+                        maxIngest = Swift.max(maxIngest, m)
+                    }
+                } catch BumpError.alreadyDeleted {
+                    // 幂等:行已 tombstone(可能 cascade 中前一条 id 把它带删了 / 重复 ⌘Backspace race)
+                    continue
+                } catch BumpError.notFound {
+                    // 行已不存在,继续处理剩余 ids
+                    continue
+                } catch {
+                    failedCount += 1
+                    FileHandle.standardError.write(Data(
+                        "AppState.deleteItems: id=\(id) failed: \(error)\n".utf8
+                    ))
+                }
+            }
+            if maxIngest > 0 {
+                let broadcaster = self.deps.wsBroadcaster
+                let deviceID = self.deps.deviceID
+                Task {
+                    await broadcaster.broadcastCursorAdvanced(
+                        deviceID: deviceID,
+                        latestIngestedAtNs: maxIngest
+                    )
+                }
+            }
+            await self.refresh()
+            // 友好 banner:不暴露 raw error type 给用户。明细写 stderr 便于排查
+            switch (deletedCount, failedCount) {
+            case (0, 0):
+                break  // 全部幂等/notFound,UI 已 refresh 对齐就好
+            case (let d, 0):
+                self.postNotice("已删除 \(d) 条")
+            case (0, let f):
+                self.postNotice("删除失败(\(f) 项),详见日志")
+            case (let d, let f):
+                self.postNotice("已删除 \(d) 条 · \(f) 项失败")
+            }
+        }
+    }
+
     /// 一次性 3s notice。同一文案在窗口内重复触发不会延长——只在过期后才能换新内容。
     /// **任何**写 recentNotice 的入口都必须走这条路,直接赋字段会绕过 3s timer 让 banner
     /// 永久残留(踩过坑:pasteBack 跨 kind fallback 写 banner 后 panel 复用 state 让用户

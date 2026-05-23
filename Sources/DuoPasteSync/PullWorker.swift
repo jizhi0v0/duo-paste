@@ -21,10 +21,19 @@ public actor PullWorker {
         public var batchLimit: Int
         public var initialBackoffSec: TimeInterval
         public var maxBackoffSec: TimeInterval
-        /// 跨设备 Continuity dedup 时间窗（纳秒）。0 = 关闭这个 dedup 层。
-        /// 配合 RemoteIngester 的同名字段，PullWorker 写 item_mirror 前查本机 item 表
-        /// 有无 origin=self 同内容在窗口内已存——命中则 skip mirror 入库，UI union
-        /// 看到的就是单条 own。Universal Clipboard 同步通常 < 1s，5s buffer 充足。
+        /// 跨设备 Continuity dedup 时间窗（纳秒）。**default 0 = 关闭这层 dedup**
+        /// （plan hashed-allen §D）。
+        ///
+        /// 历史 default 是 5_000_000_000 (5s)：PullWorker 写 item_mirror 前查本机
+        /// item 表有无 origin=self 同内容在窗口内已存——命中则 skip mirror 入库，
+        /// UI union 看到的就是单条 own。
+        ///
+        /// 但这破坏了两台 Mac 的行集合对称性（mini 上有 mirror、MBP 上没有 mirror），
+        /// cascade 删除依赖对称性才能找到 sibling tombstone。所以 default 翻 0
+        /// 让 cross-device 副本老实进 mirror，UI 靠 `Item.foldByTextFull` 兜底
+        /// 不影响显示（fold 跨 origin 同 text 折一条）。
+        ///
+        /// 非 0 = 紧急回滚口（单台机器临时回退 5_000_000_000 恢复历史行为）。
         public var crossDeviceDedupWindowNs: Int64
         /// 时钟偏移告警阈值（毫秒）。|primary.now_ms - local.now_ms| 超过这个值 →
         /// log warn + 通过 MirrorStatus 暴露给 UI banner。
@@ -54,7 +63,7 @@ public actor PullWorker {
             batchLimit: Int = 500,
             initialBackoffSec: TimeInterval = 2,
             maxBackoffSec: TimeInterval = 120,
-            crossDeviceDedupWindowNs: Int64 = 5_000_000_000,
+            crossDeviceDedupWindowNs: Int64 = 0,
             clockSkewWarnMs: Int64 = 30_000,
             storageMode: StorageMode = .default,
             reconcileFailureThreshold: Int = 3
@@ -470,8 +479,34 @@ public actor PullWorker {
             var mirroredShas: Set<String> = []
             for item in page.items {
                 // 跳过自家 origin —— 本机 own 行已在 item 表，回推会被 INSERT OR IGNORE 兜底但
-                // 防御性 early continue 节省一次查询
-                if item.originDevice == device { continue }
+                // 防御性 early continue 节省一次查询。
+                //
+                // **例外:incoming own tombstone**(plan hashed-allen §B)。
+                // softDelete cascade 在另一台 Mac 触发会 tombstone 本机 own 行的 mirror →
+                // 通过 /since 推回自家 → 必须能写入本机 own 行,否则三端不一致。
+                // 仅 incoming=tombstone + local=active + ingested 严格单增才 UPDATE;
+                // 不动 captured_at_ns / 内容字段;不进 INSERT OR REPLACE 主路径
+                if item.originDevice == device {
+                    if let deletedAt = item.deletedAtNs,
+                       let incomingIngest = item.ingestedAtNs,
+                       let local = try Item.filter(Column("id") == item.id).fetchOne(db),
+                       local.deletedAtNs == nil,
+                       incomingIngest > (local.ingestedAtNs ?? 0)
+                    {
+                        try db.execute(sql: """
+                            UPDATE item SET deleted_at_ns = ?, ingested_at_ns = ?
+                            WHERE id = ?
+                        """, arguments: [deletedAt, incomingIngest, item.id])
+                        written += 1
+                        // 观测性 log:扩大了信任面(任意 HMAC-authed peer 现在可 tombstone
+                        // 本机 own 行)。mesh-doctor / 异常溯源时通过 stderr 知道哪条 own
+                        // 行被 peer cascade 删了
+                        FileHandle.standardError.write(Data(
+                            "PullWorker.applyPage: accepted own-origin tombstone from peer=\(peerID) id=\(item.id) ingested=\(incomingIngest)\n".utf8
+                        ))
+                    }
+                    continue
+                }
                 // Paste-echo 抑制（PasteSuppressionSet）：本机刚 pasteBack 写过的内容，被对端通过
                 // Universal Clipboard 同步走 + 对端 watcher capture，再通过 /since 推回来。
                 // 这条理应不入表（避免历史里出现一条"我刚 paste 的副本"）。

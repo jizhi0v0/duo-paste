@@ -544,6 +544,20 @@ public struct Database: Sendable {
             try db.execute(sql: "DELETE FROM app_icon;")
         }
 
+        // v12: 给 softDelete cascade 加 partial index。cascade 路径(plan hashed-allen §C)
+        // 在 writer tx 内跑 `WHERE text_full = ? AND blob_sha256 IS NULL
+        // AND deleted_at_ns IS NULL AND id != ?` 找同 text 兄弟,无 index 时是全表扫,在
+        // 50k+ 行历史上会阻塞所有 capture / bump / pin writer。partial index 只索引活的
+        // text-kind 行,跟其他 partial index 心智一致(idx_item_captured / kind_captured),
+        // 占盘小、命中是 O(log n) seek+扫匹配桶
+        m.registerMigration("v12_text_full_active_index") { db in
+            try db.execute(sql: """
+                CREATE INDEX idx_item_text_active
+                    ON item(text_full)
+                    WHERE blob_sha256 IS NULL AND deleted_at_ns IS NULL;
+            """)
+        }
+
         return m
     }
 
@@ -738,34 +752,83 @@ public struct Database: Sendable {
         }
     }
 
-    /// 软删单行:写 `deleted_at_ns = now` + bump `ingested_at_ns` 让对端通过 PullWorker
+    /// 软删:写 `deleted_at_ns = now` + bump `ingested_at_ns` 让对端通过 PullWorker
     /// 看到 tombstone。**不动 captured_at_ns / origin_device / 内容字段**——删是元数据
     /// 变化,不是归属变化(任意 peer 都能删任意 origin 的行)。
     ///
-    /// 用途:iOS 长按"删除" → DELETE /item/<id> → handler 调本函数。Mac 端 capture 路径
-    /// 没有用户主动删除入口(M4 之前 retention sweeper 才会自动 tombstone),这是给"用户
-    /// 主动删除"路径用的独立入口。
+    /// 用途:iOS 长按"删除" → DELETE /item/<id> → handler 调本函数;Mac UI ⌘Backspace /
+    /// contextMenu 走 AppState.deleteItem;CLI admin-soft-delete 通过 HTTP DELETE 兜底。
+    ///
+    /// **Cascade**(plan hashed-allen §C):`cascade=true` 且目标是 text-kind
+    /// (`blob_sha256 IS NULL && text_full 非空`) → 把同 text_full 所有 active sibling
+    /// 一起 tombstone(跨 origin)。理由:mesh 拓扑下 cross-device 副本进 mirror,
+    /// 两台 Mac 行集合对称,只删单 id 会让 mirror 兄弟存活 → UI fold 仍能看到。
+    /// blob-kind / cascade=false → 退化为只删单 id。
     ///
     /// 不变量:
-    /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增,对端 < 1s 看到 tombstone
-    /// - 不存在的 id 抛 `.notFound`
-    /// - 已 tombstoned 抛 `.alreadyDeleted`(handler 映射 410 → iOS 当幂等成功处理)
-    /// - tombstone 跟 bump 一样走 broadcaster fan-out 让对端立刻 re-pull
-    public func softDelete(id: String, now: Int64) async throws -> Int64 {
+    /// - **writer tx 内调 nextIngestNs**——每个 sibling 单独 stamp 严格单增
+    /// - 目标不存在抛 `.notFound`,目标已 tombstone 抛 `.alreadyDeleted`
+    /// - sibling 已 tombstone / 不再匹配 text_full / blob_sha256 非空 → stderr warn 跳过
+    ///   (不抛——cascade 是机会主义清理,某条不匹配不该让整批失败)
+    /// - 返回 `[(id, newIngest)]` 让调用方算 max(ingestedAtNs) 喂 broadcaster
+    ///
+    /// **`now` 参数语义**:作为 `deleted_at_ns` 字面值 + `nextIngestNs` 的 floor。跟
+    /// `ingested_at_ns` 不同,`deleted_at_ns` 只是元数据时间戳(不参与 /since cursor 推进 /
+    /// 排序契约),所以 caller-provided `now` 即可——单元测试能注入小常量便于断言。
+    /// 实际单增由 `nextIngestNs` 在 writer tx 内 clamp 到 `MAX(ingested_at_ns)+1`,
+    /// caller `now` 倒退或并发竞态都不影响 /since 正确性
+    public func softDelete(
+        id: String,
+        now: Int64,
+        cascade: Bool = true
+    ) async throws -> [(id: String, ingestedAtNs: Int64)] {
         try await pool.write { db in
-            guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
+            guard let target = try Item.filter(Column("id") == id).fetchOne(db) else {
                 throw BumpError.notFound
             }
-            if row.deletedAtNs != nil {
+            if target.deletedAtNs != nil {
                 throw BumpError.alreadyDeleted
             }
-            let newIngest = try Self.nextIngestNs(db, now: now)
-            try db.execute(sql: """
-                UPDATE item
-                SET deleted_at_ns = ?, ingested_at_ns = ?
-                WHERE id = ?
-            """, arguments: [now, newIngest, id])
-            return newIngest
+
+            // 决定 cascade 范围:目标自己永远在;text-kind + cascade=true 时 SELECT 其他
+            // active sibling 同 text_full 的 id 加进来
+            var siblingIDs: [String] = [id]
+            let isTextKind = target.blobSha256 == nil
+                && (target.textFull?.isEmpty == false)
+            if cascade, isTextKind, let text = target.textFull {
+                let otherIDs = try String.fetchAll(db, sql: """
+                    SELECT id FROM item
+                    WHERE text_full = ? AND blob_sha256 IS NULL
+                      AND deleted_at_ns IS NULL AND id != ?
+                """, arguments: [text, id])
+                siblingIDs.append(contentsOf: otherIDs)
+            }
+
+            var results: [(id: String, ingestedAtNs: Int64)] = []
+            for sid in siblingIDs {
+                // sibling explicit assertion(target 本身已经在前面校验过 active +
+                // 是 text-kind,这里只校 sibling 防 race 中状态翻转)
+                if sid != id {
+                    guard let s = try Item.filter(Column("id") == sid).fetchOne(db) else {
+                        continue
+                    }
+                    if s.deletedAtNs != nil { continue }
+                    if s.blobSha256 != nil || s.textFull != target.textFull {
+                        FileHandle.standardError.write(Data(
+                            "softDelete: skip sibling \(sid) — text_full mismatch or blob-kind\n".utf8
+                        ))
+                        continue
+                    }
+                }
+                let newIngest = try Self.nextIngestNs(db, now: now)
+                try db.execute(sql: """
+                    UPDATE item
+                    SET deleted_at_ns = ?, ingested_at_ns = ?
+                    WHERE id = ?
+                """, arguments: [now, newIngest, sid])
+                results.append((id: sid, ingestedAtNs: newIngest))
+            }
+            return results
         }
     }
 

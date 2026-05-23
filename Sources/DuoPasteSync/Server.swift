@@ -445,17 +445,31 @@ public struct SyncServer: Sendable {
             }
             let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
             do {
-                let newIngest = try await database.softDelete(id: id, now: now)
-                onItemMutated(id, newIngest)
+                // plan hashed-allen §C:softDelete cascade 返回 [(id, newIngest)]
+                // (cascade 删 fold group 时多行 tombstone)。线协议保持兼容:取 max
+                // ingest 喂 broadcaster + response payload,iOS 无 schema 改动
+                let results = try await database.softDelete(id: id, now: now)
+                let maxIngest = results.map(\.ingestedAtNs).max() ?? 0
+                // onItemMutated 合并 fire 一次(target id + max ingested):cascade 删 20
+                // 行 fold group 时,逐条 fire 会让 UI refresh 风暴(每条 SwiftUI tick)。
+                // 下游 SearchProvider 拿到 max ingested 后下次 refresh 会自然看到所有
+                // tombstone 一起消失,跟 pin/bump 单 fire 路径心智一致
+                onItemMutated(id, maxIngest)
                 if let broadcaster {
                     Task {
                         await broadcaster.broadcastCursorAdvanced(
                             deviceID: deviceID,
-                            latestIngestedAtNs: newIngest
+                            latestIngestedAtNs: maxIngest
                         )
                     }
                 }
-                let payload: [String: Any] = ["ok": true, "ingested_at_ns": newIngest]
+                // payload schema:`ok + ingested_at_ns` 兼容老 iOS;`deleted_count` 让
+                // CLI / admin-soft-delete 展示 cascade 范围(新增字段,iOS 不读不报错)
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "ingested_at_ns": maxIngest,
+                    "deleted_count": results.count,
+                ]
                 let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
                 var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
                 resp.headers[.contentType] = "application/json"

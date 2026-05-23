@@ -299,11 +299,12 @@ public struct Config: Codable, Sendable, Equatable {
     ///
     /// **用户可见字段**（settings window / config.json 都暴露）：
     /// - `enabled` / `pullIntervalSec` / `wsEnabled` / `storageMode`
+    /// - `crossDeviceDedupWindowNs` / `deleteCascadeEnabled`（plan hashed-allen §D §C 回滚口）
     ///
-    /// **历史 tuning 字段已撤掉**（plan §settings-cleanup）：内部 backoff / dedup window /
+    /// **历史 tuning 字段已撤掉**（plan §settings-cleanup）：内部 backoff /
     /// WS timing / clock skew threshold 都不再从 config 读，统一走 worker / broadcaster
     /// 的硬编码 default。老 config.json 里残留 `pull_batch_limit / pull_initial_backoff_sec /
-    /// pull_max_backoff_sec / cross_device_dedup_window_ns / clock_skew_warn_ms /
+    /// pull_max_backoff_sec / clock_skew_warn_ms /
     /// ws_reconnect_initial_sec / ws_reconnect_max_sec / ws_heartbeat_sec / ws_rotation_sec`
     /// 键会被 decoder 忽略不报错；Config.write 不再序列化这些键，保留升级用户的 config
     /// 干净（nested merge 会保留任何未知键，但因为这些键不在 write 列表里，下次写回会被
@@ -319,24 +320,39 @@ public struct Config: Codable, Sendable, Equatable {
         public var storageMode: StorageMode
         /// false → 关 WS 通知层退化为周期 pull（按 pullIntervalSec）。
         public var wsEnabled: Bool
+        /// 跨设备 Continuity dedup 时间窗（纳秒）。默 0 = 关 dedup，让 cross-device 副本
+        /// 老实进 mirror，靠 UI fold（`Item.foldByTextFull`）兜底——保证两台 Mac 行集合
+        /// 对称（cascade 删除依赖这个对称性）。5_000_000_000 = 历史行为，单台机器临时
+        /// 回滚用。plan hashed-allen §D
+        public var crossDeviceDedupWindowNs: Int64
+        /// true（默）= `Database.softDelete` 删一条时 cascade 同 text_full 所有 active
+        /// sibling。false = 紧急回退，退化为只删单 id（plan hashed-allen §C 回滚口）。
+        /// 控制粒度在 daemon 级，重启 daemon 生效（kickstart -k）。
+        public var deleteCascadeEnabled: Bool
 
         public static let `default` = MeshConfig(
             enabled: true,
             pullIntervalSec: 30,
             storageMode: .default,
-            wsEnabled: true
+            wsEnabled: true,
+            crossDeviceDedupWindowNs: 0,
+            deleteCascadeEnabled: true
         )
 
         public init(
             enabled: Bool,
             pullIntervalSec: Int,
             storageMode: StorageMode,
-            wsEnabled: Bool
+            wsEnabled: Bool,
+            crossDeviceDedupWindowNs: Int64 = 0,
+            deleteCascadeEnabled: Bool = true
         ) {
             self.enabled = enabled
             self.pullIntervalSec = pullIntervalSec
             self.storageMode = storageMode
             self.wsEnabled = wsEnabled
+            self.crossDeviceDedupWindowNs = crossDeviceDedupWindowNs
+            self.deleteCascadeEnabled = deleteCascadeEnabled
         }
 
         enum CodingKeys: String, CodingKey {
@@ -345,6 +361,8 @@ public struct Config: Codable, Sendable, Equatable {
             case storageMode = "storage_mode"
             case eagerBlobs = "eager_blobs"   // 老键，decode-only 兼容；encode 走 storageMode
             case wsEnabled = "ws_enabled"
+            case crossDeviceDedupWindowNs = "cross_device_dedup_window_ns"
+            case deleteCascadeEnabled = "delete_cascade_enabled"
         }
 
         public init(from decoder: Decoder) throws {
@@ -364,6 +382,8 @@ public struct Config: Codable, Sendable, Equatable {
                 self.storageMode = d.storageMode
             }
             self.wsEnabled = try c.decodeIfPresent(Bool.self, forKey: .wsEnabled) ?? d.wsEnabled
+            self.crossDeviceDedupWindowNs = try c.decodeIfPresent(Int64.self, forKey: .crossDeviceDedupWindowNs) ?? d.crossDeviceDedupWindowNs
+            self.deleteCascadeEnabled = try c.decodeIfPresent(Bool.self, forKey: .deleteCascadeEnabled) ?? d.deleteCascadeEnabled
         }
 
         // 显式 encode：`eagerBlobs` CodingKey 是 decode-only 兼容键，没有匹配 property，
@@ -375,6 +395,8 @@ public struct Config: Codable, Sendable, Equatable {
             try c.encode(pullIntervalSec, forKey: .pullIntervalSec)
             try c.encode(storageMode, forKey: .storageMode)
             try c.encode(wsEnabled, forKey: .wsEnabled)
+            try c.encode(crossDeviceDedupWindowNs, forKey: .crossDeviceDedupWindowNs)
+            try c.encode(deleteCascadeEnabled, forKey: .deleteCascadeEnabled)
         }
     }
 
@@ -489,7 +511,7 @@ public struct Config: Codable, Sendable, Equatable {
 
         // mesh 段 nested merge——读原 sub-dict 做 base，只覆盖 cfg 内字段，保留未来字段。
         // **plan settings-cleanup**：老 tuning 键（pull_batch_limit / pull_initial_backoff_sec /
-        // pull_max_backoff_sec / cross_device_dedup_window_ns / clock_skew_warn_ms /
+        // pull_max_backoff_sec / clock_skew_warn_ms /
         // ws_reconnect_initial_sec / ws_reconnect_max_sec / ws_heartbeat_sec / ws_rotation_sec）
         // 显式 removeValue 洗掉——之前 config.json 可能写过这些；升级路径上 Config.write
         // 一次后老字段从磁盘消失
@@ -498,13 +520,17 @@ public struct Config: Codable, Sendable, Equatable {
         meshDict["pull_interval_sec"] = cfg.mesh.pullIntervalSec
         meshDict["storage_mode"] = cfg.mesh.storageMode.rawValue
         meshDict["ws_enabled"] = cfg.mesh.wsEnabled
+        // plan hashed-allen §D §C：重新引入 cross_device_dedup_window_ns（default 0）
+        // 和 delete_cascade_enabled（default true）作为 mesh first-class 字段
+        meshDict["cross_device_dedup_window_ns"] = cfg.mesh.crossDeviceDedupWindowNs
+        meshDict["delete_cascade_enabled"] = cfg.mesh.deleteCascadeEnabled
         // 老 eager_blobs 键洗掉——升级后 config.json 不再含 PR cloudy-mirroring-walnut
         // 之前的 schema 字段，避免用户读 config 时看到两套语义冲突的字段
         meshDict.removeValue(forKey: "eager_blobs")
         // 老内部 tuning 字段——下沉到 worker / broadcaster default 后从 config 移除
         for legacy in [
             "pull_batch_limit", "pull_initial_backoff_sec", "pull_max_backoff_sec",
-            "cross_device_dedup_window_ns", "clock_skew_warn_ms",
+            "clock_skew_warn_ms",
             "ws_reconnect_initial_sec", "ws_reconnect_max_sec",
             "ws_heartbeat_sec", "ws_rotation_sec",
         ] {

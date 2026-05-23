@@ -15,7 +15,8 @@ private func makeSoftDeleteDB() throws -> Database {
 
 @Test func softDeleteSetsTombstoneAndBumpsIngested() async throws {
     // 软删:deleted_at_ns 写入,ingested_at_ns 顶到当前 max+1 让 /since cursor 推进。
-    // captured_at_ns / origin / 内容字段不动——删是元数据变化不是归属变化
+    // captured_at_ns / origin / 内容字段不动——删是元数据变化不是归属变化。
+    // 单行 text-kind + 无 sibling → cascade 退化为只删自己,返回 1 条 result
     let db = try makeSoftDeleteDB()
     let original = Item(
         id: "row-1",
@@ -29,7 +30,10 @@ private func makeSoftDeleteDB() throws -> Database {
     )
     try await db.pool.write { try original.insert($0) }
     let now: Int64 = 5_000_000_000_000_000_000
-    let newIngest = try await db.softDelete(id: "row-1", now: now)
+    let results = try await db.softDelete(id: "row-1", now: now)
+    #expect(results.count == 1)
+    #expect(results[0].id == "row-1")
+    let newIngest = results[0].ingestedAtNs
     #expect(newIngest >= now)
 
     let after = try await db.pool.read { try Item.fetchOne($0)! }
@@ -70,7 +74,8 @@ private func makeSoftDeleteDB() throws -> Database {
 }
 
 @Test func softDeleteAdvancesIngestedAcrossMultipleRows() async throws {
-    // 多行连续软删,每行的 ingested_at_ns 必须单增——/since cursor 正确性前提
+    // 多行连续软删(每行内容不同,所以 cascade 不会跨行折叠),每行的 ingested_at_ns
+    // 必须单增——/since cursor 正确性前提
     let db = try makeSoftDeleteDB()
     for i in 1...3 {
         let row = Item(
@@ -87,7 +92,9 @@ private func makeSoftDeleteDB() throws -> Database {
     var prev: Int64 = 0
     for i in 1...3 {
         let now: Int64 = 1_000_000_000_000_000_000 + Int64(i)
-        let ns = try await db.softDelete(id: "row-\(i)", now: now)
+        let results = try await db.softDelete(id: "row-\(i)", now: now)
+        #expect(results.count == 1)
+        let ns = results[0].ingestedAtNs
         #expect(ns > prev)
         prev = ns
     }

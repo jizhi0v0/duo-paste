@@ -312,8 +312,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     }
                 }
                 // Backspace 在 query 空 + activeQualifiers 非空时弹最后一个 chip。
-                // 补全菜单显示时 backspace 透传(让用户改 /xx 输入),不弹 chip
-                if keyCode == 51 {
+                // 补全菜单显示时 backspace 透传(让用户改 /xx 输入),不弹 chip。
+                // **`!isCmd`** (plan hashed-allen §Step 4):⌘Backspace 是删除选中
+                // item 的快捷键(下面 switch 处理),这里必须放行不能吞掉
+                if keyCode == 51 && !isCmd {
                     if !self.state.completionMenuVisible
                         && self.state.query.isEmpty
                         && !self.state.activeQualifiers.isEmpty {
@@ -398,6 +400,23 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 case 35 where isCmd:                            // ⌘P = toggle pin
                     if let item = self.state.currentItem {
                         self.state.togglePin(item)
+                    }
+                case 51 where isCmd:                            // ⌘Backspace = 删除选中行
+                    // plan hashed-allen §E:softDelete cascade 同 text_full sibling 全删,
+                    // 3s banner 反馈;不弹二次确认(剪贴板心智)。
+                    // 多选时按 selectedItems 整批删——跟 onPaste 路径心智一致
+                    // (Return 也是 selectedItems → fallback currentItem)。contextMenu
+                    // 路径仍只删单条(Finder 右键单张不改多选)
+                    let items: [Item]
+                    if !self.state.selectedItems.isEmpty {
+                        items = self.state.selectedItems
+                    } else if let cur = self.state.currentItem {
+                        items = [cur]
+                    } else {
+                        items = []
+                    }
+                    if !items.isEmpty {
+                        self.state.deleteItems(items)
                     }
                 case 8 where isCmd:                             // ⌘C = 复制文本预览选中内容
                     // previewShown=false / preview kind 不是文本 / 无选区 → 透传(返 false)
