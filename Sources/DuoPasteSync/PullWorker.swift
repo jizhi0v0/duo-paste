@@ -21,10 +21,19 @@ public actor PullWorker {
         public var batchLimit: Int
         public var initialBackoffSec: TimeInterval
         public var maxBackoffSec: TimeInterval
-        /// 跨设备 Continuity dedup 时间窗（纳秒）。0 = 关闭这个 dedup 层。
-        /// 配合 RemoteIngester 的同名字段，PullWorker 写 item_mirror 前查本机 item 表
-        /// 有无 origin=self 同内容在窗口内已存——命中则 skip mirror 入库，UI union
-        /// 看到的就是单条 own。Universal Clipboard 同步通常 < 1s，5s buffer 充足。
+        /// 跨设备 Continuity dedup 时间窗（纳秒）。**default 0 = 关闭这层 dedup**
+        /// （plan hashed-allen §D）。
+        ///
+        /// 历史 default 是 5_000_000_000 (5s)：PullWorker 写 item_mirror 前查本机
+        /// item 表有无 origin=self 同内容在窗口内已存——命中则 skip mirror 入库，
+        /// UI union 看到的就是单条 own。
+        ///
+        /// 但这破坏了两台 Mac 的行集合对称性（mini 上有 mirror、MBP 上没有 mirror），
+        /// cascade 删除依赖对称性才能找到 sibling tombstone。所以 default 翻 0
+        /// 让 cross-device 副本老实进 mirror，UI 靠 `Item.foldByTextFull` 兜底
+        /// 不影响显示（fold 跨 origin 同 text 折一条）。
+        ///
+        /// 非 0 = 紧急回滚口（单台机器临时回退 5_000_000_000 恢复历史行为）。
         public var crossDeviceDedupWindowNs: Int64
         /// 时钟偏移告警阈值（毫秒）。|primary.now_ms - local.now_ms| 超过这个值 →
         /// log warn + 通过 MirrorStatus 暴露给 UI banner。
@@ -54,7 +63,7 @@ public actor PullWorker {
             batchLimit: Int = 500,
             initialBackoffSec: TimeInterval = 2,
             maxBackoffSec: TimeInterval = 120,
-            crossDeviceDedupWindowNs: Int64 = 5_000_000_000,
+            crossDeviceDedupWindowNs: Int64 = 0,
             clockSkewWarnMs: Int64 = 30_000,
             storageMode: StorageMode = .default,
             reconcileFailureThreshold: Int = 3

@@ -478,6 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 evictOnFull: deps.evictOnFull,
                 pullWorkerConfig: PullWorker.Config(
                     intervalSec: TimeInterval(intervalSec),
+                    crossDeviceDedupWindowNs: cfg.mesh.crossDeviceDedupWindowNs,
                     storageMode: cfg.mesh.storageMode
                 ),
                 wsEnabled: cfg.mesh.wsEnabled,

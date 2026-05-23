@@ -121,14 +121,17 @@ private func tmpConfig(_ json: String) throws -> URL {
 
 @Test func configMeshSegmentDefaults() throws {
     // mesh 段没写 → 全默认值。
-    // plan settings-cleanup：内部 tuning 字段从 Config.MeshConfig 撤掉，
-    // 这里只验 user-facing 4 个字段
+    // plan settings-cleanup：内部 tuning 字段大部分从 Config.MeshConfig 撤掉；
+    // plan hashed-allen §D §C：cross_device_dedup_window_ns / delete_cascade_enabled
+    // 重新引入做回滚口
     let url = try tmpConfig("{}")
     let cfg = try Config.load(from: url)
     #expect(cfg.mesh.enabled == true)
     #expect(cfg.mesh.pullIntervalSec == 30)
     #expect(cfg.mesh.wsEnabled == true)
     #expect(cfg.mesh.storageMode == .full)
+    #expect(cfg.mesh.crossDeviceDedupWindowNs == 0)
+    #expect(cfg.mesh.deleteCascadeEnabled == true)
 }
 
 @Test func configMeshSegmentRoundtrip() throws {
@@ -151,9 +154,10 @@ private func tmpConfig(_ json: String) throws -> URL {
 }
 
 /// plan settings-cleanup：老 mesh tuning 字段（pull_batch_limit / *_backoff_sec /
-/// cross_device_dedup_window_ns / clock_skew_warn_ms / ws_reconnect_*_sec /
-/// ws_heartbeat_sec / ws_rotation_sec）从 Config.MeshConfig 撤掉。老 config 残留这些
-/// 键时 decoder 必须容忍（unknown key 忽略），不能报错让 daemon 启动挂
+/// clock_skew_warn_ms / ws_reconnect_*_sec / ws_heartbeat_sec / ws_rotation_sec）
+/// 从 Config.MeshConfig 撤掉。老 config 残留这些键时 decoder 必须容忍（unknown key
+/// 忽略），不能报错让 daemon 启动挂。
+/// 注：cross_device_dedup_window_ns 不再是 legacy（plan hashed-allen §D 重新引入）
 @Test func configIgnoresLegacyMeshTuningKeys() throws {
     let url = try tmpConfig("""
     {
@@ -163,7 +167,6 @@ private func tmpConfig(_ json: String) throws -> URL {
             "pull_batch_limit": 500,
             "pull_initial_backoff_sec": 2,
             "pull_max_backoff_sec": 120,
-            "cross_device_dedup_window_ns": 5000000000,
             "clock_skew_warn_ms": 30000,
             "ws_enabled": true,
             "ws_reconnect_initial_sec": 1,
@@ -179,7 +182,9 @@ private func tmpConfig(_ json: String) throws -> URL {
     #expect(cfg.mesh.wsEnabled == true)
 }
 
-/// 写入路径必须 removeValue 老 tuning 键——升级后 config.json 不残留
+/// 写入路径必须 removeValue 老 tuning 键——升级后 config.json 不残留。
+/// 注：cross_device_dedup_window_ns 不再是 legacy（plan hashed-allen §D 重新引入），
+/// write 路径会保留并写为正式字段
 @Test func configWriteRemovesLegacyMeshTuningKeys() throws {
     let url = try tmpConfig("""
     {
@@ -187,8 +192,7 @@ private func tmpConfig(_ json: String) throws -> URL {
             "pull_interval_sec": 30,
             "pull_batch_limit": 500,
             "ws_heartbeat_sec": 30,
-            "ws_rotation_sec": 14400,
-            "cross_device_dedup_window_ns": 5000000000
+            "ws_rotation_sec": 14400
         }
     }
     """)
@@ -199,14 +203,16 @@ private func tmpConfig(_ json: String) throws -> URL {
     let mesh = dict["mesh"] as! [String: Any]
     for legacy in [
         "pull_batch_limit", "pull_initial_backoff_sec", "pull_max_backoff_sec",
-        "cross_device_dedup_window_ns", "clock_skew_warn_ms",
+        "clock_skew_warn_ms",
         "ws_reconnect_initial_sec", "ws_reconnect_max_sec",
         "ws_heartbeat_sec", "ws_rotation_sec",
     ] {
         #expect(mesh[legacy] == nil, "legacy key \(legacy) 应已被洗掉")
     }
-    // 用户可见字段仍在
+    // 用户可见字段仍在（含新引入的 cross_device_dedup_window_ns + delete_cascade_enabled）
     #expect(mesh["pull_interval_sec"] as? Int == 30)
+    #expect(mesh["cross_device_dedup_window_ns"] as? Int == 0)
+    #expect(mesh["delete_cascade_enabled"] as? Bool == true)
 }
 
 /// 老 shared_secret_keychain_account 字段同款撤掉（实际从未在启动路径上读，
