@@ -401,6 +401,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     if let item = self.state.currentItem {
                         self.state.togglePin(item)
                     }
+                case 51 where isCmd:                            // ⌘Backspace = 删除选中行
+                    // plan hashed-allen §E:softDelete cascade 同 text_full sibling 全删,
+                    // 3s banner 反馈;不弹二次确认(剪贴板心智)
+                    if let item = self.state.currentItem {
+                        self.state.deleteItem(item)
+                    }
                 case 8 where isCmd:                             // ⌘C = 复制文本预览选中内容
                     // previewShown=false / preview kind 不是文本 / 无选区 → 透传(返 false)
                     // 让 TextField 保留原生 ⌘C 复制搜索框选中文字的能力

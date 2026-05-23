@@ -462,6 +462,43 @@ final class AppState {
         }
     }
 
+    /// Mac UI 删除入口(plan hashed-allen §E):⌘Backspace / contextMenu "删除"调用。
+    /// 复用 togglePin 的 broadcaster fire-and-forget pattern:softDelete cascade
+    /// 删 fold group + 多 sibling 取 max(ingested) 喂 broadcaster + refresh + 3s banner。
+    ///
+    /// 不弹二次确认 alert(剪贴板心智下删除高频);误删要 undo 走未来的 admin-undelete CLI。
+    func deleteItem(_ item: Item) {
+        let id = item.id
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let results = try await self.deps.database.softDelete(
+                    id: id,
+                    now: Clock.nowNs()
+                )
+                let maxIngest = results.map(\.ingestedAtNs).max() ?? 0
+                let broadcaster = self.deps.wsBroadcaster
+                let deviceID = self.deps.deviceID
+                Task {
+                    await broadcaster.broadcastCursorAdvanced(
+                        deviceID: deviceID,
+                        latestIngestedAtNs: maxIngest
+                    )
+                }
+                await self.refresh()
+                self.postNotice("已删除 \(results.count) 条")
+            } catch BumpError.alreadyDeleted {
+                // 幂等:行已 tombstone,refresh 让 UI 跟上(罕见:重复 ⌘Backspace race)
+                await self.refresh()
+            } catch BumpError.notFound {
+                // 行已不存在,refresh 对齐
+                await self.refresh()
+            } catch {
+                self.postNotice("删除失败: \(error)")
+            }
+        }
+    }
+
     /// 一次性 3s notice。同一文案在窗口内重复触发不会延长——只在过期后才能换新内容。
     /// **任何**写 recentNotice 的入口都必须走这条路,直接赋字段会绕过 3s timer 让 banner
     /// 永久残留(踩过坑:pasteBack 跨 kind fallback 写 banner 后 panel 复用 state 让用户
