@@ -445,17 +445,23 @@ public struct SyncServer: Sendable {
             }
             let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
             do {
-                let newIngest = try await database.softDelete(id: id, now: now)
-                onItemMutated(id, newIngest)
+                // plan hashed-allen §C:softDelete cascade 返回 [(id, newIngest)]
+                // (cascade 删 fold group 时多行 tombstone)。线协议保持兼容:取 max
+                // ingest 喂 broadcaster + response payload,iOS 无 schema 改动
+                let results = try await database.softDelete(id: id, now: now)
+                let maxIngest = results.map(\.ingestedAtNs).max() ?? 0
+                // onItemMutated 对每条 tombstone 都 fire(下游 SearchProvider 等可能
+                // 监听单 id 变化);广播仍合并一次,语义跟单 id tombstone 等价
+                for r in results { onItemMutated(r.id, r.ingestedAtNs) }
                 if let broadcaster {
                     Task {
                         await broadcaster.broadcastCursorAdvanced(
                             deviceID: deviceID,
-                            latestIngestedAtNs: newIngest
+                            latestIngestedAtNs: maxIngest
                         )
                     }
                 }
-                let payload: [String: Any] = ["ok": true, "ingested_at_ns": newIngest]
+                let payload: [String: Any] = ["ok": true, "ingested_at_ns": maxIngest]
                 let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
                 var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
                 resp.headers[.contentType] = "application/json"
