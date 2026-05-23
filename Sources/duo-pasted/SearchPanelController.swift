@@ -312,8 +312,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     }
                 }
                 // Backspace 在 query 空 + activeQualifiers 非空时弹最后一个 chip。
-                // 补全菜单显示时 backspace 透传(让用户改 /xx 输入),不弹 chip
-                if keyCode == 51 {
+                // 补全菜单显示时 backspace 透传(让用户改 /xx 输入),不弹 chip。
+                // **`!isCmd`** (plan hashed-allen §Step 4):⌘Backspace 是删除选中
+                // item 的快捷键(下面 switch 处理),这里必须放行不能吞掉
+                if keyCode == 51 && !isCmd {
                     if !self.state.completionMenuVisible
                         && self.state.query.isEmpty
                         && !self.state.activeQualifiers.isEmpty {
