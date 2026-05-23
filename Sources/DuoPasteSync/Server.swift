@@ -471,16 +471,18 @@ public struct SyncServer: Sendable {
 
         // POST /pin/{id}?pinned=1|0:切换 item.pinned。跨 origin 生效(走
         // database.setPinnedAny,不带 own-origin guard,跟 /bump /item DELETE 心智一致)。
-        // iOS 长按"置顶/取消置顶"路径专用——Mac 端 SearchView contextMenu 仍走进程内
-        // database.setPinned(带 own-origin guard,保留旧契约)。
+        // iOS 长按"置顶/取消置顶"路径专用。**Mac UI 路径**(AppState.togglePin / SearchView
+        // contextMenu / ⌘P)走进程内 database.setPinnedAny + broadcaster fan-out 同款语义,
+        // 不走 HTTP 自环;严格 own-origin 变体 database.setPinned 现状无生产调用。
         //
         // query 里读 pinned:`pinned=1` → 置顶,`pinned=0` → 取消。空 / 其它值返 400。
         // 不接受 body(空 body hash),id 跟 query 都被 HMAC 签名所覆盖。已是目标状态返 200
         // (handler 当幂等成功),已 tombstoned 返 410,未知 id 返 404。
         //
-        // **已知 limitation**(写在 setPinnedAny doc):跨 origin pin 不回传 origin 设备 ——
-        // 本机 mirror 改了 pin,PullWorker.applyPage 跳过对端 own origin → origin 设备本地
-        // 仍非 pinned。本机 fold 路径"pinned OR 聚合"让搜索语义本机 + 其他 mirror peer 一致
+        // **已知 limitation**(完整列表写在 setPinnedAny doc):跨 origin pin 不回传 origin
+        // 设备 + origin 后续任何 ingested_at_ns bump 会通过 /since INSERT OR REPLACE 把
+        // 其他 mirror peer 上跨 origin 打的 pin 静默抹掉。本机 fold 路径"pinned OR 聚合"
+        // 让搜索语义本机 + 其他 mirror peer 一致(但不能 hold 住 origin 后续 mutation 的覆盖)
         router.post("/pin/:id") { request, context -> Response in
             guard let id = context.parameters.get("id"), !id.isEmpty else {
                 return errorJSON(.badRequest, "missing id")

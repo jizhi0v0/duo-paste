@@ -706,42 +706,6 @@ public struct Database: Sendable {
         }
     }
 
-    /// 切换 item.pinned。仅对 origin_device == selfDeviceID 的行生效——mirror 行
-    /// （别的机器产生的）不能 pin，由调用方在 UI 层先判断。这里在 DB 层再守一道是
-    /// 防御性：即使 UI 误传 mirror id 也不会改写跨设备行的 pinned。
-    ///
-    /// writer tx 内 bump `ingested_at_ns`，让 PullWorker 通过 /since 把变更回放到其他
-    /// 设备的 item_mirror。primary 上调 → 全局可见；client 上调 → 仅本机生效
-    /// （RemoteIngester 不更新已存在的 id，M2 契约"item 一旦 ingest 就不可变"。
-    /// 跨设备 pin 同步留到将来 /update 路由）。
-    ///
-    /// Returns: `true` 代表实际 UPDATE 了一行；`false` = item 不存在 / 非 own-origin /
-    /// 已是目标状态。**false 不是错误**，是幂等结果，调用方按需 refresh UI 即可
-    @discardableResult
-    public func setPinned(
-        id: String,
-        pinned: Bool,
-        selfDeviceID: String,
-        now: Int64
-    ) throws -> Bool {
-        try pool.write { db in
-            guard let item = try Item.filter(Column("id") == id).fetchOne(db) else {
-                return false
-            }
-            guard item.originDevice == selfDeviceID else {
-                return false
-            }
-            if item.pinned == pinned { return false }
-            let ts = try Self.nextIngestNs(db, now: now)
-            try db.execute(sql: """
-                UPDATE item
-                SET pinned = ?, ingested_at_ns = ?
-                WHERE id = ?
-            """, arguments: [pinned ? 1 : 0, ts, id])
-            return true
-        }
-    }
-
     /// 把单行 `captured_at_ns` 顶到 `now`(或 max+1 单增兜底)+ bump `ingested_at_ns` 让
     /// /since cursor 推进让对端通过 PullWorker 看到这条变化。**不动 `origin_device`**——
     /// 顶是时间属性变化,不是归属变化(剪贴板心智:任意 peer 都能把任意 origin 的行顶上去)。
@@ -805,16 +769,62 @@ public struct Database: Sendable {
         }
     }
 
-    /// 跨 origin 版 setPinned——给 `POST /pin/<id>` handler 用。**不带** own-origin guard
-    /// （`setPinned` 带；那是给 Mac 进程内 UI 路径用的）。理由：iOS 配对的 peer 上 mirror
-    /// 行占多数（origin=另一台 Mac），iOS 用户长按 pin 时若强制 own-origin 等于 90%+ 卡
-    /// 不可 pin。心智跟 `bumpCapturedAt`/`softDelete` 一致——任意 peer 都能改 pin。
+    /// 读单行 `pinned` 真值。
     ///
-    /// 已知 limitation：本机 mirror 行 pin 后，对端 origin 设备**不会**收到回传更新——
-    /// PullWorker.applyPage 跳过自家 origin 的行。本机 fold-aware 搜索 `pinned OR 聚合`
-    /// 让"内容 pinned"语义在本机 + 通过 /since 同步给其他 mirror peer 自然成立；
-    /// origin 设备本地仍看到非 pinned（CLAUDE.md / Database.setPinned 注释提到的
-    /// "跨设备 pin 同步留到将来 /update 路由"——本函数即雏形）。
+    /// **现状无生产调用方**——历史上给 `AppState.togglePin` 在 Task 内重算 target 用
+    /// (防快速双击 stale UI snapshot 倒转),后来 togglePin 改走原子 [togglePinAny]
+    /// (单 writer tx 内 read+flip+write,关 TOCTOU race),本函数不再被生产代码引用。
+    /// 留作公开 API:可独立用于只读 pin 状态查询(诊断 / 测试 / future 需要细粒度
+    /// pin 状态检查时直接复用,无需为查询单独打 SQL)。
+    ///
+    /// Returns:
+    /// - 行存在且未 tombstone → 真实 pinned 值
+    /// - 行不存在 → 抛 `BumpError.notFound`(调用方应当 silently 视作 race 已发生不再操作)
+    /// - 行已 tombstone → 抛 `BumpError.deleted`(同上)
+    ///
+    /// 跟 setPinnedAny 共享 BumpError 错误集合,catch 路径同 setPinnedAny 一致。
+    public func getPinned(id: String) async throws -> Bool {
+        try await pool.read { db in
+            guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
+                throw BumpError.notFound
+            }
+            if row.deletedAtNs != nil {
+                throw BumpError.deleted
+            }
+            return row.pinned
+        }
+    }
+
+    /// 跨 origin 版 setPinned——给 `POST /pin/<id>` HTTP handler 用(HTTP 语义是
+    /// "set 绝对值",iOS / 远端调用方明确传 `pinned=true/false`)。**Mac 进程内 UI**
+    /// 走独立的 [togglePinAny](单 writer tx 原子 read+flip+write),跟 HTTP 路径职责
+    /// 分清——本函数保留给"已知目标值"语义的调用方,不适合做 UI 的 read-modify-write
+    /// (两步走在并发场景有 TOCTOU race,详见 [togglePinAny] doc)。
+    ///
+    /// **不带** own-origin guard,跟 `bumpCapturedAt`/`softDelete` 心智一致(任意 peer
+    /// 改任意 origin 行)。理由:mesh 拓扑下 mirror 行占多数(iOS 100%,多 Mac peer 也
+    /// 大头是另一台的 mirror),强制 own-origin 等于 UI 上 90%+ 卡不可 pin。严格
+    /// own-origin 语义历史上由独立 `setPinned` 函数提供,已删,future 需要可通过加
+    /// `requireOwnOrigin: Bool` 参数恢复。
+    ///
+    /// 已知 limitation:
+    /// 1. 本机 mirror 行 pin 后,**对端 origin 设备**不会收到回传——PullWorker.applyPage
+    ///    跳过自家 origin 的行(`origin_device == self → continue`)
+    /// 2. **其他 mirror peer** 会通过 /since 看到 pin 状态,本机 fold-aware 搜索 `pinned OR
+    ///    聚合` 让"内容 pinned"语义在本机 + 其他 mirror peer 自然成立。**但**:`applyPage`
+    ///    走 INSERT OR REPLACE 全列覆盖(包括 pinned 列),一旦 origin 设备后续对该 row 做
+    ///    任何 bump `ingested_at_ns` 的操作(POST /bump = bumpCapturedAt / 文本永久 dedup
+    ///    merge bump / OCR markDone 回放 / softDelete tombstone 等),origin 视角下
+    ///    pinned=false 会带新 ingested_at_ns 通过 /since 推到其他 mirror peer,触发整行覆盖
+    ///    把跨 origin 打的 pin 静默抹掉。用户感知 = "我置顶的某条几小时后自己掉下去了"
+    /// 3. origin 设备本地仍看到非 pinned(同 #1)
+    ///
+    /// 真正双向回传 + 字段级 OR-merge(pinned 列不被回放覆盖)要等 `/update` 路由(本函数即
+    /// 雏形)。中期 mitigation 选项:applyPage 对 pinned 列走 take-max/OR-merge 而非 REPLACE。
+    ///
+    /// **注意**:OR-merge 让 unpin 操作无法跨 mirror peer 传播(本机 unpin=false 会被对端
+    /// pinned=true 吃掉),要么接受这个 trade-off,要么等 `/update` 路由做真正的字段级
+    /// last-writer-wins。
     ///
     /// 不变量:
     /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增
@@ -845,6 +855,44 @@ public struct Database: Sendable {
                 WHERE id = ?
             """, arguments: [pinned ? 1 : 0, newIngest, id])
             return newIngest
+        }
+    }
+
+    /// 原子 toggle item.pinned——在**单一 writer tx** 内 read → flip → write,
+    /// 关闭 [getPinned] + [setPinnedAny] 两步走的 TOCTOU race window:
+    /// 旧两步实现下并发 ⌘P 两 Task 都能在 A commit 前 reader-snapshot 看到 pinned=false →
+    /// 都算 target=true → A 写 true / B noop → 净翻一次。本函数让 toggle 在 writer tx
+    /// 内完成,GRDB 串行 writer queue 天然 race-free。
+    ///
+    /// 跨 origin 生效(同 [setPinnedAny] 哲学):不带 own-origin guard,本机 mirror 行也能翻。
+    /// 同款 limitation 也适用——本机翻 mirror 行不回传 origin 设备 + origin 后续 bump
+    /// 通过 INSERT OR REPLACE 抹掉跨 origin pin。详见 setPinnedAny doc。
+    ///
+    /// 不变量:
+    /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增
+    /// - tombstone (deleted_at_ns 非 nil) 拒 toggle,抛 `.deleted`
+    /// - 不存在的 id 抛 `.notFound`
+    /// - **不动 captured_at_ns / origin_device**:pin 是元数据切换不是顺序变化
+    ///
+    /// Returns: `(newPinned, newIngestNs)`——newPinned 是翻**后**的值,调用方用来 fan-out
+    /// 给对端推 cursor_advanced。**永远不返 nil**(getPinned + setPinnedAny 那种"已是目标"
+    /// noop 在 toggle 语义下不可能发生——每次 toggle 都翻反)
+    public func togglePinAny(id: String, now: Int64) async throws -> (newPinned: Bool, newIngest: Int64) {
+        try await pool.write { db in
+            guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
+                throw BumpError.notFound
+            }
+            if row.deletedAtNs != nil {
+                throw BumpError.deleted
+            }
+            let newPinned = !row.pinned
+            let newIngest = try Self.nextIngestNs(db, now: now)
+            try db.execute(sql: """
+                UPDATE item
+                SET pinned = ?, ingested_at_ns = ?
+                WHERE id = ?
+            """, arguments: [newPinned ? 1 : 0, newIngest, id])
+            return (newPinned, newIngest)
         }
     }
 }

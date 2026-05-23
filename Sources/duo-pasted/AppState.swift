@@ -43,7 +43,7 @@ final class AppState {
     var timeRange: TimeRange = .all
     /// 仅显示已置顶。SearchQuery.pinnedOnly → SQL `pinned = 1`
     var pinnedOnly: Bool = false
-    /// 临时一次性提示（pin mirror 行被拒等场景），3s 自动清掉。
+    /// 临时一次性提示（lazy blob 部分失败等场景），3s 自动清掉。
     /// 不持久化；SearchView 顶部以 caption 形态短暂显示
     var recentNotice: String?
 
@@ -387,33 +387,78 @@ final class AppState {
         self.recentSkip = nil
     }
 
-    /// 切换 item 的 pinned 状态。仅对 own-origin 行生效；mirror 行（别的机器产生的）
-    /// 给个一次性 notice 提示，不抛错。
+    /// 切换 item 的 pinned 状态。**跨 origin 生效**——本机 own-origin 行 + 对端 mirror 行
+    /// 都能 pin/unpin，跟 iOS 长按 / HTTP `POST /pin/<id>` 心智一致(`Database.togglePinAny`
+    /// 跟 `setPinnedAny` 同款不带 own-origin guard)。
     ///
     /// 行为细节：
-    /// - own-origin + 状态变化 → Database.setPinned writer tx + refresh
-    /// - own-origin + 同状态 → no-op（不动 ingested_at_ns 避免无谓 cursor 推进）
-    /// - mirror 行（origin ≠ self）→ 显示 notice"只能置顶本机产生的项"，3s 自动消失
+    /// - 单一 writer tx 内 read → flip → write(`Database.togglePinAny`)→ broadcaster fan-out
+    ///   (detach) + refresh
+    /// - tombstone / 未知 id → silently no-op(UI 列表本就不展示这两类，触发到 = race),
+    ///   refresh 让本机 UI 跟 DB 对齐
     ///
-    /// 调用方：SearchPanelController 的 ⌘P key monitor。同步执行：单行 UPDATE +
-    /// 一次 MAX 查询，pool.write 在 main actor 上 < 1ms，不卡 UI
+    /// 已知 limitation:
+    /// 1. **对端 origin 设备**不会收到回传更新——`PullWorker.applyPage` 跳过自家 origin 行
+    /// 2. **其他 mirror peer** 会通过 /since 看到 pin 状态,本机 fold-aware 搜索 `pinned OR 聚合`
+    ///    让搜索语义在本机 + 其他 mirror peer 自然成立。**但**一旦 origin 设备后续对该 row 做
+    ///    任何 bump `ingested_at_ns` 的操作(POST /bump / 文本 dedup merge / OCR markDone /
+    ///    softDelete 等),origin 视角下 pinned=false 会通过 /since 推到其他 mirror peer,触发
+    ///    `applyPage` 的 INSERT OR REPLACE 整行覆盖,跨 origin 打的 pin 被静默抹掉
+    /// 3. (仅当 iOS 配对的 Mac ≠ row 的 origin Mac 时触发,即 ≥2 Mac mesh 部署;单 Mac + iOS 不撞)
+    ///    iOS 已通过 POST /pin 把某 mirror 行 pin 后,**origin Mac** 上 item.pinned 仍是 false——
+    ///    用户在 origin Mac ⌘P 想"取消置顶"会翻成 true,反向把 own-origin 也 pin 上
+    ///    (需要再按一次 ⌘P 才真正 unpin)
+    ///
+    /// 真正双向回传 + 字段级 OR-merge(让 pinned 不被回放抹掉)要等 `/update` 路由。
+    ///
+    /// 调用方:SearchPanelController 的 ⌘P key monitor + SearchView contextMenu。async 执行
+    /// (Task @MainActor):writer tx 异步等 < 1ms,broadcaster fan-out 走独立 Task fire-and-forget
+    /// 不阻塞 refresh(跟 Server.swift /pin handler 同款 fire-and-forget 模式,慢 peer 不让 UI 等)
+    ///
+    /// **原子 togglePinAny 在单一 writer tx 内 read+flip+write,并发 ⌘P 也 race-free**——
+    /// 旧两步实现(getPinned snapshot read → setPinnedAny write)在并发场景下两个 Task 都能
+    /// 在 A commit 前 reader-snapshot 看到 pinned=false → 都算 target=true → A 写 true /
+    /// B noop → 净翻一次,正是 stale-snapshot bug。togglePinAny 把整个 read-modify-write
+    /// 塞进 GRDB 串行 writer queue 天然 race-free。
     func togglePin(_ item: Item) {
-        guard item.originDevice == deps.deviceID else {
-            postNotice("只能置顶本机产生的项")
-            return
-        }
-        do {
-            let didUpdate = try deps.database.setPinned(
-                id: item.id,
-                pinned: !item.pinned,
-                selfDeviceID: deps.deviceID,
-                now: Clock.nowNs()
-            )
-            if didUpdate {
-                Task { await refresh() }
+        let id = item.id
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                // 原子 toggle:单一 writer tx 内 read+flip+write,关 race。代替旧的
+                // getPinned + setPinnedAny 两步走(两步在并发 ⌘P 下仍 TOCTOU race——
+                // 两 Task 都能在 A commit 前 reader-snapshot 看到 pinned=false → 都算
+                // target=true → A 写 / B noop → 净翻一次,正是想修的 stale-snapshot bug)
+                let (_, newIngest) = try await self.deps.database.togglePinAny(
+                    id: id,
+                    now: Clock.nowNs()
+                )
+                // fan-out 起独立 Task 出去,不阻塞 refresh——WSBroadcaster 单 peer write 慢的话最长
+                // perBroadcastTimeoutNs(默 2s),不能让 UI pin 视觉反馈被拖到这之后。Server.swift
+                // /pin / /bump / /item DELETE 三个 handler + CaptureService / OCRWorker hook
+                // 全部用同款 fire-and-forget 模式
+                let broadcaster = self.deps.wsBroadcaster
+                let deviceID = self.deps.deviceID
+                Task {
+                    await broadcaster.broadcastCursorAdvanced(
+                        deviceID: deviceID,
+                        latestIngestedAtNs: newIngest
+                    )
+                }
+                await self.refresh()
+            } catch BumpError.notFound {
+                // 行已被硬删 / 不存在:本机 UI 跟 DB 失同步,refresh 一次让卡片消失
+                await self.refresh()
+            } catch BumpError.deleted {
+                // 行已 tombstone(常见:iOS DELETE /item 已落库但本机 onItemMutated→refresh 还没跑):
+                // 同上 refresh 强制对齐,避免列表残留显示已删行
+                await self.refresh()
+            } catch {
+                // 走 recentNotice banner——SearchView 顶部 caption 形态展示 3s 自动消失。
+                // 不写 lastError 是因为 SearchView 只在 empty state 渲染 lastError(results.isEmpty),
+                // 列表非空时 pin 失败完全没 surface + 下次 keystroke refresh() 自动清掉
+                self.postNotice("pin 失败: \(error)")
             }
-        } catch {
-            self.lastError = "pin 失败: \(error)"
         }
     }
 
