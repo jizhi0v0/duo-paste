@@ -3,6 +3,7 @@ import SwiftUI
 import PDFKit
 import AVFoundation
 import AVKit
+import VisionKit
 import DuoPasteCore
 import DuoPasteSync
 
@@ -33,6 +34,15 @@ final class PreviewPanelController {
     /// 不限容量——剪贴板典型几千条 item 但同一次会话用户只会预览少数;PDF/NSImage 各
     /// 几 MB,千条以内可接受。panel hide 不清(用户秒级 reopen 同 item 是常见场景)
     private var mediaCache: [String: PreviewMedia] = [:]
+    /// 当前文本预览路径里 `TextPreviewBody` 通过 `onTextView` 回调注册的 NSTextView。
+    /// SearchPanelController 拦 ⌘C 时调 `selectedPreviewText()` 取选中字符串。
+    /// weak:NSTextView 寿命跟 hostingView 子树绑,kind 切换 / panel 析构时自动 nil
+    weak var currentTextView: NSTextView?
+    /// 当前图片预览路径里 `ImagePreviewBody` 注册的 VisionKit Live Text overlay view。
+    /// 图片 OCR 完成后这里非 nil,`selectedPreviewText()` 兜底拿 `selectedText` 让 ⌘C 复制选中。
+    /// macOS VisionKit 用 `ImageAnalysisOverlayView`(NSView 子类),不是 UIKit-only 的
+    /// `ImageAnalysisInteraction`。weak:overlay 寿命跟挂的 container view 绑
+    weak var currentImageOverlay: ImageAnalysisOverlayView?
     /// 当前正在为哪个 item 跑后台解码 Task——切换 item 时 cancel + 检查 currentItemID
     /// 防止乱序覆盖(快速按箭头时多个 task 并发,只有最新那个 apply 生效)
     private var loadTask: Task<Void, Never>?
@@ -131,8 +141,60 @@ final class PreviewPanelController {
     func hide() {
         loadTask?.cancel()
         currentItemID = nil
+        currentTextView = nil
+        currentImageOverlay = nil
         panel?.alphaValue = 0
         panel?.ignoresMouseEvents = true
+    }
+
+    /// 当前预览的选中字符串。nil = 当前 kind 不是文本路径 / 无选中字符 /
+    /// 选区下标越界(防御性)。SearchPanelController 在 previewShown=true 时拦 ⌘C 调用。
+    /// 文本路径走 NSTextView.selectedRange;图片路径走 VisionKit Live Text 的
+    /// `ImageAnalysisInteraction.selectedText`——OCR 没识别 / 没选 → 返空串走透传
+    func selectedPreviewText() -> String? {
+        if let tv = currentTextView {
+            let range = tv.selectedRange()
+            if range.length > 0 {
+                let ns = tv.string as NSString
+                if range.location + range.length <= ns.length {
+                    return ns.substring(with: range)
+                }
+            }
+        }
+        if let ov = currentImageOverlay {
+            let sel = ov.selectedText
+            if !sel.isEmpty { return sel }
+        }
+        return nil
+    }
+
+    /// ⌘A 全选当前预览的内容。文本路径走 NSTextView.selectAll;图片走 VisionKit
+    /// `ImageAnalysisOverlayView.selectAllText(_:)`——OCR 还没跑完调它无害(没有可选文字 no-op)。
+    /// 返回 true = 已消费;false = 当前 kind 没有可全选目标,SearchPanelController 透传 ⌘A
+    /// 给搜索框 TextField (保留原生 ⌘A 全选搜索框文字的能力)
+    @discardableResult
+    func selectAllPreview() -> Bool {
+        if let tv = currentTextView {
+            tv.selectAll(nil)
+            return true
+        }
+        if let ov = currentImageOverlay {
+            // macOS VisionKit `ImageAnalysisOverlayView` 不公开 selectAllText API
+            // (iOS 上的 ImageAnalysisInteraction 有,macOS 文档明确未暴露)。这里走
+            // ObjC perform selector 兜底——存在私有 `selectAllText:` 就用,没有就退回
+            // false 让 ⌘A 透传给搜索框 TextField。NSResponder.selectAll(_:) 也试一下兜底
+            let sel = NSSelectorFromString("selectAllText:")
+            if ov.responds(to: sel) {
+                ov.perform(sel, with: nil)
+                return true
+            }
+            ov.selectAll(nil)        // ImageAnalysisOverlayView 若 override 这条会响应
+            // selectAll(_:) 是 NSResponder 标准方法,即便 overlay 不 override 也 no-op,
+            // 但我们已没法判断 overlay 是否真选中了——还是返 true 吃掉 ⌘A,
+            // 避免事件穿透到搜索框误全选搜索框文字干扰用户
+            return true
+        }
+        return false
     }
 
     private func needsAsyncDecode(_ item: Item) -> Bool {
@@ -146,8 +208,22 @@ final class PreviewPanelController {
                        cardRectInGlobal: CGRect) {
         let contentSize = sizeFor(media: media, screenFrame: visibleFrame, anchor: anchor)
         let p = ensurePanel()
+        // kind / item 切换时旧 textView / interaction 引用作废——Body.updateNSView 重新挂载会再注册;
+        // 同 item 同 media 的 reposition 路径走 updateNSView 立刻回填,不会留窗口
+        currentTextView = nil
+        currentImageOverlay = nil
         // 先 update SwiftUI 内容再 resize panel——顺序反了 SwiftUI 用旧 size 一帧再换会抖
-        hostingView?.rootView = PreviewPanelContent(item: item, media: media, blobs: blobs)
+        let registerTextView: @MainActor (NSTextView?) -> Void = { [weak self] tv in
+            self?.currentTextView = tv
+        }
+        let registerImageOverlay: @MainActor (ImageAnalysisOverlayView?) -> Void = { [weak self] ov in
+            self?.currentImageOverlay = ov
+        }
+        hostingView?.rootView = PreviewPanelContent(
+            item: item, media: media, blobs: blobs,
+            onTextView: registerTextView,
+            onImageOverlay: registerImageOverlay
+        )
         if p.frame.size != contentSize {
             p.setContentSize(contentSize)
         }
@@ -387,7 +463,10 @@ final class PreviewPanelController {
         p.animationBehavior = .none
 
         let host = NSHostingView(
-            rootView: PreviewPanelContent(item: nil, media: .none, blobs: blobs)
+            rootView: PreviewPanelContent(
+                item: nil, media: .none, blobs: blobs,
+                onTextView: nil, onImageOverlay: nil
+            )
         )
         host.frame = initial
         host.autoresizingMask = [.width, .height]
@@ -436,6 +515,12 @@ struct PreviewPanelContent: View {
     let item: Item?
     let media: PreviewMedia
     let blobs: BlobStore
+    /// 文本路径(`TextPreviewBody`) make/update NSView 时回调,把 NSTextView 弱引用
+    /// 注册回 controller。controller 拦 ⌘C 时调 selectedPreviewText 取选中字符串。
+    /// nil = 不需要注册(ensurePanel 占位 rootView 这种调用)
+    let onTextView: (@MainActor (NSTextView?) -> Void)?
+    /// 图片路径(`ImagePreviewBody`) 注册 VisionKit Live Text overlay——⌘C 兜底走它的 selectedText
+    let onImageOverlay: (@MainActor (ImageAnalysisOverlayView?) -> Void)?
 
     var body: some View {
         ZStack {
@@ -528,10 +613,7 @@ struct PreviewPanelContent: View {
                 ProgressView().controlSize(.large)
             }
         case .image(let image):
-            Image(nsImage: image)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
+            ImagePreviewBody(image: image, onOverlay: onImageOverlay)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black.opacity(0.04))
         case .pdf(let doc):
@@ -552,7 +634,8 @@ struct PreviewPanelContent: View {
             } else if item.kind == .file {
                 FilePreviewBody(item: item)
             } else {
-                TextPreviewBody(text: item.textFull ?? item.preview ?? "")
+                TextPreviewBody(text: item.textFull ?? item.preview ?? "",
+                                onTextView: onTextView)
             }
         }
     }
@@ -572,11 +655,31 @@ struct PreviewPanelContent: View {
             hintCell(label: "粘贴", key: "↩")
             hintCell(label: "关闭", key: "Space")
             hintCell(label: "切换", key: "← →")
+            // ⌘C 在文本预览 / 图片 Live Text 路径有意义;其它 kind 隐藏避免误导
+            if isCopyableTextPreview {
+                hintCell(label: "复制选中", key: "⌘C")
+            }
             Spacer()
         }
         .padding(.horizontal, 14)
         .frame(height: 28)
         .background(Color.primary.opacity(0.04))
+    }
+
+    /// hintBar 据此决定要不要显示 ⌘C 提示——文本预览总是走它,图片预览靠 VisionKit
+    /// Live Text 兜底选区(没识别字时按 ⌘C 透传给 TextField,无副作用)
+    private var isCopyableTextPreview: Bool {
+        guard let item = item else { return false }
+        switch media {
+        case .image:
+            return true
+        case .pdf, .video, .loading:
+            return false
+        case .none:
+            if item.kind == .file { return false }
+            if isImageLike(item) { return false }
+            return true
+        }
     }
 
     private func hintCell(label: String, key: String) -> some View {
@@ -648,6 +751,8 @@ struct PreviewPanelContent: View {
 @MainActor
 private struct TextPreviewBody: NSViewRepresentable {
     let text: String
+    /// 把 NSTextView 弱引用注册回 PreviewPanelController——拦 ⌘C 走 selectedPreviewText
+    let onTextView: (@MainActor (NSTextView?) -> Void)?
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
@@ -665,12 +770,16 @@ private struct TextPreviewBody: NSViewRepresentable {
             tv.textContainerInset = NSSize(width: 16, height: 14)
             tv.font = .systemFont(ofSize: 13)
             tv.string = text.isEmpty ? "（无内容）" : text
+            onTextView?(tv)
         }
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let tv = scrollView.documentView as? NSTextView else { return }
+        // controller 在每次 apply() 入口清 currentTextView——这里幂等重注册兜底,
+        // reposition / 同 item rebind rootView 路径走 update 不走 make 也能恢复引用
+        onTextView?(tv)
         let target = text.isEmpty ? "（无内容）" : text
         if tv.string != target {
             tv.string = target
@@ -787,6 +896,108 @@ private struct VideoPreviewBody: NSViewRepresentable {
         var loopObserver: NSObjectProtocol?
         var statusObservation: NSKeyValueObservation?
     }
+}
+
+/// 图片预览 + Live Text。
+///
+/// 设计要点:
+/// 1. **NSImageView 子类化 override intrinsicContentSize=.zero**——CLAUDE.md "Settings 窗口"
+///    / contentBody .id(kindKey) 注释里警示过裸 NSImageView 把 image pixel size 报成
+///    intrinsicContentSize,通过 macOS 14+ NSHostingView.updateAnimatedWindowSize 私有
+///    路径推回 NSWindow 让 panel auto-grow(497x706 → 1440x906)。这里子类显式返 .zero
+///    切断该路径,布局完全由 SwiftUI .frame(maxWidth/Height:.infinity) 决定
+/// 2. **VisionKit ImageAnalysisOverlayView**——macOS 版的 Live Text NSView(对应 iOS 的
+///    ImageAnalysisInteraction)。叠在 NSImageView 之上,`trackingImageView` 让它跟 image
+///    的 aspect-fit 显示区域对齐做选区 hit-test。preferredInteractionTypes=.textSelection
+///    只开文字选择,不开 data detector / visual look up 避免跟 panel 浮窗交互冲突。
+///    OCR 没识别 / 没选区 时按 ⌘C / ⌘A 走 selectedPreviewText/selectAllPreview 返 nil/false
+///    透传给搜索框 TextField,无副作用
+/// 3. **OCR 后台跑** —— ImageAnalyzer.analyze 是 async;coordinator 持 Task 引用,
+///    dismantleNSView 时 cancel 防止 kind 切换后老 task 把 analysis 写到已 detach 的 overlay
+@MainActor
+private struct ImagePreviewBody: NSViewRepresentable {
+    let image: NSImage
+    /// 把 ImageAnalysisOverlayView 注册回 PreviewPanelController——⌘C/⌘A 拦截时
+    /// controller 走 selectedText / selectAllText(_:) 跟它对话
+    let onOverlay: (@MainActor (ImageAnalysisOverlayView?) -> Void)?
+
+    /// 全局共享 analyzer——VisionKit 内部自己池化资源,这里别每次预览都 new 一个
+    static let analyzer: ImageAnalyzer = ImageAnalyzer()
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        let container = NSView()
+        let imageView = NoIntrinsicImageView()
+        imageView.image = image
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.imageAlignment = .alignCenter
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(imageView)
+
+        let overlay = ImageAnalysisOverlayView()
+        overlay.preferredInteractionTypes = .textSelection
+        overlay.trackingImageView = imageView
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(overlay)
+
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: container.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
+            overlay.topAnchor.constraint(equalTo: imageView.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: imageView.bottomAnchor),
+        ])
+        context.coordinator.overlay = overlay
+        onOverlay?(overlay)
+
+        // 后台 OCR——Task 不 detach,保持 main actor 继承让 NSImage 不跨 actor 边界
+        // (NSImage 非 Sendable;analyze 内部自己切后台跑 Vision)。
+        // ImageAnalysis 自身 Sendable,回 main 写 overlay.analysis 安全
+        let captured = image
+        context.coordinator.analyzeTask = Task { @MainActor [weak overlay] in
+            let config = ImageAnalyzer.Configuration(.text)
+            // macOS 重载需 orientation——NSImage 没暴露 EXIF orientation,统一传 .up
+            // (剪贴板截图绝大多数已是正向;旋转过的 EXIF 在写入 blob 时通常已被消化)
+            let analysis = try? await Self.analyzer.analyze(captured, orientation: .up, configuration: config)
+            guard !Task.isCancelled, let analysis else { return }
+            overlay?.analysis = analysis
+        }
+        return container
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // .id(kindKey) clean swap 路径下,kind/item 切换走 dismantle + make;这里只兜底
+        // reposition 期间 SwiftUI 重新构造 Body 但 view 复用,把 callback 引用回填一次
+        // (跟 TextPreviewBody.updateNSView 幂等重注册同样意图)
+        if let overlay = context.coordinator.overlay {
+            onOverlay?(overlay)
+        }
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.analyzeTask?.cancel()
+        coordinator.analyzeTask = nil
+        coordinator.overlay = nil
+    }
+
+    @MainActor
+    final class Coordinator {
+        var overlay: ImageAnalysisOverlayView?
+        var analyzeTask: Task<Void, Never>?
+    }
+}
+
+/// NSImageView 子类 override intrinsicContentSize 返 .zero——
+/// 切断 macOS 14+ NSHostingView.updateAnimatedWindowSize 把 image pixel size 推到 NSWindow
+/// 让 panel auto-grow 的私有路径(详见 ImagePreviewBody 注释 / CLAUDE.md "Settings 窗口")。
+/// 布局完全由 SwiftUI .frame(maxWidth/Height:.infinity) + Auto Layout 决定
+@MainActor
+private final class NoIntrinsicImageView: NSImageView {
+    override var intrinsicContentSize: NSSize { .zero }
 }
 
 private struct FilePreviewBody: View {

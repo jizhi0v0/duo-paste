@@ -26,6 +26,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// 右上角齿轮按钮触发——AppDelegate 用它 hide() panel + 打开 Settings 窗口。
     /// menubar icon 可被用户隐藏,这是唯一始终可见的"回到 Settings"路径
     private let onOpenSettings: (() -> Void)?
+    /// previewShown=true 时拦 ⌘C,如 TextPreviewBody 有选区则调此 callback 把选中
+    /// 文本写到 NSPasteboard。AppDelegate 实现里走 `watcher.pasteBack` barrier
+    /// 防自家 watcher 再次 capture
+    private let onCopyText: ((String) -> Void)?
     private var panel: NSPanel?
     /// panel show **之前**的 frontmost app 快照。PasteInjector 用它在 paste 完成
     /// 后把焦点拉回去 + 注入 Cmd+V。**必须**在 makeKeyAndOrderFront 之前抓——
@@ -63,13 +67,15 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
          onReveal: ((Item) -> Void)? = nil,
          onOpenWith: ((Item, URL) -> Void)? = nil,
          onDismiss: @escaping () -> Void = {},
-         onOpenSettings: (() -> Void)? = nil) {
+         onOpenSettings: (() -> Void)? = nil,
+         onCopyText: ((String) -> Void)? = nil) {
         self.state = state
         self.onPaste = onPaste
         self.onReveal = onReveal
         self.onOpenWith = onOpenWith
         self.onDismiss = onDismiss
         self.onOpenSettings = onOpenSettings
+        self.onCopyText = onCopyText
     }
 
     var isVisible: Bool {
@@ -229,6 +235,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // ⌘P (keyCode=35) = 切换选中行的 pinned。仅 Cmd 修饰键命中时截走；
             // 不带修饰键的 P 透传给 TextField 当作正常字符输入
             let isCmdP = (keyCode == 35 && isCmd)
+            // ⌘C (keyCode=8) = previewShown 状态下若文本预览有选区,复制选中文字。
+            // 无选区 / preview 未开则透传给 TextField (原生 ⌘C 仍能复制搜索框选中文字)
+            let isCmdC = (keyCode == 8 && isCmd)
+            // ⌘A (keyCode=0) = previewShown 状态下全选预览内容(文本→NSTextView.selectAll;
+            // 图片→Live Text selectAllText)。preview 未开 / 当前 kind 无可选目标透传给搜索框
+            let isCmdA = (keyCode == 0 && isCmd)
             // 空格键(49)的拦截条件——以 input 焦点状态为主分流:
             //   A) input 没焦点(用户点了卡 / 空白) → 无视 query 直接 toggle preview
             //   B) input 有焦点 + preview 已开 → 空格关 preview(从 preview 状态退出)
@@ -259,7 +271,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 return chars
             }()
             guard interceptCodes.contains(keyCode)
-                    || isCmdP || isSpace || cmdDigitPos != nil
+                    || isCmdP || isCmdC || isCmdA || isSpace || cmdDigitPos != nil
                     || printableChar != nil else { return event }
             // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
             // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
@@ -387,6 +399,24 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     if let item = self.state.currentItem {
                         self.state.togglePin(item)
                     }
+                case 8 where isCmd:                             // ⌘C = 复制文本预览选中内容
+                    // previewShown=false / preview kind 不是文本 / 无选区 → 透传(返 false)
+                    // 让 TextField 保留原生 ⌘C 复制搜索框选中文字的能力
+                    guard self.state.previewShown,
+                          let text = self.previewController?.selectedPreviewText(),
+                          !text.isEmpty else {
+                        return false
+                    }
+                    self.onCopyText?(text)
+                    return true
+                case 0 where isCmd:                             // ⌘A = 全选预览(文本 / 图片 Live Text)
+                    // previewShown=false / 当前 kind 无可选目标 → 透传给搜索框 TextField,
+                    // 保留原生 ⌘A 全选搜索框文字。preview 已开时 ⌘A 给预览符合 QuickLook 心智
+                    guard self.state.previewShown,
+                          self.previewController?.selectAllPreview() == true else {
+                        return false
+                    }
+                    return true
                 default:
                     // ⌘1-9 = 直接粘贴 results 前 9 位中第 N 项,不改 selectedIDs。
                     // 越界 (results 不足 N 条) 透传,UI 上对应 ⌘N 角标也不显示

@@ -239,6 +239,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onOpenSettings: { [weak self] in
                 self?.panel.hide()
                 self?.showSettings()
+            },
+            // previewShown=true 时 ⌘C 触发——把文本预览选中字符串写 NSPasteboard。
+            // 走 watcher.pasteBack barrier:写入期间 isPasteBackInFlight=true 让
+            // tick 跳过这一拍 + 完成后 suppressUpToCurrent 把 lastChangeCount 推齐,
+            // 不会把自家复制再 capture 入库。self-pid 过滤兜不住——panel 不抢
+            // frontmost,extract 里 frontApp.pid 是用户上一个 app 不是 self
+            onCopyText: { [weak self] text in
+                guard let self else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    _ = await self.watcher.pasteBack { () -> Bool in
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        return pb.setString(text, forType: .string)
+                    }
+                }
             }
         )
         statusBar = StatusBarController(hotkey: deps.config.hotkey) { [weak self] in
