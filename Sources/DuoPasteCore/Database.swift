@@ -544,6 +544,20 @@ public struct Database: Sendable {
             try db.execute(sql: "DELETE FROM app_icon;")
         }
 
+        // v12: 给 softDelete cascade 加 partial index。cascade 路径(plan hashed-allen §C)
+        // 在 writer tx 内跑 `WHERE text_full = ? AND blob_sha256 IS NULL
+        // AND deleted_at_ns IS NULL AND id != ?` 找同 text 兄弟,无 index 时是全表扫,在
+        // 50k+ 行历史上会阻塞所有 capture / bump / pin writer。partial index 只索引活的
+        // text-kind 行,跟其他 partial index 心智一致(idx_item_captured / kind_captured),
+        // 占盘小、命中是 O(log n) seek+扫匹配桶
+        m.registerMigration("v12_text_full_active_index") { db in
+            try db.execute(sql: """
+                CREATE INDEX idx_item_text_active
+                    ON item(text_full)
+                    WHERE blob_sha256 IS NULL AND deleted_at_ns IS NULL;
+            """)
+        }
+
         return m
     }
 
@@ -757,6 +771,12 @@ public struct Database: Sendable {
     /// - sibling 已 tombstone / 不再匹配 text_full / blob_sha256 非空 → stderr warn 跳过
     ///   (不抛——cascade 是机会主义清理,某条不匹配不该让整批失败)
     /// - 返回 `[(id, newIngest)]` 让调用方算 max(ingestedAtNs) 喂 broadcaster
+    ///
+    /// **`now` 参数语义**:作为 `deleted_at_ns` 字面值 + `nextIngestNs` 的 floor。跟
+    /// `ingested_at_ns` 不同,`deleted_at_ns` 只是元数据时间戳(不参与 /since cursor 推进 /
+    /// 排序契约),所以 caller-provided `now` 即可——单元测试能注入小常量便于断言。
+    /// 实际单增由 `nextIngestNs` 在 writer tx 内 clamp 到 `MAX(ingested_at_ns)+1`,
+    /// caller `now` 倒退或并发竞态都不影响 /since 正确性
     public func softDelete(
         id: String,
         now: Int64,
