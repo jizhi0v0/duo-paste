@@ -57,6 +57,16 @@ final class PeerWebSocket {
     @ObservationIgnored private(set) var lastAdvanceNs: Int64 = 0
     @ObservationIgnored private var lastPongAt: Date?
 
+    /// 失败计数,instance var (从 runLoop 局部变量提升出来) 让 `reconnectResettingBackoff`
+    /// 能从外部清零。语义跟之前一致(每次 connectOnce 返回/抛错都 += 1),只是状态从局部变量
+    /// 搬到 actor 内部。`@ObservationIgnored` 让 SwiftUI 不每次 +1 重渲——state 字段已经是
+    /// `.backoff(failures:)` 形态对 UI 暴露,不需要再 track 一遍 raw 计数
+    @ObservationIgnored private var failures: Int = 0
+    /// `.connected` 之后 stamp 的时间戳,runLoop 用它判断"是不是长连接成功"——
+    /// 长连接 (>longLivedThresholdSec) 后被远端断开/抖动,reset failures 让下次重连立即
+    /// 从 1s 起。对齐 Mac 端 `WSNotificationClient.longLivedConnectionThresholdSec` 设计
+    @ObservationIgnored private var connectedAt: Date?
+
     private let config: PeerConfig
     private let auth: HMACAuth
     private let onAdvance: @MainActor (Int64) -> Void
@@ -104,7 +114,13 @@ final class PeerWebSocket {
     }
 
     /// 网络 path 变化时只打断当前 NWConnection，让既有 runLoop 自己进入 backoff/retry。
-    /// 不 cancel runTask、不重建 PeerWebSocket，因此 failures 指数退避不会被清零。
+    /// 不 cancel runTask、不重建 PeerWebSocket，因此 failures 指数退避**不会被清零**。
+    ///
+    /// 用于"已经在 backoff 里的健康 candidate 想立即重试一次"的场景——比如 WS server
+    /// `ws_rotation_sec` 主动断开,client 想立即重连但不想绕过自身退避。
+    ///
+    /// **不要**用在用户切 VPN/Surge 等环境硬变化场景——之前的失败教训对新环境无效,
+    /// 用 `reconnectResettingBackoff` 让 failures 清零立即从 1s 起
     func reconnectPreservingBackoff(reason: String) {
         guard runTask != nil else {
             start()
@@ -114,15 +130,63 @@ final class PeerWebSocket {
         currentConnection?.cancel()
     }
 
+    /// 跟 `reconnectPreservingBackoff` 同步打断 NWConnection,但**额外清 failures** 让下次
+    /// 重连立即从 1s 退避起。用于"环境硬变化作废之前的失败教训"——典型场景:
+    /// - 用户切到 Surge VPN,iOS URLSession 突然开始走 proxy,`.sgponte` 候选之前永久 DNS
+    ///   失败 → 现在能解析,要立刻重试,不要等 5min 退避
+    /// - NWPath status / primary interface 变化,旧的失败信号(无 IPv6 / DNS 失败)跟新路径
+    ///   无关
+    /// - 用户在 Settings 主动点"刷新候选"按钮,显式意图就是"忘掉之前学到的退避"
+    func reconnectResettingBackoff(reason: String) {
+        guard runTask != nil else {
+            failures = 0
+            start()
+            return
+        }
+        DebugLog.shared.append("ws reconnect (reset backoff): \(config.baseURL.absoluteString) (\(reason))")
+        failures = 0
+        currentConnection?.cancel()
+    }
+
+    /// 长连接判定阈值——connectOnce 成功跑 >= 这个秒数后被远端断开,算路径健康,reset
+    /// failures。30s 跟 Mac `WSNotificationClient.Config.longLivedConnectionThresholdSec`
+    /// 默认值对齐(短闪连失败 vs 长连接合法关 的分界线)
+    nonisolated static let longLivedThresholdSec: TimeInterval = 30
+
+    /// 失败次数 → 退避秒数。阶梯 [1,2,4,8,16,32,60,120,300]——之前 cap 32s 在永久失败
+    /// candidate (无 VPN 时 .sgponte / cert SAN 不匹配的裸短名 等) 上让 client 每 32s
+    /// 一次握手, 1 小时 ~112 次, 浪费连接预算 + UI 红字噪声。新 cap 300s 同条件 ~12 次,
+    /// 降 10×。健康 candidate 短闪 reconnect 路径 (`reconnectResettingBackoff`) 清 failures
+    /// 让恢复延迟仍 ≤1s,不损 UX
+    nonisolated static let backoffLadder: [TimeInterval] = [1, 2, 4, 8, 16, 32, 60, 120, 300]
+
+    nonisolated static func backoffSeconds(failures: Int) -> TimeInterval {
+        guard failures > 0 else { return backoffLadder[0] }
+        let idx = min(failures - 1, backoffLadder.count - 1)
+        return backoffLadder[idx]
+    }
+
     private func runLoop() async {
-        var failures = 0
+        // failures 是 instance var(见类型声明), runLoop 不再局部初始化——
+        // `reconnectResettingBackoff` 需要从外部清零
         let urlStr = config.baseURL.absoluteString
         DebugLog.shared.append("ws runLoop start: \(urlStr)")
         while !Task.isCancelled {
+            connectedAt = nil
             do {
                 try await connectOnce()
-                failures += 1
-                DebugLog.shared.append("ws connectOnce returned (remote close?) failures=\(failures)")
+                // connectOnce 正常返回 = 远端 close 或 receive/ping loop 结束。判断是不是
+                // **长连接成功被关**: connected 后跑 > 30s 算路径健康(server ws_rotation 定时
+                // 主动断 / iOS 后台挂起后醒来 等情况), reset failures 让下次重连不继承
+                // 退避。否则当 transient 失败处理 +=1
+                if let ts = connectedAt, Date().timeIntervalSince(ts) >= Self.longLivedThresholdSec {
+                    let dur = Int(Date().timeIntervalSince(ts))
+                    DebugLog.shared.append("ws long-lived (\(dur)s) closed → reset failures: \(urlStr)")
+                    failures = 0
+                } else {
+                    failures += 1
+                    DebugLog.shared.append("ws connectOnce returned (remote close?) failures=\(failures)")
+                }
             } catch is CancellationError {
                 DebugLog.shared.append("ws runLoop cancelled: \(urlStr)")
                 return
@@ -132,13 +196,7 @@ final class PeerWebSocket {
                 DebugLog.shared.append("ws connectOnce failed: \(error) failures=\(failures) url=\(urlStr)")
             }
             if Task.isCancelled { return }
-            // backoff 封顶：2^(failures-1) 但 failures 在 backoff 计算上 clamp 到 6
-            // → 最大 sleep 32s（之前 60s）。`failures` 字段本身仍单调增让 UI / 日志能看到
-            // 真实失败次数，只是 backoff 不会让"网络刚恢复但当前还在 backoff 60s 里"的
-            // UX 拉长。reconnectPreservingBackoff 不 reset failures（保前一段抖动学到的
-            // 教训），但 clamp 让 max wait 较合理
-            let clampedFailures = min(failures, 6)
-            let backoff = min(pow(2.0, Double(max(clampedFailures - 1, 0))), 32.0)
+            let backoff = Self.backoffSeconds(failures: failures)
             state = .backoff(failures: failures)
             do {
                 try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
@@ -433,6 +491,7 @@ final class PeerWebSocket {
         switch msg {
         case .hello(_, let deviceID, _, let latest):
             state = .connected(peerDeviceID: deviceID)
+            connectedAt = Date()
             DebugLog.shared.append("ws hello from \(deviceID.prefix(8)) latest=\(latest)")
             if latest > lastAdvanceNs { lastAdvanceNs = latest }
             onAdvance(latest)

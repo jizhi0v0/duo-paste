@@ -96,9 +96,12 @@ final class PeerWSPool {
         sockets.removeAll()
     }
 
-    /// 网络接口/VPN 状态变化时，旧 NWConnection 可能短时间仍报告 connected，
-    /// 但底层 path 已经不可用。这里只打断当前 connection，让每个 WS 自己按现有
-    /// failures/backoff 重连；不销毁 socket 对象，避免 NWPathMonitor 抖动时把退避清零。
+    /// 旧 NWConnection 可能短时间仍报告 connected,但底层 path 已经不可用。这里只打断
+    /// 当前 connection,让每个 WS 自己按现有 failures/backoff 重连;不销毁 socket 对象。
+    ///
+    /// **保留 failures 退避**——用于"健康 candidate 需要立即重连但不绕过自身退避"的
+    /// 场景。NWPath 硬变化/手动刷新 等环境变化作废前一段失败教训 的场景用
+    /// `restartAllResettingBackoff`
     func restartAll(reason: String) {
         guard !lastEndpoints.isEmpty else { return }
         DebugLog.shared.append("ws-pool reconnect preserving backoff: \(reason)")
@@ -110,6 +113,21 @@ final class PeerWSPool {
         // 不删 socket），白消耗。更糟的边界：如果 `lastEndpoints` 跟 endpoints_changed 帧同时
         // 到达（一个改 lastEndpoints，一个走 restartAll），reconcile 会用 stale lastEndpoints
         // 关掉新 endpoint 的 ws。endpoints 真变化走 reconcile(endpoints:) 自己的路径
+    }
+
+    /// 跟 `restartAll` 一样打断每个 WS 当前 connection,但**额外让每个 sub WS 清 failures**
+    /// 让下次重连立即从 1s 退避起。用于环境硬变化作废之前的失败教训:
+    /// - NWPath status / primary interface 真变化(`handleNetworkChange`)
+    /// - 用户在 Settings 主动点"刷新候选"按钮
+    ///
+    /// 例: 用户切到 Surge VPN 后, `.sgponte` 候选 之前永久 DNS 失败 failures=11+ 在 300s 退避
+    /// 里, 切 VPN 后立刻可用 → reset 让它从 1s 起立刻重试,UX 秒级恢复
+    func restartAllResettingBackoff(reason: String) {
+        guard !lastEndpoints.isEmpty else { return }
+        DebugLog.shared.append("ws-pool reconnect resetting backoff: \(reason)")
+        for ws in sockets.values {
+            ws.reconnectResettingBackoff(reason: reason)
+        }
     }
 
     var state: State {
