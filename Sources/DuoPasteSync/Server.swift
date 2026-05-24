@@ -681,7 +681,8 @@ public struct SyncServer: Sendable {
         // 走 SearchAPI.searchHits + count,跟 Mac UI 用同一份逻辑,跨设备 chip 总数对齐
         //
         // 响应:{ ok, count, items:[{...item fields..., snippet?}] }
-        // - count:fold 后 limit/offset 之前的真实总数(UI 显"共 N 条")
+        // - count:**qualifier filter + fold 之后、limit/offset 之前**的真实总数(issue #41
+        //   之后语义校准:不再是 FTS5 命中后 fold 之前的总数)。UI 显"共 N 条"跟 chip 总数对齐
         // - items.snippet:含 STX/ETX(0x02/0x03) 控制字符的高亮片段,iOS 端切片渲染加粗。
         //   query 为空(纯列表)时 snippet 不附,客户端按缺省处理
         router.get("/search") { request, _ -> Response in
@@ -713,19 +714,65 @@ public struct SyncServer: Sendable {
 
     /// 把 URL query 参数转成 SearchQuery。`q` 为空 → 纯列表(按时间倒序+pinned-first);
     /// 非空 → FTS5 全文搜索 + fold。limit clamp [1, 500] 防巨页拖垮 iOS 端解码。
-    /// **不支持** kinds / pinnedOnly / 时间范围参数(iOS 一期就只要全文搜索 + 列表);
-    /// 后续要 chip 时再加 query 参数,不破坏现有路径
+    ///
+    /// **qualifier 透传**(issue #41):接受 `kinds=` / `file_sub_kinds=` / `text_suffixes=`
+    /// 三个可选 query 参数,每个 CSV 分隔,case-insensitive,不识别 token 静默忽略。
+    /// SearchAPI 内部已支持 fold-aware 路径下按这些字段过滤,跟 Mac SearchProvider 同源契约。
+    ///
+    /// 为什么 server 端必须支持:**消除 client-side filter pagination 盲区**。如果 server
+    /// 只走 FTS5 命中再返前 200,client 拿到再 client-side qualifier 过滤,稀疏 qualifier
+    /// (比如全库就 3 条 pdf)很容易让前 200 命中里没 pdf → 用户勾 "PDF" chip 看到空集,
+    /// 而库里其实有。server 透传 qualifier → fold + filter 在同一 pass 里,limit 切的是
+    /// 已经过滤后的结果,盲区消失。
+    ///
+    /// 老 client 不发这三个参数 → params[...] 全 nil → 行为跟之前完全等价(零回归)
     static func parseSearchQuery(_ params: FlatDictionary<Substring, Substring>) -> SearchQuery {
         let q = params["q"].map(String.init) ?? ""
         let rawLimit = params["limit"].flatMap { Int($0) } ?? 200
         let limit = max(1, min(rawLimit, 500))
         let rawOffset = params["offset"].flatMap { Int($0) } ?? 0
         let offset = max(0, rawOffset)
+        let kinds = parseCSV(params["kinds"]).compactMap { ItemKind(rawValue: $0.lowercased()) }
+        let fileSubKinds = parseCSV(params["file_sub_kinds"]).compactMap { parseFileSubKind($0) }
+        // textSuffixes 保留前导 `.` —— SearchAPI 走 LIKE `%.java` 匹配末尾,client
+        // 可发 `text_suffixes=.java,.py` 或 `text_suffixes=java,py`,后者补 `.` 让两边语义对齐
+        let textSuffixes = parseCSV(params["text_suffixes"]).map { raw -> String in
+            let lower = raw.lowercased()
+            return lower.hasPrefix(".") ? lower : "." + lower
+        }
         return SearchQuery(
             text: q.isEmpty ? nil : q,
+            kinds: kinds,
+            fileSubKinds: fileSubKinds,
+            textFullSuffixes: textSuffixes,
             limit: limit,
             offset: offset
         )
+    }
+
+    /// CSV 解析 + trim + 空 token 过滤。nil / 空串都返空数组,不需要调用方再 guard
+    private static func parseCSV(_ raw: Substring?) -> [String] {
+        guard let raw, !raw.isEmpty else { return [] }
+        return raw.split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// 大小写不敏感 + 接 snake/kebab 写法解析 FileSubKind。
+    /// SearchAPI 端 rawValue 表:`video` / `pdf` / `audio` / `imageFile`——前三是单词,
+    /// 只 imageFile 是 lowerCamel,iOS `QueryQualifier.encodeToWire` 直接用 rawValue
+    /// 发 `imageFile` 进 wire。`FileSubKind(rawValue:)` 大小写敏感,直接喂进会丢 case。
+    ///
+    /// **修法**(review #48 Critical 1):扫 `FileSubKind.allCases` 大小写不敏感比对,
+    /// 同时接受 `imageFile` / `imagefile` / `IMAGEFILE` / `image_file` / `image-file`
+    /// 各种写法,iOS / curl / 老 client 都能命中。
+    private static func parseFileSubKind(_ s: String) -> FileSubKind? {
+        // 先把 `_` / `-` 当 separator 拆 + 拼,跟 rawValue 形态对齐(`image_file` → `imagefile`),
+        // 再大小写不敏感比 allCases.rawValue。直接全去分隔符比 lowercased 让 wire 写法尽量宽容
+        let canonical = s.lowercased()
+            .split(whereSeparator: { $0 == "_" || $0 == "-" })
+            .joined()
+        return FileSubKind.allCases.first { $0.rawValue.lowercased() == canonical }
     }
 
     /// 把 URL query 参数转成 SinceQuery。空 cursor_ns / 非法值 → 视作从头拉。

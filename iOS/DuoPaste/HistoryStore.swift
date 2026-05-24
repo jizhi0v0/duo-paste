@@ -34,9 +34,16 @@ final class HistoryStore {
 
     /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
     /// 跟 Mac UI 口径一致。query 切换 / coordinator 失败时清掉走 fallback。
-    /// **匹配**靠 `q` 字段判断是否对得上当前 store.query;`q != store.query` 时不用(过期)
+    /// **匹配**靠 `q` + `qualifiers` 联合判断是否对得上当前 store.query;
+    /// 不一致 → 不用(过期),走 fallback. **qualifier snapshot**(review #48 Minor 1):
+    /// 用户取消 chip → `activeQualifiers` 变小 → onChange 250ms debounce 后才发新一轮
+    /// /search。这 250ms 窗口内若只比 `q` 命中 cache,`filtered` 会拿 server-收窄过的 items
+    /// 再 client-side filter (更宽的 qualifier),等于双重过滤 → 显示比"应该出现"少 → 闪烁。
+    /// 把 qualifiers 也存进 cache,dispatch 时 strict 比对让 stale cache 不命中,自然走
+    /// contains fallback 直到新一轮 /search 返回
     struct ServerSearchResult: Equatable, Sendable {
         let q: String
+        let qualifiers: Set<QueryQualifier>
         let items: [Item]
         let snippets: [String: String]
         let totalCount: Int
@@ -47,7 +54,7 @@ final class HistoryStore {
     /// - 空 query + 空 qualifier → 全列表(本机 fold)
     /// - 空 query + 有 qualifier → 本机 items 过 qualifier filter
     /// - 有 query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold);
-    ///   有 qualifier 时再 client-side filter 一遍(server 不识别 slash qualifier)
+    ///   有 qualifier 时再 client-side filter 一遍(双层防御兜底,详 client-side fallback 注释)
     /// - 否则 → 本机 contains fallback + qualifier filter 后 fold
     ///
     /// **Fold 契约定义在 `Item.foldByTextFull`(DuoPasteCore)**——跨 origin 同 text_full
@@ -58,13 +65,23 @@ final class HistoryStore {
     ///
     /// **Qualifier 语义**:OR 起来——`/pdf /video` 匹配 (kind=file 且 subkind=pdf) OR
     /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
-    /// Server 的 `/search` 一期不识别 qualifier,client-side 过滤兜底
+    ///
+    /// **Client-side fallback**(issue #41):新 server `/search` 接 `kinds/file_sub_kinds/
+    /// text_suffixes` query 参数透传 qualifier,server-side fold + filter 同 pass 消除
+    /// pagination 盲区。**仍保留 client-side qualifier filter** 是双层防御:
+    /// (a) 老 server(没合 #41)不识别字段静默忽略,这层兜底让 chip 还能用;
+    /// (b) 新 server 已 filter → client-side filter 是 idempotent no-op,代价 = O(N=已 filter 结果)
+    /// 几乎免费。两边语义同源(`QueryQualifier.matches` 跟 `SearchAPI` filter 是同一 OR 契约)
     var filtered: [Item] {
         // 实际 dispatch 逻辑住在 DuoPasteCore.HistoryFilterDispatch——纯函数,4 条分支
         // 契约直接在 DuoPasteCoreTests 覆盖,改 dispatch 单测先 fail. 这里只做"把
         // store 里 @Observable 字段转纯数据 + 调 dispatch"的胶水
         let cache = lastServerSearch.map {
-            HistoryFilterDispatch.ServerSearchContext(q: $0.q, items: $0.items)
+            HistoryFilterDispatch.ServerSearchContext(
+                q: $0.q,
+                qualifiers: $0.qualifiers,
+                items: $0.items
+            )
         }
         return HistoryFilterDispatch.dispatch(
             items: items,
@@ -74,10 +91,11 @@ final class HistoryStore {
         )
     }
 
-    /// coordinator 拉完 /search 把结果灌进来。**只在 `q` 仍匹配当前 store.query 时**
-    /// 应用——拉结果回来时用户可能已经改了 query,旧响应丢弃避免闪现错的命中
+    /// coordinator 拉完 /search 把结果灌进来。**只在 `q` + `qualifiers` 仍匹配当前 store
+    /// 状态时**应用——拉结果回来时用户可能已经改了 query 或 toggle 了 chip,旧响应丢弃
+    /// 避免闪现错的命中
     func applyServerSearch(_ r: ServerSearchResult) {
-        guard r.q == query else { return }
+        guard r.q == query, r.qualifiers == activeQualifiers else { return }
         lastServerSearch = r
     }
 
@@ -180,7 +198,11 @@ final class HistoryStore {
             patched[i].pinned = newPinned
             patched.sort(by: Self.iosListOrder)
             lastServerSearch = ServerSearchResult(
-                q: r.q, items: patched, snippets: r.snippets, totalCount: r.totalCount
+                q: r.q,
+                qualifiers: r.qualifiers,
+                items: patched,
+                snippets: r.snippets,
+                totalCount: r.totalCount
             )
         }
         return newPinned

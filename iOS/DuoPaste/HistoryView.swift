@@ -50,6 +50,14 @@ struct HistoryView: View {
                 store.clearServerSearch()
                 scheduleServerSearch()
             }
+            // qualifier 变化也要重打 server search——server 把 qualifier 透传进 SearchAPI,
+            // chip 选择跟 server fold + filter 同 pass(issue #41 消除 client-side pagination 盲区)。
+            // 用 hashValue 让 Set<QueryQualifier> 变化能稳定触发(Set 本身 Equatable 但 SwiftUI
+            // onChange 要求 Sendable + Hashable; Set<Hashable> 自动满足),无 query 时跳过
+            .onChange(of: store.activeQualifiers) { _, _ in
+                store.clearServerSearch()
+                scheduleServerSearch()
+            }
             .toolbar { fullToolbar }
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarBackground(.visible, for: .tabBar)
@@ -182,23 +190,26 @@ struct HistoryView: View {
     /// **不变量**:新字符进来必须 cancel 之前的 server task,否则用户快敲三个字
     /// "abc" 会让 "a" / "ab" / "abc" 三发 /search 全打过去(只想要 "abc" 那发)。
     ///
-    /// **snapshot at Task creation**:trim 操作放进 task body 里在 sleep 之后做,
-    /// 读最新 `searchText`——cancel 已经把旧 task 干掉了,这里读到的就是当前最新键。
-    /// 不用像旧实现那样 snapshot 防 race,因为 store.query 同步路径不再依赖这个 task,
-    /// task 唯一职责就是"等用户停 250ms 再打 /search"。
+    /// **qualifier snapshot at Task creation**:`activeQualifiers` 一次性 capture 进
+    /// `qualifiersSnapshot` 常量,跨 await 边界稳定不被新一轮 chip toggle 写花。
+    /// query 本身不 snapshot ——cancel 已经把旧 task 干掉,task body 内读 `searchText`
+    /// 拿到当前最新键即可(store.query 同步路径不再依赖这个 task)。
     ///
     /// **为什么 250ms 不是 100/150**:抠用户感知的话本机 filter 已经即时了,server
     /// search 多等几十 ms 用户根本感知不到,但 QPS 砍掉 60-70%。如果实测 250ms
     /// 短到 sleep 切首字母 / 中文输入法 commit 还是会多打一发,可以拉到 400ms。
-    /// issue #44
+    /// issue #44 + #41(qualifier 透传)
     private func scheduleServerSearch() {
         serverSearchTask?.cancel()
+        // qualifier snapshot 跟 task 出生那刻同步——跨 await 边界要稳定状态,
+        // 不能后续读 store.activeQualifiers 时被新一轮 chip toggle 写花
+        let qualifiersSnapshot = Array(store.activeQualifiers)
         serverSearchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             if Task.isCancelled { return }
             let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
-            coordinator.searchOnServer(q: trimmed)
+            coordinator.searchOnServer(q: trimmed, qualifiers: qualifiersSnapshot)
         }
     }
 

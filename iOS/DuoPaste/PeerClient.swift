@@ -178,12 +178,36 @@ actor PeerClient {
     ///
     /// snippets: id → 含 STX/ETX(0x02/0x03) 控制字符的高亮片段;query 为空时空 map。
     /// totalCount: fold 后 limit/offset 之前的真实总数,UI 显"共 N 条"
-    func searchItems(q: String, limit: Int = 200, offset: Int = 0) async throws -> (items: [Item], snippets: [String: String], totalCount: Int) {
-        // query items 顺序固定——签名 path 一致性硬不变量(跟 /since 同源)
+    ///
+    /// **qualifier 透传**(issue #41):传 `qualifiers` 让 server 端把 chip filter 也带进
+    /// SearchAPI,fold + filter 在同一 pass 里——消除 client-side filter pagination 盲区
+    /// (FTS5 命中 200 条但只返前 50,稀疏 qualifier 让客户端展示空集而库里其实有)。
+    /// 老 server 不识别这些字段会静默忽略,client-side `HistoryStore.filtered` 兜底过滤
+    /// 仍能工作,行为不回归
+    func searchItems(
+        q: String,
+        qualifiers: [QueryQualifier] = [],
+        limit: Int = 200,
+        offset: Int = 0
+    ) async throws -> (items: [Item], snippets: [String: String], totalCount: Int) {
+        // query items 顺序固定——签名 path 一致性硬不变量(跟 /since 同源)。
+        // qualifier 字段在 limit/offset 之后追加,新增字段不影响老 client 签名路径
         var qi: [URLQueryItem] = []
         if !q.isEmpty { qi.append(URLQueryItem(name: "q", value: q)) }
         qi.append(URLQueryItem(name: "limit", value: String(limit)))
         if offset > 0 { qi.append(URLQueryItem(name: "offset", value: String(offset))) }
+        if !qualifiers.isEmpty {
+            let wire = QueryQualifier.encodeToWire(qualifiers)
+            if let kinds = wire.kinds {
+                qi.append(URLQueryItem(name: "kinds", value: kinds))
+            }
+            if let subs = wire.fileSubKinds {
+                qi.append(URLQueryItem(name: "file_sub_kinds", value: subs))
+            }
+            if let suffixes = wire.textSuffixes {
+                qi.append(URLQueryItem(name: "text_suffixes", value: suffixes))
+            }
+        }
         var sigComp = URLComponents()
         sigComp.path = "/search"
         sigComp.queryItems = qi

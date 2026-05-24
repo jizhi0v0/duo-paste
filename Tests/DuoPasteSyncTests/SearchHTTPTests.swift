@@ -55,11 +55,23 @@ private func waitReadySearch(baseURL: URL, auth: HMACAuth) async -> Bool {
     return false
 }
 
-private func getSearch(baseURL: URL, auth: HMACAuth, q: String?, limit: Int? = nil, tamperSig: Bool = false)
+private func getSearch(
+    baseURL: URL,
+    auth: HMACAuth,
+    q: String?,
+    limit: Int? = nil,
+    kinds: String? = nil,
+    fileSubKinds: String? = nil,
+    textSuffixes: String? = nil,
+    tamperSig: Bool = false
+)
 async throws -> (Int, [String: Any]) {
     var qi: [URLQueryItem] = []
     if let q { qi.append(URLQueryItem(name: "q", value: q)) }
     if let limit { qi.append(URLQueryItem(name: "limit", value: String(limit))) }
+    if let kinds { qi.append(URLQueryItem(name: "kinds", value: kinds)) }
+    if let fileSubKinds { qi.append(URLQueryItem(name: "file_sub_kinds", value: fileSubKinds)) }
+    if let textSuffixes { qi.append(URLQueryItem(name: "text_suffixes", value: textSuffixes)) }
     var sigComp = URLComponents()
     sigComp.path = "/search"
     sigComp.queryItems = qi.isEmpty ? nil : qi
@@ -81,6 +93,34 @@ async throws -> (Int, [String: Any]) {
     let http = resp as! HTTPURLResponse
     let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     return (http.statusCode, json)
+}
+
+/// 通用 file item 工厂——给 qualifier filter 测试用。textFull 走 LIKE 后缀路径,
+/// blobMime 走 SearchAPI subKindSQL 走 mime 路径
+private func fileItem(
+    id: String,
+    origin: String = "mac-1",
+    textFull: String,
+    blobMime: String? = nil,
+    capturedAtNs: Int64
+) -> Item {
+    Item(
+        id: id,
+        originDevice: origin,
+        capturedAtNs: capturedAtNs,
+        ingestedAtNs: capturedAtNs,
+        kind: .file,
+        preview: textFull,
+        textFull: textFull,
+        blobSha256: "f".repeated(64),
+        blobMime: blobMime
+    )
+}
+
+private extension String {
+    func repeated(_ count: Int) -> String {
+        String(repeating: self, count: count)
+    }
 }
 
 @Suite(.serialized)
@@ -192,6 +232,250 @@ struct SearchHTTPTests {
 
         let (status, _) = try await getSearch(baseURL: base, auth: auth, q: "x", tamperSig: true)
         #expect(status == 401)
+    }
+
+    // MARK: - Issue #41 qualifier 透传
+
+    @Test func searchPassesKindsQualifierThroughToSearchAPI() async throws {
+        // 混合 kind 库:5 text + 5 url。带 `kinds=url` 应只返 url 那 5 条
+        var items: [Item] = []
+        for i in 0..<5 {
+            items.append(textItem(id: "t-\(i)", origin: "mac-1", text: "text item \(i)", capturedAtNs: Int64(100 + i)))
+        }
+        for i in 0..<5 {
+            var url = textItem(id: "u-\(i)", origin: "mac-1", text: "https://example.com/\(i)", capturedAtNs: Int64(200 + i))
+            url.kind = .url
+            items.append(url)
+        }
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        // 空 query + kinds=url → 只返 url
+        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: nil, kinds: "url")
+        #expect(status == 200)
+        #expect(body["count"] as? Int == 5)
+        let arr = body["items"] as? [[String: Any]] ?? []
+        #expect(arr.count == 5)
+        for it in arr {
+            #expect(it["kind"] as? String == "url", "expected only url items")
+        }
+    }
+
+    @Test func searchPassesFileSubKindThroughToSearchAPI() async throws {
+        // file sub-kind 测试:3 个 file 项,其中 1 个 PDF。`file_sub_kinds=pdf` 应只返 PDF
+        var items: [Item] = []
+        items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/doc.pdf", blobMime: "application/pdf", capturedAtNs: 100))
+        items.append(fileItem(id: "mp4-1", textFull: "/Users/bob/clip.mp4", blobMime: "video/mp4", capturedAtNs: 200))
+        items.append(fileItem(id: "mp3-1", textFull: "/Users/bob/song.mp3", blobMime: "audio/mpeg", capturedAtNs: 300))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: nil, fileSubKinds: "pdf")
+        #expect(status == 200)
+        #expect(body["count"] as? Int == 1)
+        let arr = body["items"] as? [[String: Any]] ?? []
+        #expect(arr.first?["id"] as? String == "pdf-1")
+    }
+
+    @Test func searchMixedKindAndSubKindOR() async throws {
+        // OR 关系:`kinds=url` + `file_sub_kinds=pdf` 命中 url OR pdf-file
+        var items: [Item] = []
+        items.append(textItem(id: "txt-1", origin: "mac-1", text: "plain text", capturedAtNs: 100))
+        var url = textItem(id: "url-1", origin: "mac-1", text: "https://example.com", capturedAtNs: 200)
+        url.kind = .url
+        items.append(url)
+        items.append(fileItem(id: "pdf-1", textFull: "/path/doc.pdf", blobMime: "application/pdf", capturedAtNs: 300))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        let (status, body) = try await getSearch(
+            baseURL: base, auth: auth, q: nil,
+            kinds: "url", fileSubKinds: "pdf"
+        )
+        #expect(status == 200)
+        // url + pdf = 2(不含 plain text)
+        #expect(body["count"] as? Int == 2)
+        let arr = body["items"] as? [[String: Any]] ?? []
+        #expect(arr.count == 2)
+        let ids = Set(arr.compactMap { $0["id"] as? String })
+        #expect(ids == ["url-1", "pdf-1"])
+    }
+
+    @Test func searchTextSuffixesFiltersByExtension() async throws {
+        // textSuffix 路径:textFull 末尾 LIKE。3 file 项分别 .java / .py / .swift,
+        // text_suffixes=.java,.py 只返前两条
+        var items: [Item] = []
+        items.append(fileItem(id: "java-1", textFull: "/Users/bob/Main.java", capturedAtNs: 100))
+        items.append(fileItem(id: "py-1", textFull: "/Users/bob/script.py", capturedAtNs: 200))
+        items.append(fileItem(id: "swift-1", textFull: "/Users/bob/App.swift", capturedAtNs: 300))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        let (status, body) = try await getSearch(
+            baseURL: base, auth: auth, q: nil,
+            textSuffixes: ".java,.py"
+        )
+        #expect(status == 200)
+        #expect(body["count"] as? Int == 2)
+        let arr = body["items"] as? [[String: Any]] ?? []
+        let ids = Set(arr.compactMap { $0["id"] as? String })
+        #expect(ids == ["java-1", "py-1"])
+    }
+
+    @Test func searchTextSuffixesAutoPrependsDot() async throws {
+        // 老 client / 手填 URL 可能不带 `.`——server 端自动补 `.`,语义跟带 `.` 等价
+        var items: [Item] = []
+        items.append(fileItem(id: "java-1", textFull: "/Users/bob/Main.java", capturedAtNs: 100))
+        items.append(fileItem(id: "py-1", textFull: "/Users/bob/x.py", capturedAtNs: 200))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        let (status, body) = try await getSearch(
+            baseURL: base, auth: auth, q: nil,
+            textSuffixes: "java"  // 没 dot
+        )
+        #expect(status == 200)
+        #expect(body["count"] as? Int == 1)
+        #expect((body["items"] as? [[String: Any]])?.first?["id"] as? String == "java-1")
+    }
+
+    @Test func searchUnknownKindIsSilentlyIgnored() async throws {
+        // 不识别 kind token → 静默丢,跟"无 kinds 过滤"等价(不报错,不挂 500)。
+        // 让老 client 发出未来 server 没有的 kind 时 graceful degrade
+        var items: [Item] = []
+        items.append(textItem(id: "t-1", origin: "mac-1", text: "hello", capturedAtNs: 100))
+        items.append(textItem(id: "t-2", origin: "mac-1", text: "world", capturedAtNs: 200))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        // bogus kind → kinds 解析后为空数组 → 不 filter,跟没 kinds 等价
+        let (status, body) = try await getSearch(
+            baseURL: base, auth: auth, q: nil, kinds: "bogus_kind"
+        )
+        #expect(status == 200)
+        #expect(body["count"] as? Int == 2)
+    }
+
+    @Test func searchOldClientWithoutQualifiersUnchanged() async throws {
+        // 老 client 不发 kinds / file_sub_kinds / text_suffixes —— 行为完全等价于 PR 之前
+        // (zero regression)。回归测试已经在 searchReturnsHitsWithSnippet 等,这里再独立钉一次
+        let items = [
+            textItem(id: "a", origin: "mac-1", text: "hello world", capturedAtNs: 100),
+            textItem(id: "b", origin: "mac-1", text: "another", capturedAtNs: 200),
+        ]
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        // 仅 q,不发任何 qualifier query param
+        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: "hello")
+        #expect(status == 200)
+        #expect(body["count"] as? Int == 1)
+        #expect((body["items"] as? [[String: Any]])?.first?["id"] as? String == "a")
+    }
+
+    @Test func searchWithImageMergedQualifierMatchesImageFiles() async throws {
+        // **回归 review #48 Critical 1**:iOS QueryQualifier.encodeToWire([.imageMerged])
+        // 产出 `kinds="image"` + `fileSubKinds="imageFile"`,server 端 parseFileSubKind
+        // 必须大小写不敏感解出 `.imageFile`,否则 Finder 复制的图片文件被丢(issue #41
+        // "勾图片 chip 看空集"在 imageFile 路径再现)。
+        //
+        // 之前 lowerCamelize 实现 `"imageFile".lowercased() → "imagefile"` 然后没分隔符
+        // 不拆 → `FileSubKind(rawValue: "imagefile") == nil` → 静默丢
+        var items: [Item] = []
+        // 原生 image kind (剪贴板截图)
+        var nativeImage = textItem(id: "img-1", origin: "mac-1", text: "screenshot", capturedAtNs: 100)
+        nativeImage.kind = .image
+        nativeImage.blobSha256 = "a".repeated(64)
+        nativeImage.blobMime = "image/png"
+        items.append(nativeImage)
+        // Finder 复制 png file —— kind=.file + blobMime=image/png → SearchAPI 算 imageFile sub-kind
+        items.append(fileItem(id: "imgfile-1", textFull: "/Users/bob/photo.png", blobMime: "image/png", capturedAtNs: 200))
+        // 干扰项:非图片 file
+        items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/doc.pdf", blobMime: "application/pdf", capturedAtNs: 300))
+
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        // 走 iOS 真路径:encodeToWire([.imageMerged]) → 拿到 wire 串直接打 server
+        let wire = QueryQualifier.encodeToWire([.imageMerged])
+        #expect(wire.kinds == "image", "encodeToWire contract changed?")
+        #expect(wire.fileSubKinds == "imageFile", "encodeToWire contract changed?")
+
+        let (status, body) = try await getSearch(
+            baseURL: base, auth: auth, q: nil,
+            kinds: wire.kinds, fileSubKinds: wire.fileSubKinds
+        )
+        #expect(status == 200)
+        // image kind OR imageFile sub-kind → 2 条命中(native image + png file),pdf 排除
+        #expect(body["count"] as? Int == 2)
+        let arr = body["items"] as? [[String: Any]] ?? []
+        let ids = Set(arr.compactMap { $0["id"] as? String })
+        #expect(ids == ["img-1", "imgfile-1"])
+    }
+
+    @Test func searchFileSubKindWireAcceptsCaseVariants() async throws {
+        // 二次防御:server 端 parseFileSubKind 大小写 + 分隔符不敏感。
+        // 老 client / curl 手填 `IMAGEFILE` / `image_file` / `image-file` 都该等价
+        var items: [Item] = []
+        items.append(fileItem(id: "imgfile-1", textFull: "/Users/bob/p.png", blobMime: "image/png", capturedAtNs: 100))
+        items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/d.pdf", blobMime: "application/pdf", capturedAtNs: 200))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        for variant in ["imageFile", "imagefile", "IMAGEFILE", "image_file", "image-file"] {
+            let (status, body) = try await getSearch(
+                baseURL: base, auth: auth, q: nil, fileSubKinds: variant
+            )
+            #expect(status == 200, "variant \(variant) status")
+            #expect(body["count"] as? Int == 1, "variant \(variant) count")
+            #expect((body["items"] as? [[String: Any]])?.first?["id"] as? String == "imgfile-1",
+                    "variant \(variant) hit")
+        }
     }
 
     @Test func searchClampsLimitToReasonableMax() async throws {
