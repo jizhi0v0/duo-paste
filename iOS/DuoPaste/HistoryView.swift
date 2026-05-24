@@ -7,8 +7,10 @@ struct HistoryView: View {
     /// 搜索框 plain text —— 纯内容搜索,不再解析 `/xxx`(iOS 上下拉 Menu 多选 +
     /// chip 行的入口比 slash 顺手,见 filterMenu)
     @State private var searchText: String = ""
-    /// 单 debounce 管 store.query 本机更新 + server search。150ms / 250ms 两段
-    @State private var storeUpdateTask: Task<Void, Never>?
+    /// **只**给 server search debounce 用——本机 contains filter 同步走,
+    /// 不再压在 debounce 后面让首字符延迟 150ms。新键进来 cancel 旧 task,
+    /// 250ms 静默期满才打 /search 降 server QPS。issue #44
+    @State private var serverSearchTask: Task<Void, Never>?
 
     var body: some View {
         // **per-body-call cache**:filtered 只读一次,避免**同一次 body 调用**内多次读
@@ -37,8 +39,16 @@ struct HistoryView: View {
                 }
             }
             .navigationTitle("DuoPaste")
-            .onChange(of: searchText) { _, _ in
-                scheduleStoreUpdate()
+            .onChange(of: searchText) { _, new in
+                // **本机 filter 同步** ——`store.query` mutate 让 `filtered` 重算
+                // (items × O(N) contains,iOS 数据集 1-2k 量级一帧内完成),首字符
+                // 输入即时反馈。`clearServerSearch()` 同步清旧响应让 filtered 走
+                // contains fallback,避免显示过期的远端 hit。
+                // **只对 server search debounce** —— `scheduleServerSearch` 250ms
+                // 静默期满才打 /search,降 server QPS。issue #44
+                store.query = new
+                store.clearServerSearch()
+                scheduleServerSearch()
             }
             .toolbar { fullToolbar }
             .toolbarBackground(.visible, for: .navigationBar)
@@ -166,27 +176,27 @@ struct HistoryView: View {
         ("音频", .fileSubKind(.audio)),
     ]
 
-    /// 单 debounce 同管 store.query 本机更新 + server search。**不**在按键路径直接动 store,
-    /// 那俩 mutate 会让 `HistoryStore.filtered` 重算(items × O(N)),每键卡顿。
-    /// 150ms 等用户停手再更新,250ms 打 server。
+    /// **只 debounce server search** —— 本机 filter 已经在 `.onChange(of: searchText)`
+    /// 里同步走 (`store.query = new`),这里 250ms 静默后才打远端 /search。
     ///
-    /// **snapshot at Task creation**:`searchText` 一次性 capture 进 `snapshot` 常量,
-    /// 跨 await 路径都读它。防一个 race 边界:用户在 150ms 边界刚好敲完最后一键,
-    /// 新一轮 scheduleStoreUpdate cancel 这个 Task 时 Task 已过 `Task.isCancelled` 守门
-    /// 进了同步 `store.query = searchText` 路径——读裸 `searchText` 会拿到 cancel 那一刻
-    /// 的最新值,旧 + 新两个 Task 都写一次 store + 多调一次 clearServerSearch 让 UI 闪
-    /// fallback。snapshot 让旧 Task 永远用它出生那刻的值,语义干净
-    private func scheduleStoreUpdate() {
-        storeUpdateTask?.cancel()
-        let snapshot = searchText
-        storeUpdateTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(150))
+    /// **不变量**:新字符进来必须 cancel 之前的 server task,否则用户快敲三个字
+    /// "abc" 会让 "a" / "ab" / "abc" 三发 /search 全打过去(只想要 "abc" 那发)。
+    ///
+    /// **snapshot at Task creation**:trim 操作放进 task body 里在 sleep 之后做,
+    /// 读最新 `searchText`——cancel 已经把旧 task 干掉了,这里读到的就是当前最新键。
+    /// 不用像旧实现那样 snapshot 防 race,因为 store.query 同步路径不再依赖这个 task,
+    /// task 唯一职责就是"等用户停 250ms 再打 /search"。
+    ///
+    /// **为什么 250ms 不是 100/150**:抠用户感知的话本机 filter 已经即时了,server
+    /// search 多等几十 ms 用户根本感知不到,但 QPS 砍掉 60-70%。如果实测 250ms
+    /// 短到 sleep 切首字母 / 中文输入法 commit 还是会多打一发,可以拉到 400ms。
+    /// issue #44
+    private func scheduleServerSearch() {
+        serverSearchTask?.cancel()
+        serverSearchTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
             if Task.isCancelled { return }
-            store.query = snapshot
-            store.clearServerSearch()
-            try? await Task.sleep(for: .milliseconds(100))
-            if Task.isCancelled { return }
-            let trimmed = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             coordinator.searchOnServer(q: trimmed)
         }

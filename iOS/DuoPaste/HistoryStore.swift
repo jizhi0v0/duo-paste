@@ -23,10 +23,11 @@ final class HistoryStore {
     /// View 通过 @Observable 路径绑定,reset 自然让 View 重渲。
     ///
     /// **不对称性 caveat**:`query` **仍是** `HistoryView.@State searchText` 持有,store
-    /// 里只装"已经 debounce 过的 query mirror"(`scheduleStoreUpdate` 写)。所以 `reset()`
-    /// 把 `query=""` 但 View `searchText` 不会清,下次用户敲键 onChange 才同步回来。
-    /// `reset()` 当前 doc 标"测试/debug 用",生产路径没调,所以接受这条不对称——
-    /// 把 searchText 也搬进 store 等于每键热路径都过 @Observable 一次,得不偿失
+    /// 里装的是搜索框 mirror(`HistoryView.onChange(searchText)` 同步写,issue #44 后
+    /// 不再压在 debounce 后面)。所以 `reset()` 把 `query=""` 但 View `searchText`
+    /// 不会清,下次用户敲键 onChange 才同步回来。`reset()` 当前 doc 标"测试/debug 用",
+    /// 生产路径没调,所以接受这条不对称——把 searchText 也搬进 store 等于每键热路径
+    /// 都过 @Observable 一次,得不偿失
     ///
     /// 内存态,不持久化——重启回零;qualifier 是探索性筛选不是用户长期 preference
     var activeQualifiers: Set<QueryQualifier> = []
