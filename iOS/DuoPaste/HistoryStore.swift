@@ -13,6 +13,11 @@ final class HistoryStore {
     /// 搜索框文本。空 → 全列表;非空 → 优先用 server 端 FTS5 结果,失败 fallback 本机 contains。
     var query: String = ""
 
+    /// 已激活的 slash qualifier —— 搜索框 tokens chip 形态渲染(searchable tokens:),
+    /// 跟 query 双轨并存:filter 走两者交集(qualifier OR 内 + text contains AND)。
+    /// 内存态,不持久化——重启回零;qualifier 是探索性筛选不是用户长期 preference
+    var activeQualifiers: [QueryQualifier] = []
+
     /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
     /// 跟 Mac UI 口径一致。query 切换 / coordinator 失败时清掉走 fallback。
     /// **匹配**靠 `q` 字段判断是否对得上当前 store.query;`q != store.query` 时不用(过期)
@@ -25,27 +30,79 @@ final class HistoryStore {
     private(set) var lastServerSearch: ServerSearchResult?
 
     /// SwiftUI 直接绑这个——过滤 + fold 后的列表。
-    /// - 空 query → 全列表(本机 fold)
-    /// - query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold)
-    /// - 否则 → 本机 contains fallback 后 fold(server 还在拉 / 失败 / 离线时)
+    /// - 空 query + 空 qualifier → 全列表(本机 fold)
+    /// - 空 query + 有 qualifier → 本机 items 过 qualifier filter
+    /// - 有 query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold);
+    ///   有 qualifier 时再 client-side filter 一遍(server 不识别 slash qualifier)
+    /// - 否则 → 本机 contains fallback + qualifier filter 后 fold
     ///
     /// **Fold 契约定义在 `Item.foldByTextFull`(DuoPasteCore)**——跨 origin 同 text_full
     /// 折一条,winner = max(captured_at_ns),pinned OR 聚合。修 Continuity / ToDesk 把同
     /// 文本镜到两台 Mac 后 iOS 看见两张卡(两个不同 origin_device)而 Mac UI 只一张的不对齐.
     /// 排序契约在本路径单独应用:(pinned DESC, captured_at_ns DESC)——Mac fold 多一层
     /// prefix24h boost,iOS 列表无 query 时不需要;有 query 走 server search 路径就有了
+    ///
+    /// **Qualifier 语义**:OR 起来——`/pdf /video` 匹配 (kind=file 且 subkind=pdf) OR
+    /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
+    /// Server 的 `/search` 一期不识别 qualifier,client-side 过滤兜底
     var filtered: [Item] {
-        guard !query.isEmpty else { return Self.foldAndSort(items) }
-        if let r = lastServerSearch, r.q == query {
-            return r.items
+        let qs = activeQualifiers
+
+        if query.isEmpty && qs.isEmpty {
+            return Self.foldAndSort(items)
         }
+
+        if query.isEmpty {
+            return Self.foldAndSort(items.filter { Self.matchesQualifiers($0, qs) })
+        }
+
+        if let r = lastServerSearch, r.q == query {
+            if qs.isEmpty { return r.items }
+            // server 已 fold + 已排序,qualifier 过完只 re-sort 不重 fold
+            return r.items.filter { Self.matchesQualifiers($0, qs) }.sorted(by: Self.iosListOrder)
+        }
+
         let q = query.lowercased()
-        let matched = items.filter { item in
+        let contained = items.filter { item in
             (item.preview?.lowercased().contains(q) ?? false)
                 || (item.textFull?.lowercased().contains(q) ?? false)
                 || (item.extractedText?.lowercased().contains(q) ?? false)
         }
-        return Self.foldAndSort(matched)
+        let qFiltered = qs.isEmpty ? contained : contained.filter { Self.matchesQualifiers($0, qs) }
+        return Self.foldAndSort(qFiltered)
+    }
+
+    /// Qualifier filter 单点定义。OR 语义——任一 qualifier 命中即过。`imageMerged`
+    /// 同时匹配 kind=image OR fileSubKind=imageFile(用户视角"图片"一回事)。
+    /// `textSuffix` 走 textFull 末尾 LIKE,跟 SearchAPI.fetchHitsRaw 契约同构
+    nonisolated static func matchesQualifiers(_ item: Item, _ qualifiers: [QueryQualifier]) -> Bool {
+        guard !qualifiers.isEmpty else { return true }
+        var kinds: Set<ItemKind> = []
+        var subKinds: Set<FileSubKind> = []
+        var suffixes: [String] = []
+        for q in qualifiers {
+            switch q {
+            case .kind(let k):
+                kinds.insert(k)
+            case .fileSubKind(let s):
+                subKinds.insert(s)
+            case .textSuffix(let s):
+                suffixes.append(s.lowercased())
+            case .imageMerged:
+                kinds.insert(.image)
+                subKinds.insert(.imageFile)
+            }
+        }
+        if kinds.contains(item.kind) { return true }
+        if !subKinds.isEmpty, let sub = ItemClassifier.fileSubKind(item), subKinds.contains(sub) {
+            return true
+        }
+        if !suffixes.isEmpty, let text = item.textFull?.lowercased() {
+            for sfx in suffixes where text.hasSuffix(sfx) {
+                return true
+            }
+        }
+        return false
     }
 
     /// fold + iOS list 排序契约一体应用。fold 走 DuoPasteCore 单点契约,sort 本地化
@@ -196,6 +253,7 @@ final class HistoryStore {
     func reset() {
         items = []
         query = ""
+        activeQualifiers = []
     }
 
     // MARK: - 磁盘持久化

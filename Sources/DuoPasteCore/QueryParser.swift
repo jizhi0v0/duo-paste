@@ -7,13 +7,17 @@ import Foundation
 /// `.imageMerged` case 是产品决策：从用户视角"图片"是一种东西（无论原生剪贴板截图
 /// 还是 Finder 复制的 .png 文件），落地时同时映射到 `.kind(.image)` + `.fileSubKind(.imageFile)`，
 /// 让 SQL 端 OR 拿到两种存储路径。
-public enum QueryQualifier: Equatable, Sendable, Hashable {
+public enum QueryQualifier: Equatable, Sendable, Hashable, Identifiable {
     case kind(ItemKind)
     case fileSubKind(FileSubKind)
     /// `.java` / `.c` / `.py` 等代码文件——走 textFull suffix LIKE，FTS5 token 化对 `.` 不可靠
     case textSuffix(String)
     /// `/image /img /png /jpg /jpeg /gif /webp /heic` —— 命中 `.kind(.image)` OR `.fileSubKind(.imageFile)`
     case imageMerged
+
+    /// 给 SwiftUI `.searchable(tokens:)` 用——Token 必须 Identifiable。
+    /// 同一 case 是同一 token,直接用 self 当 id(已 Hashable)
+    public var id: Self { self }
 }
 
 public struct ParsedQuery: Equatable, Sendable {

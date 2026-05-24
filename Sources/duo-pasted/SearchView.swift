@@ -602,6 +602,15 @@ struct SearchView: View {
                 // 已激活的 slash qualifier 渲染成 pill chip,排在 TextField 左侧。每个 chip
                 // 自带 ✕ 一键删,Backspace 在 TextField 为空时弹最后一个(SearchPanelController
                 // 装的 keyMonitor 拦 keyCode=51)
+                //
+                // **OR 提示**:>= 2 chip 时打头加 "任一:" 单 prefix(不再 inter-chip "或"
+                // 占 N-1 份横向空间)。语义:任一 chip 命中即过(union 不是 intersection),
+                // 单条 item 不可能同时是图片+音频之类
+                if state.activeQualifiers.count >= 2 {
+                    Text("任一:")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(state.activeQualifiers, id: \.self) { qual in
                     QualifierChipPill(qualifier: qual) {
                         state.removeQualifier(qual)
@@ -622,6 +631,11 @@ struct SearchView: View {
                     .buttonStyle(.plain)
                 }
             }
+            // **固定 22pt 高度**:防 chip 加入时 HStack max-height 抖动 → 搜索 capsule
+            // 涨 1-2pt → 整列下移。QualifierChipPill(font 12 + padding 3) ≈ 20pt 比
+            // TextField(font 14) ≈ 18pt 略高;锁 22pt 让两者都在固定空间里居中,加 chip
+            // 不撑高。值要够大装下 chip(20) + 1-2pt 余量
+            .frame(height: 22)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(
@@ -1531,7 +1545,14 @@ struct SearchView: View {
                 Text(err).font(.caption).foregroundStyle(.red)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // **height 必须跟 cardScroller 对齐 (254 + .padding(.bottom, 16))** ——
+        // 之前用 `.frame(maxHeight: .infinity)` 让 emptyView 吃掉 panel 剩余 vertical
+        // 空间(>270pt),比 cardScroller 固定 254 高一截 + 没 bottom padding 让位,
+        // 用户切到 0 结果状态时视觉上"列表区高度突然增加"。固定到跟 cardScroller 同尺寸
+        // 让 empty ↔ non-empty 切换不抖动
+        .frame(maxWidth: .infinity)
+        .frame(height: 254)
+        .padding(.bottom, 16)
     }
 
     // 旧 list(LazyVStack 垂直列表)已被 cardScroller(LazyHStack 横向卡片)替代,见 body 调用
