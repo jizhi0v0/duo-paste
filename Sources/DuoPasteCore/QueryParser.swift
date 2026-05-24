@@ -39,7 +39,11 @@ extension QueryQualifier {
             case .fileSubKind(let s):
                 subKinds.insert(s)
             case .textSuffix(let s):
-                suffixes.append(s.lowercased())
+                // 空串守门:`"".hasSuffix("")` 永远 true,空 suffix 会命中任何有 textFull
+                // 的项。当前 alias 路径不会注入空串,但 textSuffix 是 public case,未来
+                // 暴露给自由文本(slash 补全 / suggestion)时防"用户输空白前缀全命中"
+                let lower = s.lowercased()
+                if !lower.isEmpty { suffixes.append(lower) }
             case .imageMerged:
                 kinds.insert(.image)
                 subKinds.insert(.imageFile)

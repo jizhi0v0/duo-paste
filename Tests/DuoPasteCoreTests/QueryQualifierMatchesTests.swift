@@ -112,4 +112,15 @@ struct QueryQualifierMatchesTests {
         let pdf = fileItem("p", mime: "application/pdf")
         #expect(QueryQualifier.matches(pdf, qualifiers: [.fileSubKind(.pdf), .fileSubKind(.pdf)]) == true)
     }
+
+    @Test("textSuffix 空串守门:不应命中任何项")
+    func emptySuffixGuarded() {
+        let anyText = textItem("t", .text, textFull: "hello")
+        #expect(QueryQualifier.matches(anyText, qualifiers: [.textSuffix("")]) == false)
+        // 空 suffix 跟其它 qualifier 混用 — 空 suffix 不参与,其它仍生效
+        #expect(QueryQualifier.matches(anyText, qualifiers: [.textSuffix(""), .kind(.text)]) == true)
+        // 只空 suffix + 非匹配 kind → false
+        let url = textItem("u", .url, textFull: "https://example.com")
+        #expect(QueryQualifier.matches(url, qualifiers: [.textSuffix(""), .kind(.image)]) == false)
+    }
 }

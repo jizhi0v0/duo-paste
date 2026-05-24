@@ -13,9 +13,10 @@ final class HistoryStore {
     /// 搜索框文本。空 → 全列表;非空 → 优先用 server 端 FTS5 结果,失败 fallback 本机 contains。
     var query: String = ""
 
-    /// 已激活的 slash qualifier —— 搜索框 tokens chip 形态渲染(searchable tokens:),
-    /// 跟 query 双轨并存:filter 走两者交集(qualifier OR 内 + text contains AND)。
-    /// 内存态,不持久化——重启回零;qualifier 是探索性筛选不是用户长期 preference
+    /// 已激活的 slash qualifier —— 由 `HistoryView.filterChipRow` 渲染(Mail 风格独立
+    /// chip 行,不走 `.searchable(tokens:)`),跟 query 双轨并存:filter 走两者交集
+    /// (qualifier OR 内 + text contains AND)。内存态,不持久化——重启回零;qualifier 是
+    /// 探索性筛选不是用户长期 preference
     var activeQualifiers: [QueryQualifier] = []
 
     /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
