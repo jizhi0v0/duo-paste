@@ -97,8 +97,11 @@ public enum EndpointDiscovery {
         #if canImport(Darwin)
         var buf = [CChar](repeating: 0, count: 256)
         if gethostname(&buf, buf.count) == 0 {
+            // UInt8(truncatingIfNeeded:) 跨 CChar=Int8 (Darwin/x86_64 Linux) 和
+            // CChar=UInt8 (aarch64 Linux) 都成立——比 UInt8(bitPattern:) (只 Int8→UInt8)
+            // 更便携。截到 NUL 再 UTF8 解,避开已 deprecated 的 String(cString:)。
             let nullIdx = buf.firstIndex(of: 0) ?? buf.count
-            let bytes = buf[0..<nullIdx].map { UInt8(bitPattern: $0) }
+            let bytes = buf[..<nullIdx].map { UInt8(truncatingIfNeeded: $0) }
             let raw = String(decoding: bytes, as: UTF8.self)
             let first = raw.split(separator: ".").first.map(String.init) ?? raw
             let lower = first.lowercased()

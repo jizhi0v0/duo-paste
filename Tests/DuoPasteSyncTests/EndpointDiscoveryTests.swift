@@ -62,12 +62,17 @@ struct EndpointDiscoveryTests {
     // MARK: - preferredLocalHostname
 
     @Test func preferredLocalHostnameNeverDoublesLocal() {
-        // 硬不变量: 结果只含**一个** ".local" 后缀。早期实现在 Tailscale MagicDNS 在场时
-        // ProcessInfo.hostName 返 "host.tail<id>.ts.net", hasSuffix(".local")=false 又拼一次
-        // → "host.tail<id>.ts.net.local" 双 suffix。新实现走 SCDynamicStore 绝不踩
+        // 硬不变量: 结果以 ".local" 结尾,且剥掉一次后不再以 ".local" 结尾。早期实现在
+        // Tailscale MagicDNS 在场时 ProcessInfo.hostName 返 "host.tail<id>.ts.net",
+        // hasSuffix(".local")=false 又拼一次 → "host.tail<id>.ts.net.local" 双 suffix。
+        // 新实现走 SCDynamicStore 绝不踩。
+        //
+        // 不用 components(separatedBy: ".local").count 这种"子串出现次数"统计——
+        // `host.localnet.local` 这种合法 hostname 会被误报 2,松。
         let name = EndpointDiscovery.preferredLocalHostname()
-        let dotLocalCount = name.components(separatedBy: ".local").count - 1
-        #expect(dotLocalCount == 1, "preferredLocalHostname returned \(name) with \(dotLocalCount) .local suffixes")
+        #expect(name.hasSuffix(".local"))
+        #expect(!name.dropLast(".local".count).hasSuffix(".local"),
+                "preferredLocalHostname returned \(name) with doubled .local suffix")
     }
 
     @Test func preferredLocalHostnameEndsWithLocal() {
