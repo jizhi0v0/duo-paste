@@ -51,6 +51,14 @@ struct EndpointDiscoveryTests {
         #expect(EndpointDiscovery.certHostnameStem("/tls/host") == "host")
     }
 
+    @Test func certStemSuffixMatchIsCaseInsensitive() {
+        // 用户手写 config 大写扩展名概率低但合法,小写化对比避免漏剥
+        #expect(EndpointDiscovery.certHostnameStem("/tls/HOST.CRT") == "HOST")
+        #expect(EndpointDiscovery.certHostnameStem("/tls/Host.Pem") == "Host")
+        #expect(EndpointDiscovery.certHostnameStem("/tls/host.Dual.crt") == "host")
+        #expect(EndpointDiscovery.certHostnameStem("/tls/host.DUAL.CRT") == "host")
+    }
+
     // MARK: - preferredLocalHostname
 
     @Test func preferredLocalHostnameNeverDoublesLocal() {

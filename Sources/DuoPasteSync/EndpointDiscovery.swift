@@ -62,12 +62,12 @@ public enum EndpointDiscovery {
     static func certHostnameStem(_ path: String) -> String? {
         var stem = (path as NSString).lastPathComponent
         for ext in [".crt", ".pem"] {
-            if stem.hasSuffix(ext) {
+            if stem.lowercased().hasSuffix(ext) {
                 stem = String(stem.dropLast(ext.count))
                 break
             }
         }
-        if stem.hasSuffix(".dual") {
+        if stem.lowercased().hasSuffix(".dual") {
             stem = String(stem.dropLast(".dual".count))
         }
         return stem.isEmpty ? nil : stem
@@ -90,7 +90,7 @@ public enum EndpointDiscovery {
         if let cf = SCDynamicStoreCopyLocalHostName(nil) {
             let name = (cf as String).lowercased()
             if !name.isEmpty && name != "localhost" {
-                return "\(name).local"
+                return name.hasSuffix(".local") ? name : "\(name).local"
             }
         }
         #endif
@@ -103,7 +103,7 @@ public enum EndpointDiscovery {
             let first = raw.split(separator: ".").first.map(String.init) ?? raw
             let lower = first.lowercased()
             if !lower.isEmpty && lower != "localhost" {
-                return "\(lower).local"
+                return lower.hasSuffix(".local") ? lower : "\(lower).local"
             }
         }
         #endif
