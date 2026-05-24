@@ -16,7 +16,7 @@ duo-paste 的回应：捕获**同步**落盘后才更新 UI、严格按 `capture
 ## 当前状态
 
 - **M1 完成**：捕获 + SQLite/FTS5 + 内容寻址 blob + SwiftUI 搜索窗 + ⌥⌘V 全局快捷键 + 菜单栏 + LaunchAgent + 小时级 snapshot，主 Mac daily-driver 中
-- **测试**：13/13 通过（`swift test`）
+- **测试**：~270 通过（`swift test`）
 - **下一站 M2**：Mac mini 作 primary 跑 Hummingbird 2 ingest/search API，主 Mac / MBP 作 client 推送，走 Tailscale，单一归属避免冲突
 
 详细架构计划见 [`plans/https-pasteapp-io-macos-ios-paste-moonlit-wave.md`](plans/https-pasteapp-io-macos-ios-paste-moonlit-wave.md)，开发坑和设计决策见 [`CLAUDE.md`](CLAUDE.md)。
