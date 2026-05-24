@@ -122,11 +122,16 @@ final class PeerWSPool {
     ///
     /// 例: 用户切到 Surge VPN 后, `.sgponte` 候选 之前永久 DNS 失败 failures=11+ 在 300s 退避
     /// 里, 切 VPN 后立刻可用 → reset 让它从 1s 起立刻重试,UX 秒级恢复
-    func restartAllResettingBackoff(reason: String) {
+    ///
+    /// `graceSeconds>0` 透传给每个 sub WS——网络刚 satisfied 但 VPN tunnel 还在 settle,
+    /// 这窗口内 TLS 失败的 failures 增量被 cap,防恢复延迟反常拉长(详见 PeerWebSocket
+    /// `reconnectResettingBackoff` doc)
+    func restartAllResettingBackoff(reason: String, graceSeconds: TimeInterval = 0) {
         guard !lastEndpoints.isEmpty else { return }
-        DebugLog.shared.append("ws-pool reconnect resetting backoff: \(reason)")
+        let graceTag = graceSeconds > 0 ? " grace=\(Int(graceSeconds))s" : ""
+        DebugLog.shared.append("ws-pool reconnect resetting backoff\(graceTag): \(reason)")
         for ws in sockets.values {
-            ws.reconnectResettingBackoff(reason: reason)
+            ws.reconnectResettingBackoff(reason: reason, graceSeconds: graceSeconds)
         }
     }
 
