@@ -1,0 +1,50 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    # 想限制只 review 特定路径打开下面这块（默认全 review）
+    # paths:
+    #   - "Sources/**/*.swift"
+    #   - "iOS/**/*.swift"
+    #   - "Tests/**/*.swift"
+    #   - "Package.swift"
+
+jobs:
+  claude-review:
+    # 想限制 review 范围（比如只 review 非 dependabot PR），编辑下面这条 if
+    # if: github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            请对这个 pull request 做一次 code review，重点关注：
+            - 代码正确性 / 潜在 bug / 边界条件遗漏
+            - 是否触碰 CLAUDE.md 里列的"关键设计决策（不要回退）"
+            - 并发 / writer tx / async race 的正确性
+            - HMAC、TLS、签名等安全相关路径的正确性
+            - 测试覆盖是否合理
+
+            用中文给出可执行的评审意见。先 gh pr diff 看完整 diff，再用 gh pr view 看上下文。
+            review 完后用 `gh pr comment` 把意见作为一条 PR 评论发出来（不要发 inline review）。
+
+            如果改动很小且无问题，回复一句"LGTM + 简短理由"即可。
+          claude_args: '--model claude-sonnet-4-6 --allowed-tools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr comment:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"'
