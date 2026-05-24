@@ -1,5 +1,11 @@
 import Foundation
 import DuoPasteCore
+#if canImport(SystemConfiguration)
+import SystemConfiguration
+#endif
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// 计算本机 daemon 可被外部访问到的 URL 候选 list。iOS PeerSyncCoordinator 拿到后并发
 /// 探活确认可达,再按 Mac hint / route 策略选择。
@@ -24,16 +30,12 @@ public enum EndpointDiscovery {
         let port = config.servePort
         var out: [PeerEndpoint] = []
 
-        if let cert = config.tlsCertPath {
-            let stem = (cert as NSString).lastPathComponent
-                .replacingOccurrences(of: ".crt", with: "")
-            if !stem.isEmpty {
-                out.append(PeerEndpoint(
-                    url: "\(scheme)://\(stem):\(port)",
-                    kind: .tailscale,
-                    preferred: false
-                ))
-            }
+        if let cert = config.tlsCertPath, let stem = certHostnameStem(cert) {
+            out.append(PeerEndpoint(
+                url: "\(scheme)://\(stem):\(port)",
+                kind: .tailscale,
+                preferred: false
+            ))
         }
         if let pHost = ponteHost, !pHost.isEmpty {
             out.append(PeerEndpoint(
@@ -50,13 +52,64 @@ public enum EndpointDiscovery {
         return out
     }
 
-    /// 本机 Bonjour .local hostname。Host.current().localizedName 已是 ".local" 形式时不
-    /// 重复加后缀。完全拿不到 hostname → 兜底 "mac.local"
+    /// 从 cert 文件路径提取 hostname。剥两层文件名约定:
+    /// - `.crt` / `.pem` 扩展名
+    /// - `.dual` 中间段(mkcert 双 SAN 命名习惯, 见 CLAUDE.md "TLS cert 双 SAN 部署")
+    ///
+    /// **不要**回退到只 `.replacingOccurrences(of: ".crt", with: "")`——配双 SAN cert
+    /// (文件名 `<host>.dual.crt`) 时会 leak `.dual` 当 hostname 进 /endpoints 响应,iOS
+    /// 端 DNS 永久解析失败。回归测试 `EndpointDiscoveryTests.certStemStripsDualSuffix`
+    static func certHostnameStem(_ path: String) -> String? {
+        var stem = (path as NSString).lastPathComponent
+        for ext in [".crt", ".pem"] {
+            if stem.lowercased().hasSuffix(ext) {
+                stem = String(stem.dropLast(ext.count))
+                break
+            }
+        }
+        if stem.lowercased().hasSuffix(".dual") {
+            stem = String(stem.dropLast(".dual".count))
+        }
+        return stem.isEmpty ? nil : stem
+    }
+
+    /// 本机 Bonjour `.local` hostname(如 `bobbys-mac-mini.local`)。
+    ///
+    /// **macOS**: 走 `SCDynamicStoreCopyLocalHostName()` (等价 `scutil --get LocalHostName`),
+    /// 保证返 Bonjour 短名,跟 mDNSResponder 注册的 `<host>.local` A 记录硬对齐。
+    ///
+    /// **不要**回退到 `ProcessInfo.processInfo.hostName`——Darwin 上它走 `Host.current()`
+    /// → 反 DNS 查询。Tailscale MagicDNS 在场时反查 100.x.x.x 拿到 `<host>.tail<id>.ts.net`,
+    /// 进程启动早期 cache 住,再被本函数拼上 `.local` 后缀 → 出现 `bobbys-mac-mini.tail<id>.ts.net.local`
+    /// 这种永远不可解析的双 suffix URL leak 进 /endpoints 响应。回归测试
+    /// `EndpointDiscoveryTests.preferredLocalHostnameNeverDoublesLocal`
+    ///
+    /// **Linux / 非 Darwin** fallback: `gethostname()` + 取第一段 + `.local`
     public static func preferredLocalHostname() -> String {
-        // 不用 Host.current()——Host 是 Foundation macOS-only,DuoPasteSync 跨平台编译。
-        // 用 ProcessInfo.processInfo.hostName 等价(返本机 hostname,可能含 .local 后缀)
-        let raw = ProcessInfo.processInfo.hostName
-        if raw.isEmpty { return "mac.local" }
-        return raw.hasSuffix(".local") ? raw : "\(raw).local"
+        #if canImport(SystemConfiguration)
+        if let cf = SCDynamicStoreCopyLocalHostName(nil) {
+            let name = (cf as String).lowercased()
+            if !name.isEmpty && name != "localhost" {
+                return name.hasSuffix(".local") ? name : "\(name).local"
+            }
+        }
+        #endif
+        #if canImport(Darwin)
+        var buf = [CChar](repeating: 0, count: 256)
+        if gethostname(&buf, buf.count) == 0 {
+            // UInt8(truncatingIfNeeded:) 跨 CChar=Int8 (Darwin/x86_64 Linux) 和
+            // CChar=UInt8 (aarch64 Linux) 都成立——比 UInt8(bitPattern:) (只 Int8→UInt8)
+            // 更便携。截到 NUL 再 UTF8 解,避开已 deprecated 的 String(cString:)。
+            let nullIdx = buf.firstIndex(of: 0) ?? buf.count
+            let bytes = buf[..<nullIdx].map { UInt8(truncatingIfNeeded: $0) }
+            let raw = String(decoding: bytes, as: UTF8.self)
+            let first = raw.split(separator: ".").first.map(String.init) ?? raw
+            let lower = first.lowercased()
+            if !lower.isEmpty && lower != "localhost" {
+                return lower.hasSuffix(".local") ? lower : "\(lower).local"
+            }
+        }
+        #endif
+        return "mac.local"
     }
 }
