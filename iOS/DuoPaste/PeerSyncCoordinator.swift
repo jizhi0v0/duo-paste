@@ -180,9 +180,14 @@ final class PeerSyncCoordinator {
         }
     }
 
-    /// 网络切换（Wi-Fi ↔ cellular / VPN path 变化）是硬边界：旧 TCP/WS 状态不可信。
-    /// 立即清掉旧 pull + 重启 WS pool，让 UI 不再展示 stale green；cellular/expensive
+    /// 网络切换（Wi-Fi ↔ cellular / VPN path 变化）是硬边界：旧 TCP/WS 状态不可信,
+    /// 之前的失败教训也作废 (.sgponte 在新 VPN 路径上可能突然可用 等)。立即清掉旧 pull
+    /// + reset 所有 WS failures 重启 pool, 让 UI 不再展示 stale green;cellular/expensive
     /// path 下先偏向 Ponte，因为 Tailscale 与 Surge 在 iOS 上会竞争 Network Extension。
+    ///
+    /// **restartAllResettingBackoff vs restartAll**: 网络变化场景下用 reset 版本——
+    /// 之前永久失败的 candidate 在新 path 上可能秒级可用,继承 300s 退避会让恢复延迟
+    /// 反常拉长。短闪连失败的健康 candidate reset 后下一秒重试 OK,无 hammer 风险
     private func handleNetworkChange() {
         DebugLog.shared.append("network changed")
         if case .unconfigured = status {
@@ -192,7 +197,7 @@ final class PeerSyncCoordinator {
         beginRouteElection(reason: "network changed")
         cancelPullForHTTPRouteChange()
         preferPonteForCurrentPath()
-        wsPool?.restartAll(reason: "network changed")
+        wsPool?.restartAllResettingBackoff(reason: "network changed")
         repickEndpoint(reason: "network changed")
     }
 
@@ -320,6 +325,13 @@ final class PeerSyncCoordinator {
             return
         }
         guard let secret = currentSecret, !availableEndpoints.isEmpty else { return }
+        // 用户在 Settings 主动点"刷新候选"是显式意图重置——之前永久失败的 candidate
+        // (.sgponte 无 VPN / cert SAN 不匹配 等)在 backoff 里时,reset 让它从 1s 立刻重试。
+        // network changed 路径已在 handleNetworkChange 调过 reset,不重复;periodic/
+        // endpoints_changed/ws watchdog 等系统自动 reason 走原 preserving 语义(不绕过退避)
+        if reason == "manual refresh" {
+            wsPool?.restartAllResettingBackoff(reason: reason)
+        }
         lastRepickStartedAt = Date()
         repickTask?.cancel()
         let endpoints = availableEndpoints
