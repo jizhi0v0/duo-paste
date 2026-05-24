@@ -423,6 +423,15 @@ private struct PanelBackgroundModifier: ViewModifier {
 }
 
 struct SearchView: View {
+    /// cardScroller + emptyView 共用的列表区高度。两者**必须**一致——empty ↔ non-empty
+    /// 切换时面板不抖。254 = 卡片 236 + top 12 + bottom 6 余量。回归参考:
+    /// `SearchView.cardScroller` / `SearchView.emptyView`
+    private static let cardScrollerHeight: CGFloat = 254
+
+    /// cardScroller / emptyView 共用的底部 padding。跟 `cardScrollerHeight` 配套——
+    /// 改一处必须同改另一处,提常量避免漏改
+    private static let cardScrollerBottomPadding: CGFloat = 16
+
     @Bindable var state: AppState
     /// Enter / 双击触发的 paste 回调。双击行传 `[item]` 单条;Enter 由 SearchPanelController
     /// 走 selectedItems 传多条。AppDelegate.pasteBack 根据数量决定单项 / 合并 / 降级路径
@@ -602,6 +611,15 @@ struct SearchView: View {
                 // 已激活的 slash qualifier 渲染成 pill chip,排在 TextField 左侧。每个 chip
                 // 自带 ✕ 一键删,Backspace 在 TextField 为空时弹最后一个(SearchPanelController
                 // 装的 keyMonitor 拦 keyCode=51)
+                //
+                // **OR 提示**:>= 2 chip 时打头加 "任一:" 单 prefix(不再 inter-chip "或"
+                // 占 N-1 份横向空间)。语义:任一 chip 命中即过(union 不是 intersection),
+                // 单条 item 不可能同时是图片+音频之类
+                if state.activeQualifiers.count >= 2 {
+                    Text("任一:")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(state.activeQualifiers, id: \.self) { qual in
                     QualifierChipPill(qualifier: qual) {
                         state.removeQualifier(qual)
@@ -622,6 +640,11 @@ struct SearchView: View {
                     .buttonStyle(.plain)
                 }
             }
+            // **固定 22pt 高度**:防 chip 加入时 HStack max-height 抖动 → 搜索 capsule
+            // 涨 1-2pt → 整列下移。QualifierChipPill(font 12 + padding 3) ≈ 20pt 比
+            // TextField(font 14) ≈ 18pt 略高;锁 22pt 让两者都在固定空间里居中,加 chip
+            // 不撑高。值要够大装下 chip(20) + 1-2pt 余量
+            .frame(height: 22)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(
@@ -1155,12 +1178,13 @@ struct SearchView: View {
                 .padding(.leading, 16)
             }
             // 横向 padding 22 跟 header/filterBar 对齐,panel 左右两侧 padding 统一。
-            // frame height 254 = 卡片 236 + top 12 + bottom 6 余量,ScrollView 不 fill remaining
+            // frame height = 卡片 236 + top 12 + bottom 6 余量,ScrollView 不 fill remaining
             // (user 反馈"重复打开 window 下方仍有 padding" = ScrollView fill remaining 时
-            // SwiftUI 让内容 vertical center 留下方空白)
-            .frame(height: 254)
+            // SwiftUI 让内容 vertical center 留下方空白)。常量 `cardScrollerHeight` 跟
+            // emptyView 共用避免改一处忘改另一处再抖
+            .frame(height: Self.cardScrollerHeight)
             .padding(.horizontal, 22)
-            .padding(.bottom, 16)
+            .padding(.bottom, Self.cardScrollerBottomPadding)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
@@ -1531,7 +1555,13 @@ struct SearchView: View {
                 Text(err).font(.caption).foregroundStyle(.red)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // **height 必须跟 cardScroller 对齐** —— 之前用 `.frame(maxHeight: .infinity)`
+        // 让 emptyView 吃掉 panel 剩余 vertical 空间(>270pt),比 cardScroller 固定高度
+        // 高一截 + 没 bottom padding 让位,用户切到 0 结果状态时视觉上"列表区高度突然
+        // 增加"。固定到跟 cardScroller 同尺寸让 empty ↔ non-empty 切换不抖动
+        .frame(maxWidth: .infinity)
+        .frame(height: Self.cardScrollerHeight)
+        .padding(.bottom, Self.cardScrollerBottomPadding)
     }
 
     // 旧 list(LazyVStack 垂直列表)已被 cardScroller(LazyHStack 横向卡片)替代,见 body 调用

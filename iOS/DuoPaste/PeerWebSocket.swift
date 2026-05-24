@@ -67,6 +67,16 @@ final class PeerWebSocket {
     /// 从 1s 起。对齐 Mac 端 `WSNotificationClient.longLivedConnectionThresholdSec` 设计
     @ObservationIgnored private var connectedAt: Date?
 
+    /// failures 增量 grace 窗口截止时间(`nil` = 不在 grace 里)。`reconnectResettingBackoff`
+    /// 传 graceSeconds>0 时 stamp `Date()+graceSeconds`,期间 `bumpFailures` 把增量 cap 在
+    /// `failuresCapDuringGrace`(≤ 8s backoff)。grace 过期 → bumpFailures 自动清这个字段
+    /// 恢复正常 `+= 1` 语义
+    ///
+    /// 用途:网络刚 `requiresConnection → satisfied` 后 VPN tunnel 还在 settle,一连串 TLS
+    /// 失败让 failures 暴涨到指数 backoff 黑洞(150s+);grace 期间硬 cap 让每次重试间隔
+    /// 不超 8s,VPN tunnel 真 ready 时不会错过握手时机
+    @ObservationIgnored private var failuresGraceUntil: Date?
+
     private let config: PeerConfig
     private let auth: HMACAuth
     private let onAdvance: @MainActor (Int64) -> Void
@@ -137,15 +147,38 @@ final class PeerWebSocket {
     /// - NWPath status / primary interface 变化,旧的失败信号(无 IPv6 / DNS 失败)跟新路径
     ///   无关
     /// - 用户在 Settings 主动点"刷新候选"按钮,显式意图就是"忘掉之前学到的退避"
-    func reconnectResettingBackoff(reason: String) {
+    ///
+    /// `graceSeconds>0` 时同步开 grace 窗口:期间 failures 增量被 cap 在
+    /// `failuresCapDuringGrace`(≤ 8s backoff)防 VPN tunnel half-ready 期间一连串 TLS 失败
+    /// 让 failures 暴涨进 150s+ 退避黑洞,VPN 真 ready 时反而错过握手时机
+    func reconnectResettingBackoff(reason: String, graceSeconds: TimeInterval = 0) {
+        let graceUntil: Date? = graceSeconds > 0 ? Date().addingTimeInterval(graceSeconds) : nil
         guard runTask != nil else {
-            failures = 0
+            resetFailures(graceUntil: graceUntil)
             start()
             return
         }
-        DebugLog.shared.append("ws reconnect (reset backoff): \(config.baseURL.absoluteString) (\(reason))")
-        failures = 0
+        let graceTag = graceSeconds > 0 ? " grace=\(Int(graceSeconds))s" : ""
+        DebugLog.shared.append("ws reconnect (reset backoff)\(graceTag): \(config.baseURL.absoluteString) (\(reason))")
+        resetFailures(graceUntil: graceUntil)
         currentConnection?.cancel()
+    }
+
+    /// `failures = 0` 统一入口——配套清掉(或更新) grace 窗口 stamp,语义齐 runLoop
+    /// long-lived close 路径跟 `reconnectResettingBackoff` 都走这,保证 "failures 清零 →
+    /// grace 状态同步" 不掉拍。`graceUntil = nil`(默认) = 退出 grace;非 nil = 设置新窗口
+    ///
+    /// **long-lived 路径(默认无参)主动退 grace 是有意的副作用**——连接成功跑过
+    /// `longLivedThresholdSec` 说明 VPN tunnel 已 settle 完,grace cap 失去意义,
+    /// 后续失败应该回到完整指数退避(从 1s 起,该爬到 300s 就爬)。改 long-lived 阈值
+    /// 时要意识到这条配套副作用,不要把"清 grace"理解成纯清理。
+    ///
+    /// **未来 tuning 提示**:若实地观察到 long-lived close 后 30-60s 内 reconnect 抖动
+    /// 又陷入指数退避黑洞(VPN 跨边界 settle 反复),考虑把 long-lived 路径改成只清
+    /// failures 不清 grace——保留 grace cap 给"已稳定过但再次抖动"的二次保护窗口
+    private func resetFailures(graceUntil: Date? = nil) {
+        failures = 0
+        failuresGraceUntil = graceUntil
     }
 
     /// 长连接判定阈值——connectOnce 成功跑 >= 这个秒数后被远端断开,算路径健康,reset
@@ -166,6 +199,31 @@ final class PeerWebSocket {
         return backoffLadder[idx]
     }
 
+    /// grace 窗口内 retry 间隔上限。VPN tunnel settle 典型 5-30s,8s 让 60s 窗口最多
+    /// 7-8 次尝试,足够 cover. **不要直接改这个值** —— 通过 `backoffLadder` 找到第一个
+    /// > graceMaxBackoffSec 的 idx,确保 ladder 改动自动跟随(插入新档不需手动重算 cap)
+    nonisolated static let graceMaxBackoffSec: TimeInterval = 8
+
+    /// grace 窗口内 failures 增量硬上限——`backoffLadder` 中第一个 > `graceMaxBackoffSec`
+    /// 档位的索引,意味着 retry 间隔不超 `graceMaxBackoffSec`。当前 ladder `[1,2,4,8,...]`
+    /// 算出 4(idx 3 = 8s)。ladder 改动(比如插 6s 档)自动跟随,不会失锚。
+    ///
+    /// `static let` 在 initializer 一次求值——`backoffLadder` / `graceMaxBackoffSec`
+    /// 都是 nonisolated static let 常量,表达式常量化,bumpFailures 调用零开销
+    nonisolated static let failuresCapDuringGrace: Int =
+        backoffLadder.firstIndex(where: { $0 > graceMaxBackoffSec }) ?? backoffLadder.count
+
+    /// runLoop 里失败时调,统一 failures += 1 + grace cap 语义。grace 窗口未到期 → cap;
+    /// 过期 → 清 grace stamp 恢复指数 backoff
+    private func bumpFailures() {
+        if let until = failuresGraceUntil, Date() < until {
+            failures = min(failures + 1, Self.failuresCapDuringGrace)
+        } else {
+            failures += 1
+            failuresGraceUntil = nil
+        }
+    }
+
     private func runLoop() async {
         // failures 是 instance var(见类型声明), runLoop 不再局部初始化——
         // `reconnectResettingBackoff` 需要从外部清零
@@ -182,16 +240,16 @@ final class PeerWebSocket {
                 if let ts = connectedAt, Date().timeIntervalSince(ts) >= Self.longLivedThresholdSec {
                     let dur = Int(Date().timeIntervalSince(ts))
                     DebugLog.shared.append("ws long-lived (\(dur)s) closed → reset failures: \(urlStr)")
-                    failures = 0
+                    resetFailures()
                 } else {
-                    failures += 1
+                    bumpFailures()
                     DebugLog.shared.append("ws connectOnce returned (remote close?) failures=\(failures)")
                 }
             } catch is CancellationError {
                 DebugLog.shared.append("ws runLoop cancelled: \(urlStr)")
                 return
             } catch {
-                failures += 1
+                bumpFailures()
                 state = .failed(String(describing: error))
                 DebugLog.shared.append("ws connectOnce failed: \(error) failures=\(failures) url=\(urlStr)")
             }

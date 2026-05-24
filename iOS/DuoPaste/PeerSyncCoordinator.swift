@@ -197,7 +197,10 @@ final class PeerSyncCoordinator {
         beginRouteElection(reason: "network changed")
         cancelPullForHTTPRouteChange()
         preferPonteForCurrentPath()
-        wsPool?.restartAllResettingBackoff(reason: "network changed")
+        // grace=60s: nwpath flip 到 satisfied 后 VPN tunnel 还可能在 settle(踩过的坑:
+        // 这窗口内 TLS 失败让 failures 暴涨到 150s+ 退避,VPN ready 时反而错过握手),
+        // 60s 内 failures 增量 cap 让重试间隔 ≤ 8s
+        wsPool?.restartAllResettingBackoff(reason: "network changed", graceSeconds: 60)
         repickEndpoint(reason: "network changed")
     }
 
@@ -330,7 +333,8 @@ final class PeerSyncCoordinator {
         // network changed 路径已在 handleNetworkChange 调过 reset,不重复;periodic/
         // endpoints_changed/ws watchdog 等系统自动 reason 走原 preserving 语义(不绕过退避)
         if reason == "manual refresh" {
-            wsPool?.restartAllResettingBackoff(reason: reason)
+            // 用户显式"再试一次",跟 network change 同语义——给 60s grace 防 failures 暴涨
+            wsPool?.restartAllResettingBackoff(reason: reason, graceSeconds: 60)
         }
         lastRepickStartedAt = Date()
         repickTask?.cancel()

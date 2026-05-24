@@ -13,6 +13,24 @@ final class HistoryStore {
     /// 搜索框文本。空 → 全列表;非空 → 优先用 server 端 FTS5 结果,失败 fallback 本机 contains。
     var query: String = ""
 
+    /// 已激活的 slash qualifier —— `HistoryView.filterChipRow` 直接读写本字段(Mail 风格
+    /// 独立 chip 行,不走 `.searchable(tokens:)`),跟 query 双轨并存:filter 走两者交集
+    /// (qualifier OR 内 + text contains AND)。
+    ///
+    /// **单一真相源**——之前 View 有一份 `@State Set`,store 有一份 `[QueryQualifier]`,
+    /// 通过 onChange 单向同步。坑:`HistoryStore.reset()` 清 store 端,View @State 不会
+    /// 收到通知,chip 高亮还在但 filter 已不生效(数据/UI 失配)。改成 Set 直接住在 store,
+    /// View 通过 @Observable 路径绑定,reset 自然让 View 重渲。
+    ///
+    /// **不对称性 caveat**:`query` **仍是** `HistoryView.@State searchText` 持有,store
+    /// 里只装"已经 debounce 过的 query mirror"(`scheduleStoreUpdate` 写)。所以 `reset()`
+    /// 把 `query=""` 但 View `searchText` 不会清,下次用户敲键 onChange 才同步回来。
+    /// `reset()` 当前 doc 标"测试/debug 用",生产路径没调,所以接受这条不对称——
+    /// 把 searchText 也搬进 store 等于每键热路径都过 @Observable 一次,得不偿失
+    ///
+    /// 内存态,不持久化——重启回零;qualifier 是探索性筛选不是用户长期 preference
+    var activeQualifiers: Set<QueryQualifier> = []
+
     /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
     /// 跟 Mac UI 口径一致。query 切换 / coordinator 失败时清掉走 fallback。
     /// **匹配**靠 `q` 字段判断是否对得上当前 store.query;`q != store.query` 时不用(过期)
@@ -25,27 +43,50 @@ final class HistoryStore {
     private(set) var lastServerSearch: ServerSearchResult?
 
     /// SwiftUI 直接绑这个——过滤 + fold 后的列表。
-    /// - 空 query → 全列表(本机 fold)
-    /// - query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold)
-    /// - 否则 → 本机 contains fallback 后 fold(server 还在拉 / 失败 / 离线时)
+    /// - 空 query + 空 qualifier → 全列表(本机 fold)
+    /// - 空 query + 有 qualifier → 本机 items 过 qualifier filter
+    /// - 有 query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold);
+    ///   有 qualifier 时再 client-side filter 一遍(server 不识别 slash qualifier)
+    /// - 否则 → 本机 contains fallback + qualifier filter 后 fold
     ///
     /// **Fold 契约定义在 `Item.foldByTextFull`(DuoPasteCore)**——跨 origin 同 text_full
     /// 折一条,winner = max(captured_at_ns),pinned OR 聚合。修 Continuity / ToDesk 把同
     /// 文本镜到两台 Mac 后 iOS 看见两张卡(两个不同 origin_device)而 Mac UI 只一张的不对齐.
     /// 排序契约在本路径单独应用:(pinned DESC, captured_at_ns DESC)——Mac fold 多一层
     /// prefix24h boost,iOS 列表无 query 时不需要;有 query 走 server search 路径就有了
+    ///
+    /// **Qualifier 语义**:OR 起来——`/pdf /video` 匹配 (kind=file 且 subkind=pdf) OR
+    /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
+    /// Server 的 `/search` 一期不识别 qualifier,client-side 过滤兜底
     var filtered: [Item] {
-        guard !query.isEmpty else { return Self.foldAndSort(items) }
-        if let r = lastServerSearch, r.q == query {
-            return r.items
+        // `matches` 接 Array(顺序无关,语义就是 OR),从 Set 转 array 在几个 chip 量级
+        // 上 O(N) 无感开销
+        let qs = Array(activeQualifiers)
+
+        if query.isEmpty && qs.isEmpty {
+            return Self.foldAndSort(items)
         }
+
+        if query.isEmpty {
+            return Self.foldAndSort(items.filter { QueryQualifier.matches($0, qualifiers: qs) })
+        }
+
+        if let r = lastServerSearch, r.q == query {
+            if qs.isEmpty { return r.items }
+            // server 已 fold + 已 sort(含 prefix24h boost),qualifier 是 client-side
+            // 过滤,**保留 server 顺序**不再 re-sort——iosListOrder 会丢 prefix boost,
+            // 让用户感觉勾 chip 后卡片顺序"突然变样"(回归测试 reviewer 提的 #2)
+            return r.items.filter { QueryQualifier.matches($0, qualifiers: qs) }
+        }
+
         let q = query.lowercased()
-        let matched = items.filter { item in
+        let contained = items.filter { item in
             (item.preview?.lowercased().contains(q) ?? false)
                 || (item.textFull?.lowercased().contains(q) ?? false)
                 || (item.extractedText?.lowercased().contains(q) ?? false)
         }
-        return Self.foldAndSort(matched)
+        let qFiltered = qs.isEmpty ? contained : contained.filter { QueryQualifier.matches($0, qualifiers: qs) }
+        return Self.foldAndSort(qFiltered)
     }
 
     /// fold + iOS list 排序契约一体应用。fold 走 DuoPasteCore 单点契约,sort 本地化
@@ -196,6 +237,7 @@ final class HistoryStore {
     func reset() {
         items = []
         query = ""
+        activeQualifiers = []
     }
 
     // MARK: - 磁盘持久化

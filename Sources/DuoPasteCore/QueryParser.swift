@@ -16,6 +16,52 @@ public enum QueryQualifier: Equatable, Sendable, Hashable {
     case imageMerged
 }
 
+extension QueryQualifier {
+    /// 单 Item 是否满足任一 qualifier（OR 语义）。空集合等于不过滤（返 true）。
+    ///
+    /// - `.kind(k)` 直接比 `item.kind`
+    /// - `.fileSubKind(s)` 走 `ItemClassifier.fileSubKind` 推断
+    /// - `.textSuffix(sfx)` 走 `item.textFull` 末尾 LIKE（lowercased 比较）
+    /// - `.imageMerged` 命中 `.kind(.image)` OR `.fileSubKind(.imageFile)`——
+    ///   产品决策：从用户视角"图片"是一种东西，跟 SQL 端 `SearchAPI` 契约同构
+    ///
+    /// **iOS 内存过滤路径专用**。Mac 走 SQL `SearchAPI` 已经在 fold 前做完同等语义,
+    /// 不调这个函数。共享纯函数让两端契约不漂移——回归测试在 `MatchesQualifiersTests`
+    public static func matches(_ item: Item, qualifiers: [QueryQualifier]) -> Bool {
+        guard !qualifiers.isEmpty else { return true }
+        var kinds: Set<ItemKind> = []
+        var subKinds: Set<FileSubKind> = []
+        var suffixes: [String] = []
+        for q in qualifiers {
+            switch q {
+            case .kind(let k):
+                kinds.insert(k)
+            case .fileSubKind(let s):
+                subKinds.insert(s)
+            case .textSuffix(let s):
+                // 空串守门:`"".hasSuffix("")` 永远 true,空 suffix 会命中任何有 textFull
+                // 的项。当前 alias 路径不会注入空串,但 textSuffix 是 public case,未来
+                // 暴露给自由文本(slash 补全 / suggestion)时防"用户输空白前缀全命中"
+                let lower = s.lowercased()
+                if !lower.isEmpty { suffixes.append(lower) }
+            case .imageMerged:
+                kinds.insert(.image)
+                subKinds.insert(.imageFile)
+            }
+        }
+        if kinds.contains(item.kind) { return true }
+        if !subKinds.isEmpty, let sub = ItemClassifier.fileSubKind(item), subKinds.contains(sub) {
+            return true
+        }
+        if !suffixes.isEmpty, let text = item.textFull?.lowercased() {
+            for sfx in suffixes where text.hasSuffix(sfx) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
 public struct ParsedQuery: Equatable, Sendable {
     /// 剥掉所有合法 `/xxx` token 后的剩余搜索文本（token 间保留单空格）。未识别的
     /// `/xxx` 会保留进 text，避免输错时突然没结果且没解释
