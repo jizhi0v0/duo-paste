@@ -86,6 +86,10 @@ CA root 位置 `mkcert -CAROOT`（默 `~/Library/Application Support/mkcert/`）
 
 **不要回退到** tailscale 单 SAN cert——会让 ponte 路径永久 unreachable，UI ponte "不可达" 红字会再出现。
 
+**SAN 是真相，cert 文件名只是部署习惯**：`EndpointDiscovery.certTailscaleHost` 用 `SecCertificateCopyValues + kSecOIDSubjectAltName` 读 cert SAN list，优先返 `.ts.net` 结尾那条（Tailscale FQDN），次选非 `.sgponte` DNS SAN。文件名命名爱怎样怎样，`<host>.dual.crt` / `<host>.tail<id>.ts.net.dual.crt` / `<short>.crt` 都行。**不要假设**改文件名能改 endpoint URL——签新 cert 才行。读 cert 失败（Linux / 文件没了）→ fallback 到 `certHostnameStem` 剥文件名（向后兼容老部署）。
+
+**为什么有这条**：f4e711a 之前 tailscale 候选 URL 借 `ProcessInfo.hostName` 拿 MagicDNS 反查的 FQDN，f4e711a 切到 cert 文件名 stem 修 `.local` 双 suffix 时把 tailnet FQDN 信号一起丢了——cert 文件名是 `<short>.dual.crt`，stem 剥完是裸短名 `<short>`，iOS 拿到后 SNI 校验失败 `NoSuchRecord` 永久断 tailscale 路径。回归测试 `EndpointDiscoveryTests.discoverUsesSANNotFilenameStemWhenCertExists` 锁住这条契约。
+
 ### 关键路径
 
 数据（`~/Library/Application Support/duo-paste/` 下）：
