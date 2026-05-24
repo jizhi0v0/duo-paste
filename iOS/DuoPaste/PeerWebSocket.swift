@@ -209,9 +209,13 @@ final class PeerWebSocket {
     /// 算出 4(idx 3 = 8s)。ladder 改动(比如插 6s 档)自动跟随,不会失锚。
     ///
     /// `static let` 在 initializer 一次求值——`backoffLadder` / `graceMaxBackoffSec`
-    /// 都是 nonisolated static let 常量,表达式常量化,bumpFailures 调用零开销
+    /// 都是 nonisolated static let 常量,表达式常量化,bumpFailures 调用零开销。
+    ///
+    /// 算法本体住在 `DuoPasteCore.Backoff.failuresCap`——抽到 SwiftPM 可测的纯
+    /// 函数后,`Tests/DuoPasteCoreTests/BackoffCapTests.swift` 钉契约:插档自动
+    /// 跟随、谓词写错 CI 即 fail。见 PR #40 review #7 / issue #43。
     nonisolated static let failuresCapDuringGrace: Int =
-        backoffLadder.firstIndex(where: { $0 > graceMaxBackoffSec }) ?? backoffLadder.count
+        Backoff.failuresCap(ladder: backoffLadder, maxBackoffSec: graceMaxBackoffSec)
 
     /// runLoop 里失败时调,统一 failures += 1 + grace cap 语义。grace 窗口未到期 → cap;
     /// 过期 → 清 grace stamp 恢复指数 backoff
