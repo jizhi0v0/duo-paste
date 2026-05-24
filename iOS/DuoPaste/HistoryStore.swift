@@ -53,13 +53,15 @@ final class HistoryStore {
         }
 
         if query.isEmpty {
-            return Self.foldAndSort(items.filter { Self.matchesQualifiers($0, qs) })
+            return Self.foldAndSort(items.filter { QueryQualifier.matches($0, qualifiers: qs) })
         }
 
         if let r = lastServerSearch, r.q == query {
             if qs.isEmpty { return r.items }
-            // server 已 fold + 已排序,qualifier 过完只 re-sort 不重 fold
-            return r.items.filter { Self.matchesQualifiers($0, qs) }.sorted(by: Self.iosListOrder)
+            // server 已 fold + 已 sort(含 prefix24h boost),qualifier 是 client-side
+            // 过滤,**保留 server 顺序**不再 re-sort——iosListOrder 会丢 prefix boost,
+            // 让用户感觉勾 chip 后卡片顺序"突然变样"(回归测试 reviewer 提的 #2)
+            return r.items.filter { QueryQualifier.matches($0, qualifiers: qs) }
         }
 
         let q = query.lowercased()
@@ -68,41 +70,8 @@ final class HistoryStore {
                 || (item.textFull?.lowercased().contains(q) ?? false)
                 || (item.extractedText?.lowercased().contains(q) ?? false)
         }
-        let qFiltered = qs.isEmpty ? contained : contained.filter { Self.matchesQualifiers($0, qs) }
+        let qFiltered = qs.isEmpty ? contained : contained.filter { QueryQualifier.matches($0, qualifiers: qs) }
         return Self.foldAndSort(qFiltered)
-    }
-
-    /// Qualifier filter 单点定义。OR 语义——任一 qualifier 命中即过。`imageMerged`
-    /// 同时匹配 kind=image OR fileSubKind=imageFile(用户视角"图片"一回事)。
-    /// `textSuffix` 走 textFull 末尾 LIKE,跟 SearchAPI.fetchHitsRaw 契约同构
-    nonisolated static func matchesQualifiers(_ item: Item, _ qualifiers: [QueryQualifier]) -> Bool {
-        guard !qualifiers.isEmpty else { return true }
-        var kinds: Set<ItemKind> = []
-        var subKinds: Set<FileSubKind> = []
-        var suffixes: [String] = []
-        for q in qualifiers {
-            switch q {
-            case .kind(let k):
-                kinds.insert(k)
-            case .fileSubKind(let s):
-                subKinds.insert(s)
-            case .textSuffix(let s):
-                suffixes.append(s.lowercased())
-            case .imageMerged:
-                kinds.insert(.image)
-                subKinds.insert(.imageFile)
-            }
-        }
-        if kinds.contains(item.kind) { return true }
-        if !subKinds.isEmpty, let sub = ItemClassifier.fileSubKind(item), subKinds.contains(sub) {
-            return true
-        }
-        if !suffixes.isEmpty, let text = item.textFull?.lowercased() {
-            for sfx in suffixes where text.hasSuffix(sfx) {
-                return true
-            }
-        }
-        return false
     }
 
     /// fold + iOS list 排序契约一体应用。fold 走 DuoPasteCore 单点契约,sort 本地化

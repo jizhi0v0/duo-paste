@@ -7,17 +7,55 @@ import Foundation
 /// `.imageMerged` case 是产品决策：从用户视角"图片"是一种东西（无论原生剪贴板截图
 /// 还是 Finder 复制的 .png 文件），落地时同时映射到 `.kind(.image)` + `.fileSubKind(.imageFile)`，
 /// 让 SQL 端 OR 拿到两种存储路径。
-public enum QueryQualifier: Equatable, Sendable, Hashable, Identifiable {
+public enum QueryQualifier: Equatable, Sendable, Hashable {
     case kind(ItemKind)
     case fileSubKind(FileSubKind)
     /// `.java` / `.c` / `.py` 等代码文件——走 textFull suffix LIKE，FTS5 token 化对 `.` 不可靠
     case textSuffix(String)
     /// `/image /img /png /jpg /jpeg /gif /webp /heic` —— 命中 `.kind(.image)` OR `.fileSubKind(.imageFile)`
     case imageMerged
+}
 
-    /// 给 SwiftUI `.searchable(tokens:)` 用——Token 必须 Identifiable。
-    /// 同一 case 是同一 token,直接用 self 当 id(已 Hashable)
-    public var id: Self { self }
+extension QueryQualifier {
+    /// 单 Item 是否满足任一 qualifier（OR 语义）。空集合等于不过滤（返 true）。
+    ///
+    /// - `.kind(k)` 直接比 `item.kind`
+    /// - `.fileSubKind(s)` 走 `ItemClassifier.fileSubKind` 推断
+    /// - `.textSuffix(sfx)` 走 `item.textFull` 末尾 LIKE（lowercased 比较）
+    /// - `.imageMerged` 命中 `.kind(.image)` OR `.fileSubKind(.imageFile)`——
+    ///   产品决策：从用户视角"图片"是一种东西，跟 SQL 端 `SearchAPI` 契约同构
+    ///
+    /// **iOS 内存过滤路径专用**。Mac 走 SQL `SearchAPI` 已经在 fold 前做完同等语义,
+    /// 不调这个函数。共享纯函数让两端契约不漂移——回归测试在 `MatchesQualifiersTests`
+    public static func matches(_ item: Item, qualifiers: [QueryQualifier]) -> Bool {
+        guard !qualifiers.isEmpty else { return true }
+        var kinds: Set<ItemKind> = []
+        var subKinds: Set<FileSubKind> = []
+        var suffixes: [String] = []
+        for q in qualifiers {
+            switch q {
+            case .kind(let k):
+                kinds.insert(k)
+            case .fileSubKind(let s):
+                subKinds.insert(s)
+            case .textSuffix(let s):
+                suffixes.append(s.lowercased())
+            case .imageMerged:
+                kinds.insert(.image)
+                subKinds.insert(.imageFile)
+            }
+        }
+        if kinds.contains(item.kind) { return true }
+        if !subKinds.isEmpty, let sub = ItemClassifier.fileSubKind(item), subKinds.contains(sub) {
+            return true
+        }
+        if !suffixes.isEmpty, let text = item.textFull?.lowercased() {
+            for sfx in suffixes where text.hasSuffix(sfx) {
+                return true
+            }
+        }
+        return false
+    }
 }
 
 public struct ParsedQuery: Equatable, Sendable {

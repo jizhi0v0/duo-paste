@@ -331,7 +331,7 @@ struct HistoryView: View {
     }
 }
 
-/// slash qualifier 的 SF Symbol + 中文标签映射。`.searchable(tokens:)` chip + suggestion
+/// slash qualifier 的 SF Symbol + 中文标签映射。chip 行 + (未来)补全 suggestion
 /// row 共用——靠 Label(text, systemImage) 系统自动布局图标在前文字在后,跟 Mail/Files
 /// 等系统 app chip 视觉一致。
 ///

@@ -154,16 +154,22 @@ final class PeerWebSocket {
     func reconnectResettingBackoff(reason: String, graceSeconds: TimeInterval = 0) {
         let graceUntil: Date? = graceSeconds > 0 ? Date().addingTimeInterval(graceSeconds) : nil
         guard runTask != nil else {
-            failures = 0
-            failuresGraceUntil = graceUntil
+            resetFailures(graceUntil: graceUntil)
             start()
             return
         }
         let graceTag = graceSeconds > 0 ? " grace=\(Int(graceSeconds))s" : ""
         DebugLog.shared.append("ws reconnect (reset backoff)\(graceTag): \(config.baseURL.absoluteString) (\(reason))")
+        resetFailures(graceUntil: graceUntil)
+        currentConnection?.cancel()
+    }
+
+    /// `failures = 0` 统一入口——配套清掉(或更新) grace 窗口 stamp,语义齐 runLoop
+    /// long-lived close 路径跟 `reconnectResettingBackoff` 都走这,保证 "failures 清零 →
+    /// grace 状态同步" 不掉拍。`graceUntil = nil`(默认) = 退出 grace;非 nil = 设置新窗口
+    private func resetFailures(graceUntil: Date? = nil) {
         failures = 0
         failuresGraceUntil = graceUntil
-        currentConnection?.cancel()
     }
 
     /// 长连接判定阈值——connectOnce 成功跑 >= 这个秒数后被远端断开,算路径健康,reset
@@ -184,9 +190,17 @@ final class PeerWebSocket {
         return backoffLadder[idx]
     }
 
-    /// grace 窗口内 failures 增量硬上限。对应 backoffLadder[3] = 8s,即任意 retry 间隔
-    /// 不超 8s。60s grace 内最多 7-8 次尝试,足够 cover VPN tunnel settle 期(典型 5-30s)
-    nonisolated static let failuresCapDuringGrace = 4
+    /// grace 窗口内 retry 间隔上限。VPN tunnel settle 典型 5-30s,8s 让 60s 窗口最多
+    /// 7-8 次尝试,足够 cover. **不要直接改这个值** —— 通过 `backoffLadder` 找到第一个
+    /// > graceMaxBackoffSec 的 idx,确保 ladder 改动自动跟随(插入新档不需手动重算 cap)
+    nonisolated static let graceMaxBackoffSec: TimeInterval = 8
+
+    /// grace 窗口内 failures 增量硬上限——`backoffLadder` 中第一个 > `graceMaxBackoffSec`
+    /// 档位的索引,意味着 retry 间隔不超 `graceMaxBackoffSec`。当前 ladder `[1,2,4,8,...]`
+    /// 算出 4(idx 3 = 8s)。ladder 改动(比如插 6s 档)自动跟随,不会失锚
+    nonisolated static var failuresCapDuringGrace: Int {
+        backoffLadder.firstIndex(where: { $0 > graceMaxBackoffSec }) ?? backoffLadder.count
+    }
 
     /// runLoop 里失败时调,统一 failures += 1 + grace cap 语义。grace 窗口未到期 → cap;
     /// 过期 → 清 grace stamp 恢复指数 backoff
@@ -215,7 +229,7 @@ final class PeerWebSocket {
                 if let ts = connectedAt, Date().timeIntervalSince(ts) >= Self.longLivedThresholdSec {
                     let dur = Int(Date().timeIntervalSince(ts))
                     DebugLog.shared.append("ws long-lived (\(dur)s) closed → reset failures: \(urlStr)")
-                    failures = 0
+                    resetFailures()
                 } else {
                     bumpFailures()
                     DebugLog.shared.append("ws connectOnce returned (remote close?) failures=\(failures)")
