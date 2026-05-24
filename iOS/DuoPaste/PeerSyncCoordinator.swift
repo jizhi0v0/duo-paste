@@ -646,10 +646,17 @@ final class PeerSyncCoordinator {
     /// 委托 Mac peer 跑 fold-aware 全文搜索。把结果灌进 store.applyServerSearch 让 UI
     /// 切到 FTS5 结果(跟 Mac UI 口径一致),跨设备 chip 总数对齐。
     ///
+    /// **qualifier 透传**(issue #41):带 `qualifiers` 时 server-side fold + filter 同 pass,
+    /// 消除 client-side filter pagination 盲区——FTS5 命中 200 但稀疏 qualifier 让前 50 全
+    /// 不匹配的情况下,server 端先 filter 再 limit,UI 不再"勾 chip 看空集"。
+    /// `HistoryStore.filtered` 拿 server 结果时仍 client-side filter 兜底:server 已过滤
+    /// 等于二次过滤是 no-op;老 server 不识别字段时静默忽略 → client-side filter 是唯一
+    /// 防线,行为不回归
+    ///
     /// 错误处理:失败 swallow + log——HistoryStore.filtered 自然 fallback 到本机 contains。
     /// 单 endpoint 调用即可(不需要 fanout,搜索结果由任一 connected Mac 提供,内容一致)。
     /// 选 currentEndpointURL 优先;不可用时取 pool 第一个 connected URL
-    func searchOnServer(q: String) {
+    func searchOnServer(q: String, qualifiers: [QueryQualifier] = []) {
         guard let secret = currentSecret else { return }
         let urls: [String] = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
         let chosen = currentEndpointURL ?? urls.first
@@ -661,13 +668,17 @@ final class PeerSyncCoordinator {
             guard let self else { return }
             let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
             do {
-                let (items, snippets, total) = try await client.searchItems(q: q, limit: 200)
+                let (items, snippets, total) = try await client.searchItems(
+                    q: q,
+                    qualifiers: qualifiers,
+                    limit: 200
+                )
                 if Task.isCancelled { return }
                 let result = HistoryStore.ServerSearchResult(
                     q: q, items: items, snippets: snippets, totalCount: total
                 )
                 await MainActor.run { self.store.applyServerSearch(result) }
-                DebugLog.shared.append("search ok q=\(q) hits=\(items.count) total=\(total)")
+                DebugLog.shared.append("search ok q=\(q) qs=\(qualifiers.count) hits=\(items.count) total=\(total)")
             } catch is CancellationError {
                 // 用户改了 query 旧 search 被替——正常,不记日志
             } catch URLError.cancelled {

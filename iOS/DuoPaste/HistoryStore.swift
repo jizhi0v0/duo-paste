@@ -47,7 +47,7 @@ final class HistoryStore {
     /// - 空 query + 空 qualifier → 全列表(本机 fold)
     /// - 空 query + 有 qualifier → 本机 items 过 qualifier filter
     /// - 有 query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold);
-    ///   有 qualifier 时再 client-side filter 一遍(server 不识别 slash qualifier)
+    ///   有 qualifier 时再 client-side filter 一遍(双层防御兜底,详 client-side fallback 注释)
     /// - 否则 → 本机 contains fallback + qualifier filter 后 fold
     ///
     /// **Fold 契约定义在 `Item.foldByTextFull`(DuoPasteCore)**——跨 origin 同 text_full
@@ -58,7 +58,13 @@ final class HistoryStore {
     ///
     /// **Qualifier 语义**:OR 起来——`/pdf /video` 匹配 (kind=file 且 subkind=pdf) OR
     /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
-    /// Server 的 `/search` 一期不识别 qualifier,client-side 过滤兜底
+    ///
+    /// **Client-side fallback**(issue #41):新 server `/search` 接 `kinds/file_sub_kinds/
+    /// text_suffixes` query 参数透传 qualifier,server-side fold + filter 同 pass 消除
+    /// pagination 盲区。**仍保留 client-side qualifier filter** 是双层防御:
+    /// (a) 老 server(没合 #41)不识别字段静默忽略,这层兜底让 chip 还能用;
+    /// (b) 新 server 已 filter → client-side filter 是 idempotent no-op,代价 = O(N=已 filter 结果)
+    /// 几乎免费。两边语义同源(`QueryQualifier.matches` 跟 `SearchAPI` filter 是同一 OR 契约)
     var filtered: [Item] {
         // 实际 dispatch 逻辑住在 DuoPasteCore.HistoryFilterDispatch——纯函数,4 条分支
         // 契约直接在 DuoPasteCoreTests 覆盖,改 dispatch 单测先 fail. 这里只做"把

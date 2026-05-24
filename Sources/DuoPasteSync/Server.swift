@@ -713,19 +713,62 @@ public struct SyncServer: Sendable {
 
     /// 把 URL query 参数转成 SearchQuery。`q` 为空 → 纯列表(按时间倒序+pinned-first);
     /// 非空 → FTS5 全文搜索 + fold。limit clamp [1, 500] 防巨页拖垮 iOS 端解码。
-    /// **不支持** kinds / pinnedOnly / 时间范围参数(iOS 一期就只要全文搜索 + 列表);
-    /// 后续要 chip 时再加 query 参数,不破坏现有路径
+    ///
+    /// **qualifier 透传**(issue #41):接受 `kinds=` / `file_sub_kinds=` / `text_suffixes=`
+    /// 三个可选 query 参数,每个 CSV 分隔,case-insensitive,不识别 token 静默忽略。
+    /// SearchAPI 内部已支持 fold-aware 路径下按这些字段过滤,跟 Mac SearchProvider 同源契约。
+    ///
+    /// 为什么 server 端必须支持:**消除 client-side filter pagination 盲区**。如果 server
+    /// 只走 FTS5 命中再返前 200,client 拿到再 client-side qualifier 过滤,稀疏 qualifier
+    /// (比如全库就 3 条 pdf)很容易让前 200 命中里没 pdf → 用户勾 "PDF" chip 看到空集,
+    /// 而库里其实有。server 透传 qualifier → fold + filter 在同一 pass 里,limit 切的是
+    /// 已经过滤后的结果,盲区消失。
+    ///
+    /// 老 client 不发这三个参数 → params[...] 全 nil → 行为跟之前完全等价(零回归)
     static func parseSearchQuery(_ params: FlatDictionary<Substring, Substring>) -> SearchQuery {
         let q = params["q"].map(String.init) ?? ""
         let rawLimit = params["limit"].flatMap { Int($0) } ?? 200
         let limit = max(1, min(rawLimit, 500))
         let rawOffset = params["offset"].flatMap { Int($0) } ?? 0
         let offset = max(0, rawOffset)
+        let kinds = parseCSV(params["kinds"]).compactMap { ItemKind(rawValue: $0.lowercased()) }
+        let fileSubKinds = parseCSV(params["file_sub_kinds"]).compactMap { FileSubKind(rawValue: lowerCamelize($0)) }
+        // textSuffixes 保留前导 `.` —— SearchAPI 走 LIKE `%.java` 匹配末尾,client
+        // 可发 `text_suffixes=.java,.py` 或 `text_suffixes=java,py`,后者补 `.` 让两边语义对齐
+        let textSuffixes = parseCSV(params["text_suffixes"]).map { raw -> String in
+            let lower = raw.lowercased()
+            return lower.hasPrefix(".") ? lower : "." + lower
+        }
         return SearchQuery(
             text: q.isEmpty ? nil : q,
+            kinds: kinds,
+            fileSubKinds: fileSubKinds,
+            textFullSuffixes: textSuffixes,
             limit: limit,
             offset: offset
         )
+    }
+
+    /// CSV 解析 + trim + 空 token 过滤。nil / 空串都返空数组,不需要调用方再 guard
+    private static func parseCSV(_ raw: Substring?) -> [String] {
+        guard let raw, !raw.isEmpty else { return [] }
+        return raw.split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// `image_file` / `image-file` / `imagefile` → `imageFile` (FileSubKind rawValue 是 lowerCamel)。
+    /// SearchAPI 端 rawValue 表:`video` / `pdf` / `audio` / `imageFile`——前三是单词没问题,
+    /// 只 imageFile 需要拼一下让 wire 接 snake/kebab 写法
+    private static func lowerCamelize(_ s: String) -> String {
+        // 把 `_` / `-` 当 separator 拆,第一个 segment 保持小写,后面 segment 首字母大写
+        let parts = s.lowercased().split(whereSeparator: { $0 == "_" || $0 == "-" })
+        guard let first = parts.first else { return s }
+        let rest = parts.dropFirst().map { seg -> String in
+            guard let c = seg.first else { return String(seg) }
+            return c.uppercased() + seg.dropFirst()
+        }
+        return ([String(first)] + rest).joined()
     }
 
     /// 把 URL query 参数转成 SinceQuery。空 cursor_ns / 非法值 → 视作从头拉。

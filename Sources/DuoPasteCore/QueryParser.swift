@@ -60,6 +60,52 @@ extension QueryQualifier {
         }
         return false
     }
+
+    /// 把 `[QueryQualifier]` 拆成 server `/search` wire 用的三组 CSV 字符串(kinds /
+    /// file_sub_kinds / text_suffixes)。CSV 都用 ItemKind / FileSubKind rawValue,server
+    /// 端 `parseSearchQuery` 同 rawValue 反向 decode,跟 client `QueryQualifier.matches`
+    /// 是同一 OR 契约。
+    ///
+    /// 关键映射:`.imageMerged` 展开成 `.kind(.image)` + `.fileSubKind(.imageFile)` 同时发——
+    /// SearchAPI 内 OR 关系自然 union(跟 `matches` 同语义)。
+    ///
+    /// 顺序稳定(按 ItemKind/FileSubKind allCases + 输入 suffix 顺序去重),保证 URL 一致性,
+    /// HMAC 签名 path 跟 query string 顺序对齐。
+    ///
+    /// **在 DuoPasteCore 里**让 iOS PeerClient + server-side test 共享同一份编码契约——
+    /// 任何分叉就是 bug,回归测试 `QueryQualifierWireTests` 钉死
+    public static func encodeToWire(_ qualifiers: [QueryQualifier]) -> (kinds: String?, fileSubKinds: String?, textSuffixes: String?) {
+        var kinds: Set<ItemKind> = []
+        var subs: Set<FileSubKind> = []
+        var suffixesOrdered: [String] = []
+        var suffixesSeen: Set<String> = []
+        for q in qualifiers {
+            switch q {
+            case .kind(let k):
+                kinds.insert(k)
+            case .fileSubKind(let s):
+                subs.insert(s)
+            case .textSuffix(let s):
+                let lower = s.lowercased()
+                if !lower.isEmpty, !suffixesSeen.contains(lower) {
+                    suffixesSeen.insert(lower)
+                    suffixesOrdered.append(lower)
+                }
+            case .imageMerged:
+                // 跟 `QueryQualifier.matches` 同语义:image kind OR imageFile sub-kind
+                kinds.insert(.image)
+                subs.insert(.imageFile)
+            }
+        }
+        let kindsCSV = ItemKind.allCases.filter { kinds.contains($0) }.map(\.rawValue).joined(separator: ",")
+        let subsCSV = FileSubKind.allCases.filter { subs.contains($0) }.map(\.rawValue).joined(separator: ",")
+        let suffixesCSV = suffixesOrdered.joined(separator: ",")
+        return (
+            kinds: kindsCSV.isEmpty ? nil : kindsCSV,
+            fileSubKinds: subsCSV.isEmpty ? nil : subsCSV,
+            textSuffixes: suffixesCSV.isEmpty ? nil : suffixesCSV
+        )
+    }
 }
 
 public struct ParsedQuery: Equatable, Sendable {
