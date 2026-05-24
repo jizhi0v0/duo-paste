@@ -59,40 +59,18 @@ final class HistoryStore {
     /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
     /// Server 的 `/search` 一期不识别 qualifier,client-side 过滤兜底
     var filtered: [Item] {
-        // `matches` 接 Array(顺序无关,语义就是 OR),从 Set 转 array 在几个 chip 量级
-        // 上 O(N) 无感开销
-        let qs = Array(activeQualifiers)
-
-        if query.isEmpty && qs.isEmpty {
-            return Self.foldAndSort(items)
+        // 实际 dispatch 逻辑住在 DuoPasteCore.HistoryFilterDispatch——纯函数,4 条分支
+        // 契约直接在 DuoPasteCoreTests 覆盖,改 dispatch 单测先 fail. 这里只做"把
+        // store 里 @Observable 字段转纯数据 + 调 dispatch"的胶水
+        let cache = lastServerSearch.map {
+            HistoryFilterDispatch.ServerSearchContext(q: $0.q, items: $0.items)
         }
-
-        if query.isEmpty {
-            return Self.foldAndSort(items.filter { QueryQualifier.matches($0, qualifiers: qs) })
-        }
-
-        if let r = lastServerSearch, r.q == query {
-            if qs.isEmpty { return r.items }
-            // server 已 fold + 已 sort(含 prefix24h boost),qualifier 是 client-side
-            // 过滤,**保留 server 顺序**不再 re-sort——iosListOrder 会丢 prefix boost,
-            // 让用户感觉勾 chip 后卡片顺序"突然变样"(回归测试 reviewer 提的 #2)
-            return r.items.filter { QueryQualifier.matches($0, qualifiers: qs) }
-        }
-
-        let q = query.lowercased()
-        let contained = items.filter { item in
-            (item.preview?.lowercased().contains(q) ?? false)
-                || (item.textFull?.lowercased().contains(q) ?? false)
-                || (item.extractedText?.lowercased().contains(q) ?? false)
-        }
-        let qFiltered = qs.isEmpty ? contained : contained.filter { QueryQualifier.matches($0, qualifiers: qs) }
-        return Self.foldAndSort(qFiltered)
-    }
-
-    /// fold + iOS list 排序契约一体应用。fold 走 DuoPasteCore 单点契约,sort 本地化
-    /// (Mac 跟 iOS 排序契约不同——见 `filtered` 文档)
-    private static func foldAndSort(_ list: [Item]) -> [Item] {
-        Item.foldByTextFull(list).sorted(by: iosListOrder)
+        return HistoryFilterDispatch.dispatch(
+            items: items,
+            query: query,
+            lastServerSearch: cache,
+            qualifiers: Array(activeQualifiers)
+        )
     }
 
     /// coordinator 拉完 /search 把结果灌进来。**只在 `q` 仍匹配当前 store.query 时**
@@ -208,10 +186,11 @@ final class HistoryStore {
     }
 
     /// iOS 列表排序契约 — pinned DESC,captured_at_ns DESC。`filtered` 文档详述跟 Mac
-    /// 排序契约的差异(Mac 多 prefix24h boost)。单点定义避免三处 sort 闭包重复 + 漂移
+    /// 排序契约的差异(Mac 多 prefix24h boost)。**单点契约住在 `HistoryFilterDispatch.iosListOrder`**
+    /// 这里转一层让 HistoryStore 内部 merge / bumpToFront / togglePinOptimistic 调用点
+    /// 不必直接拼 module 前缀,API surface 稳定
     nonisolated static func iosListOrder(_ a: Item, _ b: Item) -> Bool {
-        if a.pinned != b.pinned { return a.pinned && !b.pinned }
-        return a.capturedAtNs > b.capturedAtNs
+        HistoryFilterDispatch.iosListOrder(a, b)
     }
 
     /// 用户长按"删除"路径——本机乐观立即移除,server 端 DELETE /item/<id> 在 coordinator
