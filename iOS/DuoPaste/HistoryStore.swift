@@ -13,11 +13,17 @@ final class HistoryStore {
     /// 搜索框文本。空 → 全列表;非空 → 优先用 server 端 FTS5 结果,失败 fallback 本机 contains。
     var query: String = ""
 
-    /// 已激活的 slash qualifier —— 由 `HistoryView.filterChipRow` 渲染(Mail 风格独立
-    /// chip 行,不走 `.searchable(tokens:)`),跟 query 双轨并存:filter 走两者交集
-    /// (qualifier OR 内 + text contains AND)。内存态,不持久化——重启回零;qualifier 是
-    /// 探索性筛选不是用户长期 preference
-    var activeQualifiers: [QueryQualifier] = []
+    /// 已激活的 slash qualifier —— `HistoryView.filterChipRow` 直接读写本字段(Mail 风格
+    /// 独立 chip 行,不走 `.searchable(tokens:)`),跟 query 双轨并存:filter 走两者交集
+    /// (qualifier OR 内 + text contains AND)。
+    ///
+    /// **单一真相源**——之前 View 有一份 `@State Set`,store 有一份 `[QueryQualifier]`,
+    /// 通过 onChange 单向同步。坑:`HistoryStore.reset()` 清 store 端,View @State 不会
+    /// 收到通知,chip 高亮还在但 filter 已不生效(数据/UI 失配)。改成 Set 直接住在 store,
+    /// View 通过 @Observable 路径绑定,reset 自然让 View 重渲。
+    ///
+    /// 内存态,不持久化——重启回零;qualifier 是探索性筛选不是用户长期 preference
+    var activeQualifiers: Set<QueryQualifier> = []
 
     /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
     /// 跟 Mac UI 口径一致。query 切换 / coordinator 失败时清掉走 fallback。
@@ -47,7 +53,9 @@ final class HistoryStore {
     /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
     /// Server 的 `/search` 一期不识别 qualifier,client-side 过滤兜底
     var filtered: [Item] {
-        let qs = activeQualifiers
+        // `matches` 接 Array(顺序无关,语义就是 OR),从 Set 转 array 在几个 chip 量级
+        // 上 O(N) 无感开销
+        let qs = Array(activeQualifiers)
 
         if query.isEmpty && qs.isEmpty {
             return Self.foldAndSort(items)

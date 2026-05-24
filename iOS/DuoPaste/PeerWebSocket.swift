@@ -171,7 +171,11 @@ final class PeerWebSocket {
     /// **long-lived 路径(默认无参)主动退 grace 是有意的副作用**——连接成功跑过
     /// `longLivedThresholdSec` 说明 VPN tunnel 已 settle 完,grace cap 失去意义,
     /// 后续失败应该回到完整指数退避(从 1s 起,该爬到 300s 就爬)。改 long-lived 阈值
-    /// 时要意识到这条配套副作用,不要把"清 grace"理解成纯清理
+    /// 时要意识到这条配套副作用,不要把"清 grace"理解成纯清理。
+    ///
+    /// **未来 tuning 提示**:若实地观察到 long-lived close 后 30-60s 内 reconnect 抖动
+    /// 又陷入指数退避黑洞(VPN 跨边界 settle 反复),考虑把 long-lived 路径改成只清
+    /// failures 不清 grace——保留 grace cap 给"已稳定过但再次抖动"的二次保护窗口
     private func resetFailures(graceUntil: Date? = nil) {
         failures = 0
         failuresGraceUntil = graceUntil

@@ -7,14 +7,13 @@ struct HistoryView: View {
     /// 搜索框 plain text —— 纯内容搜索,不再解析 `/xxx`(iOS 上下拉 Menu 多选 +
     /// chip 行的入口比 slash 顺手,见 filterMenu)
     @State private var searchText: String = ""
-    /// 已激活的过滤 qualifier —— filterChipRow tap 写,store filter 读。
-    /// Set 让多选 dedup 自然,顺序无关
-    @State private var activeQualifiers: Set<QueryQualifier> = []
     /// 单 debounce 管 store.query 本机更新 + server search。150ms / 250ms 两段
     @State private var storeUpdateTask: Task<Void, Never>?
 
     var body: some View {
-        // **per-render cache**:filtered 只读一次(computed property 多读会再跑 O(items))
+        // **per-body-call cache**:filtered 只读一次,避免**同一次 body 调用**内多次读
+        // computed property 重跑 O(items) filter+fold(并非"render 级 cache"——SwiftUI
+        // 每次 body 调用都会重算)
         let filteredItems = store.filtered
 
         return NavigationStack {
@@ -40,11 +39,6 @@ struct HistoryView: View {
             .navigationTitle("DuoPaste")
             .onChange(of: searchText) { _, _ in
                 scheduleStoreUpdate()
-            }
-            .onChange(of: activeQualifiers) { _, new in
-                // qualifiers 变低频,直接同步 store 不走 debounce(避免用户感觉"勾了
-                // 还没生效")
-                store.activeQualifiers = Array(new)
             }
             .toolbar { fullToolbar }
             .toolbarBackground(.visible, for: .navigationBar)
@@ -112,12 +106,15 @@ struct HistoryView: View {
 
     @ViewBuilder
     private func filterChip(_ item: (label: String, qualifier: QueryQualifier)) -> some View {
-        let isSelected = activeQualifiers.contains(item.qualifier)
+        // store.activeQualifiers 直接 mutate ——@Observable Set 让 chip 高亮 + filter 重算
+        // 跟数据状态永远一致(P1 fix:之前 View @State Set 跟 store [QueryQualifier] 两份
+        // 真相源 onChange 单向同步,store.reset() 时 View 不会清,chip 仍高亮 filter 已失效)
+        let isSelected = store.activeQualifiers.contains(item.qualifier)
         Button {
             if isSelected {
-                activeQualifiers.remove(item.qualifier)
+                store.activeQualifiers.remove(item.qualifier)
             } else {
-                activeQualifiers.insert(item.qualifier)
+                store.activeQualifiers.insert(item.qualifier)
             }
         } label: {
             HStack(spacing: 4) {
@@ -208,8 +205,8 @@ struct HistoryView: View {
         .accessibilityValue(coordinator.isPulling ? "正在刷新" : (canPull ? "" : "未配对,无法刷新"))
     }
 
-    /// 接外部传 items —— body 已经 per-render cache 了 `store.filtered`,这里不再重读
-    /// (computed property 重读会再跑一遍 O(items) filter,卡顿源)
+    /// 接外部传 items —— body 已经在 per-body-call cache 里读过 `store.filtered`,这里
+    /// 不再重读(computed property 重读会再跑一遍 O(items) filter,卡顿源)
     private func listScrollWithItems(_ items: [Item]) -> some View {
         ScrollView {
             LazyVGrid(
@@ -331,30 +328,10 @@ struct HistoryView: View {
     }
 }
 
-/// slash qualifier 的 SF Symbol + 中文标签映射。chip 行 + (未来)补全 suggestion
-/// row 共用——靠 Label(text, systemImage) 系统自动布局图标在前文字在后,跟 Mail/Files
-/// 等系统 app chip 视觉一致。
-///
-/// 标签策略:用 QueryParser canonical alias 显示 `/pdf` / `/image` 等——让用户看 chip
-/// 就知道在搜索栏可以输什么字符复现这个 filter,降低 slash 命令的学习门槛
+/// slash qualifier 的 SF Symbol 映射,chip 行用。chip 文字 label 走硬编码中文 tuple
+/// (`kindFilters` / `subKindFilters`) 不走这里——`QualifierUI` 只负责 icon。
+/// 未来若补 slash 补全 suggestion row,可在此加 `label(_:)` 返回 `/pdf` 风格 alias
 enum QualifierUI {
-    static func label(_ q: QueryQualifier) -> String {
-        switch q {
-        case .kind(.text):  return "/text"
-        case .kind(.url):   return "/url"
-        case .kind(.file):  return "/file"
-        case .kind(.rtf):   return "/rtf"
-        case .kind(.html):  return "/html"
-        case .kind(.image): return "/image"
-        case .imageMerged:  return "/image"
-        case .fileSubKind(.pdf):       return "/pdf"
-        case .fileSubKind(.video):     return "/video"
-        case .fileSubKind(.audio):     return "/audio"
-        case .fileSubKind(.imageFile): return "/imagefile"
-        case .textSuffix(let s):       return "/" + s.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        }
-    }
-
     static func icon(_ q: QueryQualifier) -> String {
         switch q {
         case .kind(.text):  return "text.alignleft"

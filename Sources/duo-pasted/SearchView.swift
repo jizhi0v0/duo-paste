@@ -424,9 +424,13 @@ private struct PanelBackgroundModifier: ViewModifier {
 
 struct SearchView: View {
     /// cardScroller + emptyView 共用的列表区高度。两者**必须**一致——empty ↔ non-empty
-    /// 切换时面板不抖。254 = 卡片 236 + top 12 + bottom 6 余量;改这个值要同步调整两边
-    /// `.padding(.bottom)`。回归参考:`SearchView.cardScroller` / `SearchView.emptyView`
+    /// 切换时面板不抖。254 = 卡片 236 + top 12 + bottom 6 余量。回归参考:
+    /// `SearchView.cardScroller` / `SearchView.emptyView`
     private static let cardScrollerHeight: CGFloat = 254
+
+    /// cardScroller / emptyView 共用的底部 padding。跟 `cardScrollerHeight` 配套——
+    /// 改一处必须同改另一处,提常量避免漏改
+    private static let cardScrollerBottomPadding: CGFloat = 16
 
     @Bindable var state: AppState
     /// Enter / 双击触发的 paste 回调。双击行传 `[item]` 单条;Enter 由 SearchPanelController
@@ -1180,7 +1184,7 @@ struct SearchView: View {
             // emptyView 共用避免改一处忘改另一处再抖
             .frame(height: Self.cardScrollerHeight)
             .padding(.horizontal, 22)
-            .padding(.bottom, 16)
+            .padding(.bottom, Self.cardScrollerBottomPadding)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
                     // anchor=nil → SwiftUI "scrolls the view minimally to make it visible"——
@@ -1557,7 +1561,7 @@ struct SearchView: View {
         // 增加"。固定到跟 cardScroller 同尺寸让 empty ↔ non-empty 切换不抖动
         .frame(maxWidth: .infinity)
         .frame(height: Self.cardScrollerHeight)
-        .padding(.bottom, 16)
+        .padding(.bottom, Self.cardScrollerBottomPadding)
     }
 
     // 旧 list(LazyVStack 垂直列表)已被 cardScroller(LazyHStack 横向卡片)替代,见 body 调用
