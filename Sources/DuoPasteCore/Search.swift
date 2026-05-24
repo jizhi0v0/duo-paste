@@ -7,6 +7,11 @@ import GRDB
 /// 直接对应 JSON 顶层(handler 走 itemToJSON 把 Item dict 跟 snippet 并平铺)
 public struct SearchPageWire: Decodable, Sendable {
     public let ok: Bool
+    /// **qualifier-filtered + fold 后的总数**(issue #41 之后语义校准):server 端走
+    /// `searchHitsAndCount` 单次 fold-aware pass,先 FTS5 命中 → 跨 origin fold → 按
+    /// `kinds` / `file_sub_kinds` / `text_suffixes` qualifier filter,然后 limit/offset 切页。
+    /// `count` 是 **filter 之后、limit 之前** 的真实总数,跟 `items.count` 关系:
+    /// `items.count = min(count, limit)`。UI 显"共 N 条"直接用本字段,跟 Mac chip 总数对齐
     public let count: Int
     public let items: [SearchHitWire]
 

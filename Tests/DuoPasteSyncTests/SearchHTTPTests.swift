@@ -408,6 +408,76 @@ struct SearchHTTPTests {
         #expect((body["items"] as? [[String: Any]])?.first?["id"] as? String == "a")
     }
 
+    @Test func searchWithImageMergedQualifierMatchesImageFiles() async throws {
+        // **回归 review #48 Critical 1**:iOS QueryQualifier.encodeToWire([.imageMerged])
+        // 产出 `kinds="image"` + `fileSubKinds="imageFile"`,server 端 parseFileSubKind
+        // 必须大小写不敏感解出 `.imageFile`,否则 Finder 复制的图片文件被丢(issue #41
+        // "勾图片 chip 看空集"在 imageFile 路径再现)。
+        //
+        // 之前 lowerCamelize 实现 `"imageFile".lowercased() → "imagefile"` 然后没分隔符
+        // 不拆 → `FileSubKind(rawValue: "imagefile") == nil` → 静默丢
+        var items: [Item] = []
+        // 原生 image kind (剪贴板截图)
+        var nativeImage = textItem(id: "img-1", origin: "mac-1", text: "screenshot", capturedAtNs: 100)
+        nativeImage.kind = .image
+        nativeImage.blobSha256 = "a".repeated(64)
+        nativeImage.blobMime = "image/png"
+        items.append(nativeImage)
+        // Finder 复制 png file —— kind=.file + blobMime=image/png → SearchAPI 算 imageFile sub-kind
+        items.append(fileItem(id: "imgfile-1", textFull: "/Users/bob/photo.png", blobMime: "image/png", capturedAtNs: 200))
+        // 干扰项:非图片 file
+        items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/doc.pdf", blobMime: "application/pdf", capturedAtNs: 300))
+
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        // 走 iOS 真路径:encodeToWire([.imageMerged]) → 拿到 wire 串直接打 server
+        let wire = QueryQualifier.encodeToWire([.imageMerged])
+        #expect(wire.kinds == "image", "encodeToWire contract changed?")
+        #expect(wire.fileSubKinds == "imageFile", "encodeToWire contract changed?")
+
+        let (status, body) = try await getSearch(
+            baseURL: base, auth: auth, q: nil,
+            kinds: wire.kinds, fileSubKinds: wire.fileSubKinds
+        )
+        #expect(status == 200)
+        // image kind OR imageFile sub-kind → 2 条命中(native image + png file),pdf 排除
+        #expect(body["count"] as? Int == 2)
+        let arr = body["items"] as? [[String: Any]] ?? []
+        let ids = Set(arr.compactMap { $0["id"] as? String })
+        #expect(ids == ["img-1", "imgfile-1"])
+    }
+
+    @Test func searchFileSubKindWireAcceptsCaseVariants() async throws {
+        // 二次防御:server 端 parseFileSubKind 大小写 + 分隔符不敏感。
+        // 老 client / curl 手填 `IMAGEFILE` / `image_file` / `image-file` 都该等价
+        var items: [Item] = []
+        items.append(fileItem(id: "imgfile-1", textFull: "/Users/bob/p.png", blobMime: "image/png", capturedAtNs: 100))
+        items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/d.pdf", blobMime: "application/pdf", capturedAtNs: 200))
+        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
+        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
+                                host: "127.0.0.1", port: port, auth: auth)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        let base = URL(string: "http://127.0.0.1:\(port)")!
+        #expect(await waitReadySearch(baseURL: base, auth: auth))
+
+        for variant in ["imageFile", "imagefile", "IMAGEFILE", "image_file", "image-file"] {
+            let (status, body) = try await getSearch(
+                baseURL: base, auth: auth, q: nil, fileSubKinds: variant
+            )
+            #expect(status == 200, "variant \(variant) status")
+            #expect(body["count"] as? Int == 1, "variant \(variant) count")
+            #expect((body["items"] as? [[String: Any]])?.first?["id"] as? String == "imgfile-1",
+                    "variant \(variant) hit")
+        }
+    }
+
     @Test func searchClampsLimitToReasonableMax() async throws {
         // limit=99999 → server clamp 到 500;不应该崩 / 不应该返回 99999 条
         let items = (1...10).map { i in

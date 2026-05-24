@@ -180,6 +180,7 @@ struct HistoryFilterDispatchTests {
         let serverSecond = makeText(id: "ns-new", origin: "self", capturedAtNs: 999, text: "world hello")
         let cache = HistoryFilterDispatch.ServerSearchContext(
             q: "hello",
+            qualifiers: [],
             items: [serverFirst, serverSecond]
         )
         // items 列表故意跟 cache 不一样——证明走 cache 路径而非本地
@@ -204,6 +205,7 @@ struct HistoryFilterDispatchTests {
         let txt = makeText(id: "txt", origin: "self", capturedAtNs: 999, text: "just text containing query")
         let cache = HistoryFilterDispatch.ServerSearchContext(
             q: "query",
+            qualifiers: [.kind(.url)],  // server cache 时 chip 集合 = 当前请求 qualifier
             items: [urlA, urlB, txt]  // server 顺序:urlA 前,urlB 中,txt 后
         )
 
@@ -218,11 +220,42 @@ struct HistoryFilterDispatchTests {
         #expect(out[1].id == "urlB")
     }
 
+    @Test("Branch 3: cache.q == query 但 qualifier 集合不一致 → cache 视为 stale,走 contains fallback")
+    func branch3_qualifierMismatchFallsThroughToBranch4() {
+        // **review #48 Minor 1 回归**:用户取消 chip → activeQualifiers 收缩,debounce 250ms
+        // 期间若仅按 `q` 命中 cache,会拿 server-收窄过 items 再 client-side filter(更宽的
+        // qualifier),双重过滤导致显示比"应该出现"少 → UI 闪烁。strict 比 qualifier 集合
+        // 让 cache 视为 stale 直接走 contains fallback,避免闪烁。
+        // 两条 item 都 contains "query"——url 的 textFull 含 query 子串,text 也含。
+        // qualifier=[url] cache 时 server 只返 urlA(已收窄);取消 chip 后 contains 命中两条
+        let urlA = Item(id: "urlA", originDevice: "self", capturedAtNs: 100, kind: .url,
+                        preview: "https://example.com/query", textFull: "https://example.com/query")
+        let txt = makeText(id: "txt", origin: "self", capturedAtNs: 200, text: "containing query word")
+        // cache 是 user 上一轮带 .kind(.url) chip 拉到的(server 已收窄到 url),items 只有 urlA
+        let cache = HistoryFilterDispatch.ServerSearchContext(
+            q: "query",
+            qualifiers: [.kind(.url)],
+            items: [urlA]
+        )
+        // 当前 activeQualifiers 已清空(用户刚取消 chip)→ qualifier 不一致 → cache stale
+        let out = HistoryFilterDispatch.dispatch(
+            items: [urlA, txt],
+            query: "query",
+            lastServerSearch: cache,
+            qualifiers: []  // empty —— 跟 cache.qualifiers 不一致
+        )
+        // 走 contains fallback —— urlA + txt 都命中 "query"
+        // (而不是命中 cache 路径只返 urlA,后者会让 chip 取消后还显示 url-only)
+        #expect(out.count == 2)
+        let ids = Set(out.map(\.id))
+        #expect(ids == ["urlA", "txt"], "qualifier mismatch should bypass cache and use contains fallback")
+    }
+
     @Test("Branch 3: cache.q != query → 不命中,走 contains fallback(Branch 4)")
     func branch3_staleCacheFallsThroughToBranch4() {
         // cache 里装的是旧 query 的结果, 当前 query 已改 → 走本地 contains fallback
         let staleItem = makeText(id: "stale", origin: "self", capturedAtNs: 999, text: "old result")
-        let cache = HistoryFilterDispatch.ServerSearchContext(q: "old", items: [staleItem])
+        let cache = HistoryFilterDispatch.ServerSearchContext(q: "old", qualifiers: [], items: [staleItem])
         let local = makeText(id: "local", origin: "self", capturedAtNs: 100, text: "fresh new content")
 
         let out = HistoryFilterDispatch.dispatch(

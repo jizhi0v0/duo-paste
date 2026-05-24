@@ -675,7 +675,11 @@ final class PeerSyncCoordinator {
                 )
                 if Task.isCancelled { return }
                 let result = HistoryStore.ServerSearchResult(
-                    q: q, items: items, snippets: snippets, totalCount: total
+                    q: q,
+                    qualifiers: Set(qualifiers),
+                    items: items,
+                    snippets: snippets,
+                    totalCount: total
                 )
                 await MainActor.run { self.store.applyServerSearch(result) }
                 DebugLog.shared.append("search ok q=\(q) qs=\(qualifiers.count) hits=\(items.count) total=\(total)")

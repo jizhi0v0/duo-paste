@@ -681,7 +681,8 @@ public struct SyncServer: Sendable {
         // 走 SearchAPI.searchHits + count,跟 Mac UI 用同一份逻辑,跨设备 chip 总数对齐
         //
         // 响应:{ ok, count, items:[{...item fields..., snippet?}] }
-        // - count:fold 后 limit/offset 之前的真实总数(UI 显"共 N 条")
+        // - count:**qualifier filter + fold 之后、limit/offset 之前**的真实总数(issue #41
+        //   之后语义校准:不再是 FTS5 命中后 fold 之前的总数)。UI 显"共 N 条"跟 chip 总数对齐
         // - items.snippet:含 STX/ETX(0x02/0x03) 控制字符的高亮片段,iOS 端切片渲染加粗。
         //   query 为空(纯列表)时 snippet 不附,客户端按缺省处理
         router.get("/search") { request, _ -> Response in
@@ -732,7 +733,7 @@ public struct SyncServer: Sendable {
         let rawOffset = params["offset"].flatMap { Int($0) } ?? 0
         let offset = max(0, rawOffset)
         let kinds = parseCSV(params["kinds"]).compactMap { ItemKind(rawValue: $0.lowercased()) }
-        let fileSubKinds = parseCSV(params["file_sub_kinds"]).compactMap { FileSubKind(rawValue: lowerCamelize($0)) }
+        let fileSubKinds = parseCSV(params["file_sub_kinds"]).compactMap { parseFileSubKind($0) }
         // textSuffixes 保留前导 `.` —— SearchAPI 走 LIKE `%.java` 匹配末尾,client
         // 可发 `text_suffixes=.java,.py` 或 `text_suffixes=java,py`,后者补 `.` 让两边语义对齐
         let textSuffixes = parseCSV(params["text_suffixes"]).map { raw -> String in
@@ -757,18 +758,21 @@ public struct SyncServer: Sendable {
             .filter { !$0.isEmpty }
     }
 
-    /// `image_file` / `image-file` / `imagefile` → `imageFile` (FileSubKind rawValue 是 lowerCamel)。
-    /// SearchAPI 端 rawValue 表:`video` / `pdf` / `audio` / `imageFile`——前三是单词没问题,
-    /// 只 imageFile 需要拼一下让 wire 接 snake/kebab 写法
-    private static func lowerCamelize(_ s: String) -> String {
-        // 把 `_` / `-` 当 separator 拆,第一个 segment 保持小写,后面 segment 首字母大写
-        let parts = s.lowercased().split(whereSeparator: { $0 == "_" || $0 == "-" })
-        guard let first = parts.first else { return s }
-        let rest = parts.dropFirst().map { seg -> String in
-            guard let c = seg.first else { return String(seg) }
-            return c.uppercased() + seg.dropFirst()
-        }
-        return ([String(first)] + rest).joined()
+    /// 大小写不敏感 + 接 snake/kebab 写法解析 FileSubKind。
+    /// SearchAPI 端 rawValue 表:`video` / `pdf` / `audio` / `imageFile`——前三是单词,
+    /// 只 imageFile 是 lowerCamel,iOS `QueryQualifier.encodeToWire` 直接用 rawValue
+    /// 发 `imageFile` 进 wire。`FileSubKind(rawValue:)` 大小写敏感,直接喂进会丢 case。
+    ///
+    /// **修法**(review #48 Critical 1):扫 `FileSubKind.allCases` 大小写不敏感比对,
+    /// 同时接受 `imageFile` / `imagefile` / `IMAGEFILE` / `image_file` / `image-file`
+    /// 各种写法,iOS / curl / 老 client 都能命中。
+    private static func parseFileSubKind(_ s: String) -> FileSubKind? {
+        // 先把 `_` / `-` 当 separator 拆 + 拼,跟 rawValue 形态对齐(`image_file` → `imagefile`),
+        // 再大小写不敏感比 allCases.rawValue。直接全去分隔符比 lowercased 让 wire 写法尽量宽容
+        let canonical = s.lowercased()
+            .split(whereSeparator: { $0 == "_" || $0 == "-" })
+            .joined()
+        return FileSubKind.allCases.first { $0.rawValue.lowercased() == canonical }
     }
 
     /// 把 URL query 参数转成 SinceQuery。空 cursor_ns / 非法值 → 视作从头拉。
