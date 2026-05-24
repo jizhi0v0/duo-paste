@@ -168,17 +168,25 @@ struct HistoryView: View {
 
     /// 单 debounce 同管 store.query 本机更新 + server search。**不**在按键路径直接动 store,
     /// 那俩 mutate 会让 `HistoryStore.filtered` 重算(items × O(N)),每键卡顿。
-    /// 150ms 等用户停手再更新,250ms 打 server
+    /// 150ms 等用户停手再更新,250ms 打 server。
+    ///
+    /// **snapshot at Task creation**:`searchText` 一次性 capture 进 `snapshot` 常量,
+    /// 跨 await 路径都读它。防一个 race 边界:用户在 150ms 边界刚好敲完最后一键,
+    /// 新一轮 scheduleStoreUpdate cancel 这个 Task 时 Task 已过 `Task.isCancelled` 守门
+    /// 进了同步 `store.query = searchText` 路径——读裸 `searchText` 会拿到 cancel 那一刻
+    /// 的最新值,旧 + 新两个 Task 都写一次 store + 多调一次 clearServerSearch 让 UI 闪
+    /// fallback。snapshot 让旧 Task 永远用它出生那刻的值,语义干净
     private func scheduleStoreUpdate() {
         storeUpdateTask?.cancel()
+        let snapshot = searchText
         storeUpdateTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(150))
             if Task.isCancelled { return }
-            store.query = searchText
+            store.query = snapshot
             store.clearServerSearch()
             try? await Task.sleep(for: .milliseconds(100))
             if Task.isCancelled { return }
-            let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             coordinator.searchOnServer(q: trimmed)
         }
