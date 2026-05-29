@@ -387,14 +387,18 @@ public actor PasteboardWatcher {
 
         // 4) HTML
         if let html = pasteboard.string(forType: .html) {
-            // web view selection 降级：WebKit / Chromium 系（浏览器 + Electron + Codex /
-            // ChatGPT / Claude Desktop / DingTalk 等）写 HTML 时前面会塞
-            // <meta charset='utf-8'>（裸前缀或 <head> 包裹两种变体，DingTalk 走后者），
-            // 内容是带 inline style + data-* 属性的一坨 markup——对剪贴板管理器毫无用处。
-            // 此时如果 .string 也有非空 plain text，优先用 plain，丢 markup。
-            if looksLikeWebViewHTML(html),
-               let plain = pasteboard.string(forType: .string),
-               !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            // html 只是 plain 的样式封装时降级到 plain，丢 markup。两条判别 OR：
+            // (a) looksLikeWebViewHTML —— WebKit / Chromium 系（浏览器 + Electron + Codex /
+            //     ChatGPT / Claude Desktop / DingTalk 等）写 HTML 前面塞 <meta charset='utf-8'>
+            //     的前缀白名单，便宜先判。
+            // (b) htmlIsPlainTextWrapper —— 前缀白名单覆盖不到的来源（ghostty / kitty 等终端
+            //     把选区导成 <div style="monospace">…转义后字符…</div>，无 <meta> 前缀），
+            //     strip 标签 + 反转义 entity 后逐行等价于 plain 即降级。vim 里复制 HTML 源码
+            //     时 plain 本身就是源码 → 等价判等 → 降级，源码零丢失。
+            if let plain = pasteboard.string(forType: .string),
+               !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               looksLikeWebViewHTML(html)
+                || htmlIsPlainTextWrapper(html, plain: plain, maxBytes: maxRawRTFBytes)
             {
                 // 同 RTF 降级：浏览器/Electron 选中 URL 文本会同时写 HTML + .string，
                 // plain 落 .text 会让 chip "链接" 漏计；走同一份 looksLikeURL 判断
