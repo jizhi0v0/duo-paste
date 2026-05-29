@@ -209,3 +209,11 @@ private let bigCap = 512 * 1024
     let html = "<style>body{color:red}</style><p>hello</p>"
     #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
 }
+
+@Test func attributeWithAngleBracketKeepsHTML() {
+    // greedy <[^>]*> 在属性值含裸 > 时切到第一个 >，留下属性尾 junk（b">foo）→ 不等价 →
+    // 保留 html。锁住"属性值含 > 时仍 fail-safe 不误降级"的契约。
+    let plain = "foo"
+    let html = "<div title=\"a>b\">foo</div>"
+    #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
+}

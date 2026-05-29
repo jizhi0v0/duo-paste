@@ -74,6 +74,15 @@ public func htmlIsPlainTextWrapper(_ html: String, plain: String, maxBytes: Int)
 
 /// 去掉所有 `<…>` 标签。终端导出的 html 内容字符已 entity 转义（裸 `<` 不出现），
 /// 故贪婪去标签安全；残留 entity 交给 `decodeBasicHTMLEntities`。
+///
+/// 限制：greedy `<[^>]*>` 对**属性值含裸 `>`** 的标签（如 `<a data-x="a>b">`，浏览器/
+/// Electron 合法 html 可能出现）会切到第一个 `>` 留下属性尾部 junk。但这只让 strip 结果跟
+/// plain 不等价 → 走保留 html 分支，是 fail-safe 方向，不丢数据（回归测试
+/// `attributeWithAngleBracketKeepsHTML`）。
+///
+/// 这里用 `.regularExpression` 不跟 `normalizeForPlainCompare` 的"不走正则"自相矛盾：本函数
+/// 是**整段单次** regex 调用（编译一次），跟 normalize 那种每行可能重跑的代价模型不同，叠加
+/// 512KB 字节守门兜底，单次编译开销可接受。
 func stripHTMLTags(_ html: String) -> String {
     html.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
 }
@@ -139,6 +148,10 @@ private func decodeEntityBody(_ body: Substring) -> Character? {
 /// worst-case（用户 `less` 大日志）可达 6.5k 行 × 2 路，正则编译开销会让 @MainActor 200ms
 /// tick 出现秒级纯 CPU 阻塞。手工去尾是 O(n) 无编译开销（对齐 RTF 路径不在 main actor 裸跑
 /// 重活的原则）。
+///
+/// 已知不归一 `\r`：只按 `\n` 分行、只去尾部 space/tab，CRLF 来源的行末残留 `\r` 会跟 LF
+/// 形态的 plain 不等价 → 保留 html。macOS terminal 实测全 LF 不触发，且方向 fail-safe，
+/// 跟 `<br>` / `<style>` 等 known-non-downgrade 形态并列。
 func normalizeForPlainCompare(_ s: String) -> String {
     var lines: [String] = []
     for line in s.split(separator: "\n", omittingEmptySubsequences: false) {
