@@ -194,3 +194,18 @@ private let bigCap = 512 * 1024
     let html = "<div>&#x110000;</div>"
     #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
 }
+
+@Test func brTagPreservedNotDowngraded() {
+    // <br> 在 stripHTMLTags 里被整个删掉、不补 \n，strip 后两行粘连，跟 plain 真实换行
+    // 不等价 → 不降级。锁住 docstring 契约：防后人加 "<br>→\n 优化" 把降级面变激进。
+    let plain = "line one\nline two"
+    let html = "<div>line one<br>line two</div>"
+    #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
+}
+
+@Test func styleTagBodyKeepsHTMLFromDowngrading() {
+    // <style> 标签被 strip 掉但 CSS body 留下来，跟 plain 不等价 → 保留 html（fail-safe）。
+    let plain = "hello"
+    let html = "<style>body{color:red}</style><p>hello</p>"
+    #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
+}

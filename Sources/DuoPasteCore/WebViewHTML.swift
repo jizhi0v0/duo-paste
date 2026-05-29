@@ -133,13 +133,18 @@ private func decodeEntityBody(_ body: Substring) -> Character? {
 
 /// 等价比较的归一化：nbsp 归普通空格 + 去每行尾随空白 + 整体 trim。终端 GPU 渲染常把
 /// 网格行右 padding 到终端宽度，行尾空白不携带语义，归一掉避免假"不等价"。
+///
+/// 去尾用手工反向扫描而非 `[ \t]+$` 正则——Foundation 正则无 pattern cache，每次调用重新
+/// 编译（单次 ~100μs），而本函数一次判别要在 stripped + plain 上各跑一遍、每行一次。512KB
+/// worst-case（用户 `less` 大日志）可达 6.5k 行 × 2 路，正则编译开销会让 @MainActor 200ms
+/// tick 出现秒级纯 CPU 阻塞。手工去尾是 O(n) 无编译开销（对齐 RTF 路径不在 main actor 裸跑
+/// 重活的原则）。
 func normalizeForPlainCompare(_ s: String) -> String {
-    s.split(separator: "\n", omittingEmptySubsequences: false)
-        .map { line in
-            String(line)
-                .replacingOccurrences(of: "\u{00A0}", with: " ")
-                .replacingOccurrences(of: "[ \\t]+$", with: "", options: .regularExpression)
-        }
-        .joined(separator: "\n")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    var lines: [String] = []
+    for line in s.split(separator: "\n", omittingEmptySubsequences: false) {
+        var t = line.replacingOccurrences(of: "\u{00A0}", with: " ")
+        while let last = t.last, last == " " || last == "\t" { t.removeLast() }
+        lines.append(t)
+    }
+    return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
 }
