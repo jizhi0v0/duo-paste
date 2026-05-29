@@ -58,8 +58,11 @@ public func looksLikeWebViewHTML(_ html: String) -> Bool {
 /// 反转义 → `<div>foo</div>` == plain → 判等价 → 降级，源码完整保留在 plain（零丢失）。
 /// 反之富文本（带 href / 结构）strip 后 ≠ plain → 返回 false，保留 html。
 ///
-/// `maxBytes` 守门：strip + 反转义跑在 @MainActor 200ms 轮询路径上，超限直接返回 false
-/// 让调用方保留 html，不让大 payload 拖垮轮询（对齐 RTF 路径的 maxRawRTFBytes）。
+/// `maxBytes` 守门：strip + 反转义跑在 capture actor 的 200ms 轮询 tick 上（`PasteboardWatcher`
+/// 是 `public actor`，单一 isolation context，tick 阻塞同样有害），超限直接返回 false 让调用方
+/// 保留 html，不让大 payload 拖垮轮询（对齐 RTF 路径的 maxRawRTFBytes）。**html 和 plain 都守门**
+/// ——pasteboard 两个 flavor 相互独立，某 app 可能写小 html + 巨大 plain（IDE 复制整份 log），
+/// 只 guard html 会让 `normalizeForPlainCompare(plain)` 仍全量跑一遍。
 ///
 /// fail-safe 方向：strip + 反转义后只要跟 plain 不逐行等价就返回 false 保留 html——宁可
 /// 漏判（该降的没降）也绝不误降级丢语义。已知会落到"保留 html"分支的形态：`<br>` 换行
@@ -67,7 +70,7 @@ public func looksLikeWebViewHTML(_ html: String) -> Bool {
 /// `<style>` / HTML 注释（strip 后多出 CSS / 注释体）、含 href / 图片 / 表格等额外结构的
 /// 真富文本。ghostty / kitty 实测用真实 `\n` 不走 `<br>`，故不受影响。
 public func htmlIsPlainTextWrapper(_ html: String, plain: String, maxBytes: Int) -> Bool {
-    guard html.utf8.count <= maxBytes else { return false }
+    guard html.utf8.count <= maxBytes, plain.utf8.count <= maxBytes else { return false }
     let stripped = decodeBasicHTMLEntities(stripHTMLTags(html))
     return normalizeForPlainCompare(stripped) == normalizeForPlainCompare(plain)
 }
@@ -145,9 +148,9 @@ private func decodeEntityBody(_ body: Substring) -> Character? {
 ///
 /// 去尾用手工反向扫描而非 `[ \t]+$` 正则——Foundation 正则无 pattern cache，每次调用重新
 /// 编译（单次 ~100μs），而本函数一次判别要在 stripped + plain 上各跑一遍、每行一次。512KB
-/// worst-case（用户 `less` 大日志）可达 6.5k 行 × 2 路，正则编译开销会让 @MainActor 200ms
-/// tick 出现秒级纯 CPU 阻塞。手工去尾是 O(n) 无编译开销（对齐 RTF 路径不在 main actor 裸跑
-/// 重活的原则）。
+/// worst-case（用户 `less` 大日志）可达 6.5k 行 × 2 路，正则编译开销会让 capture actor 的
+/// 200ms tick 出现秒级纯 CPU 阻塞。手工去尾是 O(n) 无编译开销（对齐 RTF 路径不在隔离 context
+/// 上裸跑重活的原则）。
 ///
 /// 已知不归一 `\r`：只按 `\n` 分行、只去尾部 space/tab，CRLF 来源的行末残留 `\r` 会跟 LF
 /// 形态的 plain 不等价 → 保留 html。macOS terminal 实测全 LF 不触发，且方向 fail-safe，

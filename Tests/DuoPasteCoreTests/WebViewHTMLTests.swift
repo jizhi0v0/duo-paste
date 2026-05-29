@@ -210,6 +210,14 @@ private let bigCap = 512 * 1024
     #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
 }
 
+@Test func oversizedPlainBypassesWrapperCheck() {
+    // 对称守门：plain 超 maxBytes 也跳过(即便 html 在限内)。pasteboard 两 flavor 独立,
+    // 小 html + 巨大 plain 不该让 normalize 全量跑 plain。
+    let smallHTML = "<div>x</div>"
+    let bigPlain = String(repeating: "a", count: 2000)
+    #expect(!htmlIsPlainTextWrapper(smallHTML, plain: bigPlain, maxBytes: 1024))
+}
+
 @Test func attributeWithAngleBracketKeepsHTML() {
     // greedy <[^>]*> 在属性值含裸 > 时切到第一个 >，留下属性尾 junk（b">foo）→ 不等价 →
     // 保留 html。锁住"属性值含 > 时仍 fail-safe 不误降级"的契约。
