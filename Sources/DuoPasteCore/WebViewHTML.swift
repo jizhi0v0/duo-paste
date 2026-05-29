@@ -42,3 +42,98 @@ public func looksLikeWebViewHTML(_ html: String) -> Bool {
     }
     return false
 }
+
+/// 判别一段 HTML payload 是否"只是 plain text 的样式封装"——即 strip 标签 + 反转义
+/// entity 后逐行等价于 pasteboard 的 `.string`，不携带 plain 没有的语义（链接 href /
+/// 图片 / 表格结构）。命中 → PasteboardWatcher 降级到 plain 入库。
+///
+/// `looksLikeWebViewHTML` 的前缀白名单是按"已知 app 长什么样"匹配，覆盖不到终端这类
+/// 不写 `<meta charset>` 前缀的来源（ghostty / kitty 把选区导成
+/// `<div style="font-family: monospace; white-space: pre;">…</div>`，内容里
+/// `< > & " '` 全部转义成 `&lt; &gt; &amp; &quot; &#39;`）。本函数换一个维度：不看
+/// html 长什么样，看它 strip 后还剩不剩 plain 没有的信息。
+///
+/// 关键反例 · 在 vim/less 里复制 **HTML 源码文本** `<div>foo</div>`：plain 就是该源码，
+/// 终端写的 html 是 `<div style="…">&lt;div&gt;foo&lt;/div&gt;</div>`，strip 外层标签 +
+/// 反转义 → `<div>foo</div>` == plain → 判等价 → 降级，源码完整保留在 plain（零丢失）。
+/// 反之富文本（带 href / 结构）strip 后 ≠ plain → 返回 false，保留 html。
+///
+/// `maxBytes` 守门：strip + 反转义跑在 @MainActor 200ms 轮询路径上，超限直接返回 false
+/// 让调用方保留 html，不让大 payload 拖垮轮询（对齐 RTF 路径的 maxRawRTFBytes）。
+public func htmlIsPlainTextWrapper(_ html: String, plain: String, maxBytes: Int) -> Bool {
+    guard html.utf8.count <= maxBytes else { return false }
+    let stripped = decodeBasicHTMLEntities(stripHTMLTags(html))
+    return normalizeForPlainCompare(stripped) == normalizeForPlainCompare(plain)
+}
+
+/// 去掉所有 `<…>` 标签。终端导出的 html 内容字符已 entity 转义（裸 `<` 不出现），
+/// 故贪婪去标签安全；残留 entity 交给 `decodeBasicHTMLEntities`。
+func stripHTMLTags(_ html: String) -> String {
+    html.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+}
+
+/// 一次遍历反转义常见 HTML entity（具名 lt/gt/amp/quot/apos/nbsp + 十进制 `&#NN;` +
+/// 十六进制 `&#xNN;`）。整体扫描而非逐 entity replace，`&amp;` 不会被二次解码。
+/// 每个 `&` 只向后看 ≤10 字符找 `;`，保证 O(n)，不退化成 O(n²)。
+func decodeBasicHTMLEntities(_ s: String) -> String {
+    guard s.contains("&") else { return s }
+    var out = ""
+    out.reserveCapacity(s.count)
+    var i = s.startIndex
+    while i < s.endIndex {
+        let c = s[i]
+        if c == "&" {
+            var j = s.index(after: i)
+            var steps = 0
+            var semi: String.Index? = nil
+            while j < s.endIndex, steps < 10 {
+                if s[j] == ";" { semi = j; break }
+                j = s.index(after: j)
+                steps += 1
+            }
+            if let semi, let decoded = decodeEntityBody(s[s.index(after: i)..<semi]) {
+                out.append(decoded)
+                i = s.index(after: semi)
+                continue
+            }
+        }
+        out.append(c)
+        i = s.index(after: i)
+    }
+    return out
+}
+
+/// 解析 `&` 与 `;` 之间的 entity body（不含两端符号）。无法识别返回 nil（保留原样）。
+private func decodeEntityBody(_ body: Substring) -> Character? {
+    switch body {
+    case "lt": return "<"
+    case "gt": return ">"
+    case "amp": return "&"
+    case "quot": return "\""
+    case "apos": return "'"
+    case "nbsp": return "\u{00A0}"
+    default: break
+    }
+    guard body.hasPrefix("#") else { return nil }
+    let num = body.dropFirst()
+    if num.first == "x" || num.first == "X" {
+        guard let code = UInt32(num.dropFirst(), radix: 16),
+              let scalar = Unicode.Scalar(code) else { return nil }
+        return Character(scalar)
+    }
+    guard let code = UInt32(num), let scalar = Unicode.Scalar(code) else { return nil }
+    return Character(scalar)
+}
+
+/// 等价比较的归一化：nbsp 归普通空格 + 去每行尾随空白 + 整体 trim。终端 GPU 渲染常把
+/// 网格行右 padding 到终端宽度，行尾空白不携带语义，归一掉避免假"不等价"。
+func normalizeForPlainCompare(_ s: String) -> String {
+    s.split(separator: "\n", omittingEmptySubsequences: false)
+        .map { line in
+            String(line)
+                .replacingOccurrences(of: "\u{00A0}", with: " ")
+                .replacingOccurrences(of: "[ \\t]+$", with: "", options: .regularExpression)
+        }
+        .joined(separator: "\n")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
