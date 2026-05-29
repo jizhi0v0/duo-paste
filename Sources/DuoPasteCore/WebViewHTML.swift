@@ -60,6 +60,12 @@ public func looksLikeWebViewHTML(_ html: String) -> Bool {
 ///
 /// `maxBytes` 守门：strip + 反转义跑在 @MainActor 200ms 轮询路径上，超限直接返回 false
 /// 让调用方保留 html，不让大 payload 拖垮轮询（对齐 RTF 路径的 maxRawRTFBytes）。
+///
+/// fail-safe 方向：strip + 反转义后只要跟 plain 不逐行等价就返回 false 保留 html——宁可
+/// 漏判（该降的没降）也绝不误降级丢语义。已知会落到"保留 html"分支的形态：`<br>` 换行
+/// （`stripHTMLTags` 把 `<br>` 整个删掉、行间不补 `\n`，跟 plain 的真实 `\n` 不等）、
+/// `<style>` / HTML 注释（strip 后多出 CSS / 注释体）、含 href / 图片 / 表格等额外结构的
+/// 真富文本。ghostty / kitty 实测用真实 `\n` 不走 `<br>`，故不受影响。
 public func htmlIsPlainTextWrapper(_ html: String, plain: String, maxBytes: Int) -> Bool {
     guard html.utf8.count <= maxBytes else { return false }
     let stripped = decodeBasicHTMLEntities(stripHTMLTags(html))

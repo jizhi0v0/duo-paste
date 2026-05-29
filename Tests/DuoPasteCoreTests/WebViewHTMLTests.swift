@@ -174,3 +174,23 @@ private let bigCap = 512 * 1024
     let html = "<div>&amp;lt;</div>"
     #expect(htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
 }
+
+@Test func nestedTagsWithEntitiesStripAndDecode() {
+    // 嵌套标签 + entity 混合：stripHTMLTags 去掉所有层级标签，decode 还原 entity。
+    let plain = "<a href=\"x\">"
+    let html = "<div><span>&lt;a href=&quot;x&quot;&gt;</span></div>"
+    #expect(htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
+}
+
+@Test func emptyHTMLWithNonEmptyPlainIsNotAWrapper() {
+    // 空 html strip 后为空，跟非空 plain 不等 → 不降级（fail-safe，守住边界不误降级）。
+    #expect(!htmlIsPlainTextWrapper("", plain: "hi", maxBytes: 100))
+}
+
+@Test func outOfRangeNumericEntityKeptVerbatim() {
+    // &#x110000; 超 Unicode 上限（max 0x10FFFF），decodeEntityBody 返 nil → entity 原样
+    // 保留 → strip 后 "&#x110000;" 跟正常 plain 不等价 → 不降级（fail-safe）。
+    let plain = "A"
+    let html = "<div>&#x110000;</div>"
+    #expect(!htmlIsPlainTextWrapper(html, plain: plain, maxBytes: bigCap))
+}
