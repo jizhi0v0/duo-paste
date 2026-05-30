@@ -137,6 +137,13 @@ jobs:
           security default-keychain -s "$KEYCHAIN_PATH"
           echo "=== identities ==="
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          # 按 SHA-1 指纹签而非按名字：self-hosted 跑在开发机上时 login.keychain 已装同名
+          # Developer ID 证书，搜索列表含 login 让 codesign 按名字解析到两处报 ambiguous。
+          # 指纹唯一锁定 build.keychain 这张，同时保留 login 在搜索列表不打断本机其它 keychain 用途。
+          SIGN_IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep -oE '[0-9A-F]{40}' | head -1)
+          [ -n "$SIGN_IDENTITY_HASH" ] || { echo "::error::build.keychain 内未找到 codesigning identity"; exit 1; }
+          echo "SIGN_IDENTITY_HASH=$SIGN_IDENTITY_HASH" >> "$GITHUB_ENV"
           rm -f "$CERT_PATH"
 
       - name: Assemble + deep-sign bundle
@@ -147,15 +154,15 @@ jobs:
         run: |
           set -euo pipefail
           # 复用 scripts/assemble-bundle.sh（install-agent.sh 同款，单一权威组 bundle/深签
-          # 实现）。CI 加 DP_TIMESTAMP=1：notarize 拒收无安全时间戳签名。SIGN_IDENTITY 走
-          # secret（"Developer ID Application: NAME (TEAMID)"）。
+          # 实现）。CI 加 DP_TIMESTAMP=1：notarize 拒收无安全时间戳签名。签名身份用上一步抽出的
+          # SHA-1 指纹（SIGN_IDENTITY_HASH）而非 secret 里的名字——见 keychain 步骤注释。
           DP_APP="$APP_PATH" \
           DP_BINARY="$PWD/.build/release/duo-pasted" \
           DP_BUNDLE_ID="$BUNDLE_ID" \
           DP_BUNDLE_NAME="$APP_NAME" \
           DP_SHORT_VERSION="$VERSION" \
           DP_BUILD_NUMBER="$BUILD" \
-          DP_SIGN_IDENTITY="$SIGN_IDENTITY" \
+          DP_SIGN_IDENTITY="$SIGN_IDENTITY_HASH" \
           DP_SPARKLE_FW="$PWD/.build/release/Sparkle.framework" \
           DP_SU_FEED_URL="$SU_FEED_URL" \
           DP_SU_PUBLIC_ED_KEY="$SU_PUBLIC_ED_KEY" \
