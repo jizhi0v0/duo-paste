@@ -1266,6 +1266,7 @@ private struct AboutPane: View {
     @State private var fetchCooldownUntil: Date?
     @State private var blobsTotalBytes: Int64?
     @State private var diskAvailableBytes: Int64?
+    @State private var checkTick = 0   // bump 后让「上次检查」字符串重算（见 lastUpdateCheckString）
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1299,6 +1300,13 @@ private struct AboutPane: View {
                             Spacer()
                             Button("检查更新") {
                                 UpdaterController.shared.checkForUpdates()
+                                // checkForUpdates 异步（Sparkle 弹窗 + 网络），lastUpdateCheckDate
+                                // 检查完成后才更新。延迟 bump checkTick 让字符串重算捕获新日期；
+                                // cosmetic——没捕获到也只是下次重渲再刷新。
+                                Task {
+                                    try? await Task.sleep(for: .seconds(3))
+                                    checkTick &+= 1
+                                }
                             }
                         }
                     }
@@ -1373,6 +1381,7 @@ private struct AboutPane: View {
     }
 
     private var lastUpdateCheckString: String {
+        _ = checkTick   // 触发依赖追踪：checkTick 变 → SwiftUI 重算此字符串
         guard let d = UpdaterController.shared.lastUpdateCheckDate else {
             return "自动检查更新已开启"
         }

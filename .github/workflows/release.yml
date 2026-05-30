@@ -309,7 +309,7 @@ jobs:
           export APPCAST="releases-repo/appcast.xml"
           export DMG_URL="https://github.com/${{ env.RELEASES_REPO }}/releases/download/${TAG}/${DMG_NAME}"
           python3 - << 'PY'
-          import os, subprocess
+          import os, subprocess, uuid
           from datetime import datetime, timezone
           from xml.etree import ElementTree as ET
 
@@ -362,7 +362,8 @@ jobs:
               v = it.find(f"{{{NS}}}version")
               if v is not None and v.text == build: ch.remove(it)
 
-          PH = "__NOTES__"
+          # 每次 run 随机 placeholder——避免某条 commit message 字面量含固定 token 被 CDATA 替换误伤。
+          PH = f"__NOTES_{uuid.uuid4().hex}__"
           item = ET.Element("item")
           ET.SubElement(item, "title").text = f"Version {version}"
           ET.SubElement(item, "guid", {"isPermaLink": "false"}).text = full_sha

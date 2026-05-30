@@ -19,8 +19,9 @@ private let logger = Logger(subsystem: "io.duopaste.daemon", category: "Relaunch
 /// 之后 Sparkle 原子替换整个 .app 目录只是 unlink 旧 inode，运行中的 helper 持旧 inode
 /// 不受影响（Unix 文件语义；Layer2b 实测 helper 在宿主 bootout 后存活并成功 kickstart）。
 enum RelaunchHelper {
-    /// LaunchAgent label，跟 install-agent.sh 写出的 plist 对齐（= LaunchAgent.duoPastedLabel）。
-    static let agentLabel = "io.duopaste.agent"
+    /// LaunchAgent label，跟 install-agent.sh 写出的 plist 对齐。复用 LaunchAgent.duoPastedLabel
+    /// 单一真相——改 label 时只动一处，避免 helper kickstart 错 label 静默失败。
+    static var agentLabel: String { LaunchAgent.duoPastedLabel }
 
     /// 隐藏子命令名。CLI.dispatch 命中后调 `run(args:)`，不进 printUsage 公开列表。
     static let subcommand = "__relaunch-helper"
@@ -31,7 +32,14 @@ enum RelaunchHelper {
         // 被替换不影响已运行的 helper。
         let exe = Bundle.main.executablePath ?? CommandLine.arguments.first ?? "/usr/bin/false"
         let bundlePath = Bundle.main.bundlePath
-        let oldVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? ""
+        // 拿不到自身 CFBundleVersion 时不 spawn——helper 靠「版本 != oldVersion」判新 bundle 就位，
+        // oldVersion 为空会让第一次 poll 就 truthy，可能在 Sparkle 装完前 kickstart 打断安装。
+        // 自身 plist 都读不到说明 bundle 全坏（概率近 0），此时放弃自控 relaunch 比误打断更安全。
+        guard let oldVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !oldVersion.isEmpty else {
+            logger.error("relaunch helper 跳过 spawn：读不到自身 CFBundleVersion")
+            return
+        }
 
         var attr = posix_spawnattr_t(nil as OpaquePointer?)
         posix_spawnattr_init(&attr)

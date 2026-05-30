@@ -1,4 +1,5 @@
 import Foundation
+import os
 import os.log
 import Sparkle
 import DuoPasteCore
@@ -66,9 +67,10 @@ final class RelaunchDelegate: NSObject, SPUUpdaterDelegate, @unchecked Sendable 
     /// 不 kickstart），多 spawn 也安全，但仍去重省资源。
     ///
     /// `@unchecked Sendable` 要求显式同步：SPUUpdaterDelegate 回调按惯例在 main thread 但
-    /// 协议无契约保证，用 os_unfair_lock 守 `helperSpawned` 的 test-and-set 防并发双 spawn。
-    private var helperSpawned = false
-    private var spawnLock = os_unfair_lock()
+    /// 协议无契约保证，用 OSAllocatedUnfairLock 守 `helperSpawned` 的 test-and-set 防并发双 spawn。
+    /// （OSAllocatedUnfairLock 而非裸 os_unfair_lock：macOS 13+ 官方推荐，Swift 6 并发友好、
+    /// 防误拷贝指针。）
+    private let spawnGuard = OSAllocatedUnfairLock(initialState: false)
 
     /// beta/stable channel 过滤。includePrereleases=true 看 beta，否则只看无 channel 的 stable。
     func allowedChannels(for updater: SPUUpdater) -> Set<String> {
@@ -87,10 +89,11 @@ final class RelaunchDelegate: NSObject, SPUUpdaterDelegate, @unchecked Sendable 
 
     /// 方案 A 的关键：返回 NO 阻止 Sparkle open-relaunch（脱离 launchd），spawn helper 接管。
     func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool {
-        os_unfair_lock_lock(&spawnLock)
-        let shouldSpawn = !helperSpawned
-        if shouldSpawn { helperSpawned = true }
-        os_unfair_lock_unlock(&spawnLock)
+        let shouldSpawn = spawnGuard.withLock { spawned -> Bool in
+            if spawned { return false }
+            spawned = true
+            return true
+        }
         if shouldSpawn {
             RelaunchHelper.spawnDetached()
             logger.info("updaterShouldRelaunchApplication → NO（已 spawn detached relaunch helper）")
