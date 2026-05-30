@@ -1287,6 +1287,33 @@ private struct AboutPane: View {
                 }
             }
 
+            // 软件更新——仅当 bundle 嵌了 Sparkle（SUFeedURL 存在）才显。DP_NO_SPARKLE
+            // 本地构建不写 SU 键、不实例化 UpdaterController，这里不能碰 .shared
+            if sparkleEnabled {
+                SettingsGroup(title: "软件更新") {
+                    SettingsBlock(isFirst: true) {
+                        HStack {
+                            Text(lastUpdateCheckString)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("检查更新") {
+                                UpdaterController.shared.checkForUpdates()
+                            }
+                        }
+                    }
+                    SettingsRow(title: "接收测试版（beta）",
+                                subtitle: "打开后更新到 beta channel 的预发布版本；关闭只跟 stable") {
+                        Toggle("", isOn: Binding(
+                            get: { UpdaterController.shared.includePrereleases },
+                            set: { UpdaterController.shared.includePrereleases = $0 }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    }
+                }
+            }
+
             SettingsGroup(title: "Blob 补齐") {
                 SettingsBlock(isFirst: true) {
                     HStack {
@@ -1339,6 +1366,20 @@ private struct AboutPane: View {
             }
         }
         .task { await subscribeStorageStats() }
+    }
+
+    private var sparkleEnabled: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil
+    }
+
+    private var lastUpdateCheckString: String {
+        guard let d = UpdaterController.shared.lastUpdateCheckDate else {
+            return "自动检查更新已开启"
+        }
+        let fmt = DateFormatter()
+        fmt.dateStyle = .medium
+        fmt.timeStyle = .short
+        return "上次检查：\(fmt.string(from: d))"
     }
 
     private func pathRow(_ title: String, path: String, isFirst: Bool = false) -> some View {
