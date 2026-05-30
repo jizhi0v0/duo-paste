@@ -18,6 +18,22 @@ SIGN_IDENTITY="Developer ID Application: BO LI (RS59HDH7Y3)"
 LEGACY_INSTALL_DIR="$HOME/Applications/duo-paste"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# ── Sparkle 自动更新（方案 A：KeepAlive daemon 自控 relaunch）─────────────────
+# feed 走公开 release 仓的 raw appcast；公钥是 duo-paste 专属 EdDSA（generate_keys
+# --account duopaste 生成，私钥在本机 login keychain，CI 用 -x 导成 secret）。
+# DP_NO_SPARKLE=1 → 纯本地构建不嵌 Sparkle / 不写 SU 键（开发自测时不想被自动更新顶掉）。
+SU_FEED_URL="https://raw.githubusercontent.com/jizhi0v0/duo-paste-releases/main/appcast.xml"
+SU_PUBLIC_ED_KEY="5Ws5rSunj3IH4UiP8aN8YFtDni4inudOxMLTgmzhr1s="
+EMBED_SPARKLE=1
+[[ "${DP_NO_SPARKLE:-0}" == "1" ]] && EMBED_SPARKLE=0
+
+# 版本号：build 号 = git commit count + 1000 offset（与 .github CI / claude-usage
+# deploy.sh 同口径），让本地装的版本跟 appcast 上的 release build 单调对齐——Sparkle
+# 按 CFBundleVersion 比较不会误判「本地比 release 旧/新」。short version 派生自 build。
+BUILD_OFFSET=1000
+BUILD_NUMBER=$(( $(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo 0) + BUILD_OFFSET ))
+SHORT_VERSION="0.1.${BUILD_NUMBER}"
+
 echo "==> 构建 release"
 cd "$REPO_ROOT"
 swift build -c release
@@ -28,53 +44,30 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-echo "==> 组装 .app bundle: $APP"
-# rm -rf 整个 bundle 后重建,避免旧 Resources / 旧签名残留
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$LOG_DIR"
-cp "$BINARY" "$APP/Contents/MacOS/duo-pasted"
-chmod +x "$APP/Contents/MacOS/duo-pasted"
+mkdir -p "$LOG_DIR"
 
-# LSUIElement=true 让 macOS 把这个 bundle 当 accessory app 处理:不显 Dock 图标,
-# 不抢 NSApp 主菜单。daemon 本来就走 SwiftUI accessory 模式
-cat >"$APP/Contents/Info.plist" <<INFO_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>
-    <string>$BUNDLE_ID</string>
-    <key>CFBundleExecutable</key>
-    <string>duo-pasted</string>
-    <key>CFBundleName</key>
-    <string>$BUNDLE_NAME</string>
-    <key>CFBundleDisplayName</key>
-    <string>$BUNDLE_NAME</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-</dict>
-</plist>
-INFO_EOF
-
-# --options runtime:开 hardened runtime。CGEvent / NSPasteboard / GRDB sqlite /
-# HummingbirdTLS 都在 hardened runtime 下 OK,不需要额外 entitlements。
-# --force:覆盖之前签名(install 重跑时旧签名失效)。
-# 不加 --timestamp:本机自用不 notarize,timestamp 服务连 Apple 慢且非必需
-echo "==> 签名 bundle (Developer ID Application + hardened runtime)"
-codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP"
-
-echo "==> 验证签名"
-codesign --verify --strict --verbose=2 "$APP"
-# 打印 Bundle ID + Team ID + Authority 让用户日后排查 TCC 问题
-codesign -dvv "$APP" 2>&1 | grep -E "Identifier|TeamIdentifier|Authority" | head -10 || true
+# 组 bundle + 嵌 Sparkle + 深签 → 抽到 assemble-bundle.sh（release.yml CI 也调它，单一真相，
+# 避免组 bundle / 深签顺序两处漂移）。本机自用不 notarize（不设 DP_TIMESTAMP）。
+# DP_NO_SPARKLE=1 时 SPARKLE_FW_ARG 传空 → 不嵌 Sparkle、不写 SU 键。
+SPARKLE_FW_ARG=""
+if [[ "$EMBED_SPARKLE" == "1" ]]; then
+    SPARKLE_FW_ARG="$REPO_ROOT/.build/release/Sparkle.framework"
+    if [[ ! -d "$SPARKLE_FW_ARG" ]]; then
+        echo "Sparkle.framework 不存在: $SPARKLE_FW_ARG（swift build 没产出？）" >&2
+        exit 1
+    fi
+fi
+DP_APP="$APP" \
+DP_BINARY="$BINARY" \
+DP_BUNDLE_ID="$BUNDLE_ID" \
+DP_BUNDLE_NAME="$BUNDLE_NAME" \
+DP_SHORT_VERSION="$SHORT_VERSION" \
+DP_BUILD_NUMBER="$BUILD_NUMBER" \
+DP_SIGN_IDENTITY="$SIGN_IDENTITY" \
+DP_SPARKLE_FW="$SPARKLE_FW_ARG" \
+DP_SU_FEED_URL="$SU_FEED_URL" \
+DP_SU_PUBLIC_ED_KEY="$SU_PUBLIC_ED_KEY" \
+    bash "$REPO_ROOT/scripts/assemble-bundle.sh"
 
 if [[ -d "$LEGACY_INSTALL_DIR" ]]; then
     echo "==> 清理旧 adhoc 路径: $LEGACY_INSTALL_DIR"
@@ -95,7 +88,10 @@ cat >"$PLIST" <<PLIST_EOF
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>

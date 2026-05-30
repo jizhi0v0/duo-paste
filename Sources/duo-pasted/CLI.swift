@@ -31,6 +31,10 @@ enum CLI {
             runAdminSoftDelete(args: rest)
         case "ponte-self":
             runPonteSelf(args: rest)
+        case RelaunchHelper.subcommand:
+            // Sparkle 自动更新方案 A 的 relaunch helper。被宿主（updater delegate）以
+            // posix_spawn SETSID detached 方式调起，不给用户用——不进 printUsage 列表。
+            exit(RelaunchHelper.run(args: rest))
         case "--help", "-h", "help":
             printUsage()
             exit(0)

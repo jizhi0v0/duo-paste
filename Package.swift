@@ -17,6 +17,10 @@ let package = Package(
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.9.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.6.0"),
+        // Sparkle 自动更新。SPM 包走 binaryTarget（下载预签 xcframework zip，不是源码
+        // clone），避开 GRDB 那种弱网 clone 断流。只 link 到 duo-pasted（macOS 可执行），
+        // iOS / 各 library target 不依赖它。版本跟 claude-usage 对齐（2.6.4 起）
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.6.4"),
     ],
     targets: [
         .target(
@@ -45,6 +49,7 @@ let package = Package(
                 "DuoPasteCore",
                 "DuoPasteCapture",
                 "DuoPasteSync",
+                .product(name: "Sparkle", package: "Sparkle"),
             ]
         ),
         .testTarget(

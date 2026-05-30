@@ -108,13 +108,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// SettingsView「立即重启 daemon」按钮调用——`exit(0)` 让 launchd KeepAlive
-    /// 自动 respawn 新进程（plist 有 KeepAlive=true）。daemon 进程级重启比手动
-    /// `launchctl kickstart` 直接，且新进程会重读 config 让所有非热重载字段生效
+    /// SettingsView「立即重启 daemon」按钮调用——退出让 launchd KeepAlive 自动 respawn
+    /// 新进程，新进程重读 config 让所有非热重载字段生效。
+    ///
+    /// **必须 exit 非 0**：plist 的 KeepAlive 是 `{SuccessfulExit:false}`（Sparkle 自动更新
+    /// 方案 A 的前提——Sparkle clean exit 0 不重启、让位安装）。exit(0) 会被这条 gate 当
+    /// 「正常退出」**不重启**，重启按钮就失效了。用 173 只为在日志里跟 fatal(1) 区分，
+    /// launchd 只认 0 vs 非 0，数值本身无特殊含义。详 install-agent.sh KeepAlive 段。
     func restartDaemon() {
         try? "1".write(to: Self.reopenSettingsFlag, atomically: true, encoding: .utf8)
-        fputs("restart requested via settings — exiting for launchd respawn\n", stderr)
-        exit(0)
+        fputs("restart requested via settings — exiting(173) for launchd respawn\n", stderr)
+        exit(173)
     }
 
     func showSettings() {
@@ -223,8 +227,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             deps = try AppDependencies()
         } catch {
             fputs("fatal: bootstrap deps failed: \(error)\n", stderr)
-            NSApp.terminate(nil)
-            return
+            // 非 0 退出让 launchd（KeepAlive={SuccessfulExit:false}）重启重试——bootstrap
+            // 失败常是 transient（DB 临时被占 / snapshot 中）。**不能**用 NSApp.terminate：
+            // 它走 exit 0，会被 SuccessfulExit gate 当「正常退出」不重启，daemon 就此死掉。
+            // 这条 gate 是 Sparkle 自动更新方案 A 的前提（Sparkle clean exit 0 不重启，
+            // 让位安装；崩溃/fatal 非 0 才重启自愈）。详 install-agent.sh KeepAlive 段。
+            exit(1)
         }
 
         state = AppState(deps: deps)

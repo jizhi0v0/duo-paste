@@ -99,6 +99,9 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func quit() {
+        // NSApp.terminate 走 exit 0。plist KeepAlive={SuccessfulExit:false} 下 exit 0 不被
+        // launchd 拉回——正是「退出」想要的：用户主动退就真的停掉。（旧 KeepAlive=true 时
+        // 点退出会被立刻 respawn，是 bug；方案 A 的 gate 顺带修了它。）
         NSApp.terminate(nil)
     }
 }

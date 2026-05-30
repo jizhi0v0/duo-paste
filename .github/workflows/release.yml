@@ -1,0 +1,414 @@
+name: Release DuoPaste
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      force_stable:
+        description: 'Force publish as stable release'
+        type: boolean
+        default: false
+
+concurrency:
+  # self-hosted mac 上签名/公证动全局 keychain + 共享 temp，串行所有 release ref。
+  group: release-duopaste
+  cancel-in-progress: false
+
+env:
+  RELEASES_REPO: jizhi0v0/duo-paste-releases
+  APP_NAME: DuoPaste
+  BUNDLE_ID: io.duopaste.daemon
+  SU_FEED_URL: https://raw.githubusercontent.com/jizhi0v0/duo-paste-releases/main/appcast.xml
+  SU_PUBLIC_ED_KEY: 5Ws5rSunj3IH4UiP8aN8YFtDni4inudOxMLTgmzhr1s=
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+jobs:
+  prepare:
+    name: Determine version + channel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
+      channel: ${{ steps.version.outputs.channel }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version + channel
+        id: version
+        run: |
+          set -euo pipefail
+          # build 号 = commit count + 1000 offset（与 scripts/install-agent.sh 同口径）。
+          # Sparkle 按 CFBundleVersion(=build) 单调比较新旧；offset 给历史/本地手装留头部缓冲。
+          BUILD_OFFSET=1000
+          BUILD_NUMBER=$(( $(git rev-list --count HEAD) + BUILD_OFFSET ))
+          BASE_VERSION="0.1.${BUILD_NUMBER}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            CHANNEL="stable"; IS_PRERELEASE="false"; TAG="v${VERSION}"
+            # 同一 commit 既被 main push 触发 beta 又被 tag 触发 stable，不抬 build 会共用同一
+            # CFBundleVersion，beta 用户永远收不到 stable 升级（Sparkle 比 build 相等）。
+            BUILD_NUMBER=$(( BUILD_NUMBER + 1 ))
+          elif [[ "${{ github.event.inputs.force_stable }}" == "true" ]]; then
+            VERSION="$BASE_VERSION"
+            CHANNEL="stable"; IS_PRERELEASE="false"; TAG="v${VERSION}"
+            BUILD_NUMBER=$(( BUILD_NUMBER + 1 ))
+          else
+            SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+            VERSION="${BASE_VERSION}-beta+${SHORT_SHA}"
+            CHANNEL="beta"; IS_PRERELEASE="true"; TAG="v${VERSION}"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "build=$BUILD_NUMBER"
+            echo "channel=$CHANNEL"
+            echo "prerelease=$IS_PRERELEASE"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ version=$VERSION build=$BUILD_NUMBER channel=$CHANNEL"
+
+  build-macos:
+    name: Build, sign & notarize
+    needs: prepare
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 45
+    outputs:
+      dmg_name: ${{ steps.dmg.outputs.dmg_name }}
+      dmg_size: ${{ steps.sparkle_sign.outputs.length }}
+      ed_sig: ${{ steps.sparkle_sign.outputs.ed_sig }}
+    steps:
+      - name: Prepare runner workspace
+        run: |
+          set -euo pipefail
+          RUN_WORK_DIR="${RUNNER_TEMP:-/tmp}/duopaste-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "$RUN_WORK_DIR"; mkdir -p "$RUN_WORK_DIR/dmg-staging"
+          {
+            echo "RUN_WORK_DIR=$RUN_WORK_DIR"
+            echo "APP_PATH=$RUN_WORK_DIR/${APP_NAME}.app"
+            echo "KEYCHAIN_PATH=$RUN_WORK_DIR/build.keychain"
+            echo "CERT_PATH=$RUN_WORK_DIR/cert.p12"
+            echo "NOTARIZE_ZIP=$RUN_WORK_DIR/notarize.zip"
+            echo "DMG_STAGING=$RUN_WORK_DIR/dmg-staging"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release (SwiftPM)
+        run: |
+          set -euo pipefail
+          swift build -c release --product duo-pasted
+          test -x .build/release/duo-pasted
+          test -d .build/release/Sparkle.framework
+
+      - name: Set up signing keychain
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_P12_PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # self-hosted runner：先 snapshot 原 keychain 状态，cleanup 还原，避免破坏本机密码。
+          ORIGINAL_LIST=$(security list-keychains -d user | sed -e 's/"//g' | tr '\n' ' ')
+          ORIGINAL_DEFAULT=$(security default-keychain -d user | sed -e 's/"//g' | xargs)
+          echo "ORIGINAL_KEYCHAIN_LIST=$ORIGINAL_LIST" >> "$GITHUB_ENV"
+          echo "ORIGINAL_KEYCHAIN_DEFAULT=$ORIGINAL_DEFAULT" >> "$GITHUB_ENV"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERT_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $ORIGINAL_LIST
+          security default-keychain -s "$KEYCHAIN_PATH"
+          echo "=== identities ==="
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      - name: Assemble + deep-sign bundle
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+        run: |
+          set -euo pipefail
+          # 复用 scripts/assemble-bundle.sh（install-agent.sh 同款，单一权威组 bundle/深签
+          # 实现）。CI 加 DP_TIMESTAMP=1：notarize 拒收无安全时间戳签名。SIGN_IDENTITY 走
+          # secret（"Developer ID Application: NAME (TEAMID)"）。
+          DP_APP="$APP_PATH" \
+          DP_BINARY="$PWD/.build/release/duo-pasted" \
+          DP_BUNDLE_ID="$BUNDLE_ID" \
+          DP_BUNDLE_NAME="$APP_NAME" \
+          DP_SHORT_VERSION="$VERSION" \
+          DP_BUILD_NUMBER="$BUILD" \
+          DP_SIGN_IDENTITY="$SIGN_IDENTITY" \
+          DP_SPARKLE_FW="$PWD/.build/release/Sparkle.framework" \
+          DP_SU_FEED_URL="$SU_FEED_URL" \
+          DP_SU_PUBLIC_ED_KEY="$SU_PUBLIC_ED_KEY" \
+          DP_TIMESTAMP=1 \
+            bash scripts/assemble-bundle.sh
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "$APP_PATH" "$NOTARIZE_ZIP"
+          SUBMIT_JSON=$(xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD" --output-format json)
+          echo "$SUBMIT_JSON"
+          SUBMISSION_ID=$(echo "$SUBMIT_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+          xcrun notarytool wait "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APP_SPECIFIC_PASSWORD"
+          STATUS=$(xcrun notarytool info "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APP_SPECIFIC_PASSWORD" \
+            --output-format json | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
+          echo "::group::notarytool log"
+          xcrun notarytool log "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APP_SPECIFIC_PASSWORD" || true
+          echo "::endgroup::"
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::notarization failed: $STATUS"; exit 1
+          fi
+          xcrun stapler staple "$APP_PATH"
+          rm -f "$NOTARIZE_ZIP"
+
+      - name: Create DMG
+        id: dmg
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG_NAME="${APP_NAME}-${VERSION}.dmg"
+          DMG_PATH="$RUN_WORK_DIR/$DMG_NAME"
+          rm -rf "$DMG_STAGING"; mkdir -p "$DMG_STAGING"
+          cp -R "$APP_PATH" "$DMG_STAGING/"
+          ln -s /Applications "$DMG_STAGING/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH"
+          echo "dmg_name=$DMG_NAME" >> "$GITHUB_OUTPUT"
+          echo "DMG_PATH=$DMG_PATH" >> "$GITHUB_ENV"
+
+      - name: Locate Sparkle sign_update
+        id: sparkle_tools
+        run: |
+          set -euo pipefail
+          # SwiftPM binaryTarget 把 sign_update 解到 .build/artifacts（版本跟 app 内 Sparkle 一致）。
+          CAND=$(find .build/artifacts -path '*sparkle*/bin/sign_update' -type f 2>/dev/null | head -1)
+          for f in "$CAND" /opt/homebrew/bin/sign_update /usr/local/bin/sign_update; do
+            if [ -n "$f" ] && [ -x "$f" ]; then echo "sign_update=$f" >> "$GITHUB_OUTPUT"; exit 0; fi
+          done
+          echo "::error::sign_update not found"; exit 1
+
+      - name: Sign update with Sparkle EdDSA
+        id: sparkle_sign
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          KEY_FILE=$(mktemp)
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEY_FILE"
+          OUTPUT=$("${{ steps.sparkle_tools.outputs.sign_update }}" -f "$KEY_FILE" "$DMG_PATH")
+          rm -f "$KEY_FILE"
+          echo "sign_update: $OUTPUT"
+          ED_SIG=$(echo "$OUTPUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')
+          LENGTH=$(echo "$OUTPUT" | sed -E 's/.*length="([0-9]+)".*/\1/')
+          echo "ed_sig=$ED_SIG" >> "$GITHUB_OUTPUT"
+          echo "length=$LENGTH" >> "$GITHUB_OUTPUT"
+
+      - name: Stash DMG to permanent dir
+        if: always() && env.DMG_PATH != ''
+        run: |
+          set -euo pipefail
+          STASH_DIR="$HOME/duopaste-builds/${{ steps.dmg.outputs.dmg_name }}"
+          mkdir -p "$(dirname "$STASH_DIR")"
+          cp "$DMG_PATH" "$STASH_DIR"
+
+      - name: Upload DMG artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: ${{ env.DMG_PATH }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Restore keychain state
+        if: always()
+        run: |
+          set +e
+          [ -n "${ORIGINAL_KEYCHAIN_LIST:-}" ] && security list-keychains -d user -s $ORIGINAL_KEYCHAIN_LIST 2>/dev/null
+          [ -n "${ORIGINAL_KEYCHAIN_DEFAULT:-}" ] && security default-keychain -s "$ORIGINAL_KEYCHAIN_DEFAULT" 2>/dev/null
+          [ -n "${KEYCHAIN_PATH:-}" ] && security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null
+          [ -n "${RUN_WORK_DIR:-}" ] && rm -rf "$RUN_WORK_DIR" 2>/dev/null
+          exit 0
+
+  publish:
+    name: Publish release + appcast
+    needs: [prepare, build-macos]
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Copy DMG from local stash
+        env:
+          DMG_NAME: ${{ needs.build-macos.outputs.dmg_name }}
+        run: |
+          set -euo pipefail
+          STASH="$HOME/duopaste-builds/${DMG_NAME}"
+          test -f "$STASH" || { echo "::error::stash DMG missing: $STASH"; exit 1; }
+          mkdir -p artifacts/macos-dmg
+          cp "$STASH" artifacts/macos-dmg/
+
+      - name: Checkout releases repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RELEASES_REPO }}
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          path: releases-repo
+          fetch-depth: 1
+
+      - name: Update appcast.xml
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DMG_NAME: ${{ needs.build-macos.outputs.dmg_name }}
+          DMG_SIZE: ${{ needs.build-macos.outputs.dmg_size }}
+          ED_SIG: ${{ needs.build-macos.outputs.ed_sig }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export APPCAST="releases-repo/appcast.xml"
+          export DMG_URL="https://github.com/${{ env.RELEASES_REPO }}/releases/download/${TAG}/${DMG_NAME}"
+          python3 - << 'PY'
+          import os, subprocess
+          from datetime import datetime, timezone
+          from xml.etree import ElementTree as ET
+
+          NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+          ET.register_namespace("sparkle", NS)
+          version = os.environ["VERSION"]; build = os.environ["BUILD"]
+          channel = os.environ["CHANNEL"]; dmg_url = os.environ["DMG_URL"]
+          dmg_size = os.environ["DMG_SIZE"]; ed_sig = os.environ["ED_SIG"]
+          full_sha = os.environ["COMMIT_SHA"]; commit = full_sha[:7]
+          path = os.environ["APPCAST"]
+
+          prev_sha = None
+          if os.path.exists(path):
+              tree = ET.parse(path); root = tree.getroot()
+              ch = root.find("channel")
+              items = ch.findall("item") if ch is not None else []
+              if items:
+                  g = items[0].find("guid")
+                  if g is not None and g.text: prev_sha = g.text.strip()
+          else:
+              root = ET.Element("rss", {"version": "2.0"})
+              ch = ET.SubElement(root, "channel")
+              ET.SubElement(ch, "title").text = "DuoPaste"
+              ET.SubElement(ch, "link").text = "https://github.com/jizhi0v0/duo-paste-releases"
+              ET.SubElement(ch, "description").text = "DuoPaste daemon updates"
+              ET.SubElement(ch, "language").text = "en"
+              tree = ET.ElementTree(root)
+
+          def git_log(a):
+              return subprocess.check_output(["git","log"]+a, text=True, stderr=subprocess.DEVNULL)
+          commits = []
+          if prev_sha:
+              try: commits = [l for l in git_log([f"{prev_sha}..HEAD","--pretty=format:%s","--no-merges"]).strip().splitlines() if l]
+              except subprocess.CalledProcessError: pass
+          if not commits:
+              try: commits = [l for l in git_log(["-20","--pretty=format:%s","--no-merges"]).strip().splitlines() if l]
+              except subprocess.CalledProcessError: pass
+          if not commits: commits = ["内部构建变更"]
+
+          def esc(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+          notes = f"<h3>Build {build} · {commit}</h3><ul>" + "".join(f"<li>{esc(c)}</li>" for c in commits) + "</ul>"
+
+          # 去重同 build 的旧 item（重跑保护）
+          for it in list(ch.findall("item")):
+              v = it.find(f"{{{NS}}}version")
+              if v is not None and v.text == build: ch.remove(it)
+
+          PH = "__NOTES__"
+          item = ET.Element("item")
+          ET.SubElement(item, "title").text = f"Version {version}"
+          ET.SubElement(item, "guid", {"isPermaLink": "false"}).text = full_sha
+          ET.SubElement(item, f"{{{NS}}}version").text = build
+          ET.SubElement(item, f"{{{NS}}}shortVersionString").text = version
+          ET.SubElement(item, f"{{{NS}}}minimumSystemVersion").text = "14.0"
+          if channel == "beta":
+              ET.SubElement(item, f"{{{NS}}}channel").text = "beta"
+          ET.SubElement(item, "pubDate").text = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+          ET.SubElement(item, "description").text = PH
+          ET.SubElement(item, "enclosure", {
+              "url": dmg_url, f"{{{NS}}}edSignature": ed_sig,
+              "length": dmg_size, "type": "application/octet-stream"})
+
+          for old in ch.findall("item")[19:]: ch.remove(old)
+          meta = 0
+          for c in list(ch):
+              if c.tag == "item": break
+              meta += 1
+          ch.insert(meta, item)
+          ET.indent(tree, space="  ")
+          tree.write(path, xml_declaration=True, encoding="utf-8")
+          with open(path) as f: content = f.read()
+          content = content.replace(f"<description>{PH}</description>", f"<description><![CDATA[{notes}]]></description>")
+          with open(path, "w") as f: f.write(content)
+          print(f"✅ appcast updated with {len(commits)} commit(s)")
+          PY
+          head -30 "$APPCAST"
+
+      - name: Commit + push appcast
+        working-directory: releases-repo
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          if git diff --cached --quiet; then
+            echo "no appcast change"
+          else
+            git commit -m "release: ${VERSION}"
+            git push
+          fi
+
+      - name: Create release on releases repo
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.RELEASES_REPO }}
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/macos-dmg/*.dmg
+          body: |
+            Channel: **${{ needs.prepare.outputs.channel }}**
+            Build: ${{ needs.prepare.outputs.build }}
+            Commit: ${{ github.sha }}
