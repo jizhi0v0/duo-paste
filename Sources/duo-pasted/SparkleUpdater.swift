@@ -1,6 +1,7 @@
 import Foundation
 import os.log
 import Sparkle
+import DuoPasteCore
 
 private let logger = Logger(subsystem: "io.duopaste.daemon", category: "Updater")
 
@@ -63,29 +64,34 @@ final class RelaunchDelegate: NSObject, SPUUpdaterDelegate, @unchecked Sendable 
     /// 只 spawn 一次 helper：`updaterShouldRelaunchApplication` 可能被调多次（文档说装更新
     /// 流程里会多处 consult relaunch 决策）。helper 本身对「版本没变」幂等（poll 超时静默退出
     /// 不 kickstart），多 spawn 也安全，但仍去重省资源。
+    ///
+    /// `@unchecked Sendable` 要求显式同步：SPUUpdaterDelegate 回调按惯例在 main thread 但
+    /// 协议无契约保证，用 os_unfair_lock 守 `helperSpawned` 的 test-and-set 防并发双 spawn。
     private var helperSpawned = false
+    private var spawnLock = os_unfair_lock()
 
     /// beta/stable channel 过滤。includePrereleases=true 看 beta，否则只看无 channel 的 stable。
     func allowedChannels(for updater: SPUUpdater) -> Set<String> {
-        UserDefaults.standard.bool(forKey: "sparkleIncludePrereleases") ? ["beta"] : []
+        UpdateLogic.allowedChannels(
+            includePrereleases: UserDefaults.standard.bool(forKey: "sparkleIncludePrereleases")
+        )
     }
 
     /// CDN 绕过：feed 在 raw.githubusercontent.com（Fastly CDN，源站 max-age=300）。
     /// CI publish 完到 edge 失效有 ~5min 窗口会拿到旧 appcast 误判「已最新」。拼时间戳
     /// query 强制不同 cache key。（与 claude-usage SparkleUpdater 同款。）
     func feedURLString(for updater: SPUUpdater) -> String? {
-        guard let url = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
-              var comps = URLComponents(string: url) else { return nil }
-        var items = comps.queryItems ?? []
-        items.append(URLQueryItem(name: "_", value: String(Int(Date().timeIntervalSince1970))))
-        comps.queryItems = items
-        return comps.url?.absoluteString
+        guard let url = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String else { return nil }
+        return UpdateLogic.cacheBustedFeedURL(url, epochSeconds: Int(Date().timeIntervalSince1970))
     }
 
     /// 方案 A 的关键：返回 NO 阻止 Sparkle open-relaunch（脱离 launchd），spawn helper 接管。
     func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool {
-        if !helperSpawned {
-            helperSpawned = true
+        os_unfair_lock_lock(&spawnLock)
+        let shouldSpawn = !helperSpawned
+        if shouldSpawn { helperSpawned = true }
+        os_unfair_lock_unlock(&spawnLock)
+        if shouldSpawn {
             RelaunchHelper.spawnDetached()
             logger.info("updaterShouldRelaunchApplication → NO（已 spawn detached relaunch helper）")
         }

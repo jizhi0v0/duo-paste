@@ -118,6 +118,22 @@ bootstrap 报 `5: Input/output error` → sleep 2s 后手动 `launchctl bootstra
 
 ## 关键设计决策（不要回退）
 
+### daemon 退出码 / KeepAlive gate（Sparkle 方案 A 前提）
+
+plist `KeepAlive={SuccessfulExit:false}` + `ThrottleInterval=30`（install-agent.sh 写出）。退出码语义是硬契约——改动 daemon 退出路径前先对齐：
+
+| 退出码 | 来源 | launchd 行为 | 用途 |
+|---|---|---|---|
+| `0`（clean） | `NSApp.terminate`（StatusBar「退出」/ Sparkle 装更新后宿主自退） | **不重启**（SuccessfulExit:false gate） | 用户主动退 = 真停；Sparkle 让位安装 |
+| `1`（fatal） | `applicationDidFinishLaunching` bootstrap `AppDependencies()` 失败 | 重启（≥30s/次，ThrottleInterval 压 tight loop） | bootstrap 多为 transient（DB 临时被占 / snapshot 中），重试自愈 |
+| `173`（restart） | `AppDelegate.restartDaemon`（Settings「立即重启」） | 重启 | 重读 config；数值仅为日志区分 fatal，launchd 只认 0 vs 非 0 |
+
+要点：
+- **bootstrap 失败必须 `exit(1)` 不能 `NSApp.terminate`**——后者走 exit 0 被 gate 当正常退出永不重启，daemon 就此死掉。
+- **Settings 重启必须 exit 非 0**（用 173）——exit 0 会被 gate 吃掉，重启按钮失效。
+- **`ThrottleInterval=30` 只节流「上次启动后 30s 内」的 respawn**——正常运行数小时后的崩溃自愈 / 重启按钮不受影响，只压 bootstrap 持久失败的 tight loop（exit 1 立刻又被拉起）烧 CPU + 灌日志。`launchctl kickstart -k`（含 relaunch helper）强制重启不走 throttle。
+- 「退出」菜单弹 NSAlert 确认——讲清 daemon 真停、恢复要 kickstart / install-agent.sh，避免误以为只是关窗。
+
 ### Capture 字节守门（防意外 Cmd+C 巨物）
 
 `config.capture.{max_blob_mb=32, max_text_kb=512}`。超 cap → CaptureService 跳过入库返 `.skippedTooLarge`，**NSPasteboard 自身不受影响**（Cmd+V 仍正常）。文件路径走 `.file` kind + 字符串形式（< 1KB）永远过文本 cap，Finder 复制 50GB 工程文件夹零受影响。

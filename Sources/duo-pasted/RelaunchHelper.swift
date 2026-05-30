@@ -1,5 +1,6 @@
 import Foundation
 import os.log
+import DuoPasteCore
 
 private let logger = Logger(subsystem: "io.duopaste.daemon", category: "RelaunchHelper")
 
@@ -98,24 +99,12 @@ enum RelaunchHelper {
         }
     }
 
-    /// 读 Info.plist 的 CFBundleVersion。用 PlistBuddy 子进程而非 Bundle API——helper 关心的
-    /// 是**磁盘上安装目录**的版本（被 Sparkle 替换的那个），不是本进程载入时的版本。
+    /// 读**磁盘上安装目录** Info.plist 的 CFBundleVersion（被 Sparkle 替换的那个，不是本进程
+    /// 载入时的版本）——直接 `Data(contentsOf:)` + `PropertyListSerialization`，不起 PlistBuddy
+    /// 子进程（poll 每 0.5s 一次最多 240 次，逐次 spawn 没必要）。`Data(contentsOf:)` 不 cache，
+    /// 每次都读最新磁盘内容，能看到 Sparkle 原子替换后的新 plist。
     private static func readBundleVersion(_ infoPlist: String) -> String? {
-        guard FileManager.default.fileExists(atPath: infoPlist) else { return nil }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/libexec/PlistBuddy")
-        p.arguments = ["-c", "Print :CFBundleVersion", infoPlist]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = Pipe()
-        do {
-            try p.run()
-            p.waitUntilExit()
-            guard p.terminationStatus == 0 else { return nil }
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            return nil
-        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: infoPlist)) else { return nil }
+        return UpdateLogic.bundleVersion(fromInfoPlist: data)
     }
 }

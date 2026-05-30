@@ -381,6 +381,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshAccessibilityTrusted()
 
         fputs("duo-paste UI ready · device=\(deps.deviceID) · mode=\(deps.config.summary) · storage_mode=\(deps.config.mesh.storageMode.rawValue) · db=\(deps.paths.mainDB.path)\n", stderr)
+
+        // Sparkle 自动更新（方案 A）——SUFeedURL 存在才启。读这个 lazy static 触发
+        // UpdaterController 初始化 → SPUStandardUpdaterController(startingUpdater:true)
+        // 开始周期检查。DP_NO_SPARKLE 本地构建不写 SU 键 → 不实例化，避免 Sparkle 报
+        // feed 缺失。手动「检查更新」入口见 StatusBarController / SettingsView 关于页。
+        if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
+            _ = UpdaterController.shared
+        }
+
         if Self.consumeReopenSettingsFlag() {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.showSettings()

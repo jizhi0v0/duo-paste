@@ -92,6 +92,13 @@ cat >"$PLIST" <<PLIST_EOF
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <!-- ThrottleInterval：只节流「上次启动后 30s 内」的 respawn。正常运行数小时后的
+         崩溃自愈 / Settings 重启按钮（exit 173）不受影响；只有 bootstrap 持久失败
+         （DB schema 坏 / config 解析挂 / 缺 secret，exit 1 立刻又被 KeepAlive 拉起）
+         的 tight loop 会被压到 ≥30s/次，避免烧 CPU + 灌爆日志。launchctl kickstart -k
+         强制重启（含 Sparkle relaunch helper）不走 throttle。-->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>

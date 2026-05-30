@@ -210,7 +210,9 @@ jobs:
         run: |
           set -euo pipefail
           # SwiftPM binaryTarget 把 sign_update 解到 .build/artifacts（版本跟 app 内 Sparkle 一致）。
-          CAND=$(find .build/artifacts -path '*sparkle*/bin/sign_update' -type f 2>/dev/null | head -1)
+          # -ipath 大小写不敏感——Sparkle 解出来的目录通常是大写 Sparkle/，小写 '*sparkle*'
+          # 的 -path 匹配不到会误判「找不到」走 fallback。
+          CAND=$(find .build/artifacts -ipath '*sparkle*/bin/sign_update' -type f 2>/dev/null | head -1)
           for f in "$CAND" /opt/homebrew/bin/sign_update /usr/local/bin/sign_update; do
             if [ -n "$f" ] && [ -x "$f" ]; then echo "sign_update=$f" >> "$GITHUB_OUTPUT"; exit 0; fi
           done
@@ -223,9 +225,11 @@ jobs:
         run: |
           set -euo pipefail
           KEY_FILE=$(mktemp)
+          # trap EXIT 清私钥比手动 rm 稳——sign_update 失败时 set -e 会跳过后面的 rm，
+          # 私钥就残留在 self-hosted runner 磁盘上。trap 在任何退出路径（含出错）都跑。
+          trap 'rm -f "$KEY_FILE"' EXIT
           printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEY_FILE"
           OUTPUT=$("${{ steps.sparkle_tools.outputs.sign_update }}" -f "$KEY_FILE" "$DMG_PATH")
-          rm -f "$KEY_FILE"
           echo "sign_update: $OUTPUT"
           ED_SIG=$(echo "$OUTPUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')
           LENGTH=$(echo "$OUTPUT" | sed -E 's/.*length="([0-9]+)".*/\1/')
@@ -236,9 +240,11 @@ jobs:
         if: always() && env.DMG_PATH != ''
         run: |
           set -euo pipefail
-          STASH_DIR="$HOME/duopaste-builds/${{ steps.dmg.outputs.dmg_name }}"
-          mkdir -p "$(dirname "$STASH_DIR")"
-          cp "$DMG_PATH" "$STASH_DIR"
+          # STASH_PATH 是完整文件路径（含 dmg 文件名），不是目录——publish job 的 Copy DMG
+          # 步骤按同样路径 test -f 取回。
+          STASH_PATH="$HOME/duopaste-builds/${{ steps.dmg.outputs.dmg_name }}"
+          mkdir -p "$(dirname "$STASH_PATH")"
+          cp "$DMG_PATH" "$STASH_PATH"
 
       - name: Upload DMG artifact
         continue-on-error: true
@@ -334,11 +340,16 @@ jobs:
 
           def git_log(a):
               return subprocess.check_output(["git","log"]+a, text=True, stderr=subprocess.DEVNULL)
+          import sys
           commits = []
           if prev_sha:
               try: commits = [l for l in git_log([f"{prev_sha}..HEAD","--pretty=format:%s","--no-merges"]).strip().splitlines() if l]
               except subprocess.CalledProcessError: pass
           if not commits:
+              # prev_sha 不可达（首发 / appcast guid 指向被 force-push 删掉的 commit /
+              # 分支 rebase 后历史不连续）。回退到最近 20 条可能混入跟本次 release 无关的旧
+              # commit，留一行 stderr 便于 forensic（CI 日志里能看到为什么 notes 是 -20）。
+              print(f"⚠ prev_sha={prev_sha} 不可达或无 commit，release notes 回退到最近 20 条", file=sys.stderr)
               try: commits = [l for l in git_log(["-20","--pretty=format:%s","--no-merges"]).strip().splitlines() if l]
               except subprocess.CalledProcessError: pass
           if not commits: commits = ["内部构建变更"]
