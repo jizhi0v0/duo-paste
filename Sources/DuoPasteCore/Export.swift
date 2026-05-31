@@ -195,8 +195,9 @@ public struct Exporter: Sendable {
         try? FileManager.default.removeItem(at: target)
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
-        // rawCount = non-tombstone physical rows, NOT fold-aware — intentionally differs from
-        // JSON/Markdown's items.count because VACUUM INTO dumps the full DB including cross-origin dupes.
+        // rawCount = non-tombstone physical rows, NOT fold-aware and NOT query-filtered — VACUUM INTO
+        // copies the entire DB; options.query only affects which items' blobs get copied alongside.
+        // Intentionally differs from JSON/Markdown's items.count (fold-aware + filtered).
         let rawCount = try database.pool.writeWithoutTransaction { db -> Int in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
             return try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0

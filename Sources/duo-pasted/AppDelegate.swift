@@ -281,19 +281,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let gen = exportGeneration
 
         let task = Task.detached(priority: .userInitiated) { [weak self] in
-            let delegate = self
             do {
                 let result = try exporter.export(to: exportDir, options: options) { p in
                     let key = (p.phase == .copyingBlobs ? 1_000_000_000 : 0) + p.current
                     Task { @MainActor in
-                        guard delegate?.exportGeneration == gen else { return }
-                        guard key >= delegate?.exportProgressKey ?? 0 else { return }
-                        delegate?.exportProgressKey = key
+                        guard self?.exportGeneration == gen else { return }
+                        guard key >= self?.exportProgressKey ?? 0 else { return }
+                        self?.exportProgressKey = key
                         switch p.phase {
                         case .exporting:
-                            delegate?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
+                            self?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
                         case .copyingBlobs:
-                            delegate?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
+                            self?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
                         }
                     }
                 }
