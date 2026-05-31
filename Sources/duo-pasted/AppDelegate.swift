@@ -278,7 +278,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let result = try exporter.export(to: exportDir, options: options)
                 await MainActor.run {
-                    self?.currentExportTask = nil
                     let done = NSAlert()
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
@@ -292,15 +291,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             inFileViewerRootedAtPath: exportDir.path
                         )
                     }
+                    self?.currentExportTask = nil
                 }
             } catch {
                 await MainActor.run {
-                    self?.currentExportTask = nil
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
                     err.informativeText = String(describing: error)
                     err.runModal()
+                    self?.currentExportTask = nil
                 }
             }
         }
