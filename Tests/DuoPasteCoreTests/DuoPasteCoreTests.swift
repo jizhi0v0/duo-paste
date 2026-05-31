@@ -314,6 +314,33 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(count == 1)
 }
 
+@Test func exportMarkdownBlobLinksIncludeExtension() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(
+        kind: .image,
+        blob: Data([0x89, 0x50, 0x4E, 0x47]),
+        blobExt: "png",
+        blobMime: "image/png",
+        capturedAtNs: 9_000_000_000_000_000_000
+    ))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-md", isDirectory: true)
+    let result = try exporter.export(to: dest, options: ExportOptions(format: .markdown, includeBlobs: true))
+    #expect(result.blobCount == 1)
+
+    let md = try String(contentsOf: result.destination, encoding: .utf8)
+    let linkPattern = /!\[.*?\]\((blobs\/.+?)\)/
+    guard let match = md.firstMatch(of: linkPattern) else {
+        Issue.record("markdown 里没找到 ![...](blobs/...) 图片链接")
+        return
+    }
+    let relPath = String(match.output.1)
+    let blobFile = dest.appendingPathComponent(relPath)
+    #expect(relPath.hasSuffix(".png"))
+    #expect(FileManager.default.fileExists(atPath: blobFile.path))
+}
+
 // MARK: - setPinnedAny (跨 origin 版,给 POST /pin handler 用)
 
 /// own-origin 行 pin 切换:pinned 列翻转 + bump ingested_at_ns

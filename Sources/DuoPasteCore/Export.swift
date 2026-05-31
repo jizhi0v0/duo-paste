@@ -120,7 +120,7 @@ public struct Exporter: Sendable {
             let body = item.textFull ?? item.preview ?? ""
             return header + "\n\n```\n\(body)\n```\n"
         case .image:
-            if let sha = item.blobSha256 {
+            if let sha = item.blobSha256, blobs.locate(sha256: sha) != nil {
                 let rel = relativeBlobPath(sha: sha)
                 return header + "\n\n![\(item.preview ?? "")](\(rel))\n"
             }
@@ -162,7 +162,8 @@ public struct Exporter: Sendable {
     private func relativeBlobPath(sha: String) -> String {
         let a = String(sha.prefix(2))
         let b = String(sha.dropFirst(2).prefix(2))
-        return "blobs/\(a)/\(b)/\(sha)"
+        let filename = blobs.locate(sha256: sha)?.lastPathComponent ?? sha
+        return "blobs/\(a)/\(b)/\(filename)"
     }
 
     private func copyReferencedBlobs(items: [Item], to dir: URL) throws -> Int {

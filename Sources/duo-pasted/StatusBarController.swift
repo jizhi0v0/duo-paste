@@ -68,6 +68,14 @@ final class StatusBarController: NSObject {
             menu.addItem(update)
         }
 
+        let exportItem = NSMenuItem(
+            title: "导出…",
+            action: #selector(exportData),
+            keyEquivalent: ""
+        )
+        exportItem.target = self
+        menu.addItem(exportItem)
+
         menu.addItem(NSMenuItem.separator())
 
         let quit = NSMenuItem(
@@ -108,6 +116,10 @@ final class StatusBarController: NSObject {
 
     @objc private func openSearch() {
         onOpenSearch()
+    }
+
+    @objc private func exportData() {
+        AppDelegate.shared?.showExportDialog()
     }
 
     @objc private func checkForUpdates() {
