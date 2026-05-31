@@ -522,23 +522,23 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
 // MARK: - Export: SQLite cancel (VACUUM INTO uninterruptible)
 
-@Test func exportSQLiteCancelPostVacuumCleansUp() async throws {
+@Test func exportSQLitePreCancelledTaskCleansUp() async throws {
     let (paths, db, blobs, service) = try makeFixture()
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "no-blob-cancel", capturedAtNs: 9_000_000_000_000_000_000))
 
     let exporter = Exporter(database: db, blobs: blobs)
     let dest = paths.root.appendingPathComponent("export-sqlite-cancel", isDirectory: true)
 
-    // includeBlobs=false + pre-cancelled task: the post-VACUUM checkCancellation() is the
-    // only cancel point that fires. Verifies cleanup removes the new directory regardless
-    // of whether cancel arrives before or after VACUUM completes.
+    // Pre-cancelled task: cancel fires at the first checkCancellation (before VACUUM) or at
+    // the post-VACUUM checkCancellation if VACUUM completes first. Either way cleanup runs.
+    // Note: deterministically hitting only the post-VACUUM checkpoint is not feasible since
+    // VACUUM is atomic and fast on a small DB.
     let task = Task {
         try exporter.export(to: dest, options: ExportOptions(format: .sqlite, includeBlobs: false))
     }
     task.cancel()
     do {
         _ = try await task.value
-        // VACUUM on 1 row is fast — may complete before cancel takes effect; that's OK.
     } catch is CancellationError {
         #expect(!FileManager.default.fileExists(atPath: dest.path))
     }
@@ -563,8 +563,9 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
         _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
         Issue.record("Expected export to throw")
     } catch {
-        // dirExisted=true path: cleanup removes individual output files but keeps dest
+        // dirExisted=true path: cleanup removes output file but keeps dest
         #expect(fm.fileExists(atPath: dest.path))
+        #expect(!fm.fileExists(atPath: jsonPath.path))
     }
 }
 
@@ -580,6 +581,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(!fm.fileExists(atPath: dest.path))
 
     try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: paths.root.path)
+    defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.root.path) }
 
     do {
         _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
@@ -587,7 +589,6 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     } catch {
         #expect(!fm.fileExists(atPath: dest.path))
     }
-    try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.root.path)
 }
 
 // MARK: - Export: blob progress phase fires

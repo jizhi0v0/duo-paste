@@ -297,7 +297,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         switch p.phase {
                         case .vacuuming:
                             self?.exportIsVacuuming = true
-                            self?.statusBar?.setExportProgress("正在生成 SQLite 副本…")
+                            if self?.currentExportTask?.isCancelled == true {
+                                self?.statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
+                            } else {
+                                self?.statusBar?.setExportProgress("正在生成 SQLite 副本…")
+                            }
                         case .exporting:
                             self?.exportIsVacuuming = false
                             self?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
@@ -354,12 +358,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func cancelExport() {
         currentExportTask?.cancel()
         if exportIsVacuuming {
-            statusBar.setExportProgress("等待 VACUUM 完成后取消…")
+            statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
         }
     }
 
     private func finishExport() {
         exportGeneration += 1
+        exportProgressKey = 0
         exportIsVacuuming = false
         statusBar?.setExportProgress(nil)
         currentExportTask = nil
