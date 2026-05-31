@@ -341,6 +341,97 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(FileManager.default.fileExists(atPath: blobFile.path))
 }
 
+// MARK: - Export follow-ups (fold-aware + streaming + cleanup)
+
+@Test func exportFoldAwareDeduplicatesCrossOrigin() async throws {
+    let root = tempDir()
+    let paths = Paths(root: root)
+    paths.ensureExists()
+    let db = try Database(path: paths.mainDB)
+    let blobs = BlobStore(root: paths.blobsDir)
+
+    let svcA = CaptureService(database: db, blobs: blobs, deviceID: "device-A")
+    let svcB = CaptureService(database: db, blobs: blobs, deviceID: "device-B")
+    _ = try await svcA.ingest(CapturedPasteboard(kind: .text, text: "same-text", capturedAtNs: 9_000_000_000_000_000_000))
+    _ = try await svcB.ingest(CapturedPasteboard(kind: .text, text: "same-text", capturedAtNs: 9_000_000_001_000_000_000))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-fold", isDirectory: true)
+    let result = try exporter.export(to: dest, options: ExportOptions(format: .json))
+    #expect(result.itemCount == 1)
+
+    let data = try Data(contentsOf: result.destination)
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    let items = json?["items"] as? [Any]
+    #expect(items?.count == 1)
+}
+
+@Test func exportStreamingJSONIsValidJSON() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    for i in 0..<50 {
+        _ = try await service.ingest(CapturedPasteboard(
+            kind: .text, text: "item-\(i)",
+            capturedAtNs: Int64(9_000_000_000_000_000_000) + Int64(i) * 1_000_000_000
+        ))
+    }
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-stream", isDirectory: true)
+    let result = try exporter.export(to: dest, options: ExportOptions(format: .json))
+    #expect(result.itemCount == 50)
+
+    let data = try Data(contentsOf: result.destination)
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    #expect(json?["schema_version"] as? Int == 1)
+    let items = json?["items"] as? [Any]
+    #expect(items?.count == 50)
+}
+
+@Test func exportProgressCallbackFires() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    for i in 0..<150 {
+        _ = try await service.ingest(CapturedPasteboard(
+            kind: .text, text: "progress-\(i)",
+            capturedAtNs: Int64(9_000_000_000_000_000_000) + Int64(i) * 1_000_000_000
+        ))
+    }
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-progress", isDirectory: true)
+    nonisolated(unsafe) var progressCalls: [ExportProgress] = []
+    let result = try exporter.export(to: dest, options: ExportOptions(format: .json)) { p in
+        progressCalls.append(p)
+    }
+    #expect(result.itemCount == 150)
+    #expect(!progressCalls.isEmpty)
+    #expect(progressCalls.last?.phase == .exporting)
+    #expect(progressCalls.last?.current == 150)
+}
+
+@Test func exportCancellationCleansUpDirectory() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    for i in 0..<10 {
+        _ = try await service.ingest(CapturedPasteboard(
+            kind: .text, text: "cancel-\(i)",
+            capturedAtNs: Int64(9_000_000_000_000_000_000) + Int64(i) * 1_000_000_000
+        ))
+    }
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-cancel", isDirectory: true)
+
+    let task = Task {
+        try exporter.export(to: dest, options: ExportOptions(format: .json))
+    }
+    task.cancel()
+    do {
+        _ = try await task.value
+    } catch is CancellationError {
+        // expected
+    }
+    #expect(!FileManager.default.fileExists(atPath: dest.path))
+}
+
 // MARK: - setPinnedAny (跨 origin 版,给 POST /pin handler 用)
 
 /// own-origin 行 pin 切换:pinned 列翻转 + bump ingested_at_ns

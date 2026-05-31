@@ -274,10 +274,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
+        statusBar.setExportProgress("取消导出…")
+
         currentExportTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let delegate = self
             do {
-                let result = try exporter.export(to: exportDir, options: options)
+                let result = try exporter.export(to: exportDir, options: options) { p in
+                    Task { @MainActor in
+                        switch p.phase {
+                        case .exporting:
+                            delegate?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
+                        case .copyingBlobs:
+                            delegate?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
+                        }
+                    }
+                }
                 await MainActor.run {
+                    self?.statusBar?.setExportProgress(nil)
                     let done = NSAlert()
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
@@ -293,8 +306,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     self?.currentExportTask = nil
                 }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self?.statusBar?.setExportProgress(nil)
+                    self?.currentExportTask = nil
+                }
             } catch {
                 await MainActor.run {
+                    self?.statusBar?.setExportProgress(nil)
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
@@ -304,6 +323,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    func cancelExport() {
+        currentExportTask?.cancel()
     }
 
     private static func exportTimestamp() -> String {

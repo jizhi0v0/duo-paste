@@ -6,6 +6,7 @@ final class StatusBarController: NSObject {
     private let item: NSStatusItem
     private let onOpenSearch: () -> Void
     private var openMenuItem: NSMenuItem!
+    private var exportMenuItem: NSMenuItem!
 
     init(hotkey: Config.HotkeyConfig, onOpenSearch: @escaping () -> Void) {
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -68,13 +69,13 @@ final class StatusBarController: NSObject {
             menu.addItem(update)
         }
 
-        let exportItem = NSMenuItem(
+        exportMenuItem = NSMenuItem(
             title: "导出…",
             action: #selector(exportData),
             keyEquivalent: ""
         )
-        exportItem.target = self
-        menu.addItem(exportItem)
+        exportMenuItem.target = self
+        menu.addItem(exportMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -118,8 +119,22 @@ final class StatusBarController: NSObject {
         onOpenSearch()
     }
 
+    func setExportProgress(_ text: String?) {
+        if let text {
+            exportMenuItem.title = text
+            exportMenuItem.action = #selector(cancelExport)
+        } else {
+            exportMenuItem.title = "导出…"
+            exportMenuItem.action = #selector(exportData)
+        }
+    }
+
     @objc private func exportData() {
         AppDelegate.shared?.showExportDialog()
+    }
+
+    @objc private func cancelExport() {
+        AppDelegate.shared?.cancelExport()
     }
 
     @objc private func checkForUpdates() {
