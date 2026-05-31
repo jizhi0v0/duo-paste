@@ -92,7 +92,9 @@ public struct Exporter: Sendable {
 
     private static let writeBufferSize = 256 * 1024
 
-    private func makeBufferedWriter(to file: URL) throws -> (append: (Data) throws -> Void, flush: () throws -> Void) {
+    private func makeBufferedWriter(to file: URL) throws -> (
+        append: (Data) throws -> Void, flush: () throws -> Void, close: () -> Void
+    ) {
         FileManager.default.createFile(atPath: file.path, contents: nil)
         let handle = try FileHandle(forWritingTo: file)
         var buf = Data()
@@ -108,7 +110,8 @@ public struct Exporter: Sendable {
             if !buf.isEmpty { try handle.write(contentsOf: buf) }
             try handle.close()
         }
-        return (append, flush)
+        let close: () -> Void = { try? handle.close() }
+        return (append, flush, close)
     }
 
     // MARK: - JSON (streaming)
@@ -118,7 +121,8 @@ public struct Exporter: Sendable {
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
         let file = dir.appendingPathComponent(ExportFormat.json.filename)
-        let (append, flush) = try makeBufferedWriter(to: file)
+        let (append, flush, close) = try makeBufferedWriter(to: file)
+        defer { close() }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -157,7 +161,8 @@ public struct Exporter: Sendable {
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
         let file = dir.appendingPathComponent(ExportFormat.markdown.filename)
-        let (append, flush) = try makeBufferedWriter(to: file)
+        let (append, flush, close) = try makeBufferedWriter(to: file)
+        defer { close() }
 
         try append(Data(
             "# duo-paste 导出\n\n导出时间：\(humanDate(Date())) · 共 \(items.count) 条\n\n".utf8
@@ -231,12 +236,11 @@ public struct Exporter: Sendable {
         try? FileManager.default.removeItem(at: target)
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
-        // rawCount = non-tombstone rows, NOT fold-aware, NOT query-filtered — VACUUM INTO copies the
-        // entire DB but count excludes tombstones for user-facing display. Blob query includes tombstones
-        // so exported sqlite has no broken blob references.
+        // rawCount = all physical rows (including tombstones), NOT fold-aware, NOT query-filtered.
+        // Matches what the user sees running SELECT COUNT(*) on the exported sqlite.
         let (rawCount, allBlobShas) = try database.pool.writeWithoutTransaction { db -> (Int, [String]) in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
-            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item") ?? 0
             let shas = try String.fetchAll(db, sql:
                 "SELECT DISTINCT blob_sha256 FROM item WHERE blob_sha256 IS NOT NULL")
             return (count, shas)
@@ -274,6 +278,9 @@ public struct Exporter: Sendable {
 
         for (i, sha) in shas.enumerated() {
             try Task.checkCancellation()
+            if (i + 1) % 50 == 0 {
+                progress?(ExportProgress(phase: .copyingBlobs, current: i + 1, total: total))
+            }
             guard let src = blobs.locate(sha256: sha) else { continue }
             let a = String(sha.prefix(2))
             let b = String(sha.dropFirst(2).prefix(2))
@@ -286,9 +293,6 @@ public struct Exporter: Sendable {
                 try fm.copyItem(at: src, to: dest)
             }
             copied += 1
-            if (i + 1) % 50 == 0 {
-                progress?(ExportProgress(phase: .copyingBlobs, current: i + 1, total: total))
-            }
         }
         if total > 0 {
             progress?(ExportProgress(phase: .copyingBlobs, current: total, total: total))
