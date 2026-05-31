@@ -307,7 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let blobLine = result.blobCount > 0 ? "\n图片/文件：\(result.blobCount) 个" : ""
                     let countLine: String
                     if format == .sqlite {
-                        countLine = "完整数据库副本：\(result.itemCount) 条物理行（含跨设备重复）"
+                        countLine = "完整数据库副本：\(result.itemCount) 条物理行（含跨设备重复及已删除项）"
                     } else {
                         countLine = "共 \(result.itemCount) 条记录"
                     }
