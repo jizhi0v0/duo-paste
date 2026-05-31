@@ -382,7 +382,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
     let data = try Data(contentsOf: result.destination)
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-    #expect(json?["schema_version"] as? Int == 1)
+    #expect(json?["schema_version"] as? Int == 2)
     let items = json?["items"] as? [Any]
     #expect(items?.count == 50)
 }
@@ -465,6 +465,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     }
     #expect(fm.fileExists(atPath: dest.path))
     #expect(fm.fileExists(atPath: sentinel.path))
+    #expect(!fm.fileExists(atPath: dest.appendingPathComponent("duo-paste-export.json").path))
 }
 
 @Test func exportSQLiteItemCountIsRawNotFolded() async throws {

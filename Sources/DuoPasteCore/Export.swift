@@ -70,7 +70,14 @@ public struct Exporter: Sendable {
                 return try writeSQLite(to: dir, includeBlobs: options.includeBlobs, progress: progress)
             }
         } catch {
-            if !dirExisted { try? fm.removeItem(at: dir) }
+            if !dirExisted {
+                try? fm.removeItem(at: dir)
+            } else {
+                for name in ["duo-paste-export.json", "duo-paste-export.md", "duo-paste-export.sqlite"] {
+                    try? fm.removeItem(at: dir.appendingPathComponent(name))
+                }
+                try? fm.removeItem(at: dir.appendingPathComponent("blobs"))
+            }
             throw error
         }
     }
@@ -90,7 +97,7 @@ public struct Exporter: Sendable {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         try handle.write(contentsOf: Data(
-            "{\n  \"schema_version\": 1,\n  \"exported_at_ns\": \(Clock.nowNs()),\n  \"item_count\": \(items.count),\n  \"items\": [\n".utf8
+            "{\n  \"schema_version\": 2,\n  \"exported_at_ns\": \(Clock.nowNs()),\n  \"item_count\": \(items.count),\n  \"items\": [\n".utf8
         ))
 
         let total = items.count
@@ -235,18 +242,19 @@ public struct Exporter: Sendable {
         for item in items {
             guard let sha = item.blobSha256, seen.insert(sha).inserted else { continue }
             try Task.checkCancellation()
-            guard let src = blobs.locate(sha256: sha) else { continue }
-            let a = String(sha.prefix(2))
-            let b = String(sha.dropFirst(2).prefix(2))
-            let destDir = destRoot
-                .appendingPathComponent(a, isDirectory: true)
-                .appendingPathComponent(b, isDirectory: true)
-            try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
-            let dest = destDir.appendingPathComponent(src.lastPathComponent)
-            if !fm.fileExists(atPath: dest.path) {
-                try fm.copyItem(at: src, to: dest)
+            if let src = blobs.locate(sha256: sha) {
+                let a = String(sha.prefix(2))
+                let b = String(sha.dropFirst(2).prefix(2))
+                let destDir = destRoot
+                    .appendingPathComponent(a, isDirectory: true)
+                    .appendingPathComponent(b, isDirectory: true)
+                try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+                let dest = destDir.appendingPathComponent(src.lastPathComponent)
+                if !fm.fileExists(atPath: dest.path) {
+                    try fm.copyItem(at: src, to: dest)
+                }
+                copied += 1
             }
-            copied += 1
             if seen.count % 50 == 0 {
                 progress?(ExportProgress(phase: .copyingBlobs, current: seen.count, total: total))
             }
