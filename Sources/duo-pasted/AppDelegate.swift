@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var settingsTrafficLightOverlay: TrafficLightGlyphOverlay?
     private var currentExportTask: Task<Void, Never>?
+    private var exportGeneration = 0
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -274,11 +275,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
+        exportGeneration += 1
+        let gen = exportGeneration
+
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             let delegate = self
             do {
                 let result = try exporter.export(to: exportDir, options: options) { p in
                     Task { @MainActor in
+                        guard delegate?.exportGeneration == gen else { return }
                         switch p.phase {
                         case .exporting:
                             delegate?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
@@ -288,7 +293,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
                 await MainActor.run {
+                    self?.exportGeneration += 1
                     self?.statusBar?.setExportProgress(nil)
+                    self?.currentExportTask = nil
                     let done = NSAlert()
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
@@ -302,22 +309,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             inFileViewerRootedAtPath: exportDir.path
                         )
                     }
-                    self?.currentExportTask = nil
                 }
             } catch is CancellationError {
                 await MainActor.run {
+                    self?.exportGeneration += 1
                     self?.statusBar?.setExportProgress(nil)
                     self?.currentExportTask = nil
                 }
             } catch {
                 await MainActor.run {
+                    self?.exportGeneration += 1
                     self?.statusBar?.setExportProgress(nil)
+                    self?.currentExportTask = nil
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
                     err.informativeText = String(describing: error)
                     err.runModal()
-                    self?.currentExportTask = nil
                 }
             }
         }

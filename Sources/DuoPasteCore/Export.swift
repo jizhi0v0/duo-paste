@@ -219,7 +219,8 @@ public struct Exporter: Sendable {
         let destRoot = dir.appendingPathComponent("blobs", isDirectory: true)
         var copied = 0
         var seen: Set<String> = []
-        let total = Set(items.compactMap(\.blobSha256)).count
+        let uniqueShas = Set(items.compactMap(\.blobSha256))
+        let total = uniqueShas.count
 
         for item in items {
             guard let sha = item.blobSha256, seen.insert(sha).inserted else { continue }
@@ -236,12 +237,12 @@ public struct Exporter: Sendable {
                 try fm.copyItem(at: src, to: dest)
             }
             copied += 1
-            if copied % 50 == 0 {
-                progress?(ExportProgress(phase: .copyingBlobs, current: copied, total: total))
+            if seen.count % 50 == 0 {
+                progress?(ExportProgress(phase: .copyingBlobs, current: seen.count, total: total))
             }
         }
         if total > 0 {
-            progress?(ExportProgress(phase: .copyingBlobs, current: copied, total: total))
+            progress?(ExportProgress(phase: .copyingBlobs, current: total, total: total))
         }
         return copied
     }
