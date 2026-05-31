@@ -216,6 +216,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.needsDisplay = true
     }
 
+    // MARK: - Export
+
+    func showExportDialog() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "导出剪贴板历史"
+        alert.informativeText = "选择导出格式和目标目录。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "选择目录…")
+        alert.addButton(withTitle: "取消")
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 64))
+
+        let formatLabel = NSTextField(labelWithString: "格式：")
+        formatLabel.frame = NSRect(x: 0, y: 36, width: 50, height: 20)
+        accessory.addSubview(formatLabel)
+
+        let formatPopup = NSPopUpButton(frame: NSRect(x: 52, y: 34, width: 160, height: 24), pullsDown: false)
+        formatPopup.addItems(withTitles: ["JSON", "Markdown", "SQLite"])
+        accessory.addSubview(formatPopup)
+
+        let blobCheck = NSButton(checkboxWithTitle: "包含图片和文件字节", target: nil, action: nil)
+        blobCheck.frame = NSRect(x: 0, y: 4, width: 220, height: 20)
+        blobCheck.state = .on
+        accessory.addSubview(blobCheck)
+
+        alert.accessoryView = accessory
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let format: ExportFormat = [.json, .markdown, .sqlite][formatPopup.indexOfSelectedItem]
+        let includeBlobs = blobCheck.state == .on
+
+        let panel = NSOpenPanel()
+        panel.message = "选择导出目录"
+        panel.prompt = "导出"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+
+        let exportDir = dir.appendingPathComponent(
+            "duo-paste-export-\(Self.exportTimestamp())", isDirectory: true
+        )
+
+        guard let deps = self.deps else { return }
+        let exporter = Exporter(database: deps.database, blobs: deps.blobs)
+        let options = ExportOptions(format: format, includeBlobs: includeBlobs)
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let result = try exporter.export(to: exportDir, options: options)
+                await MainActor.run {
+                    let done = NSAlert()
+                    done.alertStyle = .informational
+                    done.messageText = "导出完成"
+                    let blobLine = result.blobCount > 0 ? "\n图片/文件：\(result.blobCount) 个" : ""
+                    done.informativeText = "共 \(result.itemCount) 条记录\(blobLine)\n位置：\(exportDir.path)"
+                    done.addButton(withTitle: "在 Finder 中显示")
+                    done.addButton(withTitle: "好")
+                    if done.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.selectFile(
+                            result.destination.path,
+                            inFileViewerRootedAtPath: exportDir.path
+                        )
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    let err = NSAlert()
+                    err.alertStyle = .critical
+                    err.messageText = "导出失败"
+                    err.informativeText = "\(error)"
+                    err.runModal()
+                }
+            }
+        }
+    }
+
+    private static func exportTimestamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        return f.string(from: Date())
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 早一点切 accessory，避免 Dock 闪一下
         NSApp.setActivationPolicy(.accessory)
