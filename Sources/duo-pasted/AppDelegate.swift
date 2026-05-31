@@ -59,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsTrafficLightOverlay: TrafficLightGlyphOverlay?
     private var currentExportTask: Task<Void, Never>?
     private var exportGeneration = 0
+    private var exportProgressKey = 0
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -276,14 +277,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
         exportGeneration += 1
+        exportProgressKey = 0
         let gen = exportGeneration
 
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             let delegate = self
             do {
                 let result = try exporter.export(to: exportDir, options: options) { p in
+                    let key = (p.phase == .copyingBlobs ? 1_000_000_000 : 0) + p.current
                     Task { @MainActor in
                         guard delegate?.exportGeneration == gen else { return }
+                        guard key >= delegate?.exportProgressKey ?? 0 else { return }
+                        delegate?.exportProgressKey = key
                         switch p.phase {
                         case .exporting:
                             delegate?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")

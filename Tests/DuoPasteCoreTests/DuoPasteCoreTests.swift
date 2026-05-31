@@ -410,7 +410,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
 @Test func exportCancellationCleansUpDirectory() async throws {
     let (paths, db, blobs, service) = try makeFixture()
-    for i in 0..<10 {
+    for i in 0..<200 {
         _ = try await service.ingest(CapturedPasteboard(
             kind: .text, text: "cancel-\(i)",
             capturedAtNs: Int64(9_000_000_000_000_000_000) + Int64(i) * 1_000_000_000
@@ -420,16 +420,42 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let exporter = Exporter(database: db, blobs: blobs)
     let dest = paths.root.appendingPathComponent("export-cancel", isDirectory: true)
 
+    nonisolated(unsafe) var taskRef: Task<ExportResult, Error>?
     let task = Task {
-        try exporter.export(to: dest, options: ExportOptions(format: .json))
+        try exporter.export(to: dest, options: ExportOptions(format: .json)) { _ in
+            taskRef?.cancel()
+        }
     }
-    task.cancel()
+    taskRef = task
     do {
         _ = try await task.value
     } catch is CancellationError {
         // expected
     }
     #expect(!FileManager.default.fileExists(atPath: dest.path))
+}
+
+@Test func exportSQLiteItemCountIsRawNotFolded() async throws {
+    let root = tempDir()
+    let paths = Paths(root: root)
+    paths.ensureExists()
+    let db = try Database(path: paths.mainDB)
+    let blobs = BlobStore(root: paths.blobsDir)
+
+    let svcA = CaptureService(database: db, blobs: blobs, deviceID: "device-A")
+    let svcB = CaptureService(database: db, blobs: blobs, deviceID: "device-B")
+    _ = try await svcA.ingest(CapturedPasteboard(kind: .text, text: "dupe-text", capturedAtNs: 9_000_000_000_000_000_000))
+    _ = try await svcB.ingest(CapturedPasteboard(kind: .text, text: "dupe-text", capturedAtNs: 9_000_000_001_000_000_000))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+
+    let jsonDest = paths.root.appendingPathComponent("export-json", isDirectory: true)
+    let jsonResult = try exporter.export(to: jsonDest, options: ExportOptions(format: .json))
+    #expect(jsonResult.itemCount == 1)
+
+    let sqliteDest = paths.root.appendingPathComponent("export-sqlite", isDirectory: true)
+    let sqliteResult = try exporter.export(to: sqliteDest, options: ExportOptions(format: .sqlite))
+    #expect(sqliteResult.itemCount == 2)
 }
 
 // MARK: - setPinnedAny (跨 origin 版,给 POST /pin handler 用)
