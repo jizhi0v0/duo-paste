@@ -55,17 +55,19 @@ public struct Exporter: Sendable {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
 
         do {
-            let api = SearchAPI(database: database)
-            let items = try api.searchHits(options.query).map(\.0)
-            try Task.checkCancellation()
-
             switch options.format {
-            case .json:
-                return try writeJSON(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
-            case .markdown:
-                return try writeMarkdown(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
+            case .json, .markdown:
+                try Task.checkCancellation()
+                let api = SearchAPI(database: database)
+                let items = try api.searchHits(options.query).map(\.0)
+                try Task.checkCancellation()
+                if options.format == .json {
+                    return try writeJSON(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
+                } else {
+                    return try writeMarkdown(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
+                }
             case .sqlite:
-                return try writeSQLite(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
+                return try writeSQLite(to: dir, includeBlobs: options.includeBlobs, progress: progress)
             }
         } catch {
             if !dirExisted { try? fm.removeItem(at: dir) }
@@ -188,7 +190,7 @@ public struct Exporter: Sendable {
     // MARK: - Raw SQLite
 
     private func writeSQLite(
-        items: [Item], to dir: URL, includeBlobs: Bool,
+        to dir: URL, includeBlobs: Bool,
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
         try Task.checkCancellation()
@@ -196,8 +198,8 @@ public struct Exporter: Sendable {
         try? FileManager.default.removeItem(at: target)
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
-        // rawCount = non-tombstone physical rows, NOT fold-aware and NOT query-filtered — VACUUM INTO
-        // copies the entire DB. Intentionally differs from JSON/Markdown's items.count (fold-aware + filtered).
+        // rawCount = all physical rows (including tombstones), NOT fold-aware, NOT query-filtered —
+        // VACUUM INTO copies the entire DB. Intentionally differs from JSON/Markdown's fold-aware count.
         let (rawCount, allBlobShas) = try database.pool.writeWithoutTransaction { db -> (Int, [String]) in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
             let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item") ?? 0

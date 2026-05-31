@@ -297,6 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
                 await MainActor.run {
+                    guard self?.exportGeneration == gen else { return }
                     self?.exportGeneration += 1
                     self?.statusBar?.setExportProgress(nil)
                     self?.currentExportTask = nil
@@ -322,12 +323,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch is CancellationError {
                 await MainActor.run {
+                    guard self?.exportGeneration == gen else { return }
                     self?.exportGeneration += 1
                     self?.statusBar?.setExportProgress(nil)
                     self?.currentExportTask = nil
                 }
             } catch {
                 await MainActor.run {
+                    guard self?.exportGeneration == gen else { return }
                     self?.exportGeneration += 1
                     self?.statusBar?.setExportProgress(nil)
                     self?.currentExportTask = nil
