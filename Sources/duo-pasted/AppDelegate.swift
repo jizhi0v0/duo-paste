@@ -283,7 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try exporter.export(to: exportDir, options: options) { p in
-                    let key = (p.phase == .copyingBlobs ? 1_000_000_000 : 0) + p.current
+                    let key = (p.phase == .copyingBlobs ? Int.max / 2 : 0) + p.current
                     Task { @MainActor in
                         guard self?.exportGeneration == gen else { return }
                         guard key >= self?.exportProgressKey ?? 0 else { return }

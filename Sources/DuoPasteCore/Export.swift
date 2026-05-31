@@ -5,6 +5,14 @@ public enum ExportFormat: String, Sendable, CaseIterable {
     case json
     case markdown
     case sqlite
+
+    public var filename: String {
+        switch self {
+        case .json: "duo-paste-export.json"
+        case .markdown: "duo-paste-export.md"
+        case .sqlite: "duo-paste-export.sqlite"
+        }
+    }
 }
 
 public struct ExportOptions: Sendable {
@@ -73,9 +81,7 @@ public struct Exporter: Sendable {
             if !dirExisted {
                 try? fm.removeItem(at: dir)
             } else {
-                for name in ["duo-paste-export.json", "duo-paste-export.md", "duo-paste-export.sqlite"] {
-                    try? fm.removeItem(at: dir.appendingPathComponent(name))
-                }
+                try? fm.removeItem(at: dir.appendingPathComponent(options.format.filename))
                 try? fm.removeItem(at: dir.appendingPathComponent("blobs"))
             }
             throw error
@@ -88,7 +94,7 @@ public struct Exporter: Sendable {
         items: [Item], to dir: URL, includeBlobs: Bool,
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
-        let file = dir.appendingPathComponent("duo-paste-export.json")
+        let file = dir.appendingPathComponent(ExportFormat.json.filename)
         FileManager.default.createFile(atPath: file.path, contents: nil)
         let handle = try FileHandle(forWritingTo: file)
         defer { try? handle.close() }
@@ -128,7 +134,7 @@ public struct Exporter: Sendable {
         items: [Item], to dir: URL, includeBlobs: Bool,
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
-        let file = dir.appendingPathComponent("duo-paste-export.md")
+        let file = dir.appendingPathComponent(ExportFormat.markdown.filename)
         FileManager.default.createFile(atPath: file.path, contents: nil)
         let handle = try FileHandle(forWritingTo: file)
         defer { try? handle.close() }
@@ -201,7 +207,7 @@ public struct Exporter: Sendable {
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
         try Task.checkCancellation()
-        let target = dir.appendingPathComponent("duo-paste-export.sqlite")
+        let target = dir.appendingPathComponent(ExportFormat.sqlite.filename)
         try? FileManager.default.removeItem(at: target)
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
@@ -232,37 +238,8 @@ public struct Exporter: Sendable {
         items: [Item], to dir: URL,
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> Int {
-        let fm = FileManager.default
-        let destRoot = dir.appendingPathComponent("blobs", isDirectory: true)
-        var copied = 0
-        var seen: Set<String> = []
-        let uniqueShas = Set(items.compactMap(\.blobSha256))
-        let total = uniqueShas.count
-
-        for item in items {
-            guard let sha = item.blobSha256, seen.insert(sha).inserted else { continue }
-            try Task.checkCancellation()
-            if let src = blobs.locate(sha256: sha) {
-                let a = String(sha.prefix(2))
-                let b = String(sha.dropFirst(2).prefix(2))
-                let destDir = destRoot
-                    .appendingPathComponent(a, isDirectory: true)
-                    .appendingPathComponent(b, isDirectory: true)
-                try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
-                let dest = destDir.appendingPathComponent(src.lastPathComponent)
-                if !fm.fileExists(atPath: dest.path) {
-                    try fm.copyItem(at: src, to: dest)
-                }
-                copied += 1
-            }
-            if seen.count % 50 == 0 {
-                progress?(ExportProgress(phase: .copyingBlobs, current: seen.count, total: total))
-            }
-        }
-        if total > 0 {
-            progress?(ExportProgress(phase: .copyingBlobs, current: total, total: total))
-        }
-        return copied
+        let shas = Array(Set(items.compactMap(\.blobSha256)))
+        return try copyReferencedBlobsBySha(shas: shas, to: dir, progress: progress)
     }
 
     private func copyReferencedBlobsBySha(
