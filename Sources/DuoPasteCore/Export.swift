@@ -120,7 +120,7 @@ public struct Exporter: Sendable {
             let body = item.textFull ?? item.preview ?? ""
             return header + "\n\n```\n\(body)\n```\n"
         case .image:
-            if let sha = item.blobSha256 {
+            if let sha = item.blobSha256, blobs.locate(sha256: sha) != nil {
                 let rel = relativeBlobPath(sha: sha)
                 return header + "\n\n![\(item.preview ?? "")](\(rel))\n"
             }
