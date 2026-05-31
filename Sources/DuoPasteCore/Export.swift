@@ -249,6 +249,8 @@ public struct Exporter: Sendable {
             return (count, shas)
         }
 
+        try Task.checkCancellation()
+
         let blobCount = includeBlobs ? try copyReferencedBlobsBySha(shas: allBlobShas, to: dir, progress: progress) : 0
         return ExportResult(destination: target, itemCount: rawCount, blobCount: blobCount)
     }

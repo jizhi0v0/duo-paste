@@ -495,9 +495,9 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
 @Test func exportMarkdownDayHeadersDescAndExactlyPerDay() async throws {
     let (paths, db, blobs, service) = try makeFixture()
-    // Two items on day 2025-03-10, one item on day 2025-03-09 (different days in UTC-relative nanoseconds)
+    // Use timestamps 48h apart — guaranteed different calendar days in any timezone.
     let day1Ns: Int64 = 1_741_564_800_000_000_000 // 2025-03-10 00:00:00 UTC
-    let day2Ns: Int64 = 1_741_478_400_000_000_000 // 2025-03-09 00:00:00 UTC
+    let day2Ns: Int64 = day1Ns - 48 * 3_600_000_000_000 // 48h earlier
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "item-a", capturedAtNs: day1Ns))
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "item-b", capturedAtNs: day1Ns + 3_600_000_000_000))
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "item-c", capturedAtNs: day2Ns))
@@ -509,8 +509,15 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     let md = try String(contentsOf: result.destination, encoding: .utf8)
     let dayHeaders = md.components(separatedBy: "\n").filter { $0.hasPrefix("## ") }
     #expect(dayHeaders.count == 2)
-    // DESC order: newer day first
+    // DESC order: newer day first (yyyy-MM-dd string comparison works)
     #expect(dayHeaders[0] > dayHeaders[1])
+
+    // Verify headers match what the same formatter produces (timezone-aligned)
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd"
+    let expectedDay1 = "## " + df.string(from: Date(timeIntervalSince1970: Double(day1Ns) / 1_000_000_000))
+    let expectedDay2 = "## " + df.string(from: Date(timeIntervalSince1970: Double(day2Ns) / 1_000_000_000))
+    #expect(Set(dayHeaders) == Set([expectedDay1, expectedDay2]))
 }
 
 // MARK: - Export: SQLite cancel (VACUUM INTO uninterruptible)
@@ -533,6 +540,25 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
         // If it completes before cancel takes effect, that's fine too — VACUUM is fast on 1 row.
     } catch is CancellationError {
         // Cancel hit after VACUUM — verify cleanup removed the directory.
+        #expect(!FileManager.default.fileExists(atPath: dest.path))
+    }
+}
+
+@Test func exportSQLiteCancelNoBlobsStillCleansUp() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "no-blob-cancel", capturedAtNs: 9_000_000_000_000_000_000))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-sqlite-nobl-cancel", isDirectory: true)
+
+    // includeBlobs=false: the only checkCancellation after VACUUM is the explicit one we added.
+    let task = Task {
+        try exporter.export(to: dest, options: ExportOptions(format: .sqlite, includeBlobs: false))
+    }
+    task.cancel()
+    do {
+        _ = try await task.value
+    } catch is CancellationError {
         #expect(!FileManager.default.fileExists(atPath: dest.path))
     }
 }
@@ -572,33 +598,35 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
     let exporter = Exporter(database: db, blobs: blobs)
     let fm = FileManager.default
-    // dirExisted=false scenario: new directory, but write fails because json file path is a directory
+    // dirExisted=false: dest does NOT exist before export. Export creates it, then write fails
+    // because we pre-plant a subdirectory at the json output path (FileHandle can't open a dir).
     let dest = paths.root.appendingPathComponent("export-fail-new", isDirectory: true)
-    // Let exporter create it, but pre-seed the json filename as a directory so FileHandle throws
+    #expect(!fm.fileExists(atPath: dest.path))
+
+    // Pre-plant blocker: create dest/duo-paste-export.json as a directory so createFile succeeds
+    // but FileHandle(forWritingTo:) throws (can't write to a directory).
     try fm.createDirectory(
         at: dest.appendingPathComponent(ExportFormat.json.filename),
         withIntermediateDirectories: true
     )
-    // Now dest exists — but we need dirExisted=false. Remove dest and re-setup:
+    // Now dest exists on disk (createDirectory made intermediate dirs). But the exporter's
+    // fileExists check sees it as existing. To truly test !dirExisted we need a different approach:
+    // remove dest entirely, then make parent read-only so createDirectory inside export throws.
     try fm.removeItem(at: dest)
-    // Instead: create dest fresh just before export so the json file being a dir blocks write.
-    // Actually, the simplest approach: the exporter checks dirExisted before createDirectory.
-    // If we don't pre-create, the exporter creates it. Then write fails → !dirExisted → removeItem(dir).
-    // But we need to *cause* the write to fail. A non-writable directory works:
-    try fm.createDirectory(at: dest, withIntermediateDirectories: true)
-    try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dest.path)
+
+    // Make parent directory read-only so exporter's createDirectory(at: dest) throws
+    let parent = paths.root
+    try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: parent.path)
 
     do {
-        // dirExisted=true here since we made it. Let's test differently:
-        // Remove and don't pre-create — but insert a readonly parent won't work either.
-        // Let's just verify the !dirExisted path more directly by creating the file as a subdirectory.
         _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
-        Issue.record("Expected export to throw on read-only directory")
+        Issue.record("Expected export to throw when directory creation fails")
     } catch {
-        // Expected — permission denied on file creation inside readonly directory
+        // !dirExisted path: entire dest should not exist (createDirectory failed → dir never made)
+        #expect(!fm.fileExists(atPath: dest.path))
     }
     // Restore permissions for cleanup
-    try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest.path)
+    try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
 }
 
 // MARK: - Export: blob progress phase fires
