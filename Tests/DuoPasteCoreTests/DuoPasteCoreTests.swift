@@ -522,42 +522,23 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
 // MARK: - Export: SQLite cancel (VACUUM INTO uninterruptible)
 
-@Test func exportSQLiteCancelAfterVacuumStillCleansUp() async throws {
-    let (paths, db, blobs, service) = try makeFixture()
-    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "vacuum-item", capturedAtNs: 9_000_000_000_000_000_000))
-
-    let exporter = Exporter(database: db, blobs: blobs)
-    let dest = paths.root.appendingPathComponent("export-sqlite-cancel", isDirectory: true)
-
-    // Cancel immediately — VACUUM INTO completes atomically before cancel takes effect.
-    // The cleanup path should still remove the new directory.
-    let task = Task {
-        try exporter.export(to: dest, options: ExportOptions(format: .sqlite, includeBlobs: false))
-    }
-    task.cancel()
-    do {
-        _ = try await task.value
-        // If it completes before cancel takes effect, that's fine too — VACUUM is fast on 1 row.
-    } catch is CancellationError {
-        // Cancel hit after VACUUM — verify cleanup removed the directory.
-        #expect(!FileManager.default.fileExists(atPath: dest.path))
-    }
-}
-
-@Test func exportSQLiteCancelNoBlobsStillCleansUp() async throws {
+@Test func exportSQLiteCancelPostVacuumCleansUp() async throws {
     let (paths, db, blobs, service) = try makeFixture()
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "no-blob-cancel", capturedAtNs: 9_000_000_000_000_000_000))
 
     let exporter = Exporter(database: db, blobs: blobs)
-    let dest = paths.root.appendingPathComponent("export-sqlite-nobl-cancel", isDirectory: true)
+    let dest = paths.root.appendingPathComponent("export-sqlite-cancel", isDirectory: true)
 
-    // includeBlobs=false: the only checkCancellation after VACUUM is the explicit one we added.
+    // includeBlobs=false + pre-cancelled task: the post-VACUUM checkCancellation() is the
+    // only cancel point that fires. Verifies cleanup removes the new directory regardless
+    // of whether cancel arrives before or after VACUUM completes.
     let task = Task {
         try exporter.export(to: dest, options: ExportOptions(format: .sqlite, includeBlobs: false))
     }
     task.cancel()
     do {
         _ = try await task.value
+        // VACUUM on 1 row is fast — may complete before cancel takes effect; that's OK.
     } catch is CancellationError {
         #expect(!FileManager.default.fileExists(atPath: dest.path))
     }
@@ -565,68 +546,48 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
 // MARK: - Export: non-cancel failure cleans up directory
 
-@Test func exportFailureOnReadOnlyDestRemovesNewDirectory() async throws {
+@Test func exportFailureOnExistingDestRemovesOnlyOutputFile() async throws {
     let (paths, db, blobs, service) = try makeFixture()
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "fail-item", capturedAtNs: 9_000_000_000_000_000_000))
 
     let exporter = Exporter(database: db, blobs: blobs)
     let fm = FileManager.default
-    // Create a directory that will cause file writes to fail — make it read-only after creation.
+    // dirExisted=true: pre-create dest, then plant a subdirectory at the json output path
+    // so FileHandle(forWritingTo:) throws (can't write to a directory).
     let dest = paths.root.appendingPathComponent("export-readonly", isDirectory: true)
-    // Don't pre-create dest (dirExisted = false) — let exporter create it, then the write fails
-    // because we make a blocking file at the output path.
-    let blocker = paths.root.appendingPathComponent("export-readonly")
-    // Strategy: pre-create the output file path as an unwritable directory to trigger error
     try fm.createDirectory(at: dest, withIntermediateDirectories: true)
     let jsonPath = dest.appendingPathComponent(ExportFormat.json.filename)
     try fm.createDirectory(at: jsonPath, withIntermediateDirectories: true)
-    // createFile on a path that is already a directory will fail → FileHandle throws
 
-    // Since dest already existed, the cleanup should only remove individual files, not the directory
     do {
         _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
         Issue.record("Expected export to throw")
     } catch {
-        // dirExisted=true path: should remove the json file (directory) but keep dest
+        // dirExisted=true path: cleanup removes individual output files but keeps dest
         #expect(fm.fileExists(atPath: dest.path))
     }
 }
 
-@Test func exportFailureOnNewDirectoryCleansUpEntirely() async throws {
+@Test func exportCreateDirectoryFailureDoesNotLeakPath() async throws {
     let (paths, db, blobs, service) = try makeFixture()
     _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "fail-new", capturedAtNs: 9_000_000_000_000_000_000))
 
     let exporter = Exporter(database: db, blobs: blobs)
     let fm = FileManager.default
-    // dirExisted=false: dest does NOT exist before export. Export creates it, then write fails
-    // because we pre-plant a subdirectory at the json output path (FileHandle can't open a dir).
+    // dest does NOT exist. Make parent read-only so createDirectory(at: dest) throws
+    // before the do-catch cleanup block is reached — verifies no partial directory leaks.
     let dest = paths.root.appendingPathComponent("export-fail-new", isDirectory: true)
     #expect(!fm.fileExists(atPath: dest.path))
 
-    // Pre-plant blocker: create dest/duo-paste-export.json as a directory so createFile succeeds
-    // but FileHandle(forWritingTo:) throws (can't write to a directory).
-    try fm.createDirectory(
-        at: dest.appendingPathComponent(ExportFormat.json.filename),
-        withIntermediateDirectories: true
-    )
-    // Now dest exists on disk (createDirectory made intermediate dirs). But the exporter's
-    // fileExists check sees it as existing. To truly test !dirExisted we need a different approach:
-    // remove dest entirely, then make parent read-only so createDirectory inside export throws.
-    try fm.removeItem(at: dest)
-
-    // Make parent directory read-only so exporter's createDirectory(at: dest) throws
-    let parent = paths.root
-    try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: parent.path)
+    try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: paths.root.path)
 
     do {
         _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
         Issue.record("Expected export to throw when directory creation fails")
     } catch {
-        // !dirExisted path: entire dest should not exist (createDirectory failed → dir never made)
         #expect(!fm.fileExists(atPath: dest.path))
     }
-    // Restore permissions for cleanup
-    try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+    try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.root.path)
 }
 
 // MARK: - Export: blob progress phase fires
