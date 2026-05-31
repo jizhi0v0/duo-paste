@@ -539,6 +539,9 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     task.cancel()
     do {
         _ = try await task.value
+        // VACUUM on 1 row may complete before cancel cooperatively fires — not a test failure,
+        // but means we didn't exercise the cleanup path this run.
+        Issue.record("Cancel did not fire (VACUUM completed too fast); cleanup path not exercised")
     } catch is CancellationError {
         #expect(!FileManager.default.fileExists(atPath: dest.path))
     }
