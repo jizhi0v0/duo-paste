@@ -274,9 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
-        statusBar.setExportProgress("取消导出…")
-
-        currentExportTask = Task.detached(priority: .userInitiated) { [weak self] in
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
             let delegate = self
             do {
                 let result = try exporter.export(to: exportDir, options: options) { p in
@@ -323,6 +321,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        currentExportTask = task
+        statusBar.setExportProgress("取消导出…")
     }
 
     func cancelExport() {

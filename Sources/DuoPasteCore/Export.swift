@@ -118,8 +118,6 @@ public struct Exporter: Sendable {
         items: [Item], to dir: URL, includeBlobs: Bool,
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
-        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
-
         let file = dir.appendingPathComponent("duo-paste-export.md")
         FileManager.default.createFile(atPath: file.path, contents: nil)
         let handle = try FileHandle(forWritingTo: file)
@@ -147,6 +145,7 @@ public struct Exporter: Sendable {
         }
         progress?(ExportProgress(phase: .exporting, current: total, total: total))
 
+        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
         return ExportResult(destination: file, itemCount: items.count, blobCount: blobCount)
     }
 
@@ -194,6 +193,7 @@ public struct Exporter: Sendable {
         let target = dir.appendingPathComponent("duo-paste-export.sqlite")
         try? FileManager.default.removeItem(at: target)
 
+        // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes
         _ = try database.pool.writeWithoutTransaction { db in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
         }
