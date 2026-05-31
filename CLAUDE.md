@@ -110,6 +110,20 @@ launchctl bootout  gui/$UID/io.duopaste.agent      # 停
 launchctl kickstart -k gui/$UID/io.duopaste.agent  # 强重启
 ```
 
+### CI 发布链（Sparkle）+ self-hosted runner
+
+`.github/workflows/release.yml`：触发 = **push 到 main**（自动出 beta）或 **打 `vX.Y.Z` tag**（出 stable）或 **workflow_dispatch**（手动，默 beta）。三段 job：`prepare`（ubuntu，定 version/channel + build 号）→ `build/sign/notarize`（self-hosted mac）→ `publish`（self-hosted mac，发 GitHub release 到 `jizhi0v0/duo-paste-releases` + 写 appcast.xml）。version 规则：tag→剥 `v` 当 stable version；main push→`0.1.<commitcount+1000>-beta+<sha>`。CFBundleVersion(build)=`git rev-list --count + 1000`，跟 tag 字符串无关，Sparkle 按它单调比新旧。
+
+**mac job 跑在 self-hosted runner 上**（`runs-on: [self-hosted, macOS, ARM64]`）——签名/公证要 GUI session 的 login keychain，GitHub 托管 runner 给不了。**repo 级 runner 只绑一个仓库不能跨仓共享**：duo-paste 和 claude-usage 各需自己的 runner 实例。mini 上是 `~/actions-runner`（claude-usage）+ `~/actions-runner-duopaste`（duo-paste），各装成用户态 LaunchAgent service（`actions.runner.<owner>-<repo>.<name>`，跑在 GUI session）。新增实例：另起目录 → `./config.sh --url .../duo-paste --token <一次性> --labels self-hosted,macOS,ARM64` → `./svc.sh install && ./svc.sh start`。
+
+**三个 self-hosted-on-dev-machine 特有的坑（都已解，别回退）**：
+
+1. **runner service 缺代理 → git checkout 直连 github 超时**。LaunchAgent 不 source shell profile，拿不到 `HTTPS_PROXY=127.0.0.1:6152`（Surge）。**修法**：runner 根目录放 `.env` 注入 `HTTPS_PROXY/HTTP_PROXY=http://127.0.0.1:6152` + `NO_PROXY=localhost,127.0.0.1,.apple.com,.icloud.com`。**这是机器本地配置、不在仓库里**——换机/重装 runner 必须重建。notarytool 走 NSURLSession 用系统网络设置不认这俩 env，不受影响（apple 走 NO_PROXY 直连）。
+2. **codesign 按名字签报 ambiguous**。开发机 login.keychain 已装同名 Developer ID 证书，签名搜索列表含 build.keychain + login 两张同名 → codesign 拒签。**修法**（release.yml 已实现）：从 build.keychain 抽证书 SHA-1 指纹按指纹签（`SIGN_IDENTITY_HASH`），唯一锁定 CI 导入那张 + 保留 login 在列表不打断本机。GitHub 托管 runner 不撞（login 没那证书）。
+3. **`SPARKLE_ED_PRIVATE_KEY` secret 必须填**。Sparkle EdDSA 私钥在 mini login keychain（service `https://sparkle-project.org`，label "Private key for signing Sparkle updates"），对应嵌客户端的公钥 `5Ws5rSunj3IH...`。导出要在 **GUI 终端**（SSH session keychain 锁着 `generate_keys -x` 报 "No existing signing key"）：`security find-generic-password -w -s 'https://sparkle-project.org'` 取值 → `gh secret set SPARKLE_ED_PRIVATE_KEY --body "$(...)"`（`$()` 去尾换行）。
+
+**SU 公钥两处对齐**：`release.yml` env `SU_PUBLIC_ED_KEY` + `install-agent.sh:26` 必须同一个值，换密钥对要一起改 + 重装 daemon。发版前 secret 清单：`SPARKLE_ED_PRIVATE_KEY` / `MACOS_CERT_P12_BASE64`+`_PASSWORD` / `MACOS_SIGN_IDENTITY` / `KEYCHAIN_PASSWORD` / `APPLE_ID`+`APP_SPECIFIC_PASSWORD`+`APPLE_TEAM_ID` / `RELEASES_REPO_TOKEN`。
+
 ## 开发工作流
 
 LaunchAgent 装好后常驻 release daemon。**不能** `swift run` 直接调试——双进程重复捕获、抢全局快捷键、SQLite WAL 多写者竞争。流程：改代码 → `swift build && swift test` → `./scripts/install-agent.sh` 重装（幂等）。跑 dev 二进制前先 `launchctl bootout gui/$UID/io.duopaste.agent`，跑完恢复。日志 `tail -f ~/Library/Logs/duo-paste/duo-pasted.err.log`（含 "UI ready" / "snapshot ok" / `[HummingbirdCore] Server started` 正常诊断，不全是错误）。
