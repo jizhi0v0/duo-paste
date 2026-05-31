@@ -209,17 +209,16 @@ public struct Exporter: Sendable {
         }
     }
 
-    private func dayKey(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
-    }
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f
+    }()
 
-    private func humanDate(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f.string(from: date)
-    }
+    private static let humanFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f
+    }()
+
+    private func dayKey(_ date: Date) -> String { Self.dayFormatter.string(from: date) }
+    private func humanDate(_ date: Date) -> String { Self.humanFormatter.string(from: date) }
 
     // MARK: - Raw SQLite
 
@@ -232,11 +231,12 @@ public struct Exporter: Sendable {
         try? FileManager.default.removeItem(at: target)
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
-        // rawCount = all physical rows (including tombstones), NOT fold-aware, NOT query-filtered —
-        // VACUUM INTO copies the entire DB. Intentionally differs from JSON/Markdown's fold-aware count.
+        // rawCount = non-tombstone rows, NOT fold-aware, NOT query-filtered — VACUUM INTO copies the
+        // entire DB but count excludes tombstones for user-facing display. Blob query includes tombstones
+        // so exported sqlite has no broken blob references.
         let (rawCount, allBlobShas) = try database.pool.writeWithoutTransaction { db -> (Int, [String]) in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
-            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item") ?? 0
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0
             let shas = try String.fetchAll(db, sql:
                 "SELECT DISTINCT blob_sha256 FROM item WHERE blob_sha256 IS NOT NULL")
             return (count, shas)
