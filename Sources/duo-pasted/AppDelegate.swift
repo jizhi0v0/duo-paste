@@ -57,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 让 SwiftUI 状态（SettingsModel 的 working copy）保留
     private var settingsWindow: NSWindow?
     private var settingsTrafficLightOverlay: TrafficLightGlyphOverlay?
+    private var currentExportTask: Task<Void, Never>?
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -219,6 +220,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Export
 
     func showExportDialog() {
+        guard currentExportTask == nil else { return }
+
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
@@ -234,8 +237,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         formatLabel.frame = NSRect(x: 0, y: 36, width: 50, height: 20)
         accessory.addSubview(formatLabel)
 
+        let formats: [(String, ExportFormat)] = [
+            ("JSON", .json), ("Markdown", .markdown), ("SQLite", .sqlite),
+        ]
         let formatPopup = NSPopUpButton(frame: NSRect(x: 52, y: 34, width: 160, height: 24), pullsDown: false)
-        formatPopup.addItems(withTitles: ["JSON", "Markdown", "SQLite"])
+        formatPopup.addItems(withTitles: formats.map(\.0))
         accessory.addSubview(formatPopup)
 
         let blobCheck = NSButton(checkboxWithTitle: "包含图片和文件字节", target: nil, action: nil)
@@ -247,8 +253,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        let formatIndex = max(0, formatPopup.indexOfSelectedItem)
-        let format: ExportFormat = [.json, .markdown, .sqlite][formatIndex]
+        let formatIndex = max(0, min(formatPopup.indexOfSelectedItem, formats.count - 1))
+        let format = formats[formatIndex].1
         let includeBlobs = blobCheck.state == .on
 
         let panel = NSOpenPanel()
@@ -267,10 +273,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
-        Task.detached(priority: .userInitiated) {
+        currentExportTask = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try exporter.export(to: exportDir, options: options)
-                await MainActor.run {
+                await MainActor.run { [weak self] in
+                    self?.currentExportTask = nil
                     let done = NSAlert()
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
@@ -286,11 +293,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             } catch {
-                await MainActor.run {
+                await MainActor.run { [weak self] in
+                    self?.currentExportTask = nil
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
-                    err.informativeText = "\(error)"
+                    err.informativeText = error.localizedDescription
                     err.runModal()
                 }
             }
