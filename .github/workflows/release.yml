@@ -140,15 +140,17 @@ jobs:
           # 按 SHA-1 指纹签而非按名字：self-hosted 跑在开发机上时 login.keychain 已装同名
           # Developer ID 证书，搜索列表含 login 让 codesign 按名字解析到两处报 ambiguous。
           # 指纹唯一锁定 build.keychain 这张，同时保留 login 在搜索列表不打断本机其它 keychain 用途。
-          SIGN_IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-            | grep -oE '[0-9A-F]{40}' | head -1)
-          [ -n "$SIGN_IDENTITY_HASH" ] || { echo "::error::build.keychain 内未找到 codesigning identity"; exit 1; }
+          # build.keychain 是每次 run 新建的临时空 keychain，只导入这一张 P12——若意外含多张
+          # leaf（多身份）指纹会有歧义，sanity check 卡住而非 head -1 静默取第一张。
+          IDS=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -oE '[0-9A-Fa-f]{40}')
+          COUNT=$(printf '%s\n' "$IDS" | grep -cE '[0-9A-Fa-f]{40}')
+          [ "$COUNT" = "1" ] || { echo "::error::build.keychain 应只含 1 张 codesigning identity，实际 $COUNT"; exit 1; }
+          SIGN_IDENTITY_HASH=$(printf '%s\n' "$IDS" | head -1)
           echo "SIGN_IDENTITY_HASH=$SIGN_IDENTITY_HASH" >> "$GITHUB_ENV"
           rm -f "$CERT_PATH"
 
       - name: Assemble + deep-sign bundle
         env:
-          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD: ${{ needs.prepare.outputs.build }}
         run: |
