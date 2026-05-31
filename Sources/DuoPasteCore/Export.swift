@@ -57,6 +57,7 @@ public struct Exporter: Sendable {
         do {
             let api = SearchAPI(database: database)
             let items = try api.searchHits(options.query).map(\.0)
+            try Task.checkCancellation()
 
             switch options.format {
             case .json:
@@ -194,12 +195,13 @@ public struct Exporter: Sendable {
         try? FileManager.default.removeItem(at: target)
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes
-        _ = try database.pool.writeWithoutTransaction { db in
+        let rawCount = try database.pool.writeWithoutTransaction { db -> Int in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
+            return try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0
         }
 
         let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
-        return ExportResult(destination: target, itemCount: items.count, blobCount: blobCount)
+        return ExportResult(destination: target, itemCount: rawCount, blobCount: blobCount)
     }
 
     // MARK: - Blob 复制
