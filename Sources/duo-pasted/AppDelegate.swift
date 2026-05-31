@@ -304,7 +304,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
                     let blobLine = result.blobCount > 0 ? "\n图片/文件：\(result.blobCount) 个" : ""
-                    done.informativeText = "共 \(result.itemCount) 条记录\(blobLine)\n位置：\(exportDir.path)"
+                    let countLine: String
+                    if format == .sqlite {
+                        countLine = "完整数据库副本：\(result.itemCount) 条物理行（含跨设备重复）"
+                    } else {
+                        countLine = "共 \(result.itemCount) 条记录"
+                    }
+                    done.informativeText = "\(countLine)\(blobLine)\n位置：\(exportDir.path)"
                     done.addButton(withTitle: "在 Finder 中显示")
                     done.addButton(withTitle: "好")
                     if done.runModal() == .alertFirstButtonReturn {

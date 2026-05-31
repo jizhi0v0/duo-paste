@@ -196,14 +196,16 @@ public struct Exporter: Sendable {
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
         // rawCount = non-tombstone physical rows, NOT fold-aware and NOT query-filtered — VACUUM INTO
-        // copies the entire DB; options.query only affects which items' blobs get copied alongside.
-        // Intentionally differs from JSON/Markdown's items.count (fold-aware + filtered).
-        let rawCount = try database.pool.writeWithoutTransaction { db -> Int in
+        // copies the entire DB. Intentionally differs from JSON/Markdown's items.count (fold-aware + filtered).
+        let (rawCount, allBlobShas) = try database.pool.writeWithoutTransaction { db -> (Int, [String]) in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
-            return try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0
+            let shas = try String.fetchAll(db, sql:
+                "SELECT DISTINCT blob_sha256 FROM item WHERE deleted_at_ns IS NULL AND blob_sha256 IS NOT NULL")
+            return (count, shas)
         }
 
-        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
+        let blobCount = includeBlobs ? try copyReferencedBlobsBySha(shas: allBlobShas, to: dir, progress: progress) : 0
         return ExportResult(destination: target, itemCount: rawCount, blobCount: blobCount)
     }
 
@@ -244,6 +246,39 @@ public struct Exporter: Sendable {
             copied += 1
             if seen.count % 50 == 0 {
                 progress?(ExportProgress(phase: .copyingBlobs, current: seen.count, total: total))
+            }
+        }
+        if total > 0 {
+            progress?(ExportProgress(phase: .copyingBlobs, current: total, total: total))
+        }
+        return copied
+    }
+
+    private func copyReferencedBlobsBySha(
+        shas: [String], to dir: URL,
+        progress: (@Sendable (ExportProgress) -> Void)?
+    ) throws -> Int {
+        let fm = FileManager.default
+        let destRoot = dir.appendingPathComponent("blobs", isDirectory: true)
+        var copied = 0
+        let total = shas.count
+
+        for (i, sha) in shas.enumerated() {
+            try Task.checkCancellation()
+            guard let src = blobs.locate(sha256: sha) else { continue }
+            let a = String(sha.prefix(2))
+            let b = String(sha.dropFirst(2).prefix(2))
+            let destDir = destRoot
+                .appendingPathComponent(a, isDirectory: true)
+                .appendingPathComponent(b, isDirectory: true)
+            try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+            let dest = destDir.appendingPathComponent(src.lastPathComponent)
+            if !fm.fileExists(atPath: dest.path) {
+                try fm.copyItem(at: src, to: dest)
+            }
+            copied += 1
+            if (i + 1) % 50 == 0 {
+                progress?(ExportProgress(phase: .copyingBlobs, current: i + 1, total: total))
             }
         }
         if total > 0 {
