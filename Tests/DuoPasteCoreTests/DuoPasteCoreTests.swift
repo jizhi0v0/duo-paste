@@ -435,6 +435,38 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(!FileManager.default.fileExists(atPath: dest.path))
 }
 
+@Test func exportCancellationKeepsPreExistingDirectory() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    for i in 0..<200 {
+        _ = try await service.ingest(CapturedPasteboard(
+            kind: .text, text: "keep-\(i)",
+            capturedAtNs: Int64(9_000_000_000_000_000_000) + Int64(i) * 1_000_000_000
+        ))
+    }
+
+    let dest = paths.root.appendingPathComponent("export-preexist", isDirectory: true)
+    let fm = FileManager.default
+    try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+    let sentinel = dest.appendingPathComponent("sentinel.txt")
+    try Data("keep me".utf8).write(to: sentinel)
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    nonisolated(unsafe) var taskRef: Task<ExportResult, Error>?
+    let task = Task {
+        try exporter.export(to: dest, options: ExportOptions(format: .json)) { _ in
+            taskRef?.cancel()
+        }
+    }
+    taskRef = task
+    do {
+        _ = try await task.value
+    } catch is CancellationError {
+        // expected
+    }
+    #expect(fm.fileExists(atPath: dest.path))
+    #expect(fm.fileExists(atPath: sentinel.path))
+}
+
 @Test func exportSQLiteItemCountIsRawNotFolded() async throws {
     let root = tempDir()
     let paths = Paths(root: root)

@@ -128,6 +128,7 @@ public struct Exporter: Sendable {
             "# duo-paste 导出\n\n导出时间：\(humanDate(Date())) · 共 \(items.count) 条\n\n".utf8
         ))
 
+        // Re-sort by time DESC for day-grouped output; intentionally drops searchHits' pinned/prefix ordering
         let sorted = items.sorted { $0.capturedAtNs > $1.capturedAtNs }
         var currentDay = ""
         let total = sorted.count
@@ -199,7 +200,7 @@ public struct Exporter: Sendable {
         // copies the entire DB. Intentionally differs from JSON/Markdown's items.count (fold-aware + filtered).
         let (rawCount, allBlobShas) = try database.pool.writeWithoutTransaction { db -> (Int, [String]) in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
-            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item WHERE deleted_at_ns IS NULL") ?? 0
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item") ?? 0
             let shas = try String.fetchAll(db, sql:
                 "SELECT DISTINCT blob_sha256 FROM item WHERE deleted_at_ns IS NULL AND blob_sha256 IS NOT NULL")
             return (count, shas)
