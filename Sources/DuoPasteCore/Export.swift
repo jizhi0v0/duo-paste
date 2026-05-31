@@ -5,6 +5,14 @@ public enum ExportFormat: String, Sendable, CaseIterable {
     case json
     case markdown
     case sqlite
+
+    public var filename: String {
+        switch self {
+        case .json: "duo-paste-export.json"
+        case .markdown: "duo-paste-export.md"
+        case .sqlite: "duo-paste-export.sqlite"
+        }
+    }
 }
 
 public struct ExportOptions: Sendable {
@@ -25,6 +33,17 @@ public struct ExportResult: Sendable {
     public let blobCount: Int
 }
 
+public struct ExportProgress: Sendable {
+    public let phase: Phase
+    public let current: Int
+    public let total: Int
+
+    public enum Phase: Sendable {
+        case exporting
+        case copyingBlobs
+    }
+}
+
 public struct Exporter: Sendable {
     public let database: Database
     public let blobs: BlobStore
@@ -34,77 +53,142 @@ public struct Exporter: Sendable {
         self.blobs = blobs
     }
 
-    /// 把数据导出到目录 `dir`，已存在则覆盖其中内容。
-    public func export(to dir: URL, options: ExportOptions) throws -> ExportResult {
+    public func export(
+        to dir: URL,
+        options: ExportOptions,
+        progress: (@Sendable (ExportProgress) -> Void)? = nil
+    ) throws -> ExportResult {
         let fm = FileManager.default
+        let dirExisted = fm.fileExists(atPath: dir.path)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        let items = try database.pool.read { db in
-            try SearchAPI.fetch(db, query: options.query)
-        }
-
-        switch options.format {
-        case .json:
-            return try writeJSON(items: items, to: dir, includeBlobs: options.includeBlobs)
-        case .markdown:
-            return try writeMarkdown(items: items, to: dir, includeBlobs: options.includeBlobs)
-        case .sqlite:
-            return try writeSQLite(items: items, to: dir, includeBlobs: options.includeBlobs)
+        do {
+            switch options.format {
+            case .json, .markdown:
+                try Task.checkCancellation()
+                let api = SearchAPI(database: database)
+                let items = try api.searchHits(options.query).map(\.0)
+                try Task.checkCancellation()
+                if options.format == .json {
+                    return try writeJSON(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
+                } else {
+                    return try writeMarkdown(items: items, to: dir, includeBlobs: options.includeBlobs, progress: progress)
+                }
+            case .sqlite:
+                return try writeSQLite(to: dir, includeBlobs: options.includeBlobs, progress: progress)
+            }
+        } catch {
+            if !dirExisted {
+                try? fm.removeItem(at: dir)
+            } else {
+                try? fm.removeItem(at: dir.appendingPathComponent(options.format.filename))
+                try? fm.removeItem(at: dir.appendingPathComponent("blobs"))
+            }
+            throw error
         }
     }
 
-    // MARK: - JSON
+    // MARK: - Buffered write
 
-    private func writeJSON(items: [Item], to dir: URL, includeBlobs: Bool) throws -> ExportResult {
-        let payload: [String: Any] = [
-            "schema_version": 1,
-            "exported_at_ns": Clock.nowNs(),
-            "item_count": items.count,
-            "items": try items.map { try itemDict($0) },
-        ]
-        let data = try JSONSerialization.data(
-            withJSONObject: payload,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        )
-        let file = dir.appendingPathComponent("duo-paste-export.json")
-        try data.write(to: file, options: [.atomic])
+    private static let writeBufferSize = 256 * 1024
 
-        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir) : 0
+    private func makeBufferedWriter(to file: URL) throws -> (
+        append: (Data) throws -> Void, flush: () throws -> Void, close: () -> Void
+    ) {
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        var buf = Data()
+        buf.reserveCapacity(Self.writeBufferSize)
+        let append: (Data) throws -> Void = { data in
+            buf.append(data)
+            if buf.count >= Self.writeBufferSize {
+                try handle.write(contentsOf: buf)
+                buf.removeAll(keepingCapacity: true)
+            }
+        }
+        let flush: () throws -> Void = {
+            if !buf.isEmpty { try handle.write(contentsOf: buf) }
+            try handle.close()
+        }
+        let close: () -> Void = { try? handle.close() }
+        return (append, flush, close)
+    }
+
+    // MARK: - JSON (streaming)
+
+    private func writeJSON(
+        items: [Item], to dir: URL, includeBlobs: Bool,
+        progress: (@Sendable (ExportProgress) -> Void)?
+    ) throws -> ExportResult {
+        let file = dir.appendingPathComponent(ExportFormat.json.filename)
+        let (append, flush, close) = try makeBufferedWriter(to: file)
+        defer { close() }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+
+        try append(Data(
+            "{\n  \"schema_version\": 1,\n  \"exported_at_ns\": \(Clock.nowNs()),\n  \"item_count\": \(items.count),\n  \"items\": [\n".utf8
+        ))
+
+        let total = items.count
+        for (i, item) in items.enumerated() {
+            try Task.checkCancellation()
+            var line = Data()
+            line.reserveCapacity(512)
+            line.append(contentsOf: "    ".utf8)
+            line.append(try encoder.encode(item))
+            if i < total - 1 { line.append(contentsOf: ",".utf8) }
+            line.append(contentsOf: "\n".utf8)
+            try append(line)
+            if (i + 1) % 100 == 0 {
+                progress?(ExportProgress(phase: .exporting, current: i + 1, total: total))
+            }
+        }
+        progress?(ExportProgress(phase: .exporting, current: total, total: total))
+
+        try append(Data("  ]\n}\n".utf8))
+        try flush()
+
+        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
         return ExportResult(destination: file, itemCount: items.count, blobCount: blobCount)
     }
 
-    private func itemDict(_ item: Item) throws -> [String: Any] {
-        let data = try JSONEncoder().encode(item)
-        guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return [:]
-        }
-        return dict
-    }
+    // MARK: - Markdown (streaming)
 
-    // MARK: - Markdown
+    private func writeMarkdown(
+        items: [Item], to dir: URL, includeBlobs: Bool,
+        progress: (@Sendable (ExportProgress) -> Void)?
+    ) throws -> ExportResult {
+        let file = dir.appendingPathComponent(ExportFormat.markdown.filename)
+        let (append, flush, close) = try makeBufferedWriter(to: file)
+        defer { close() }
 
-    private func writeMarkdown(items: [Item], to dir: URL, includeBlobs: Bool) throws -> ExportResult {
-        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir) : 0
+        try append(Data(
+            "# duo-paste 导出\n\n导出时间：\(humanDate(Date())) · 共 \(items.count) 条\n\n".utf8
+        ))
 
-        // 按天分组（本地时区）
-        let grouped = Dictionary(grouping: items) { item -> String in
-            let date = Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000)
-            return dayKey(date)
-        }
+        // Re-sort by time DESC for day-grouped output; intentionally drops searchHits' pinned/prefix ordering
+        let sorted = items.sorted { $0.capturedAtNs > $1.capturedAtNs }
+        var currentDay = ""
+        let total = sorted.count
 
-        var md = "# duo-paste 导出\n\n"
-        md += "导出时间：\(humanDate(Date())) · 共 \(items.count) 条\n\n"
-
-        for day in grouped.keys.sorted(by: >) {
-            md += "## \(day)\n\n"
-            let dayItems = grouped[day]!.sorted { $0.capturedAtNs > $1.capturedAtNs }
-            for item in dayItems {
-                md += render(item) + "\n"
+        for (i, item) in sorted.enumerated() {
+            try Task.checkCancellation()
+            let day = dayKey(Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000))
+            if day != currentDay {
+                try append(Data("## \(day)\n\n".utf8))
+                currentDay = day
+            }
+            try append(Data((render(item) + "\n").utf8))
+            if (i + 1) % 100 == 0 {
+                progress?(ExportProgress(phase: .exporting, current: i + 1, total: total))
             }
         }
+        progress?(ExportProgress(phase: .exporting, current: total, total: total))
+        try flush()
 
-        let file = dir.appendingPathComponent("duo-paste-export.md")
-        try md.write(to: file, atomically: true, encoding: .utf8)
+        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
         return ExportResult(destination: file, itemCount: items.count, blobCount: blobCount)
     }
 
@@ -130,31 +214,40 @@ public struct Exporter: Sendable {
         }
     }
 
-    private func dayKey(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
-    }
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f
+    }()
 
-    private func humanDate(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f.string(from: date)
-    }
+    private static let humanFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f
+    }()
+
+    private func dayKey(_ date: Date) -> String { Self.dayFormatter.string(from: date) }
+    private func humanDate(_ date: Date) -> String { Self.humanFormatter.string(from: date) }
 
     // MARK: - Raw SQLite
 
-    private func writeSQLite(items: [Item], to dir: URL, includeBlobs: Bool) throws -> ExportResult {
-        let target = dir.appendingPathComponent("duo-paste-export.sqlite")
+    private func writeSQLite(
+        to dir: URL, includeBlobs: Bool,
+        progress: (@Sendable (ExportProgress) -> Void)?
+    ) throws -> ExportResult {
+        try Task.checkCancellation()
+        let target = dir.appendingPathComponent(ExportFormat.sqlite.filename)
         try? FileManager.default.removeItem(at: target)
 
-        // VACUUM INTO 必须在事务外执行，会产生一份不含 WAL/SHM 的完整副本
-        _ = try database.pool.writeWithoutTransaction { db in
+        // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
+        // rawCount = all physical rows (including tombstones), NOT fold-aware, NOT query-filtered.
+        // Matches what the user sees running SELECT COUNT(*) on the exported sqlite.
+        let (rawCount, allBlobShas) = try database.pool.writeWithoutTransaction { db -> (Int, [String]) in
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item") ?? 0
+            let shas = try String.fetchAll(db, sql:
+                "SELECT DISTINCT blob_sha256 FROM item WHERE blob_sha256 IS NOT NULL")
+            return (count, shas)
         }
 
-        let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir) : 0
-        return ExportResult(destination: target, itemCount: items.count, blobCount: blobCount)
+        let blobCount = includeBlobs ? try copyReferencedBlobsBySha(shas: allBlobShas, to: dir, progress: progress) : 0
+        return ExportResult(destination: target, itemCount: rawCount, blobCount: blobCount)
     }
 
     // MARK: - Blob 复制
@@ -166,14 +259,28 @@ public struct Exporter: Sendable {
         return "blobs/\(a)/\(b)/\(filename)"
     }
 
-    private func copyReferencedBlobs(items: [Item], to dir: URL) throws -> Int {
+    private func copyReferencedBlobs(
+        items: [Item], to dir: URL,
+        progress: (@Sendable (ExportProgress) -> Void)?
+    ) throws -> Int {
+        let shas = Array(Set(items.compactMap(\.blobSha256)))
+        return try copyReferencedBlobsBySha(shas: shas, to: dir, progress: progress)
+    }
+
+    private func copyReferencedBlobsBySha(
+        shas: [String], to dir: URL,
+        progress: (@Sendable (ExportProgress) -> Void)?
+    ) throws -> Int {
         let fm = FileManager.default
         let destRoot = dir.appendingPathComponent("blobs", isDirectory: true)
         var copied = 0
-        var seen: Set<String> = []
-        for item in items {
-            guard let sha = item.blobSha256, !seen.contains(sha) else { continue }
-            seen.insert(sha)
+        let total = shas.count
+
+        for (i, sha) in shas.enumerated() {
+            try Task.checkCancellation()
+            if (i + 1) % 50 == 0 {
+                progress?(ExportProgress(phase: .copyingBlobs, current: i + 1, total: total))
+            }
             guard let src = blobs.locate(sha256: sha) else { continue }
             let a = String(sha.prefix(2))
             let b = String(sha.dropFirst(2).prefix(2))
@@ -186,6 +293,9 @@ public struct Exporter: Sendable {
                 try fm.copyItem(at: src, to: dest)
             }
             copied += 1
+        }
+        if total > 0 {
+            progress?(ExportProgress(phase: .copyingBlobs, current: total, total: total))
         }
         return copied
     }

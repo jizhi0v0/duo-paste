@@ -58,6 +58,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var settingsTrafficLightOverlay: TrafficLightGlyphOverlay?
     private var currentExportTask: Task<Void, Never>?
+    private var exportGeneration = 0
+    private var exportProgressKey = 0
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -274,15 +276,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
-        currentExportTask = Task.detached(priority: .userInitiated) { [weak self] in
+        exportGeneration += 1
+        exportProgressKey = 0
+        let gen = exportGeneration
+
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
             do {
-                let result = try exporter.export(to: exportDir, options: options)
+                let result = try exporter.export(to: exportDir, options: options) { p in
+                    let key = (p.phase == .copyingBlobs ? Int.max / 2 : 0) + p.current
+                    Task { @MainActor in
+                        guard self?.exportGeneration == gen else { return }
+                        guard key >= self?.exportProgressKey ?? 0 else { return }
+                        self?.exportProgressKey = key
+                        switch p.phase {
+                        case .exporting:
+                            self?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
+                        case .copyingBlobs:
+                            self?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
+                        }
+                    }
+                }
                 await MainActor.run {
+                    guard self?.exportGeneration == gen else { return }
+                    self?.exportGeneration += 1
+                    self?.statusBar?.setExportProgress(nil)
+                    self?.currentExportTask = nil
                     let done = NSAlert()
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
                     let blobLine = result.blobCount > 0 ? "\n图片/文件：\(result.blobCount) 个" : ""
-                    done.informativeText = "共 \(result.itemCount) 条记录\(blobLine)\n位置：\(exportDir.path)"
+                    let countLine: String
+                    if format == .sqlite {
+                        countLine = "完整数据库副本：\(result.itemCount) 条物理行（含跨设备重复及已删除项）"
+                    } else {
+                        countLine = "共 \(result.itemCount) 条记录"
+                    }
+                    done.informativeText = "\(countLine)\(blobLine)\n位置：\(exportDir.path)"
                     done.addButton(withTitle: "在 Finder 中显示")
                     done.addButton(withTitle: "好")
                     if done.runModal() == .alertFirstButtonReturn {
@@ -291,19 +320,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             inFileViewerRootedAtPath: exportDir.path
                         )
                     }
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    guard self?.exportGeneration == gen else { return }
+                    self?.exportGeneration += 1
+                    self?.statusBar?.setExportProgress(nil)
                     self?.currentExportTask = nil
                 }
             } catch {
                 await MainActor.run {
+                    guard self?.exportGeneration == gen else { return }
+                    self?.exportGeneration += 1
+                    self?.statusBar?.setExportProgress(nil)
+                    self?.currentExportTask = nil
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
                     err.informativeText = String(describing: error)
                     err.runModal()
-                    self?.currentExportTask = nil
                 }
             }
         }
+        currentExportTask = task
+        statusBar.setExportProgress("取消导出…")
+    }
+
+    func cancelExport() {
+        currentExportTask?.cancel()
     }
 
     private static func exportTimestamp() -> String {
