@@ -40,6 +40,7 @@ public struct ExportProgress: Sendable {
 
     public enum Phase: Sendable {
         case exporting
+        case vacuuming
         case copyingBlobs
     }
 }
@@ -234,6 +235,8 @@ public struct Exporter: Sendable {
         try Task.checkCancellation()
         let target = dir.appendingPathComponent(ExportFormat.sqlite.filename)
         try? FileManager.default.removeItem(at: target)
+
+        progress?(ExportProgress(phase: .vacuuming, current: 0, total: 0))
 
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
         // rawCount = all physical rows (including tombstones), NOT fold-aware, NOT query-filtered.
