@@ -270,13 +270,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "duo-paste-export-\(Self.exportTimestamp())", isDirectory: true
         )
 
+        guard let deps = self.deps else { return }
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
         currentExportTask = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try exporter.export(to: exportDir, options: options)
-                await MainActor.run { [weak self] in
+                await MainActor.run {
                     self?.currentExportTask = nil
                     let done = NSAlert()
                     done.alertStyle = .informational
@@ -293,12 +294,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             } catch {
-                await MainActor.run { [weak self] in
+                await MainActor.run {
                     self?.currentExportTask = nil
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
-                    err.informativeText = error.localizedDescription
+                    err.informativeText = String(describing: error)
                     err.runModal()
                 }
             }
