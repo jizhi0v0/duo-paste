@@ -247,7 +247,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        let format: ExportFormat = [.json, .markdown, .sqlite][formatPopup.indexOfSelectedItem]
+        let formatIndex = max(0, formatPopup.indexOfSelectedItem)
+        let format: ExportFormat = [.json, .markdown, .sqlite][formatIndex]
         let includeBlobs = blobCheck.state == .on
 
         let panel = NSOpenPanel()
@@ -263,7 +264,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "duo-paste-export-\(Self.exportTimestamp())", isDirectory: true
         )
 
-        guard let deps = self.deps else { return }
         let exporter = Exporter(database: deps.database, blobs: deps.blobs)
         let options = ExportOptions(format: format, includeBlobs: includeBlobs)
 
@@ -299,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static func exportTimestamp() -> String {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyyMMdd-HHmmss"
         return f.string(from: Date())
     }
