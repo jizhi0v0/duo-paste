@@ -88,6 +88,29 @@ public struct Exporter: Sendable {
         }
     }
 
+    // MARK: - Buffered write
+
+    private static let writeBufferSize = 256 * 1024
+
+    private func makeBufferedWriter(to file: URL) throws -> (append: (Data) throws -> Void, flush: () throws -> Void) {
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        var buf = Data()
+        buf.reserveCapacity(Self.writeBufferSize)
+        let append: (Data) throws -> Void = { data in
+            buf.append(data)
+            if buf.count >= Self.writeBufferSize {
+                try handle.write(contentsOf: buf)
+                buf.removeAll(keepingCapacity: true)
+            }
+        }
+        let flush: () throws -> Void = {
+            if !buf.isEmpty { try handle.write(contentsOf: buf) }
+            try handle.close()
+        }
+        return (append, flush)
+    }
+
     // MARK: - JSON (streaming)
 
     private func writeJSON(
@@ -95,15 +118,13 @@ public struct Exporter: Sendable {
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
         let file = dir.appendingPathComponent(ExportFormat.json.filename)
-        FileManager.default.createFile(atPath: file.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: file)
-        defer { try? handle.close() }
+        let (append, flush) = try makeBufferedWriter(to: file)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
-        try handle.write(contentsOf: Data(
-            "{\n  \"schema_version\": 2,\n  \"exported_at_ns\": \(Clock.nowNs()),\n  \"item_count\": \(items.count),\n  \"items\": [\n".utf8
+        try append(Data(
+            "{\n  \"schema_version\": 1,\n  \"exported_at_ns\": \(Clock.nowNs()),\n  \"item_count\": \(items.count),\n  \"items\": [\n".utf8
         ))
 
         let total = items.count
@@ -115,14 +136,15 @@ public struct Exporter: Sendable {
             line.append(try encoder.encode(item))
             if i < total - 1 { line.append(contentsOf: ",".utf8) }
             line.append(contentsOf: "\n".utf8)
-            try handle.write(contentsOf: line)
+            try append(line)
             if (i + 1) % 100 == 0 {
                 progress?(ExportProgress(phase: .exporting, current: i + 1, total: total))
             }
         }
         progress?(ExportProgress(phase: .exporting, current: total, total: total))
 
-        try handle.write(contentsOf: Data("  ]\n}\n".utf8))
+        try append(Data("  ]\n}\n".utf8))
+        try flush()
 
         let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
         return ExportResult(destination: file, itemCount: items.count, blobCount: blobCount)
@@ -135,11 +157,9 @@ public struct Exporter: Sendable {
         progress: (@Sendable (ExportProgress) -> Void)?
     ) throws -> ExportResult {
         let file = dir.appendingPathComponent(ExportFormat.markdown.filename)
-        FileManager.default.createFile(atPath: file.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: file)
-        defer { try? handle.close() }
+        let (append, flush) = try makeBufferedWriter(to: file)
 
-        try handle.write(contentsOf: Data(
+        try append(Data(
             "# duo-paste 导出\n\n导出时间：\(humanDate(Date())) · 共 \(items.count) 条\n\n".utf8
         ))
 
@@ -152,15 +172,16 @@ public struct Exporter: Sendable {
             try Task.checkCancellation()
             let day = dayKey(Date(timeIntervalSince1970: TimeInterval(item.capturedAtNs) / 1_000_000_000))
             if day != currentDay {
-                try handle.write(contentsOf: Data("## \(day)\n\n".utf8))
+                try append(Data("## \(day)\n\n".utf8))
                 currentDay = day
             }
-            try handle.write(contentsOf: Data((render(item) + "\n").utf8))
+            try append(Data((render(item) + "\n").utf8))
             if (i + 1) % 100 == 0 {
                 progress?(ExportProgress(phase: .exporting, current: i + 1, total: total))
             }
         }
         progress?(ExportProgress(phase: .exporting, current: total, total: total))
+        try flush()
 
         let blobCount = includeBlobs ? try copyReferencedBlobs(items: items, to: dir, progress: progress) : 0
         return ExportResult(destination: file, itemCount: items.count, blobCount: blobCount)
@@ -217,7 +238,7 @@ public struct Exporter: Sendable {
             try db.execute(sql: "VACUUM INTO ?", arguments: [target.path])
             let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM item") ?? 0
             let shas = try String.fetchAll(db, sql:
-                "SELECT DISTINCT blob_sha256 FROM item WHERE deleted_at_ns IS NULL AND blob_sha256 IS NOT NULL")
+                "SELECT DISTINCT blob_sha256 FROM item WHERE blob_sha256 IS NOT NULL")
             return (count, shas)
         }
 

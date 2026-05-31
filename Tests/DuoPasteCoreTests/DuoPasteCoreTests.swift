@@ -382,7 +382,7 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
 
     let data = try Data(contentsOf: result.destination)
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-    #expect(json?["schema_version"] as? Int == 2)
+    #expect(json?["schema_version"] as? Int == 1)
     let items = json?["items"] as? [Any]
     #expect(items?.count == 50)
 }
