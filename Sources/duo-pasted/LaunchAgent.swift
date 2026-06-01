@@ -37,6 +37,51 @@ enum LaunchAgent {
         return p.terminationStatus == 0
     }
 
+    static func servicePID(label: String) -> pid_t? {
+        let uid = getuid()
+        let p = Process()
+        p.launchPath = "/bin/launchctl"
+        p.arguments = ["print", "gui/\(uid)/\(label)"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        do {
+            try p.run()
+        } catch {
+            return nil
+        }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("pid = ") else { continue }
+            let raw = trimmed.dropFirst("pid = ".count).trimmingCharacters(in: .whitespaces)
+            if let pid = pid_t(raw) {
+                return pid
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    static func kickstart(label: String) -> Int32 {
+        let uid = getuid()
+        let p = Process()
+        p.launchPath = "/bin/launchctl"
+        p.arguments = ["kickstart", "-k", "gui/\(uid)/\(label)"]
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        do {
+            try p.run()
+        } catch {
+            return 127
+        }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
     /// duo-pasted LaunchAgent 的固定 label，定义在 scripts/install-agent.sh 写出的 plist 里
     static let duoPastedLabel = "io.duopaste.agent"
 }

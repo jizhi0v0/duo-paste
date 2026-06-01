@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import os
 import os.log
 import Sparkle
@@ -6,25 +7,10 @@ import DuoPasteCore
 
 private let logger = Logger(subsystem: "io.duopaste.daemon", category: "Updater")
 
-/// duo-paste 是 `KeepAlive` launchd daemon（不是普通登录项 app），完整 Sparkle 在这个
-/// 进程模型下走「方案 A：自控 relaunch」——已三层 spike 实测 + Sparkle 头文件 SPUUpdaterDelegate.h
-/// 背书：`updaterShouldRelaunchApplication` 文档「This method can be used to explicitly
-/// prevent a relaunch」；install-on-quit 文档「Sparkle will always attempt to install the
-/// update when the app terminates」。即：返回 NO 只阻止 relaunch 这一步，**不**阻止 Sparkle
-/// 替换 bundle + terminate 宿主。
-///
-/// 链路：
-///   1) `updaterShouldRelaunchApplication` 返回 NO —— Sparkle 仍装更新（替换 bundle）+
-///      terminate 宿主，但**不** open-relaunch（open relaunch 起的进程脱离 launchd 监管）。
-///   2) 返回前 spawn 一个 detached（POSIX_SPAWN_SETSID）relaunch helper（= 本 binary 的
-///      `__relaunch-helper` 隐藏子命令）。helper 脱离宿主进程组/session，宿主被 terminate
-///      时不被连带杀（launchd bootout 杀整个进程组——Layer1-C 实测）。
-///   3) helper poll 安装目录 Info.plist 的 CFBundleVersion，变了（= Sparkle Installer 已
-///      把新 bundle 换到位）就 `launchctl kickstart -k` 让 launchd 拉起新版。时序无关、
-///      自纠正：即便宿主非 clean-exit 被 launchd 抢先拉起旧版，helper 的 kickstart 仍会
-///      强制换到新版。
-///   4) plist 配 `KeepAlive={SuccessfulExit:false}`：宿主 clean exit 不被 launchd 抢重启
-///      （让位给 Sparkle 安装），崩溃（非 0）才重启（自愈语义保留）。见 install-agent.sh。
+/// duo-paste 是 LaunchAgent 托管的 accessory daemon，不是普通 Dock app。
+/// Sparkle 的标准安装链路必须允许 relaunch（`updaterShouldRelaunchApplication == true`），
+/// 否则 Sparkle 会在安装前直接 abort；安装后的 LaunchServices relaunch 只做一次
+/// `SparkleLaunchdHandoff`，把长期运行权交回 launchd。
 @MainActor
 final class UpdaterController {
     static let shared = UpdaterController()
@@ -36,7 +22,7 @@ final class UpdaterController {
         controller = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: delegate,
-            userDriverDelegate: nil
+            userDriverDelegate: delegate
         )
         logger.info("Sparkle updater started · canCheck=\(self.controller.updater.canCheckForUpdates, privacy: .public)")
     }
@@ -59,19 +45,9 @@ final class UpdaterController {
     }
 }
 
-// MARK: - Sparkle Delegate（方案 A 核心）
+// MARK: - Sparkle Delegate
 
-final class RelaunchDelegate: NSObject, SPUUpdaterDelegate, @unchecked Sendable {
-    /// 只 spawn 一次 helper：`updaterShouldRelaunchApplication` 可能被调多次（文档说装更新
-    /// 流程里会多处 consult relaunch 决策）。helper 本身对「版本没变」幂等（poll 超时静默退出
-    /// 不 kickstart），多 spawn 也安全，但仍去重省资源。
-    ///
-    /// `@unchecked Sendable` 要求显式同步：SPUUpdaterDelegate 回调按惯例在 main thread 但
-    /// 协议无契约保证，用 OSAllocatedUnfairLock 守 `helperSpawned` 的 test-and-set 防并发双 spawn。
-    /// （OSAllocatedUnfairLock 而非裸 os_unfair_lock：macOS 13+ 官方推荐，Swift 6 并发友好、
-    /// 防误拷贝指针。）
-    private let spawnGuard = OSAllocatedUnfairLock(initialState: false)
-
+final class RelaunchDelegate: NSObject, SPUUpdaterDelegate, @preconcurrency SPUStandardUserDriverDelegate, @unchecked Sendable {
     /// beta/stable channel 过滤。includePrereleases=true 看 beta，否则只看无 channel 的 stable。
     func allowedChannels(for updater: SPUUpdater) -> Set<String> {
         UpdateLogic.allowedChannels(
@@ -87,17 +63,52 @@ final class RelaunchDelegate: NSObject, SPUUpdaterDelegate, @unchecked Sendable 
         return UpdateLogic.cacheBustedFeedURL(url, epochSeconds: Int(Date().timeIntervalSince1970))
     }
 
-    /// 方案 A 的关键：返回 NO 阻止 Sparkle open-relaunch（脱离 launchd），spawn helper 接管。
+    /// 这里必须返回 true：Sparkle 在安装前用这个结果决定是否继续，false 会让
+    /// "Install and Relaunch" 直接 abort，看起来像按钮没反应。
     func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool {
-        let shouldSpawn = spawnGuard.withLock { spawned -> Bool in
-            if spawned { return false }
-            spawned = true
+        true
+    }
+
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        SparkleLaunchdHandoff.markForNextLaunch()
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        bringSparkleWindowsForward(reason: "update found")
+    }
+
+    func standardUserDriverDidShowModalAlert() {
+        bringSparkleWindowsForward(reason: "modal alert")
+    }
+
+    func standardUserDriverAllowsMinimizableStatusWindow() -> Bool {
+        false
+    }
+
+    private func bringSparkleWindowsForward(reason: String) {
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            for window in NSApp.windows where Self.isSparkleWindow(window) {
+                window.level = .floating
+                window.orderFrontRegardless()
+                window.makeKeyAndOrderFront(nil)
+            }
+            logger.info("Sparkle UI brought forward: \(reason, privacy: .public)")
+        }
+    }
+
+    private static func isSparkleWindow(_ window: NSWindow) -> Bool {
+        let controllerName = window.windowController.map { String(describing: type(of: $0)) } ?? ""
+        if controllerName.hasPrefix("SU") || controllerName.hasPrefix("SPU") {
             return true
         }
-        if shouldSpawn {
-            RelaunchHelper.spawnDetached()
-            logger.info("updaterShouldRelaunchApplication → NO（已 spawn detached relaunch helper）")
-        }
-        return false
+        let title = window.title.lowercased()
+        return title.contains("software update")
+            || title.contains("updating")
+            || title.contains("update")
     }
 }

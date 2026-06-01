@@ -6,6 +6,7 @@ struct DuoPasteApp: App {
     // 直接返回，daemon 流程照常。
     init() {
         CLI.dispatchAndExitIfApplicable()
+        SparkleLaunchdHandoff.consumeAndExitIfNeeded()
     }
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
