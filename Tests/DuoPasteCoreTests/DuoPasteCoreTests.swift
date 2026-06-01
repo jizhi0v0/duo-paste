@@ -491,6 +491,142 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(sqliteResult.itemCount == 2)
 }
 
+// MARK: - Export: markdown day-header round-trip
+
+@Test func exportMarkdownDayHeadersDescAndExactlyPerDay() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    // Use timestamps 48h apart — guaranteed different calendar days in any timezone.
+    let day1Ns: Int64 = 1_741_564_800_000_000_000 // 2025-03-10 00:00:00 UTC
+    let day2Ns: Int64 = day1Ns - 48 * 3_600_000_000_000 // 48h earlier
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "item-a", capturedAtNs: day1Ns))
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "item-b", capturedAtNs: day1Ns + 3_600_000_000_000))
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "item-c", capturedAtNs: day2Ns))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-md-days", isDirectory: true)
+    let result = try exporter.export(to: dest, options: ExportOptions(format: .markdown, includeBlobs: false))
+
+    let md = try String(contentsOf: result.destination, encoding: .utf8)
+    let dayHeaders = md.components(separatedBy: "\n").filter { $0.hasPrefix("## ") }
+    #expect(dayHeaders.count == 2)
+    // DESC order: newer day first (yyyy-MM-dd string comparison works)
+    #expect(dayHeaders[0] > dayHeaders[1])
+
+    // Verify headers match what the same formatter produces (timezone-aligned)
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd"
+    let expectedDay1 = "## " + df.string(from: Date(timeIntervalSince1970: Double(day1Ns) / 1_000_000_000))
+    let expectedDay2 = "## " + df.string(from: Date(timeIntervalSince1970: Double(day2Ns) / 1_000_000_000))
+    #expect(Set(dayHeaders) == Set([expectedDay1, expectedDay2]))
+}
+
+// MARK: - Export: SQLite cancel (VACUUM INTO uninterruptible)
+
+@Test func exportSQLitePreCancelledTaskCleansUp() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "no-blob-cancel", capturedAtNs: 9_000_000_000_000_000_000))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-sqlite-cancel", isDirectory: true)
+
+    // Pre-cancelled task: cancel fires at the first checkCancellation (before VACUUM) or at
+    // the post-VACUUM checkCancellation if VACUUM completes first. Either way cleanup runs.
+    // Note: deterministically hitting only the post-VACUUM checkpoint is not feasible since
+    // VACUUM is atomic and fast on a small DB.
+    let task = Task {
+        try exporter.export(to: dest, options: ExportOptions(format: .sqlite, includeBlobs: false))
+    }
+    task.cancel()
+    do {
+        _ = try await task.value
+        // VACUUM on 1 row may complete before cancel cooperatively fires — not a test failure,
+        // but means we didn't exercise the cleanup path this run.
+        Issue.record("Cancel did not fire (VACUUM completed too fast); cleanup path not exercised")
+    } catch is CancellationError {
+        #expect(!FileManager.default.fileExists(atPath: dest.path))
+    }
+}
+
+// MARK: - Export: non-cancel failure cleans up directory
+
+@Test func exportFailureOnExistingDestRemovesOnlyOutputFile() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "fail-item", capturedAtNs: 9_000_000_000_000_000_000))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let fm = FileManager.default
+    // dirExisted=true: pre-create dest, then plant a subdirectory at the json output path
+    // so FileHandle(forWritingTo:) throws (can't write to a directory).
+    let dest = paths.root.appendingPathComponent("export-readonly", isDirectory: true)
+    try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+    let jsonPath = dest.appendingPathComponent(ExportFormat.json.filename)
+    try fm.createDirectory(at: jsonPath, withIntermediateDirectories: true)
+
+    do {
+        _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
+        Issue.record("Expected export to throw")
+    } catch {
+        // dirExisted=true path: cleanup removes output file but keeps dest
+        #expect(fm.fileExists(atPath: dest.path))
+        #expect(!fm.fileExists(atPath: jsonPath.path))
+    }
+}
+
+@Test func exportCreateDirectoryFailureDoesNotLeakPath() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "fail-new", capturedAtNs: 9_000_000_000_000_000_000))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let fm = FileManager.default
+    // dest does NOT exist. Make parent read-only so createDirectory(at: dest) throws
+    // before the do-catch cleanup block is reached — verifies no partial directory leaks.
+    let dest = paths.root.appendingPathComponent("export-fail-new", isDirectory: true)
+    #expect(!fm.fileExists(atPath: dest.path))
+
+    try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: paths.root.path)
+    defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.root.path) }
+
+    do {
+        _ = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: false))
+        Issue.record("Expected export to throw when directory creation fails")
+    } catch {
+        #expect(!fm.fileExists(atPath: dest.path))
+    }
+}
+
+// MARK: - Export: blob progress phase fires
+
+@Test func exportBlobProgressPhaseFires() async throws {
+    let (paths, db, blobs, service) = try makeFixture()
+    // Mix of text (no blob) + images (with blob)
+    _ = try await service.ingest(CapturedPasteboard(kind: .text, text: "text-only", capturedAtNs: 9_000_000_000_000_000_000))
+    _ = try await service.ingest(CapturedPasteboard(
+        kind: .image, blob: Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        blobExt: "png", blobMime: "image/png",
+        capturedAtNs: 9_000_000_001_000_000_000
+    ))
+    _ = try await service.ingest(CapturedPasteboard(
+        kind: .image, blob: Data([0xFF, 0xD8, 0xFF, 0xE0]),
+        blobExt: "jpg", blobMime: "image/jpeg",
+        capturedAtNs: 9_000_000_002_000_000_000
+    ))
+
+    let exporter = Exporter(database: db, blobs: blobs)
+    let dest = paths.root.appendingPathComponent("export-blob-progress", isDirectory: true)
+    nonisolated(unsafe) var progressCalls: [ExportProgress] = []
+    let result = try exporter.export(to: dest, options: ExportOptions(format: .json, includeBlobs: true)) { p in
+        progressCalls.append(p)
+    }
+    #expect(result.itemCount == 3)
+    #expect(result.blobCount == 2)
+
+    let blobPhases = progressCalls.filter { $0.phase == .copyingBlobs }
+    #expect(!blobPhases.isEmpty)
+    // Last blob progress should have current == total
+    #expect(blobPhases.last?.current == blobPhases.last?.total)
+    #expect(blobPhases.last?.total == 2)
+}
+
 // MARK: - setPinnedAny (跨 origin 版,给 POST /pin handler 用)
 
 /// own-origin 行 pin 切换:pinned 列翻转 + bump ingested_at_ns

@@ -40,6 +40,7 @@ public struct ExportProgress: Sendable {
 
     public enum Phase: Sendable {
         case exporting
+        case vacuuming
         case copyingBlobs
     }
 }
@@ -235,6 +236,8 @@ public struct Exporter: Sendable {
         let target = dir.appendingPathComponent(ExportFormat.sqlite.filename)
         try? FileManager.default.removeItem(at: target)
 
+        progress?(ExportProgress(phase: .vacuuming, current: 0, total: 0))
+
         // VACUUM INTO is atomic and not interruptible — cancel only takes effect after it completes.
         // rawCount = all physical rows (including tombstones), NOT fold-aware, NOT query-filtered.
         // Matches what the user sees running SELECT COUNT(*) on the exported sqlite.
@@ -245,6 +248,8 @@ public struct Exporter: Sendable {
                 "SELECT DISTINCT blob_sha256 FROM item WHERE blob_sha256 IS NOT NULL")
             return (count, shas)
         }
+
+        try Task.checkCancellation()
 
         let blobCount = includeBlobs ? try copyReferencedBlobsBySha(shas: allBlobShas, to: dir, progress: progress) : 0
         return ExportResult(destination: target, itemCount: rawCount, blobCount: blobCount)

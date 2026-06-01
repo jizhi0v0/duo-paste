@@ -60,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentExportTask: Task<Void, Never>?
     private var exportGeneration = 0
     private var exportProgressKey = 0
+    private var exportIsVacuuming = false
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -283,24 +284,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try exporter.export(to: exportDir, options: options) { p in
-                    let key = (p.phase == .copyingBlobs ? Int.max / 2 : 0) + p.current
+                    let key: Int
+                    switch p.phase {
+                    case .vacuuming: key = 0
+                    case .exporting: key = p.current
+                    case .copyingBlobs: key = Int.max / 2 + p.current
+                    }
                     Task { @MainActor in
                         guard self?.exportGeneration == gen else { return }
                         guard key >= self?.exportProgressKey ?? 0 else { return }
                         self?.exportProgressKey = key
                         switch p.phase {
+                        case .vacuuming:
+                            self?.exportIsVacuuming = true
+                            if self?.currentExportTask?.isCancelled == true {
+                                self?.statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
+                            } else {
+                                self?.statusBar?.setExportProgress("正在生成 SQLite 副本…")
+                            }
                         case .exporting:
+                            self?.exportIsVacuuming = false
                             self?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
                         case .copyingBlobs:
+                            self?.exportIsVacuuming = false
                             self?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
                         }
                     }
                 }
                 await MainActor.run {
                     guard self?.exportGeneration == gen else { return }
-                    self?.exportGeneration += 1
-                    self?.statusBar?.setExportProgress(nil)
-                    self?.currentExportTask = nil
+                    self?.finishExport()
                     let done = NSAlert()
                     done.alertStyle = .informational
                     done.messageText = "导出完成"
@@ -324,16 +337,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch is CancellationError {
                 await MainActor.run {
                     guard self?.exportGeneration == gen else { return }
-                    self?.exportGeneration += 1
-                    self?.statusBar?.setExportProgress(nil)
-                    self?.currentExportTask = nil
+                    self?.finishExport()
                 }
             } catch {
                 await MainActor.run {
                     guard self?.exportGeneration == gen else { return }
-                    self?.exportGeneration += 1
-                    self?.statusBar?.setExportProgress(nil)
-                    self?.currentExportTask = nil
+                    self?.finishExport()
                     let err = NSAlert()
                     err.alertStyle = .critical
                     err.messageText = "导出失败"
@@ -348,6 +357,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func cancelExport() {
         currentExportTask?.cancel()
+        if exportIsVacuuming {
+            statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
+        }
+    }
+
+    private func finishExport() {
+        exportGeneration += 1
+        exportProgressKey = 0
+        exportIsVacuuming = false
+        statusBar?.setExportProgress(nil)
+        currentExportTask = nil
     }
 
     private static func exportTimestamp() -> String {
