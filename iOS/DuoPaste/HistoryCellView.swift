@@ -327,13 +327,14 @@ struct HistoryCellView: View {
             .padding(.vertical, 10)
         }
         .frame(width: 300)
+        .id(previewIdentity)
         .onAppear {
             UILatencyLog.mark("context menu preview appear", itemLogDetail())
         }
         .onDisappear {
             UILatencyLog.mark("context menu preview disappear", itemLogDetail())
         }
-        .task {
+        .task(id: previewIdentity) {
             // image kind + file kind 带 image blob 都触发——之前只看 .image kind
             // 让 .png 文件长按只走 text scroll 路径,跟卡片渲染口径不齐
             if isThumbnailable, let sha = item.blobSha256 {
@@ -358,6 +359,14 @@ struct HistoryCellView: View {
                 }
             }
         }
+    }
+
+    private var previewIdentity: String {
+        PreviewIdentity.make(
+            itemID: item.id,
+            kindRawValue: item.kind.rawValue,
+            blobSHA256: item.blobSha256
+        )
     }
 
     @ViewBuilder
@@ -419,14 +428,12 @@ struct HistoryCellView: View {
         // best-effort,swallow 错误(网络抖 / 404 都不影响本机已完成的复制)
         coordinator.bumpItemOnServer(id: item.id)
 
-        if item.kind == .image, let sha = item.blobSha256 {
+        if let sha = item.blobSha256, itemHasImageBlob {
             if let cached = blobs.cached(sha) {
                 UILatencyLog.mark("copy image cache hit", itemLogDetail("bytes=\(cached.count)"))
                 copyImageBytes(cached, sha: sha, reason: "copy cached")
                 return
             }
-            // 未命中 — 立即出 "复制中" badge 给 immediate 反馈,async fetch 完再切到
-            // .copied / .failed。原先无任何反馈用户体感"卡了"
             showBadge(.copying, autoHideMs: nil)
             Task {
                 do {
@@ -444,11 +451,6 @@ struct HistoryCellView: View {
                 }
             }
         } else if item.kind == .file {
-            // .file kind text_full 是 Mac 上的文件路径——写到 iOS UIPasteboard 没有用
-            // (文件不在 iOS 上,paste 到别处只是个无意义路径字符串),而且 UCB 会把这字符串
-            // 送回 Mac 让 watcher 当 kind=text 重新 capture——跟原 kind=file 行 dedup
-            // miss (kind 不同就不 merge) → 出现重复 entry。
-            // 只 bump 不写 UIPasteboard,跨设备语义靠 POST /bump
             UILatencyLog.mark("copy file: skip pasteboard write (bump only)", itemLogDetail())
             flashCopied()
         } else {
@@ -478,7 +480,7 @@ struct HistoryCellView: View {
 
     private func triggerShare() {
         UILatencyLog.mark("share action begin", itemLogDetail())
-        if item.kind == .image, let sha = item.blobSha256 {
+        if let sha = item.blobSha256, itemHasImageBlob {
             if let cached = blobs.cached(sha) {
                 UILatencyLog.mark("share image cache hit", itemLogDetail("bytes=\(cached.count)"))
                 shareImageBytes(cached, sha: sha, reason: "share cached")
@@ -631,6 +633,13 @@ struct HistoryCellView: View {
     /// - kind=.image:必有 blob,无脑 yes
     /// - kind=.file + blob_mime=image/*:Mac 把 .png 文件读字节当 image 副本上传(同步路径)
     /// - kind=.file + path 后缀像图片:fileLooksLikeImage 判,且必须 blob 存在(iOS 拿不到 Mac 本机文件)
+    private var itemHasImageBlob: Bool {
+        guard item.blobSha256 != nil else { return false }
+        if item.kind == .image { return true }
+        if item.kind == .file, let mime = item.blobMime, mime.hasPrefix("image/") { return true }
+        return false
+    }
+
     private var isThumbnailable: Bool {
         guard let _ = item.blobSha256 else { return false }
         if item.kind == .image { return true }
