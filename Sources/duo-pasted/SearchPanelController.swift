@@ -575,6 +575,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             onOpenSettings: onOpenSettings
         )
         let hosting = NSHostingView(rootView: root)
+        // sizingOptions=[]:搜索窗尺寸固定(contentRect),不需要 hosting view 从 SwiftUI
+        // ideal size 反推窗口大小——显式关掉,杜绝布局期从 intrinsic-size 约束抛异常的可能。
+        hosting.sizingOptions = []
         hosting.frame = contentRect
         hosting.autoresizingMask = [.width, .height]
         // Floating island:四角全圆。panel 四周有 margin,不再有任何一边贴屏幕

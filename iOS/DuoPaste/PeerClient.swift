@@ -309,16 +309,11 @@ actor PeerClient {
     }
 
     private func data(for req: URLRequest) async throws -> (Data, URLResponse) {
-        if Self.isPonte(req.url) {
+        if NWHTTPTransport.isPonte(req.url) {
             DebugLog.shared.append("http nw transport: \(req.httpMethod ?? "GET") \(req.url?.absoluteString ?? "?")")
             return try await NWHTTPTransport.data(for: req, timeoutSec: 12)
         }
         return try await session.data(for: req, delegate: taskDelegate)
-    }
-
-    private static func isPonte(_ url: URL?) -> Bool {
-        guard let host = url?.host?.lowercased() else { return false }
-        return host.hasSuffix(".sgponte")
     }
 
     private static func requireOK(_ resp: URLResponse) throws {
@@ -382,7 +377,16 @@ enum PeerClientError: LocalizedError {
     }
 }
 
-private enum NWHTTPTransport {
+/// 自建 NWConnection HTTP——绕 URLSession+SecureTransport 在 .sgponte（Surge Ponte 代理）
+/// 路径上的解析/cert 坑。`internal` 让 EndpointPicker probe 复用同一套 transport 判定，
+/// 探活跟 /since 走完全一致的路（否则 probe 留在 URLSession 老路径，iOS 27 beta 上失败）
+enum NWHTTPTransport {
+    /// .sgponte 主机判定。PeerClient./since + EndpointPicker.probe 共用此单点真相
+    static func isPonte(_ url: URL?) -> Bool {
+        guard let host = url?.host?.lowercased() else { return false }
+        return host.hasSuffix(".sgponte")
+    }
+
     static func data(for req: URLRequest, timeoutSec: TimeInterval) async throws -> (Data, URLResponse) {
         guard let url = req.url,
               let host = url.host,

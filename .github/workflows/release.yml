@@ -108,7 +108,11 @@ jobs:
       - name: Build release (SwiftPM)
         run: |
           set -euo pipefail
-          swift build -c release --product duo-pasted
+          # --disable-keychain: Sparkle binary artifact 是 public 下载不需凭据，但 SwiftPM
+          # 每次下载前会查 login keychain；runner GUI session 锁屏时 keychain 锁住 →
+          # 查询返 -25308 errSecInteractionNotAllowed 致命退出（checkout clean:true 每次清
+          # .build 强制重下 artifact 才暴露）。关掉 keychain 查询绕过，public 下载本就无需。
+          swift build -c release --product duo-pasted --disable-keychain
           test -x .build/release/duo-pasted
           test -d .build/release/Sparkle.framework
 

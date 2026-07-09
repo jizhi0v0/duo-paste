@@ -6,8 +6,9 @@ import DuoPasteCore
 /// 输入:候选 list(从 Mac GET /endpoints 拿)+ HMAC secret(签 /health 请求)
 /// 输出:包含全部候选的 probe 结果。排序后的第一个 ok 候选即当前建议路线。
 ///
-/// 探活方式:HEAD /health (无 body) × 1 次,3s timeout。HEAD 比 GET 省字节,/health
-/// 不像 /since 那么大,但 /health 也允许 HEAD(没有 body 影响)。
+/// 探活方式:GET /health (HMAC 签名,空 body) × 1 次,走 NWHTTPTransport(NWConnection)——
+/// 跟 WS 同一传输栈,让 probe 可达性 == WS 可达性(URLSession 在 cellular 对 .ts.net /
+/// .sgponte 会失败但 NWConnection 能连,见 probe 注释)。
 ///
 /// **不缓存**:每次 pickBest() 完整重测。调用方负责何时重测(NWPathMonitor 路径变 /
 /// WS endpoints_changed / 周期 timer)
@@ -24,11 +25,16 @@ enum EndpointPicker {
     /// 排序按 (Mac preferred hint, kind 优先级, RTT 升序)。
     /// Mac 端后续做 speed/transport 测试后只要把最佳路线标成 preferred,iOS 会优先跟随。
     /// RTT 只是 reachability 证据 + 同策略层级内的 tiebreaker,不是最终目标函数。
-    /// timeout 默 5s——cellular 经 Surge ponte 路径首次握手可能慢
+    /// timeout 默 12s——对齐 PeerClient./since 的 ponte 超时。cellular 经 Surge Ponte /
+    /// DERP 中继首次 TLS 握手实测 6–10s，5s 太短会让本来可达的路径被判失败（RTT 显示 "—"）
+    /// `onProbe`:每个 endpoint 探完即回调一次(MainActor),让 UI 增量刷新 RTT，不必等
+    /// 整轮最慢的 endpoint(不可达 tailscale 要等满 timeoutSec)才显示其余 endpoint 的延迟。
+    /// 最终仍返回排好序的完整结果给选路用
     static func probeAll(
         endpoints: [PeerEndpoint],
         secret: Data,
-        timeoutSec: TimeInterval = 5
+        timeoutSec: TimeInterval = 12,
+        onProbe: (@MainActor @Sendable (Probe) -> Void)? = nil
     ) async -> [Probe] {
         guard !endpoints.isEmpty else { return [] }
         let auth = HMACAuth(secret: secret)
@@ -39,7 +45,10 @@ enum EndpointPicker {
                 }
             }
             var results: [Probe] = []
-            for await r in group { results.append(r) }
+            for await r in group {
+                results.append(r)
+                await onProbe?(r)
+            }
             // 按 (Mac hint, kind 优先级, RTT) 排:不可达的排到最后
             return results.sorted { a, b in
                 if !a.ok && b.ok { return false }
@@ -71,7 +80,7 @@ enum EndpointPicker {
     static func pickBest(
         endpoints: [PeerEndpoint],
         secret: Data,
-        timeoutSec: TimeInterval = 5
+        timeoutSec: TimeInterval = 12
     ) async -> PeerEndpoint? {
         let probes = await probeAll(endpoints: endpoints, secret: secret, timeoutSec: timeoutSec)
         return probes.first(where: { $0.ok })?.endpoint
@@ -103,16 +112,15 @@ enum EndpointPicker {
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
 
-        // 复用 TrustAnyHTTP.shared（接受任何 cert + HMAC 兜底 MitM）。旧实现每次 probe
-        // 都新建 URLSession + invalidateAndCancel，cellular 抖动期 repick 6 个 endpoint
-        // 同时跑会让 6 个 session/delegate 短暂同时存活；shared session 走 task-level
-        // cancellation（Task.cancel 让 URLSession 自己 cancel 底层连接），不需要 invalidate
-        let session = TrustAnyHTTP.shared
-        // URLRequest.timeoutInterval 覆盖 session 默认 timeout，shared session resource
-        // timeout 是 20s，probe timeoutSec 通常 1-3s 远低于上限不会冲突
+        // 探活走 NWHTTPTransport(NWConnection)——**跟 WS 同一传输栈**。这是关键:UI 把
+        // probe RTT 显示在 WS 状态(绿/橙)旁边,用户预期两者一致。iOS cellular 上 URLSession
+        // 对 .ts.net / .sgponte 经常 NoSuchRecord / TLS error(DNS / 代理解析路径跟 NWConnection
+        // 不一致),但 WS(NWConnection)能连上 → "WS 在线但 probe 失败 = 绿但无延迟"。统一走
+        // NWConnection 让 probe 可达性 == WS 可达性,从根上消除这个分叉。
+        // (/health 响应极小,NWHTTPTransport 手写 parser 足够;只有大响应的 /since 才需 URLSession)
         let started = Date()
         do {
-            let (_, resp) = try await session.data(for: req)
+            let (_, resp) = try await NWHTTPTransport.data(for: req, timeoutSec: timeoutSec)
             let rtt = Int(Date().timeIntervalSince(started) * 1000)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? -1

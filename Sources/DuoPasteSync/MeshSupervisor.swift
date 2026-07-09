@@ -252,10 +252,12 @@ public final class MeshSupervisor: @unchecked Sendable {
             if let override = discoverOverride {
                 decisions = await override()
             } else {
+                let cached = await slots.decisions().map { $0?.learnedPonteHost }
                 decisions = await smart.discover(
                     peers: configPeers,
                     auth: auth,
-                    tailscaleSession: tailscaleSession
+                    tailscaleSession: tailscaleSession,
+                    cachedPonteHosts: cached
                 )
             }
             await applyDecisions(decisions, buildPeer: buildPeer)

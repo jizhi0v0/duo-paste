@@ -146,6 +146,9 @@ final class PeerSyncCoordinator {
     /// 在没人通知的情况下变快了/慢了让 iOS 没法选最优
     private var periodicRepickTask: Task<Void, Never>?
     nonisolated let periodicRepickIntervalSec: TimeInterval = 300
+    /// WS-connect 跳变检测——记录上次 tick 每个 url 的 WS phase。某 url(非connected→connected)
+    /// 跳变且当前无有效 RTT 时补一次 re-probe,让"绿但无延迟"自愈(见 maybeReprobeOnNewlyConnected)
+    private var lastReprobePhases: [String: PoolURLStatus.Phase] = [:]
 
     /// NetworkChangeWatcher listener token——用于在 stop / dealloc 时 removeListener,
     /// 避免 SwiftUI @State 重建 PeerSyncCoordinator 实例时旧 listener 永久留在 watcher。
@@ -320,6 +323,7 @@ final class PeerSyncCoordinator {
         let userInitiated = reason == "pairing complete"
             || reason == "manual refresh"
             || reason == "network changed"
+            || reason == "ws connected reprobe"   // WS 跳变后只 fire 一次(tickStatus 5s 限速),不该被吞
             || reason.hasPrefix("ws: endpoints_changed")
             || reason.hasPrefix("ws watchdog")
         if !userInitiated, let last = lastRepickStartedAt,
@@ -344,7 +348,11 @@ final class PeerSyncCoordinator {
         }
         DebugLog.shared.append("endpoint repick: \(reason) (\(endpoints.count) candidates)")
         repickTask = Task { [weak self] in
-            let probes = await EndpointPicker.probeAll(endpoints: endpoints, secret: secret)
+            let probes = await EndpointPicker.probeAll(
+                endpoints: endpoints, secret: secret
+            ) { @MainActor @Sendable [weak self] p in
+                self?.mergeProbeResult(p)
+            }
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self?.recordRTTs(probes: probes)
@@ -370,6 +378,17 @@ final class PeerSyncCoordinator {
             await MainActor.run {
                 self?.applyPicks(probes: probes, secret: secret)
             }
+        }
+    }
+
+    /// 增量 probe 回调:每个 endpoint 探完就把结果并进 `lastProbes`(按 url 替换),UI 不用
+    /// 等整轮 probeAll 结束(最慢的不可达 endpoint 拖满 timeoutSec)才刷新。只动展示用
+    /// `lastProbes`;`lastRTT` / 排序在整轮结束的 recordRTTs / applyPicks 里收口
+    private func mergeProbeResult(_ p: EndpointPicker.Probe) {
+        if let idx = lastProbes.firstIndex(where: { $0.endpoint.url == p.endpoint.url }) {
+            lastProbes[idx] = p
+        } else {
+            lastProbes.append(p)
         }
     }
 
@@ -820,6 +839,7 @@ final class PeerSyncCoordinator {
         periodicRepickTask = nil
         repickTask?.cancel()
         repickTask = nil
+        lastReprobePhases.removeAll()
         statusTickTask?.cancel()
         statusTickTask = nil
         routeElectionTimeoutTask?.cancel()
@@ -1033,6 +1053,31 @@ final class PeerSyncCoordinator {
                 finishRouteElection()
                 status = .connected(peerDeviceID: pid, lastSync: lastConnectedStampAt)
             }
+        }
+        maybeReprobeOnNewlyConnected()
+    }
+
+    /// WS 变绿 = 该 endpoint 现在可达。若它最近一次 probe 还是失败/缺失("绿但无延迟"),补一次
+    /// re-probe 把 RTT 跟上——修两类残留:(1) 某 endpoint 恢复得比上一轮 probe 晚很多(log 里
+    /// mac.sgponte 比 settle re-probe 晚 80s 才连上);(2) probe 那一帧抓到过渡态失败。只在
+    /// (非connected → connected) **跳变**时 fire,绿稳定后不再重复触发(避免 WS-up-but-HTTP-down
+    /// 每 tick 刷)。repick 重探全部候选,incremental 回调让各自 RTT 就位;throttle 已 bypass
+    /// (tickStatus 5s 天然限速,每跳变最多一轮)
+    private func maybeReprobeOnNewlyConnected() {
+        guard currentSecret != nil, !availableEndpoints.isEmpty else { return }
+        var needReprobe = false
+        for ep in availableEndpoints {
+            let phase = poolStatus(for: ep.url).phase
+            let prev = lastReprobePhases[ep.url]
+            lastReprobePhases[ep.url] = phase
+            // prev==nil 是首次观测,跳过防启动误触发;只认真正的 →connected 跳变
+            guard phase == .connected, let prev, prev != .connected else { continue }
+            let hasRTT = lastProbes.first(where: { $0.endpoint.url == ep.url })?.ok == true
+            if !hasRTT { needReprobe = true }
+        }
+        if needReprobe {
+            DebugLog.shared.append("ws newly connected with stale RTT → reprobe")
+            repickEndpoint(reason: "ws connected reprobe")
         }
     }
 

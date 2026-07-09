@@ -96,6 +96,7 @@ public struct SmartTransport: Sendable {
         auth: HMACAuth,
         tailscaleSession: URLSession,
         rttProbeTimeoutSec: TimeInterval = 3.0,
+        cachedPonteHosts: [String?] = [],
         probe: HealthProbe? = nil,
         logger: ProbeLogger? = nil
     ) async -> [PeerDecision] {
@@ -105,9 +106,11 @@ public struct SmartTransport: Sendable {
         let actualLogger: ProbeLogger = logger ?? Self.defaultStderrLogger
         var out: [PeerDecision] = []
         for (idx, peer) in peers.enumerated() {
+            let cached = cachedPonteHosts.indices.contains(idx) ? cachedPonteHosts[idx] : nil
             let decision = await Self.decideOne(
                 peerIndex: idx,
                 peer: peer,
+                cachedPonteHost: cached,
                 probe: actualProbe,
                 logger: actualLogger
             )
@@ -140,6 +143,7 @@ public struct SmartTransport: Sendable {
     static func decideOne(
         peerIndex: Int,
         peer: Config.PeerConfig,
+        cachedPonteHost: String? = nil,
         probe: HealthProbe,
         logger: ProbeLogger? = nil
     ) async -> PeerDecision {
@@ -151,6 +155,11 @@ public struct SmartTransport: Sendable {
         var rtts: [URL: Int64] = [peer.url: (isReachable(c1Outcome) ? c1Rtt : -1)]
         var learnedPonteHost: String? = nil
         if case .ok(_, _, let ponteHost) = c1Outcome { learnedPonteHost = ponteHost }
+        // C1 没学到 ponte_host（tailscale 不通）但上一轮成功学过 → 用缓存构造 C3
+        if learnedPonteHost == nil, let cached = cachedPonteHost {
+            learnedPonteHost = cached
+            logger?("smart-transport: peer \(peerIndex) using cached ponte_host=\(cached) (tailscale unreachable)")
+        }
 
         // C2 — manual pull_url 如有
         var manualReachable = false

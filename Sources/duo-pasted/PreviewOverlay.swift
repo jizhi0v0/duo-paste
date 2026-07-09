@@ -468,6 +468,12 @@ final class PreviewPanelController {
                 onTextView: nil, onImageOverlay: nil
             )
         )
+        // sizingOptions=[]:不让 hosting view 从 SwiftUI ideal size(root 是
+        // .frame(maxWidth/Height:.infinity),ideal 可能无穷)往自己身上装 intrinsic-size
+        // 约束——尺寸只由下面 setContentSize + autoresizingMask 说了算。堵死
+        // NSHostingView.updateAnimatedWindowSize 把 size 推回 NSWindow auto-grow 的反馈,
+        // 也就堵掉了类注释里 "windowDidLayout 死循环崩 NSException" 那条布局期抛异常的路。
+        host.sizingOptions = []
         host.frame = initial
         host.autoresizingMask = [.width, .height]
         host.wantsLayer = true

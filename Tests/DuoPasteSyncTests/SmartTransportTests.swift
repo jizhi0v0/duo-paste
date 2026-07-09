@@ -401,6 +401,79 @@ struct SmartTransportTests {
         #expect(warnLines.isEmpty, "空 peers 不该打 WARN")
     }
 
+    // MARK: - cached ponte host fallback
+
+    @Test func cachedPonteHostUsedWhenTailscaleDown() async {
+        // tailscale 完全不通，但上一轮 discover 学到了 ponte_host → 用缓存构造 C3
+        let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
+        let probe = makeFakeProbe(responses: [
+            "https://mbp.tail.ts.net:8443": (.unreachable(reason: "tailscale down"), -1),
+            "https://mbp.sgponte:8443": (.ok(deviceID: "mbp-id", nowMs: 1, ponteHost: "mbp.sgponte"), 40)
+        ])
+        let d = await SmartTransport.decideOne(
+            peerIndex: 0, peer: peer,
+            cachedPonteHost: "mbp.sgponte",
+            probe: probe
+        )
+        #expect(d.chosenPullURL.host == "mbp.sgponte")
+        #expect(d.chosenWSKind == .urlSession)
+        #expect(d.learnedPonteHost == "mbp.sgponte")
+    }
+
+    @Test func cachedPonteHostNotUsedWhenFreshLearnedAvailable() async {
+        // C1 成功学到新 ponte_host → 不用缓存（fresh 优先）
+        let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
+        let probe = makeFakeProbe(responses: [
+            "https://mbp.tail.ts.net:8443": (.ok(deviceID: "mbp-id", nowMs: 1, ponteHost: "new.sgponte"), 100),
+            "https://new.sgponte:8443": (.ok(deviceID: "mbp-id", nowMs: 2, ponteHost: nil), 30)
+        ])
+        let d = await SmartTransport.decideOne(
+            peerIndex: 0, peer: peer,
+            cachedPonteHost: "old.sgponte",
+            probe: probe
+        )
+        #expect(d.chosenPullURL.host == "new.sgponte")
+        #expect(d.learnedPonteHost == "new.sgponte")
+    }
+
+    @Test func cachedPonteHostPropagatesThroughDiscover() async {
+        // discover() 接 cachedPonteHosts，正确传递给 decideOne
+        let smart = SmartTransport()
+        let peers = [makePeer(url: "https://mbp.tail.ts.net:8443")]
+        let probe = makeFakeProbe(responses: [
+            "https://mbp.tail.ts.net:8443": (.unreachable(reason: "tailscale down"), -1),
+            "https://mbp.sgponte:8443": (.ok(deviceID: "mbp", nowMs: 1, ponteHost: "mbp.sgponte"), 40)
+        ])
+        let decisions = await smart.discover(
+            peers: peers,
+            auth: HMACAuth(secret: Data(repeating: 0xFF, count: 32)),
+            tailscaleSession: .shared,
+            cachedPonteHosts: ["mbp.sgponte"],
+            probe: probe
+        )
+        #expect(decisions.count == 1)
+        #expect(decisions[0].chosenPullURL.host == "mbp.sgponte")
+        #expect(decisions[0].chosenWSKind == .urlSession)
+    }
+
+    @Test func cachedPonteHostBothDown() async {
+        // tailscale 挂 + cached ponte 也挂 → 退回 tailscale 兜底
+        let peer = makePeer(url: "https://mbp.tail.ts.net:8443")
+        let probe = makeFakeProbe(responses: [
+            "https://mbp.tail.ts.net:8443": (.unreachable(reason: "tailscale down"), -1),
+            "https://mbp.sgponte:8443": (.unreachable(reason: "ponte also down"), -1)
+        ])
+        let d = await SmartTransport.decideOne(
+            peerIndex: 0, peer: peer,
+            cachedPonteHost: "mbp.sgponte",
+            probe: probe
+        )
+        #expect(d.chosenPullURL.host == "mbp.tail.ts.net")
+        #expect(d.chosenWSKind == .nio)
+        // learnedPonteHost 保留缓存值，下一轮还能用
+        #expect(d.learnedPonteHost == "mbp.sgponte")
+    }
+
     @Test func decideOnePonteRecoveredOnSecondTry() async {
         // 启动竞态典型场景:tailscale C1 第一次 fail 第二次 OK(顺带学到 ponte_host),
         // ponte C3 第一次 fail 第二次 OK → 最终选 ponte。这正是 B1 在真实环境想救的 case

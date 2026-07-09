@@ -4,7 +4,7 @@ CLAUDE.md 只放"已落地的不变量 + best practice + 硬护栏",真正的"�
 
 ## 可选下一站(plan 之外)
 
-- M4 导出
+- ~~M4 导出~~ → PR #54 已落地
 - pinned UI
 - 快捷键自定义
 - 自定义时间 picker
