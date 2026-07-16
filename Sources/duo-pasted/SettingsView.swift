@@ -6,14 +6,11 @@ import CoreImage.CIFilterBuiltins
 import DuoPasteCore
 import DuoPasteSync
 
-/// Paste 风格 Settings：左侧自绘 sidebar，右侧标题 + 紧凑分组卡片。
-/// SwiftUI Settings scene 在 accessory app 里不可靠，所以窗口仍由 AppDelegate 自管。
+/// macOS 26 原生 Settings 内容。Settings scene 托管窗口和标题栏，
+/// TabView / Form / Section 跟随系统设置外观。
 struct SettingsView: View {
     @State private var model = SettingsModel()
     @State private var pane: Pane = .general
-    /// AppDelegate.showSettings 注入——给 GeneralPane 订阅 transports 状态用。
-    /// nil = preview / 测试场景，UI 那块 transport 区降级为"未连接"提示
-    var appState: AppState?
 
     enum Pane: String, CaseIterable, Hashable, Identifiable {
         case general, ocr, about
@@ -37,91 +34,20 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            Sidebar(pane: $pane)
-                .frame(width: 220)
-            SettingsDetail(pane: pane, model: model, appState: appState)
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .ignoresSafeArea()
-        .frame(minWidth: 700, idealWidth: 760, minHeight: 560, idealHeight: 620)
-    }
-}
-
-private struct Sidebar: View {
-    @Binding var pane: SettingsView.Pane
-
-    var body: some View {
-        sidebarBody
-    }
-
-    private var sidebarBody: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            ForEach(SettingsView.Pane.allCases) { p in
-                SidebarRow(pane: p, selected: p == pane)
-                    .contentShape(Rectangle())
-                    .onTapGesture { pane = p }
+        TabView(selection: $pane) {
+            ForEach(Pane.allCases) { pane in
+                SettingsDetail(
+                    pane: pane,
+                    model: model,
+                    appState: AppDelegate.shared?.state
+                )
+                .tag(pane)
+                .tabItem {
+                    Label(pane.title, systemImage: pane.icon)
+                }
             }
-            Spacer(minLength: 0)
-            HelpRow()
         }
-        .padding(.horizontal, 8)
-        .padding(.top, 52)
-        .padding(.bottom, 12)
-        .frame(maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.62))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.13), lineWidth: 1)
-        )
-        .padding(.leading, 14)
-        .padding(.trailing, 10)
-        .padding(.top, 16)
-        .padding(.bottom, 16)
-        .frame(maxHeight: .infinity)
-    }
-}
-
-private struct SidebarRow: View {
-    let pane: SettingsView.Pane
-    let selected: Bool
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: pane.icon)
-                .font(.system(size: 14, weight: selected ? .semibold : .regular))
-                .frame(width: 22)
-            Text(pane.title)
-                .font(.system(size: 14, weight: selected ? .semibold : .regular))
-            Spacer(minLength: 0)
-        }
-        .foregroundStyle(selected ? Color.white : Color.primary)
-        .padding(.horizontal, 12)
-        .frame(height: 38)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(selected ? Color.accentColor : Color.clear)
-        )
-    }
-}
-
-private struct HelpRow: View {
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "questionmark.circle")
-                .font(.system(size: 14, weight: .regular))
-                .frame(width: 22)
-            Text("帮助")
-                .font(.system(size: 13, weight: .regular))
-            Spacer(minLength: 0)
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 12)
-        .frame(height: 36)
-        .opacity(0.8)
+        .frame(width: 760, height: 620)
     }
 }
 
@@ -131,24 +57,16 @@ private struct SettingsDetail: View {
     var appState: AppState?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                switch pane {
-                case .general: GeneralPane(model: model, appState: appState)
-                case .ocr: OCRPane(model: model)
-                case .about: AboutPane()
-                }
+        Group {
+            switch pane {
+            case .general: GeneralPane(model: model, appState: appState)
+            case .ocr: OCRPane(model: model)
+            case .about: AboutPane()
             }
-            .frame(maxWidth: 480, alignment: .leading)
-            .padding(.horizontal, 34)
-            .padding(.top, 32)
-            .padding(.bottom, pane == .about ? 28 : 118)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .overlay(alignment: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if pane != .about && (model.isDirty || model.statusMessage != nil) {
                 ApplyBar(model: model)
-                    .padding(.bottom, 28)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -431,20 +349,10 @@ private struct SettingsGroup<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        Section {
+            content
+        } header: {
             Text(title)
-                .font(.system(size: 13, weight: .medium))
-            VStack(spacing: 0) {
-                content
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Color.primary.opacity(0.04))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-            )
         }
     }
 }
@@ -456,27 +364,18 @@ private struct SettingsRow<Trailing: View>: View {
     @ViewBuilder var trailing: Trailing
 
     var body: some View {
-        VStack(spacing: 0) {
-            if !isFirst {
-                Divider().padding(.leading, 16).opacity(0.55)
-            }
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .regular))
-                    if let subtitle {
-                        Text(subtitle)
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+        LabeledContent {
+            trailing
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer(minLength: 10)
-                trailing
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, subtitle == nil ? 8 : 10)
-            .frame(minHeight: 40)
         }
     }
 }
@@ -485,16 +384,11 @@ private struct SettingsNoteRow: View {
     let text: String
 
     var body: some View {
-        VStack(spacing: 0) {
-            Divider().padding(.leading, 16).opacity(0.55)
-            Text(text)
-                .font(.system(size: 11, weight: .regular))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-        }
+        Text(text)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -503,14 +397,7 @@ private struct SettingsBlock<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(spacing: 0) {
-            if !isFirst {
-                Divider().padding(.leading, 16).opacity(0.55)
-            }
-            content
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-        }
+        content
     }
 }
 
@@ -645,7 +532,7 @@ private struct GeneralPane: View {
     var appState: AppState?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        Form {
             SettingsGroup(title: "快捷键") {
                 SettingsRow(title: "快捷键",
                             subtitle: "点按后直接输入新的组合键",
@@ -661,13 +548,21 @@ private struct GeneralPane: View {
 
             SettingsGroup(title: "存储模式") {
                 SettingsRow(title: "blob 同步策略", isFirst: true) {
-                    Picker("", selection: $model.config.mesh.storageMode) {
-                        Text("完整 mirror").tag(StorageMode.full)
-                        Text("按需拉取").tag(StorageMode.optimized)
+                    HStack(spacing: 8) {
+                        GlassChoiceButton(
+                            title: "完整 mirror",
+                            isSelected: model.config.mesh.storageMode == .full
+                        ) {
+                            model.config.mesh.storageMode = .full
+                        }
+                        GlassChoiceButton(
+                            title: "按需拉取",
+                            isSelected: model.config.mesh.storageMode == .optimized
+                        ) {
+                            model.config.mesh.storageMode = .optimized
+                        }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 190)
+                    .frame(width: 220)
                 }
                 SettingsNoteRow(
                     text: model.config.mesh.storageMode == .full
@@ -715,6 +610,7 @@ private struct GeneralPane: View {
 
             IOSPairingGroup(model: model)
         }
+        .formStyle(.grouped)
     }
 
     private var blobMBBinding: Binding<Int> {
@@ -950,7 +846,7 @@ private struct OCRPane: View {
     @State private var isLanguagePickerPresented = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        Form {
             SettingsGroup(title: "OCR 索引") {
                 SettingsRow(title: "启用 OCR",
                             subtitle: "把图片里的文字写进搜索索引",
@@ -960,13 +856,21 @@ private struct OCRPane: View {
                         .toggleStyle(.switch)
                 }
                 SettingsRow(title: "识别精度") {
-                    Picker("", selection: $model.config.ocr.recognitionLevel) {
-                        Text("accurate（默认）").tag("accurate")
-                        Text("fast").tag("fast")
+                    HStack(spacing: 8) {
+                        GlassChoiceButton(
+                            title: "accurate（默认）",
+                            isSelected: model.config.ocr.recognitionLevel == "accurate"
+                        ) {
+                            model.config.ocr.recognitionLevel = "accurate"
+                        }
+                        GlassChoiceButton(
+                            title: "fast",
+                            isSelected: model.config.ocr.recognitionLevel == "fast"
+                        ) {
+                            model.config.ocr.recognitionLevel = "fast"
+                        }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 190)
+                    .frame(width: 280)
                 }
                 SettingsRow(title: "单图字节上限") {
                     Stepper(value: $model.config.ocr.maxBlobMB, in: 1...128) {
@@ -1010,17 +914,9 @@ private struct OCRPane: View {
                         .padding(.leading, 8)
                         .padding(.trailing, 7)
                         .padding(.vertical, 5)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Color.primary.opacity(0.055))
-                        )
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-                        )
                         .frame(maxWidth: 190, alignment: .trailing)
                     }
-                    .buttonStyle(.plain)
+                    .modifier(NativeGlassButtonChrome(isProminent: false))
                     .popover(isPresented: $isLanguagePickerPresented, arrowEdge: .bottom) {
                         LanguageMultiSelectPopover(
                             options: OCRLanguageOption.allOptions,
@@ -1036,6 +932,7 @@ private struct OCRPane: View {
 
             OCRIndexStatusGroup(model: model)
         }
+        .formStyle(.grouped)
         .task(id: model.config.ocr.enabled) {
             // OCRPane 进场起 ticker，离场 / 切 pane 触发 task cancel 自动 stop
             model.startOCRStatsTicker()
@@ -1269,7 +1166,7 @@ private struct AboutPane: View {
     @State private var checkTick = 0   // bump 后让「上次检查」字符串重算（见 lastUpdateCheckString）
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        Form {
             SettingsGroup(title: "进程") {
                 SettingsRow(title: "应用", isFirst: true) {
                     Text("duo-paste").foregroundStyle(.secondary)
@@ -1298,7 +1195,7 @@ private struct AboutPane: View {
                                 .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Button("检查更新") {
+                            GlassActionButton(title: "检查更新", isProminent: true) {
                                 UpdaterController.shared.checkForUpdates()
                                 // checkForUpdates 异步（Sparkle 弹窗 + 网络），lastUpdateCheckDate
                                 // 检查完成后才更新。延迟 bump checkTick 让字符串重算捕获新日期；
@@ -1339,6 +1236,7 @@ private struct AboutPane: View {
                                 Text("补齐缺失 blob")
                             }
                         }
+                        .modifier(NativeGlassButtonChrome(isProminent: false))
                         .disabled(fetchInProgress || isFetchCoolingDown || AppDelegate.shared?.dependencies == nil)
                         Spacer()
                     }
@@ -1373,6 +1271,7 @@ private struct AboutPane: View {
                 pathRow("Blob 仓库", path: paths.blobsDir.path)
             }
         }
+        .formStyle(.grouped)
         .task { await subscribeStorageStats() }
     }
 
@@ -1577,7 +1476,7 @@ private struct PathChip: View {
                     .font(.system(size: 10, weight: .medium))
                     .frame(width: 18, height: 18)
             }
-            .buttonStyle(.plain)
+            .modifier(NativeGlassButtonChrome(isProminent: false))
             .foregroundStyle(Color.secondary)
             .help("在 Finder 中显示")
         }
@@ -1638,10 +1537,10 @@ private struct ApplyBar: View {
                     .keyboardShortcut(.return)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(applyBarBackground)
-        .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(.bar)
     }
 
     /// OCR 字段 dirty 且本机已有 OCR 结果(pending 在跑 / done 历史)时弹警告。
@@ -1668,15 +1567,6 @@ private struct ApplyBar: View {
         model.statusMessage?.contains("重启") ?? false
     }
 
-    @ViewBuilder
-    private var applyBarBackground: some View {
-        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
-        if #available(macOS 26.0, *) {
-            Color.clear.glassEffect(.regular, in: shape)
-        } else {
-            shape.fill(.ultraThinMaterial)
-        }
-    }
 }
 
 private struct GlassActionButton: View {
@@ -1686,30 +1576,65 @@ private struct GlassActionButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(isProminent ? Color.white : Color.primary)
-                .frame(minWidth: 48)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(buttonBackground)
-        }
-        .buttonStyle(.plain)
-        .disabled(isDisabled)
-        .opacity(isDisabled ? 0.45 : 1)
+        Button(title, action: action)
+            .modifier(NativeGlassButtonChrome(isProminent: isProminent))
+            .disabled(isDisabled)
     }
+}
+
+/// Settings 里所有独立 action button 的单点样式契约。macOS 26 直接使用系统
+/// Liquid Glass button styles；旧系统只做编译 / 运行兼容 fallback。
+private struct NativeGlassButtonChrome: ViewModifier {
+    let isProminent: Bool
 
     @ViewBuilder
-    private var buttonBackground: some View {
-        let shape = Capsule(style: .continuous)
+    func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            Color.clear.glassEffect(
-                .regular.tint(isProminent ? Color.accentColor.opacity(0.72) : Color.primary.opacity(0.08)),
-                in: shape
-            )
+            if isProminent {
+                content
+                    .buttonStyle(.glassProminent)
+                    .tint(.accentColor)
+            } else {
+                content.buttonStyle(.glass)
+            }
         } else {
-            shape.fill(isProminent ? Color.accentColor : Color.primary.opacity(0.1))
+            if isProminent {
+                content
+                    .buttonStyle(.borderedProminent)
+                    .tint(.accentColor)
+            } else {
+                content.buttonStyle(.bordered)
+            }
+        }
+    }
+}
+
+/// macOS 26 原生 Liquid Glass 二态选择按钮。两态始终使用同一个 `.glass(.regular)`
+/// 样式，只切换 Glass tint；避免 `.glass` / `.glassProminent` 不同 intrinsic padding
+/// 造成点击时按钮高度跳变。材质、按压、hover 全交给系统。
+private struct GlassChoiceButton: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @ViewBuilder
+    var body: some View {
+        if #available(macOS 26.0, *) {
+            button.buttonStyle(.glass(
+                .regular.tint(isSelected ? Color.accentColor : nil)
+            ))
+        } else {
+            button
+                .buttonStyle(.bordered)
+                .tint(isSelected ? Color.accentColor : nil)
+        }
+    }
+
+    private var button: some View {
+        Button(action: action) {
+            Text(title)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
         }
     }
 }
@@ -1778,11 +1703,11 @@ private struct IOSPairingGroup: View {
                     .foregroundStyle(model.config.serve ? Color.green : Color.secondary)
             }
             SettingsRow(title: "PIN 配对") {
-                Button("显示配对码") {
+                GlassActionButton(title: "显示配对码", isProminent: true,
+                                  isDisabled: !model.config.serve) {
                     showPIN = true
                 }
                 .controlSize(.small)
-                .disabled(!model.config.serve)
             }
             SettingsNoteRow(text: "iOS Settings 选「发现的 Mac」对应一行 → 输入这边显示的 6 位数字 → 自动获取 secret + 候选 endpoints。PIN 60s 失效,错 5 次封锁")
         }
@@ -1900,6 +1825,7 @@ private struct IOSPairingPINSheet: View {
                     Button("重新生成") {
                         generatePIN()
                     }
+                    .modifier(NativeGlassButtonChrome(isProminent: false))
                     .controlSize(.small)
                     .disabled(pin == nil)
                 }
@@ -1910,6 +1836,7 @@ private struct IOSPairingPINSheet: View {
                     // 作废刚 cache 的 PIN,下次开 sheet 可能拿到服务端已 cancel 的 PIN
                     isPresented = false
                 }
+                .modifier(NativeGlassButtonChrome(isProminent: true))
                 .controlSize(.small)
                 .keyboardShortcut(.escape)
             }
@@ -2010,4 +1937,3 @@ private struct IOSPairingPINSheet: View {
         }
     }
 }
-

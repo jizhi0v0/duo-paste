@@ -321,7 +321,7 @@ public struct Config: Codable, Sendable, Equatable {
         /// false → 关 WS 通知层退化为周期 pull（按 pullIntervalSec）。
         public var wsEnabled: Bool
         /// 跨设备 Continuity dedup 时间窗（纳秒）。默 0 = 关 dedup，让 cross-device 副本
-        /// 老实进 mirror，靠 UI fold（`Item.foldByTextFull`）兜底——保证两台 Mac 行集合
+        /// 老实进 mirror，靠 UI fold（文本永久 + 近时间跨-origin 同 sha blob）兜底——保证两台 Mac 行集合
         /// 对称（cascade 删除依赖这个对称性）。5_000_000_000 = 历史行为，单台机器临时
         /// 回滚用。plan hashed-allen §D
         public var crossDeviceDedupWindowNs: Int64

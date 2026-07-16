@@ -2,11 +2,11 @@ import Testing
 import Foundation
 @testable import DuoPasteCore
 
-/// 覆盖 `Item.foldByTextFull` 的契约——剪贴板"文本永久 dedup"的单点逻辑。
+/// 覆盖 `Item.foldByTextFull` 的契约——文本永久 dedup + 跨设备 blob 副本 fold。
 ///
 /// **不钉这个测试,下次 PR 把 winner 选择 / pinned 聚合 / blob 行参与判断改错也能
 /// 编译过,Mac 端 `SearchFoldV7Tests` 走 SQL + searchHits 路径,iOS 端无单测——本 suite
-/// 是核心 fold 行为的 minimum 守门**:winner = max ns / pinned OR / blob 不参与 /
+/// 是核心 fold 行为的 minimum 守门**:winner / pinned OR / blob 跨-origin 时窗 /
 /// 空 text_full 不参与 / nil text_full 落 nonText 桶不丢. iOS HistoryStore.filtered
 /// 与 Mac Search.fetchHitsFolded 必须共用本契约,任何分叉是 bug.
 @Suite("Item.foldByTextFull (cross-origin text dedup)")
@@ -77,12 +77,80 @@ struct ItemFoldTests {
         #expect(folded.first?.pinned == true, "pinned 必须 OR 聚合,不能丢")
     }
 
-    @Test("blob_sha256 非空(image)不参与 fold——同 sha 多次复制保留时间线")
+    @Test("同 origin 的同 sha blob 不 fold——主动多次复制保留时间线")
     func imageSameShaDoesNotFold() {
         let a = makeImage(id: "img1", origin: "self", capturedAtNs: 100, sha: "abcd")
         let b = makeImage(id: "img2", origin: "self", capturedAtNs: 500, sha: "abcd")
         let folded = Item.foldByTextFull([a, b])
         #expect(folded.count == 2, "blob 行必须保留两份")
+    }
+
+    @Test("跨 origin 近时间同 sha fold，保留原始文件名 + 最新排序时间")
+    func nearbyCrossOriginBlobFolds() {
+        let sha = String(repeating: "a", count: 64)
+        let original = Item(
+            id: "original",
+            originDevice: "mac-a",
+            capturedAtNs: 1_000_000_000,
+            kind: .file,
+            sourceAppName: "CleanShot X",
+            preview: "CleanShot 2026-07-14 at 10.32.52@2x.png",
+            textFull: "/original/CleanShot 2026-07-14 at 10.32.52@2x.png",
+            blobSha256: sha
+        )
+        let continuityCopy = Item(
+            id: "copy",
+            originDevice: "mac-b",
+            capturedAtNs: 8_000_000_000,
+            kind: .file,
+            sourceAppName: "Claude",
+            preview: "mac_1783996376558.png",
+            textFull: "/cache/mac_1783996376558.png",
+            blobSha256: sha,
+            pinned: true
+        )
+
+        let folded = Item.foldByTextFull([continuityCopy, original])
+        #expect(folded.count == 1)
+        #expect(folded[0].id == "original")
+        #expect(folded[0].preview == original.preview)
+        #expect(folded[0].textFull == original.textFull)
+        #expect(folded[0].capturedAtNs == continuityCopy.capturedAtNs)
+        #expect(folded[0].pinned == true)
+    }
+
+    @Test("跨 origin 同 sha 超过 15s 不 fold")
+    func distantCrossOriginBlobStaysSeparate() {
+        let a = makeImage(id: "a", origin: "mac-a", capturedAtNs: 0, sha: "same")
+        let b = makeImage(
+            id: "b",
+            origin: "mac-b",
+            capturedAtNs: Item.crossOriginBlobFoldWindowNs + 1,
+            sha: "same"
+        )
+        #expect(Item.foldByTextFull([a, b]).count == 2)
+    }
+
+    @Test("paste bump captured_at 不拆开 UUIDv7 跨 origin blob fold")
+    func capturedAtBumpDoesNotSplitBlobFold() {
+        let firstID = UUIDv7.generate(timestampMs: 1_000).uuidString
+        let copyID = UUIDv7.generate(timestampMs: 1_005).uuidString
+        let bumped = makeImage(
+            id: firstID,
+            origin: "mac-a",
+            capturedAtNs: 999_000_000_000,
+            sha: "same"
+        )
+        let copy = makeImage(
+            id: copyID,
+            origin: "mac-b",
+            capturedAtNs: 1_005_000_000,
+            sha: "same"
+        )
+        let folded = Item.foldByTextFull([bumped, copy])
+        #expect(folded.count == 1)
+        #expect(folded[0].id == firstID)
+        #expect(folded[0].capturedAtNs == bumped.capturedAtNs)
     }
 
     @Test("text_full 空串不参与 fold——不会把所有空文本折一条")

@@ -148,7 +148,7 @@ extension Item {
 }
 
 extension Item {
-    /// 跨 origin 同 `text_full` fold——剪贴板"文本永久 dedup"的单点契约定义。
+    /// 跨 origin 展示 fold——剪贴板内容 dedup 的单点契约定义。
     ///
     /// 在 Mac + iOS UI 显示之前都走这条逻辑：Continuity / ToDesk / 跨 peer pull 等链路
     /// 会把同文本以不同 `origin_device` 重复落库，UI 展示时折叠回一条让"同内容"心智成立。
@@ -159,11 +159,13 @@ extension Item {
     ///   tombstone 可能因 `capturedAtNs` 大于活的 sibling 成为 winner，UI 看到被删除内容。
     ///   Mac 端走 SQL `WHERE deleted_at_ns IS NULL` 在 fold 前过滤，iOS HistoryStore.merge
     ///   也已剔除——本函数作为 public API 不依赖 caller 记忆，自带这层兜底
-    /// - 参与：仅 `blob_sha256 == nil` 且 `text_full` 非空的行（text / url / rtf / html /
-    ///   file 文本路径都按 byte-equal 等同处理）；blob kind（image）**不**参与——同 sha
-    ///   多次复制可能是用户故意保留时间线
+    /// - 文本：`blob_sha256 == nil` 且 `text_full` 非空的行按 byte-equal 永久 fold
+    /// - Blob：同 sha 仅在**不同 origin** 且原始 capture 时间差 ≤ 15s 时 fold。
+    ///   每个 cluster 同一 origin 最多一行，所以本机主动重复复制仍保留时间线。
+    ///   原始时间优先从 UUIDv7 id 取，避免 paste 后 bump `captured_at_ns` 把组拆开。
+    ///   代表行取最早 capture（保留 CleanShot 等原始文件名），但排序时间取组内最新。
     /// - Key：`text_full` 原值，大小写敏感、不 trim、不归一化空白
-    /// - Winner：`max(capturedAtNs)`；同 ns 时保留先入的（与 dict 语义一致）
+    /// - 文本 Winner：`max(capturedAtNs)`；同 ns 时保留先入的（与 dict 语义一致）
     /// - Pinned：参与行 `pinned` OR 聚合赋给 winner——"pin 是对内容的属性而非具体 row"
     /// - **不排序**：fold 后顺序未定义，调用方自行 sort（Mac 走 prefix24h 三层契约，
     ///   iOS 默认 list 走 pinned + captured_at_ns DESC）
@@ -175,10 +177,13 @@ extension Item {
     ///
     /// - Parameter items: 待 fold 的行列表（tombstone 由本函数 skip，caller 无需预过滤）
     /// - Returns: fold 后的行列表（不含 tombstone），顺序未定义
+    public static let crossOriginBlobFoldWindowNs: Int64 = 15_000_000_000
+
     public static func foldByTextFull(_ items: [Item]) -> [Item] {
         var byText: [String: Item] = [:]
-        var nonText: [Item] = []
-        nonText.reserveCapacity(items.count)
+        var blobsBySHA: [String: [Item]] = [:]
+        var passthrough: [Item] = []
+        passthrough.reserveCapacity(items.count)
         for it in items {
             if it.deletedAtNs != nil { continue }
             if it.blobSha256 == nil, let tf = it.textFull, !tf.isEmpty {
@@ -189,10 +194,100 @@ extension Item {
                 } else {
                     byText[tf] = it
                 }
+            } else if let sha = it.blobSha256, !sha.isEmpty {
+                blobsBySHA[sha, default: []].append(it)
             } else {
-                nonText.append(it)
+                passthrough.append(it)
             }
         }
-        return Array(byText.values) + nonText
+
+        var result = Array(byText.values) + passthrough
+        for group in blobsBySHA.values {
+            result.append(contentsOf: foldBlobGroup(group))
+        }
+        return result
+    }
+
+    private struct BlobFoldCluster {
+        var representative: Item
+        var members: [Item]
+        var earliestOriginalNs: Int64
+        var latestOriginalNs: Int64
+        var latestCapturedAtNs: Int64
+        var pinned: Bool
+        var origins: Set<String>
+    }
+
+    private static func foldBlobGroup(_ items: [Item]) -> [Item] {
+        blobFoldClusters(items).map { cluster in
+            var display = cluster.representative
+            display.capturedAtNs = cluster.latestCapturedAtNs
+            display.pinned = cluster.pinned
+            return display
+        }
+    }
+
+    /// Database.softDelete 用同一份 blob fold 契约找到展示卡的物理 siblings，
+    /// 避免删了代表行后另一台 Mac 的 Continuity 副本立即复活。
+    static func blobFoldSiblingIDs(containing id: String, items: [Item]) -> [String] {
+        blobFoldClusters(items)
+            .first { cluster in cluster.members.contains(where: { $0.id == id }) }?
+            .members.map(\.id) ?? [id]
+    }
+
+    private static func blobFoldClusters(_ items: [Item]) -> [BlobFoldCluster] {
+        let sorted = items.sorted { lhs, rhs in
+            let l = originalCaptureNs(lhs)
+            let r = originalCaptureNs(rhs)
+            if l != r { return l < r }
+            return lhs.id < rhs.id
+        }
+        var clusters: [BlobFoldCluster] = []
+
+        for item in sorted {
+            let originalNs = originalCaptureNs(item)
+            let candidate = clusters.indices
+                .filter { index in
+                    let cluster = clusters[index]
+                    return !cluster.origins.contains(item.originDevice)
+                        && originalNs - cluster.earliestOriginalNs <= crossOriginBlobFoldWindowNs
+                }
+                .min { lhs, rhs in
+                    let leftDistance = originalNs - clusters[lhs].latestOriginalNs
+                    let rightDistance = originalNs - clusters[rhs].latestOriginalNs
+                    if leftDistance != rightDistance { return leftDistance < rightDistance }
+                    return clusters[lhs].earliestOriginalNs > clusters[rhs].earliestOriginalNs
+                }
+
+            if let index = candidate {
+                clusters[index].latestOriginalNs = max(clusters[index].latestOriginalNs, originalNs)
+                clusters[index].latestCapturedAtNs = max(
+                    clusters[index].latestCapturedAtNs,
+                    item.capturedAtNs
+                )
+                clusters[index].pinned = clusters[index].pinned || item.pinned
+                clusters[index].origins.insert(item.originDevice)
+                clusters[index].members.append(item)
+            } else {
+                clusters.append(BlobFoldCluster(
+                    representative: item,
+                    members: [item],
+                    earliestOriginalNs: originalNs,
+                    latestOriginalNs: originalNs,
+                    latestCapturedAtNs: item.capturedAtNs,
+                    pinned: item.pinned,
+                    origins: [item.originDevice]
+                ))
+            }
+        }
+        return clusters
+    }
+
+    private static func originalCaptureNs(_ item: Item) -> Int64 {
+        guard let ms = UUIDv7.timestampMs(from: item.id),
+              ms <= UInt64(Int64.max / 1_000_000) else {
+            return item.capturedAtNs
+        }
+        return Int64(ms) * 1_000_000
     }
 }

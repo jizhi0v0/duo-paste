@@ -4,20 +4,21 @@ import Foundation
 /// 失败兜底 banner"两层语义拆出来单测.
 ///
 /// **背景**:server `softDelete`(plan hashed-allen §C / PR #32)把同 text_full 所有 active
-/// sibling 一起 tombstone(跨 origin).iOS 端 fold by text_full,但旧 `removeOptimistic(id:)`
+/// sibling 一起 tombstone(跨 origin).iOS 端按文本 / Continuity blob group fold,但旧
+/// `removeOptimistic(id:)`
 /// 只删单 id → 同 text_full sibling 仍在内存里,fold 立刻 elect 另一条当代表 → 用户感觉
 /// "卡片没删掉,几秒后才消失"(等 server cascade tombstones 通过 /since 拉回).
 ///
 /// **本 tracker 提供两个原语**:
-/// 1. [markDeleted]:返回 caller 应当从 items 移除的所有 id(text-kind cascade,blob-kind
-///    单 id).同时按 id + text_full 双维度记 pending 让后续 [observeIncoming] 用.
+/// 1. [markDeleted]:返回 caller 应当从 items 移除的所有 id(text-kind cascade,以及
+///    15s 内跨 origin 的同 SHA blob group).同时记 pending 让后续 [observeIncoming] 用.
 /// 2. [observeIncoming]:扫 incoming 批,返回 (skipIds, resurrectedIds).skip 让 caller 把
 ///    in-flight `/since` 带回的同 text_full sibling 屏蔽在 grace 窗口内不入库;resurrected
 ///    让 caller 弹"删除未送达"banner.tombstone 自动清对应 pending entry.
 ///
 /// **不变量**:
-/// - cascade 范围跟 server `Database.softDelete` 严格对齐——`blob_sha256 == nil &&
-///   text_full 非空`(text / url / rtf / html / 无 blob 的 file 路径)
+/// - cascade 范围跟 server `Database.softDelete` 严格对齐——文本按 `text_full`；blob
+///   复用 `Item.blobFoldSiblingIDs` 的跨 origin + 15s cluster 契约
 /// - 所有 cascade 出来的 id 都进 pendingIds——sibling 后续在 grace 后回流时 banner 也算
 /// - pendingTextFulls 命中 + 未超 grace → skip(不闪回);超 grace → resurrected(banner)
 /// - tombstone 行到达永远清两边 pending entry(server 真删除了,后续 sibling 不再 skip)
@@ -28,6 +29,7 @@ public struct OptimisticDeleteTracker: Sendable {
 
     private var pendingIds: [String: Date] = [:]
     private var pendingTextFulls: [String: Date] = [:]
+    private var pendingBlobFolds: [String: PendingBlobFold] = [:]
 
     public init(gracePeriod: TimeInterval = 3, prunePeriod: TimeInterval = 60) {
         self.gracePeriod = gracePeriod
@@ -36,7 +38,7 @@ public struct OptimisticDeleteTracker: Sendable {
 
     /// caller 长按删除路径调.返回应当从 items 立即移除的所有 id(含 target 自己).
     /// text-kind(`blob_sha256 == nil && text_full 非空`)→ cascade 同 text_full 所有
-    /// active sibling;否则单 id.同时按 id + text_full 双维度记 pending.
+    /// active sibling；blob-kind → cascade 同一展示 fold cluster；否则单 id。
     public mutating func markDeleted(
         _ target: Item,
         in items: [Item],
@@ -57,6 +59,24 @@ public struct OptimisticDeleteTracker: Sendable {
                 && it.deletedAtNs == nil {
                 ids.insert(it.id)
                 pendingIds[it.id] = now
+            }
+        } else if let sha = target.blobSha256, !sha.isEmpty {
+            let candidates = items.filter {
+                $0.deletedAtNs == nil && $0.blobSha256 == sha
+            }
+            let memberIDs = Set(Item.blobFoldSiblingIDs(
+                containing: target.id,
+                items: candidates
+            ))
+            let members = candidates.filter { memberIDs.contains($0.id) }
+            if !members.isEmpty {
+                ids.formUnion(memberIDs)
+                for id in memberIDs { pendingIds[id] = now }
+                pendingBlobFolds[target.id] = PendingBlobFold(
+                    anchorID: target.id,
+                    members: members,
+                    pendingAt: now
+                )
             }
         }
         return ids
@@ -81,6 +101,9 @@ public struct OptimisticDeleteTracker: Sendable {
                 if let t = it.textFull, !t.isEmpty {
                     pendingTextFulls.removeValue(forKey: t)
                 }
+                pendingBlobFolds = pendingBlobFolds.filter {
+                    !$0.value.members.contains(where: { $0.id == it.id })
+                }
                 continue
             }
             if let pendingAt = pendingIds[it.id],
@@ -97,6 +120,20 @@ public struct OptimisticDeleteTracker: Sendable {
                     pendingTextFulls.removeValue(forKey: t)
                 }
             }
+            for (key, fold) in pendingBlobFolds {
+                let elapsed = now.timeIntervalSince(fold.pendingAt)
+                let siblingIDs = Item.blobFoldSiblingIDs(
+                    containing: fold.anchorID,
+                    items: fold.members + [it]
+                )
+                guard siblingIDs.contains(it.id) else { continue }
+                if elapsed <= gracePeriod {
+                    skipIds.insert(it.id)
+                } else {
+                    resurrectedIds.insert(it.id)
+                    pendingBlobFolds.removeValue(forKey: key)
+                }
+            }
         }
         return ObserveOutcome(skipIds: skipIds, resurrectedIds: resurrectedIds)
     }
@@ -110,6 +147,13 @@ public struct OptimisticDeleteTracker: Sendable {
         let cutoff = now.addingTimeInterval(-prunePeriod)
         pendingIds = pendingIds.filter { $0.value > cutoff }
         pendingTextFulls = pendingTextFulls.filter { $0.value > cutoff }
+        pendingBlobFolds = pendingBlobFolds.filter { $0.value.pendingAt > cutoff }
+    }
+
+    private struct PendingBlobFold: Sendable {
+        let anchorID: String
+        let members: [Item]
+        let pendingAt: Date
     }
 
     public struct ObserveOutcome: Equatable, Sendable {

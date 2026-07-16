@@ -10,7 +10,7 @@ import GRDB
 ///
 /// 本套覆盖 v7 单表语义下的 fold 不变量，保证 SearchProvider.localMirror 路径行为跟合表前一致：
 /// - 跨 origin 同 text_full 在单表内 fold 为一条（winner = max(capturedAtNs)，pinned OR 聚合）
-/// - 同 blob_sha256 不 fold（保留时间线，blob kind 独立）
+/// - 同 blob_sha256 的近时间跨-origin 副本 fold；同 origin 重复仍保留
 /// - kinds / pinnedOnly filter 应用到 winner 行（不前置到子查询）
 /// - fetchUnion / count / countByKind 三路口径一致
 ///
@@ -76,15 +76,26 @@ private func insertItem(
     #expect(hits.first?.0.pinned == true)
 }
 
-@Test func foldDoesNotFoldBlobsBySameShaInSingleTable() throws {
-    // 同 sha 图片多次复制可能是用户故意保留时间线 → 不 fold（仅 blob_sha256 IS NULL 行参与 fold）
+@Test func foldNearbyCrossOriginBlobsBySameShaInSingleTable() throws {
+    // Continuity 在两台 Mac 各自 capture 同一图片，id/文件名不同但 sha 相同 → UI 只显一条。
     let db = try makeDB()
     let sha = String(repeating: "a", count: 64)
     try insertItem(db, id: "own-img", origin: "self", capturedAtNs: 100, kind: .image, blobSha256: sha)
     try insertItem(db, id: "peer-img", origin: "peer", capturedAtNs: 500, kind: .image, blobSha256: sha)
     let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
+    #expect(hits.count == 1)
+    #expect(hits.first?.0.id == "own-img")
+    #expect(hits.first?.0.capturedAtNs == 500)
+}
+
+@Test func foldKeepsSameOriginBlobTimelineInSingleTable() throws {
+    let db = try makeDB()
+    let sha = String(repeating: "b", count: 64)
+    try insertItem(db, id: "img-1", origin: "self", capturedAtNs: 100, kind: .image, blobSha256: sha)
+    try insertItem(db, id: "img-2", origin: "self", capturedAtNs: 500, kind: .image, blobSha256: sha)
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
     #expect(hits.count == 2)
-    #expect(Set(hits.map(\.0.id)) == ["own-img", "peer-img"])
+    #expect(Set(hits.map(\.0.id)) == ["img-1", "img-2"])
 }
 
 @Test func foldRespectsKindFilter() throws {

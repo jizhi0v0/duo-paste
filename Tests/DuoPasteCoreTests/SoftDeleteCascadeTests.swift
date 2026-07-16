@@ -128,11 +128,11 @@ private func insertImage(
     #expect(dead.ingestedAtNs == 200)
 }
 
-@Test func cascadeDoesNotApplyToBlobKind() async throws {
-    // blob-kind(blob_sha256 非空) → 即使 cascade=true 也不 cascade,只删单 id
+@Test func cascadeDoesNotMergeSameOriginBlobTimeline() async throws {
+    // 同一设备主动重复复制同一 blob → 两张独立时间线卡，删除只动目标。
     let db = try makeCascadeDB()
     try await insertImage(db, id: "img-a", origin: "mbp", sha: "deadbeef", capturedNs: 100, ingestedNs: 100)
-    try await insertImage(db, id: "img-b", origin: "mini", sha: "deadbeef", capturedNs: 200, ingestedNs: 200)
+    try await insertImage(db, id: "img-b", origin: "mbp", sha: "deadbeef", capturedNs: 200, ingestedNs: 200)
 
     let now: Int64 = 5_000_000_000_000_000_000
     let results = try await db.softDelete(id: "img-a", now: now)
@@ -140,7 +140,7 @@ private func insertImage(
     #expect(results[0].id == "img-a")
 
     let imgB = try await db.pool.read { try Item.filter(Column("id") == "img-b").fetchOne($0)! }
-    #expect(imgB.deletedAtNs == nil, "blob-kind sibling 不该被 cascade")
+    #expect(imgB.deletedAtNs == nil, "同 origin 的独立时间线不该被 cascade")
 }
 
 @Test func cascadeRejectsAlreadyDeletedTarget() async throws {
@@ -226,6 +226,29 @@ private func insertImage(
 
     let img = try await db.pool.read { try Item.filter(Column("id") == "img-1").fetchOne($0)! }
     #expect(img.deletedAtNs == nil, "blob-kind 同 text_full 不该被 cascade")
+}
+
+@Test func cascadeDeletesOnlyTheMatchingCrossOriginBlobFoldGroup() async throws {
+    let db = try makeCascadeDB()
+    let sha = String(repeating: "c", count: 64)
+    // 同 origin 两次主动 copy 应是两张卡；peer 副本跟更近的 own-new 折叠。
+    try await insertImage(db, id: "own-old", origin: "mbp", sha: sha,
+                          capturedNs: 0, ingestedNs: 1)
+    try await insertImage(db, id: "own-new", origin: "mbp", sha: sha,
+                          capturedNs: 5_000_000_000, ingestedNs: 2)
+    try await insertImage(db, id: "peer-copy", origin: "mini", sha: sha,
+                          capturedNs: 6_000_000_000, ingestedNs: 3)
+
+    let results = try await db.softDelete(
+        id: "own-new",
+        now: 5_000_000_000_000_000_000
+    )
+    #expect(Set(results.map(\.id)) == ["own-new", "peer-copy"])
+
+    let old = try await db.pool.read { try Item.filter(Column("id") == "own-old").fetchOne($0)! }
+    let peer = try await db.pool.read { try Item.filter(Column("id") == "peer-copy").fetchOne($0)! }
+    #expect(old.deletedAtNs == nil, "同 origin 的独立时间线卡不应被误删")
+    #expect(peer.deletedAtNs != nil, "折叠的跨 origin 副本必须一起 tombstone")
 }
 
 @Test func cascadeMatchesFoldPredicate() async throws {

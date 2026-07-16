@@ -68,11 +68,12 @@ private func makeDB() throws -> DuoPasteCore.Database {
     #expect(callCount.value == 1)
 
     // 表里**不**应该有这一行(负命中不写表,避免 BLOB 浪费空间)
-    let row = try await db.pool.read { conn -> Row? in
-        try Row.fetchOne(conn, sql: "SELECT * FROM app_icon WHERE bundle_id = ?",
-                        arguments: ["com.nonexistent.app"])
+    let exists = try await db.pool.read { conn -> Bool in
+        try Bool.fetchOne(conn, sql: """
+            SELECT EXISTS(SELECT 1 FROM app_icon WHERE bundle_id = ?)
+        """, arguments: ["com.nonexistent.app"]) ?? false
     }
-    #expect(row == nil)
+    #expect(exists == false)
 }
 
 @Test func appIconStorePersistsAcrossInstances() async throws {

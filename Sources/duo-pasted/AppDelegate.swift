@@ -6,9 +6,8 @@ import DuoPasteSync
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// SwiftUI Settings scene 不能直接访问 AppDelegate 实例字段。这里挂一个 weak 弱引用，
-    /// 让 SettingsView 能拿到当前 AppState（含 deps.config / deps.deviceID / pasteBlobFetcher
-    /// / meshStatus）。单 daemon 进程内永远只有 1 个 AppDelegate
+    /// Settings scene 里的业务视图通过这个弱引用读取 daemon 运行状态。
+    /// 单 daemon 进程内永远只有 1 个 AppDelegate。
     static weak var shared: AppDelegate?
 
     private var deps: AppDependencies!
@@ -22,7 +21,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ocrWorker?.wake()
     }
     private var panel: SearchPanelController!
-    private var statusBar: StatusBarController!
     private var watcher: PasteboardWatcher!
     private var hotkey: GlobalHotKey!
     private var snapshotScheduler: SnapshotScheduler!
@@ -52,11 +50,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// nonisolated 让 TaskGroup 的 sleeper task 能 capture（详 fetchBlobLazy）
     nonisolated static let lazyBlobTimeoutSec: TimeInterval = 30
 
-    /// 自管的 Settings 窗口。第一次点状态栏「设置…」时 lazy 创建；
-    /// 后续点击 makeKeyAndOrderFront 复用同一个 window，关掉时 orderOut 不销毁
-    /// 让 SwiftUI 状态（SettingsModel 的 working copy）保留
-    private var settingsWindow: NSWindow?
-    private var settingsTrafficLightOverlay: TrafficLightGlyphOverlay?
     private var currentExportTask: Task<Void, Never>?
     private var exportGeneration = 0
     private var exportProgressKey = 0
@@ -83,8 +76,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// StatusBarController 触发的「设置…」入口。accessory app 没 Dock + 无主菜单，
-    /// SwiftUI Settings scene 不响应 `showSettingsWindow:` —— 自管 NSWindow 绕开整个机制
     /// SettingsView apply 后调用——重读 config.hotkey 把 GlobalHotKey 重 register 到新组合。
     /// 零成本（register API 幂等：先 unregister 旧 + remove 旧 handler，再 register 新）。
     /// **关键**：必须重新 load 一次 config 拿最新值；deps.config 是 daemon 启动时快照不会变
@@ -105,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ) { [weak self] in
                 self?.panel.toggle()
             }
-            statusBar?.updateOpenSearchHotkey(cfg.hotkey)
+            StatusBarState.shared.hotkey = cfg.hotkey
             fputs("hotkey re-registered: \(cfg.hotkey.modifiers.joined(separator: "+"))+\(cfg.hotkey.key)\n", stderr)
         } catch {
             fputs("reloadHotkey: register 失败：\(error)\n", stderr)
@@ -127,97 +118,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func showSettings() {
         NSApp.activate(ignoringOtherApps: true)
-        if let win = settingsWindow {
-            centerSettingsWindow(win)
-            win.makeKeyAndOrderFront(nil)
-            return
-        }
-        // Paste 风格窗口：内容铺进 titlebar，traffic lights 漂在 sidebar 顶部。
-        // 必须在创建时就传完整 styleMask——NSWindow(contentViewController:) 先用默认
-        // styleMask 完成首次布局，事后追加 .fullSizeContentView 在 macOS 26 上不重新 layout
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        let host = FullBleedHostingView(rootView: SettingsView(appState: self.state))
-        win.contentView = host
-        win.title = ""
-        win.titlebarAppearsTransparent = true
-        win.titleVisibility = .hidden
-        win.setContentSize(NSSize(width: 760, height: 620))
-        // 锁固定尺寸——styleMask 没 .resizable，理论上不会有 resize 路径；min/max 都设到
-        // frame.size 让契约自证（避免之前 minSize=700×560 让阅读代码的人以为支持缩到 700）。
-        // CLAUDE.md §"Settings 窗口" 不变量：traffic lights placement 在 fixed size 下才稳
-        win.minSize = win.frame.size
-        win.maxSize = win.frame.size
-        win.isReleasedWhenClosed = false   // close 走 orderOut，下次直接复用
-        win.delegate = self
-        centerSettingsWindow(win)
-        self.settingsWindow = win
-        win.makeKeyAndOrderFront(nil)
-        positionSettingsTrafficLights(in: win)
-        // 某些机器 NSThemeFrame 在 makeKeyAndOrderFront 之后还要 layout 一次，
-        // 会把我们的 setFrameOrigin 覆盖回默认位置。延后一拍再摆一次，赢这场 race。
-        DispatchQueue.main.async { [weak self] in
-            self?.positionSettingsTrafficLights(in: win)
-        }
+        openSettingsWhenReady(attempt: 0)
     }
 
-    private func centerSettingsWindow(_ window: NSWindow) {
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
-            ?? window.screen
-            ?? NSScreen.main
-        guard let visibleFrame = screen?.visibleFrame else {
-            window.center()
+    private func openSettingsWhenReady(attempt: Int) {
+        if let openSettings = StatusBarState.shared.openSettings {
+            openSettings()
             return
         }
 
-        let frame = window.frame
-        let origin = NSPoint(
-            x: visibleFrame.midX - frame.width / 2,
-            y: visibleFrame.midY - frame.height / 2
-        )
-        window.setFrameOrigin(origin)
+        // MenuBarExtra label 会安装 scene environment 的 openSettings action。
+        // daemon 重启后自动恢复 Settings 可能早于 label 首帧，短暂等待即可。
+        guard attempt < 20 else {
+            fputs("settings: openSettings action unavailable after 1s\n", stderr)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.openSettingsWhenReady(attempt: attempt + 1)
+        }
     }
 
-    private func positionSettingsTrafficLights(in window: NSWindow) {
-        guard let contentView = window.contentView else { return }
+    func toggleSearch() {
+        panel?.toggle()
+    }
 
-        // 系统 standardWindowButton 在某些 macOS 版本上 NSThemeFrame 会反复 re-layout
-        // 把我们的 setFrameOrigin 覆盖回左上角默认位置（mini 上复现，MBP 上 OK）。
-        // 干脆隐藏掉走真·自绘——overlay 自己画红黄绿 + 处理点击。
-        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(kind)?.isHidden = true
+    func confirmQuit() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "退出 duo-paste？"
+        alert.informativeText = "退出后剪贴板捕获与跨设备同步会停止，直到下次开机自启，"
+            + "或手动运行 install-agent.sh / launchctl kickstart 重新启动。"
+        alert.addButton(withTitle: "退出")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSApp.terminate(nil)
         }
-
-        let topInset: CGFloat = 32   // 跟右侧 SettingsGroup title (.padding(.top, 32) + 13pt) 垂直中心对齐
-        let leftInset: CGFloat = 34  // 跟 sidebar 项左边缘对齐 = sidebar padding(14) + 内 padding(8) + row padding(12)
-        let diameter: CGFloat = 14
-        let spacing: CGFloat = 20
-
-        let overlay = settingsTrafficLightOverlay ?? TrafficLightGlyphOverlay()
-        overlay.hostWindow = window
-        overlay.buttonDiameter = diameter
-        overlay.buttonSpacing = spacing
-        if overlay.superview !== contentView {
-            overlay.removeFromSuperview()
-            contentView.addSubview(overlay, positioned: .above, relativeTo: nil)
-            settingsTrafficLightOverlay = overlay
-        }
-        let y = contentView.isFlipped
-            ? topInset
-            : contentView.bounds.height - topInset - diameter
-        overlay.frame = NSRect(
-            x: leftInset,
-            y: y,
-            width: diameter + spacing * 2 + 2,
-            height: diameter + 2
-        )
-        overlay.needsDisplay = true
-        overlay.needsDisplay = true
     }
 
     // MARK: - Export
@@ -298,16 +234,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         case .vacuuming:
                             self?.exportIsVacuuming = true
                             if self?.currentExportTask?.isCancelled == true {
-                                self?.statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
+                                StatusBarState.shared.exportProgressText = "等待 VACUUM 完成后取消…"
                             } else {
-                                self?.statusBar?.setExportProgress("正在生成 SQLite 副本…")
+                                StatusBarState.shared.exportProgressText = "正在生成 SQLite 副本…"
                             }
                         case .exporting:
                             self?.exportIsVacuuming = false
-                            self?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
+                            StatusBarState.shared.exportProgressText = "取消导出 (\(p.current)/\(p.total))"
                         case .copyingBlobs:
                             self?.exportIsVacuuming = false
-                            self?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
+                            StatusBarState.shared.exportProgressText = "取消导出 (复制 \(p.current)/\(p.total))"
                         }
                     }
                 }
@@ -352,13 +288,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         currentExportTask = task
-        statusBar.setExportProgress("取消导出…")
+        StatusBarState.shared.exportProgressText = "取消导出…"
     }
 
     func cancelExport() {
         currentExportTask?.cancel()
         if exportIsVacuuming {
-            statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
+            StatusBarState.shared.exportProgressText = "等待 VACUUM 完成后取消…"
         }
     }
 
@@ -366,7 +302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         exportGeneration += 1
         exportProgressKey = 0
         exportIsVacuuming = false
-        statusBar?.setExportProgress(nil)
+        StatusBarState.shared.exportProgressText = nil
         currentExportTask = nil
     }
 
@@ -397,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         state = AppState(deps: deps)
+        StatusBarState.shared.hotkey = deps.config.hotkey
         panel = SearchPanelController(
             state: state,
             onPaste: { [weak self] items in self?.pasteBack(items) },
@@ -426,10 +363,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         )
-        statusBar = StatusBarController(hotkey: deps.config.hotkey) { [weak self] in
-            self?.panel.toggle()
-        }
-
         watcher = PasteboardWatcher(
             maxRawRTFBytes: deps.config.capture.maxTextBytes,
             maxBlobBytes: deps.config.capture.maxBlobBytes,
@@ -546,7 +479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Sparkle 自动更新（方案 A）——SUFeedURL 存在才启。读这个 lazy static 触发
         // UpdaterController 初始化 → SPUStandardUpdaterController(startingUpdater:true)
         // 开始周期检查。DP_NO_SPARKLE 本地构建不写 SU 键 → 不实例化，避免 Sparkle 报
-        // feed 缺失。手动「检查更新」入口见 StatusBarController / SettingsView 关于页。
+        // feed 缺失。手动「检查更新」入口见 MenuBarExtra / SettingsView 关于页。
         if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
             _ = UpdaterController.shared
         }
@@ -1433,153 +1366,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return .failure(reason: "拉取失败")
-    }
-}
-
-extension AppDelegate: NSWindowDelegate {
-    func windowDidResize(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow,
-              window === settingsWindow else { return }
-        positionSettingsTrafficLights(in: window)
-    }
-}
-
-private final class FullBleedHostingView<Content: View>: NSHostingView<Content> {
-    override var safeAreaInsets: NSEdgeInsets {
-        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-    }
-}
-
-private final class TrafficLightGlyphOverlay: NSView {
-    weak var hostWindow: NSWindow? {
-        didSet {
-            for obs in keyObservers { NotificationCenter.default.removeObserver(obs) }
-            keyObservers.removeAll()
-            guard let win = hostWindow else { return }
-            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification, NSWindow.didBecomeMainNotification, NSWindow.didResignMainNotification] {
-                let obs = NotificationCenter.default.addObserver(forName: name, object: win, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.needsDisplay = true }
-                }
-                keyObservers.append(obs)
-            }
-        }
-    }
-    var buttonDiameter: CGFloat = 14
-    var buttonSpacing: CGFloat = 20
-    private var isHovering = false
-    private var keyObservers: [NSObjectProtocol] = []
-
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        super.viewWillMove(toWindow: newWindow)
-        if newWindow == nil {
-            for obs in keyObservers { NotificationCenter.default.removeObserver(obs) }
-            keyObservers.removeAll()
-        }
-    }
-
-    override var isFlipped: Bool { true }
-
-    override func updateTrackingAreas() {
-        for area in trackingAreas {
-            removeTrackingArea(area)
-        }
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        ))
-        super.updateTrackingAreas()
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovering = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovering = false
-        needsDisplay = true
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        guard let win = hostWindow else { return }
-        let idx = Int(floor((p.x - 1) / buttonSpacing))
-        switch idx {
-        case 0: win.performClose(nil)
-        case 1: win.performMiniaturize(nil)
-        case 2: win.performZoom(nil)
-        default: break
-        }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
-        let isActive = hostWindow?.isKeyWindow ?? hostWindow?.isMainWindow ?? false
-        let fills: [NSColor] = isActive
-            ? [NSColor(srgbRed: 1.0, green: 0.373, blue: 0.341, alpha: 1),
-               NSColor(srgbRed: 0.996, green: 0.737, blue: 0.184, alpha: 1),
-               NSColor(srgbRed: 0.157, green: 0.784, blue: 0.251, alpha: 1)]
-            : Array(repeating: NSColor(srgbRed: 0.32, green: 0.32, blue: 0.32, alpha: 1), count: 3)
-
-        for i in 0..<3 {
-            let c = center(forButtonAt: i)
-            let rect = CGRect(
-                x: c.x - buttonDiameter / 2,
-                y: c.y - buttonDiameter / 2,
-                width: buttonDiameter,
-                height: buttonDiameter
-            )
-            context.setFillColor(fills[i].cgColor)
-            context.fillEllipse(in: rect)
-            // 极淡描边模仿系统
-            context.setStrokeColor(NSColor.black.withAlphaComponent(0.12).cgColor)
-            context.setLineWidth(0.5)
-            context.strokeEllipse(in: rect.insetBy(dx: 0.25, dy: 0.25))
-        }
-
-        guard isHovering else { return }
-        context.setLineCap(.round)
-        context.setLineWidth(1.25)
-        context.setStrokeColor(NSColor.black.withAlphaComponent(0.52).cgColor)
-
-        drawClose(in: context, center: center(forButtonAt: 0))
-        drawMiniaturize(in: context, center: center(forButtonAt: 1))
-        drawZoom(in: context, center: center(forButtonAt: 2))
-    }
-
-    private func center(forButtonAt index: Int) -> CGPoint {
-        CGPoint(
-            x: 1 + buttonDiameter / 2 + CGFloat(index) * buttonSpacing,
-            y: 1 + buttonDiameter / 2
-        )
-    }
-
-    private func drawClose(in context: CGContext, center: CGPoint) {
-        let r: CGFloat = 3.2
-        context.beginPath()
-        context.move(to: CGPoint(x: center.x - r, y: center.y - r))
-        context.addLine(to: CGPoint(x: center.x + r, y: center.y + r))
-        context.move(to: CGPoint(x: center.x + r, y: center.y - r))
-        context.addLine(to: CGPoint(x: center.x - r, y: center.y + r))
-        context.strokePath()
-    }
-
-    private func drawMiniaturize(in context: CGContext, center: CGPoint) {
-        let r: CGFloat = 3.8
-        context.beginPath()
-        context.move(to: CGPoint(x: center.x - r, y: center.y))
-        context.addLine(to: CGPoint(x: center.x + r, y: center.y))
-        context.strokePath()
-    }
-
-    private func drawZoom(in context: CGContext, center: CGPoint) {
-        let r: CGFloat = 3.9
-        context.beginPath()
-        context.move(to: CGPoint(x: center.x - r, y: center.y))
-        context.addLine(to: CGPoint(x: center.x + r, y: center.y))
-        context.move(to: CGPoint(x: center.x, y: center.y - r))
-        context.addLine(to: CGPoint(x: center.x, y: center.y + r))
-        context.strokePath()
     }
 }

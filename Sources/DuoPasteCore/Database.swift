@@ -759,11 +759,10 @@ public struct Database: Sendable {
     /// 用途:iOS 长按"删除" → DELETE /item/<id> → handler 调本函数;Mac UI ⌘Backspace /
     /// contextMenu 走 AppState.deleteItem;CLI admin-soft-delete 通过 HTTP DELETE 兜底。
     ///
-    /// **Cascade**(plan hashed-allen §C):`cascade=true` 且目标是 text-kind
-    /// (`blob_sha256 IS NULL && text_full 非空`) → 把同 text_full 所有 active sibling
-    /// 一起 tombstone(跨 origin)。理由:mesh 拓扑下 cross-device 副本进 mirror,
-    /// 两台 Mac 行集合对称,只删单 id 会让 mirror 兄弟存活 → UI fold 仍能看到。
-    /// blob-kind / cascade=false → 退化为只删单 id。
+    /// **Cascade**(plan hashed-allen §C):`cascade=true` 时，text 按同 text_full 全量
+    /// cascade；blob 按 `Item` 的“近时间跨-origin 同 sha”展示 fold group cascade。
+    /// 理由:mesh 行集合保持对称，只删代表 id 会让折叠 sibling 立即复活。
+    /// `cascade=false` 仍只删单 id。
     ///
     /// 不变量:
     /// - **writer tx 内调 nextIngestNs**——每个 sibling 单独 stamp 严格单增
@@ -795,13 +794,22 @@ public struct Database: Sendable {
             var siblingIDs: [String] = [id]
             let isTextKind = target.blobSha256 == nil
                 && (target.textFull?.isEmpty == false)
-            if cascade, isTextKind, let text = target.textFull {
-                let otherIDs = try String.fetchAll(db, sql: """
-                    SELECT id FROM item
-                    WHERE text_full = ? AND blob_sha256 IS NULL
-                      AND deleted_at_ns IS NULL AND id != ?
-                """, arguments: [text, id])
-                siblingIDs.append(contentsOf: otherIDs)
+            if cascade {
+                if isTextKind, let text = target.textFull {
+                    let otherIDs = try String.fetchAll(db, sql: """
+                        SELECT id FROM item
+                        WHERE text_full = ? AND blob_sha256 IS NULL
+                          AND deleted_at_ns IS NULL AND id != ?
+                    """, arguments: [text, id])
+                    siblingIDs.append(contentsOf: otherIDs)
+                } else if let sha = target.blobSha256, !sha.isEmpty {
+                    let candidates = try Item
+                        .filter(Column("blob_sha256") == sha)
+                        .filter(Column("deleted_at_ns") == nil)
+                        .fetchAll(db)
+                    let groupIDs = Item.blobFoldSiblingIDs(containing: id, items: candidates)
+                    siblingIDs.append(contentsOf: groupIDs.filter { $0 != id })
+                }
             }
 
             var results: [(id: String, ingestedAtNs: Int64)] = []
@@ -813,9 +821,12 @@ public struct Database: Sendable {
                         continue
                     }
                     if s.deletedAtNs != nil { continue }
-                    if s.blobSha256 != nil || s.textFull != target.textFull {
+                    let stillMatches = isTextKind
+                        ? (s.blobSha256 == nil && s.textFull == target.textFull)
+                        : (s.blobSha256 == target.blobSha256)
+                    if !stillMatches {
                         FileHandle.standardError.write(Data(
-                            "softDelete: skip sibling \(sid) — text_full mismatch or blob-kind\n".utf8
+                            "softDelete: skip sibling \(sid) — fold key mismatch\n".utf8
                         ))
                         continue
                     }

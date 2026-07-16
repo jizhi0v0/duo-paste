@@ -592,21 +592,35 @@ struct PreviewPanelContent: View {
         .frame(height: 36)
     }
 
-    /// 当前 media 对应的稳定身份 key——给 contentBody .id() 用,kind 切换强制干净 swap。
-    /// video 把 URL 编进 key,确保切到不同视频时 SwiftUI 整体重建 VideoPreviewBody
-    /// (否则 same .id 复用,@State player 不会重置 → 还在播旧视频)
+    /// 当前 media 对应的稳定身份 key——给 contentBody .id() 用。
+    ///
+    /// 必须包含 item 身份,不能只用 `"image"` / `"pdf"` 这种 kind key。
+    /// 否则连续预览同 kind 的两条时 SwiftUI 会复用上一条的
+    /// NSViewRepresentable。ImagePreviewBody.updateNSView 不会替换 NSImageView.image,
+    /// 结果就是选中下一张、浮窗仍显示上一张。blob SHA 也编进身份,
+    /// 覆盖同 item 在同步/补齐后预览源变化的情况。
+    /// video 额外包含 URL,确保 player 在来源变化时也重建。
     private var kindKey: String {
+        let itemIdentity: String = {
+            guard let item else { return "no-item" }
+            return PreviewIdentity.make(
+                itemID: item.id,
+                kindRawValue: item.kind.rawValue,
+                blobSHA256: item.blobSha256
+            )
+        }()
         switch media {
         case .none:
             if let item = item {
-                if item.kind == .file { return "file-icon" }
-                return "text"
+                if item.kind == .file { return "file-icon:" + itemIdentity }
+                return "text:" + itemIdentity
             }
             return "none"
-        case .loading: return "loading"
-        case .image: return "image"
-        case .pdf: return "pdf"
-        case .video(let url, _): return "video:" + url.absoluteString
+        case .loading: return "loading:" + itemIdentity
+        case .image: return "image:" + itemIdentity
+        case .pdf: return "pdf:" + itemIdentity
+        case .video(let url, _):
+            return "video:" + itemIdentity + "|" + url.absoluteString
         }
     }
 
@@ -1042,4 +1056,3 @@ private struct FilePreviewBody: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
-

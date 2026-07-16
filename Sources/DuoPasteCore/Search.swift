@@ -175,37 +175,21 @@ public struct SearchAPI: Sendable {
         )
         let raw = try fetchHitsRaw(db, query: oversample)
 
-        // 文本永久 dedup：单表 item 内按 text_full 二次 fold。仅 blob_sha256 IS NULL 行参与
-        // （即 text/url/file，"字节相等即同"），blob kind 不动——同 sha 图片多次复制可能是
-        // 用户故意保留时间线。winner = max(capturedAtNs)，pinned 通过 OR 聚合（任一条 pinned
-        // → fold 结果 pinned=true），符合"pin 是对内容的属性而非具体 row"心智。
+        // 展示 fold：文本按 text_full 永久 dedup；blob 同 sha 仅折叠近时间的
+        // 跨-origin Continuity 副本，同 origin 主动重复复制仍保留时间线。
         //
         // 必须在下面的 kind/pinned 后置 filter **之前**——pinned 聚合后 winner.pinned 才是
         // 正确的过滤依据。
         //
-        // **契约定义在 `Item.foldByTextFull`(DuoPasteCore)** —— iOS HistoryStore.filtered
-        // 也按同一份契约 fold,Mac/iOS UI 跨设备 dedup 行为对齐. 本路径因为要同时携带 FTS5
-        // snippet (tuple `(Item, String?)`) 走自己的 fold 副本,逻辑必须与 `Item.foldByTextFull`
-        // 严格一致——任何分叉都是 bug. 回归测试 `SearchFoldV7Tests` (Mac) + `ItemFoldTests` (核心)
-        var byText: [String: (Item, String?)] = [:]
-        var nonTextFolded: [(Item, String?)] = []
-        nonTextFolded.reserveCapacity(raw.count)
-        for hit in raw {
-            let it = hit.0
-            if it.blobSha256 == nil, let tf = it.textFull, !tf.isEmpty {
-                if let existing = byText[tf] {
-                    let winner = it.capturedAtNs > existing.0.capturedAtNs ? hit : existing
-                    var w = winner.0
-                    w.pinned = it.pinned || existing.0.pinned
-                    byText[tf] = (w, winner.1)
-                } else {
-                    byText[tf] = hit
-                }
-            } else {
-                nonTextFolded.append(hit)
-            }
+        // **契约定义在 `Item.foldByTextFull`(DuoPasteCore)**。Mac 只在 fold 后把
+        // 代表行 id 对应的 FTS snippet 接回去，不再维护第二份 fold 逻辑。
+        var snippetByID: [String: String] = [:]
+        for (item, snippet) in raw {
+            if let snippet { snippetByID[item.id] = snippet }
         }
-        var deduped = Array(byText.values) + nonTextFolded
+        var deduped = Item.foldByTextFull(raw.map(\.0)).map { item in
+            (item, snippetByID[item.id])
+        }
 
         // 按 winner 行的字段过滤——不可前置到子查询。countByKindUnion / countUnion 走同源
         // 不变量保证 chip 数字、count、list 三者口径一致。

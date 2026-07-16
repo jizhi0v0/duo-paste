@@ -30,7 +30,7 @@ public actor PullWorker {
         ///
         /// 但这破坏了两台 Mac 的行集合对称性（mini 上有 mirror、MBP 上没有 mirror），
         /// cascade 删除依赖对称性才能找到 sibling tombstone。所以 default 翻 0
-        /// 让 cross-device 副本老实进 mirror，UI 靠 `Item.foldByTextFull` 兜底
+        /// 让 cross-device 副本老实进 mirror，UI 靠内容 fold 兜底
         /// 不影响显示（fold 跨 origin 同 text 折一条）。
         ///
         /// 非 0 = 紧急回滚口（单台机器临时回退 5_000_000_000 恢复历史行为）。

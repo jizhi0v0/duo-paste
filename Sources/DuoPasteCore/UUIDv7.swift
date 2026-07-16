@@ -42,6 +42,21 @@ public enum UUIDv7 {
         generate().uuidString.lowercased()
     }
 
+    /// 从 UUIDv7 取回高 48 bit Unix 毫秒。非 UUIDv7 / 非法字符串返 nil。
+    /// Item 的 capturedAtNs 会在用户粘贴后 bump，不能用它判断最初 capture 时间；
+    /// UUIDv7 里的时间戳不会随使用更新，适合做跨设备 Continuity 副本判定。
+    public static func timestampMs(from string: String) -> UInt64? {
+        guard let uuid = UUID(uuidString: string) else { return nil }
+        let bytes = withUnsafeBytes(of: uuid.uuid) { Array($0) }
+        guard bytes.count == 16, (bytes[6] >> 4) == 0x7 else { return nil }
+
+        var timestamp: UInt64 = 0
+        for byte in bytes.prefix(6) {
+            timestamp = (timestamp << 8) | UInt64(byte)
+        }
+        return timestamp
+    }
+
     private static func currentTimestampMs() -> UInt64 {
         var ts = timespec()
         clock_gettime(CLOCK_REALTIME, &ts)

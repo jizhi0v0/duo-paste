@@ -117,15 +117,19 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     await runWorkerBriefly(worker)
 
     let mirrored = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
+        try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
-    #expect(mirrored.map { $0["id"] as String } == ["p-1", "p-2"])
+    #expect(mirrored == ["p-1", "p-2"])
     let cur = try await db.pool.read { conn in
-        try Row.fetchOne(conn, sql: "SELECT cursor_ns, cursor_id, peer_device_id FROM pull_cursor")
+        try Row.fetchOne(conn, sql: "SELECT cursor_ns, cursor_id, peer_device_id FROM pull_cursor").map {
+            (ns: $0["cursor_ns"] as Int64,
+             id: $0["cursor_id"] as String,
+             peerID: $0["peer_device_id"] as String)
+        }
     }
-    #expect(cur?["cursor_ns"] as Int64? == 200)
-    #expect(cur?["cursor_id"] as String? == "p-2")
-    #expect(cur?["peer_device_id"] as String? == "primary-device")
+    #expect(cur?.ns == 200)
+    #expect(cur?.id == "p-2")
+    #expect(cur?.peerID == "primary-device")
     // lastPullNs 应该被标 —— 完整追平（hasMore=false）
     // 学习模式下 PullWorker 用 /health 学到的 peer device_id 当 MeshStatus key，
     // oldestLastPullNs == 单 peer 的 lastPullNs（PR 2 单 peer 部署等价语义）
@@ -153,9 +157,9 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     await runWorkerBriefly(worker)
 
     let mirrored = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item")
+        try String.fetchAll(conn, sql: "SELECT id FROM item")
     }
-    #expect(mirrored.map { $0["id"] as String } == ["primary-row"])
+    #expect(mirrored == ["primary-row"])
     // cursor 应该照样推进到 page 末（包括自家 origin 那次也"算"过）
     let curNs = try await db.pool.read { conn -> Int64? in
         try Int64.fetchOne(conn, sql: "SELECT cursor_ns FROM pull_cursor")
@@ -186,9 +190,9 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     await runWorkerBriefly(worker, ms: 500)
 
     let mirrored = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
+        try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
-    #expect(mirrored.map { $0["id"] as String } == ["a", "b"])
+    #expect(mirrored == ["a", "b"])
     let calls = await transport.fetchSinceCalls
     // 至少两次 since 调用，第二次 cursor 应该是 (10, "a")
     #expect(calls.count >= 2)
@@ -234,11 +238,15 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     }
     #expect(ids == ["fresh"])  // 旧的 stale-1 应已被清掉
     let row = try await db.pool.read { conn in
-        try Row.fetchOne(conn, sql: "SELECT peer_device_id, cursor_ns, cursor_id FROM pull_cursor")
+        try Row.fetchOne(conn, sql: "SELECT peer_device_id, cursor_ns, cursor_id FROM pull_cursor").map {
+            (peerID: $0["peer_device_id"] as String,
+             ns: $0["cursor_ns"] as Int64,
+             id: $0["cursor_id"] as String)
+        }
     }
-    #expect(row?["peer_device_id"] as String? == "new-primary")
-    #expect(row?["cursor_ns"] as Int64? == 50)
-    #expect(row?["cursor_id"] as String? == "fresh")
+    #expect(row?.peerID == "new-primary")
+    #expect(row?.ns == 50)
+    #expect(row?.id == "fresh")
     // /since 第一次调用 cursor 应该是 .zero（重置后从头拉）
     let calls = await transport.fetchSinceCalls
     #expect(calls.first?.0 == SinceCursor.zero)
@@ -579,10 +587,10 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
     )
     await runWorkerBriefly(worker)
 
-    let row = try await db.pool.read { conn in
-        try Row.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item WHERE id='dead'")
+    let deletedAt = try await db.pool.read { conn -> Int64? in
+        try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item WHERE id='dead'")
     }
-    #expect(row?["deleted_at_ns"] as Int64? == 999)
+    #expect(deletedAt == 999)
 }
 
 @Test func pullWorkerRecordsClockSkewFromHealth() async throws {

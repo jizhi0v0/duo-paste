@@ -59,6 +59,14 @@ private func makeFixture() throws -> (Paths, Database, BlobStore, CaptureService
     #expect(version == "7")
 }
 
+@Test func uuidv7TimestampRoundTrip() {
+    let timestamp: UInt64 = 1_784_000_000_123
+    let id = UUIDv7.generate(timestampMs: timestamp).uuidString
+    #expect(UUIDv7.timestampMs(from: id) == timestamp)
+    #expect(UUIDv7.timestampMs(from: "not-a-uuid") == nil)
+    #expect(UUIDv7.timestampMs(from: UUID().uuidString) == nil)
+}
+
 @Test func blobStorePutDedupsByHash() throws {
     let (_, _, blobs, _) = try makeFixture()
     let data = Data("hello world".utf8)

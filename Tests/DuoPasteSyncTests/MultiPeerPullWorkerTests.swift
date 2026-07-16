@@ -130,22 +130,26 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
 
     // 两条 peer 行都在 item 表
     let rows = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id, origin_device FROM item ORDER BY id")
+        try Row.fetchAll(conn, sql: "SELECT id, origin_device FROM item ORDER BY id").map {
+            (id: $0["id"] as String, origin: $0["origin_device"] as String)
+        }
     }
-    #expect(rows.map { $0["id"] as String } == ["a-1", "b-1"])
-    #expect(Set(rows.map { $0["origin_device"] as String }) == [peerAID, peerBID])
+    #expect(rows.map(\.id) == ["a-1", "b-1"])
+    #expect(Set(rows.map(\.origin)) == [peerAID, peerBID])
 
     // pull_cursor 两行各自独立
     let cursors = try await db.pool.read { conn in
         try Row.fetchAll(conn, sql: """
             SELECT peer_device_id, cursor_ns, cursor_id FROM pull_cursor ORDER BY peer_device_id
-        """)
+        """).map {
+            (peerID: $0["peer_device_id"] as String, ns: $0["cursor_ns"] as Int64)
+        }
     }
     #expect(cursors.count == 2)
-    #expect(cursors[0]["peer_device_id"] as String == peerAID)
-    #expect(cursors[0]["cursor_ns"] as Int64 == 100)
-    #expect(cursors[1]["peer_device_id"] as String == peerBID)
-    #expect(cursors[1]["cursor_ns"] as Int64 == 200)
+    #expect(cursors[0].peerID == peerAID)
+    #expect(cursors[0].ns == 100)
+    #expect(cursors[1].peerID == peerBID)
+    #expect(cursors[1].ns == 200)
 
     // MeshStatus 两 peer 都已注册，oldestLastPullNs == min(两 peer 的 lastPullNs)
     let registered = Set(mesh.registeredPeerDeviceIDs())
@@ -222,15 +226,15 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
 
     // 严格模式 + ID 不匹配 → 没有任何 SQL 落地。验证旧状态完整保留。
     let allRows = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT id, origin_device FROM item ORDER BY id")
+        try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
     }
     #expect(allRows.count == 2)
-    #expect(allRows.map { $0["id"] as String } == ["a-row", "b-row"])
+    #expect(allRows == ["a-row", "b-row"])
 
     let cursorRows = try await db.pool.read { conn in
-        try Row.fetchAll(conn, sql: "SELECT peer_device_id FROM pull_cursor ORDER BY peer_device_id")
+        try String.fetchAll(conn, sql: "SELECT peer_device_id FROM pull_cursor ORDER BY peer_device_id")
     }
-    #expect(cursorRows.map { $0["peer_device_id"] as String } == [peerAID, peerBOldID])
+    #expect(cursorRows == [peerAID, peerBOldID])
 }
 
 @Test func reconcilePeerLearningModeDeletesOnlyThatPeerRows() async throws {

@@ -108,20 +108,44 @@ struct OptimisticDeleteTrackerTests {
         #expect(outcome.resurrectedIds.isEmpty)
     }
 
-    /// **C4**:text-kind(`blob_sha256 == nil && text_full 非空`)才 cascade.
-    /// blob-kind(image)按 id 单删——跟 server `Database.softDelete` cascade 范围
-    /// 对齐(同 sha 多次复制可能是用户故意保留时间线,不折叠也不 cascade 删除).
-    @Test("blob-kind 不 cascade,只删单 id")
-    func blobKindNoCascade() {
+    /// **C4**:跨 origin、15s 内同 SHA 是一张展示卡，删除时必须一起移除。
+    @Test("附近跨 origin 同 SHA blob cascade")
+    func nearbyCrossOriginBlobCascades() {
         var tracker = OptimisticDeleteTracker()
         let img1 = makeImage(id: "img1", origin: "self", sha: "abc")
         let img2 = makeImage(id: "img2", origin: "peer", sha: "abc")  // 同 sha sibling
 
         let ids = tracker.markDeleted(img1, in: [img1, img2])
 
-        #expect(ids == ["img1"], "blob-kind 不参与 cascade,同 sha sibling img2 留着")
+        #expect(ids == ["img1", "img2"])
         #expect(tracker.pendingCount.textFulls == 0, "blob-kind 不进 pendingTextFulls")
-        #expect(tracker.pendingCount.ids == 1, "只有 img1 进 pendingIds")
+        #expect(tracker.pendingCount.ids == 2)
+    }
+
+    @Test("同 origin 同 SHA blob 保留独立时间线")
+    func sameOriginBlobDoesNotCascade() {
+        var tracker = OptimisticDeleteTracker()
+        let img1 = makeImage(id: "img1", origin: "self", sha: "abc")
+        let img2 = makeImage(id: "img2", origin: "self", sha: "abc")
+
+        let ids = tracker.markDeleted(img1, in: [img1, img2])
+
+        #expect(ids == ["img1"])
+        #expect(tracker.pendingCount.ids == 1)
+    }
+
+    @Test("blob 删除 grace 内新到的跨 origin sibling 不闪回")
+    func skipsBlobSiblingWithinGrace() {
+        var tracker = OptimisticDeleteTracker(gracePeriod: 3)
+        let now = Date()
+        let target = makeImage(id: "target", origin: "self", sha: "abc")
+        _ = tracker.markDeleted(target, in: [target], now: now)
+
+        let inflight = makeImage(id: "mirror", origin: "peer", sha: "abc")
+        let outcome = tracker.observeIncoming([inflight], now: now.addingTimeInterval(1))
+
+        #expect(outcome.skipIds == ["mirror"])
+        #expect(outcome.resurrectedIds.isEmpty)
     }
 
     /// **C5**:60s 后 pending entry 被 prune.防 dict 无限增长 + Mac 长时间不可达

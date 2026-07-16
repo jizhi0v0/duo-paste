@@ -1,8 +1,8 @@
 - **同步路径**：每个 peer 一对 `(PullWorker, WSNotificationClient)`。PullWorker 周期 `/since` 拉对端增量到本机 item 表（origin=对端 device_id）；WSNotificationClient 订 `/sync/ws` cursor_advanced 帧 → 收到 `worker.wake()` 跳过 sleep（< 1s 延迟）。WS 断了退化为周期 pull
 - **HTTP routes**：`GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /sync/ws`（Upgrade）+ `GET /app_icon/<bundleID>` + `POST /bump/<id>`（跨设备一致"复制即顶"：iOS tap → Mac DB bump captured/ingested_at_ns → broadcaster fan-out → 其他 peer 通过 PullWorker 看到）。无 push / 远端搜索路径（`POST /ingest` / `PUT/HEAD /blob` / `GET /search` 已下线）
 - **CaptureService**：永远走 `Database.nextIngestNs` stamp（writer tx 内）；merge candidate 带 `origin_device == selfDeviceID` 过滤防 bump 对端行；commit 后回调 `onCursorAdvanced` 让 server 端 `WSBroadcaster` fan-out
-- **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → text-fold（跨 origin 同 text_full 折一条，pinned OR 聚合）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量。`SearchProvider.Mode` 仅 `.local` / `.mesh(stalenessSec:)`，永远走本机 fold 不打远端
-- **跨设备 dedup**：两层防御——capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Continuity / ToDesk 副本通过 PullWorker `crossDeviceDedupWindowNs` (5s) + PasteSuppressionSet 拦
+- **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → content-fold（文本跨 origin 同 text_full；blob 同 SHA 仅折叠 15s 内跨 origin 副本）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量。`SearchProvider.Mode` 仅 `.local` / `.mesh(stalenessSec:)`，永远走本机 fold 不打远端
+- **跨设备 dedup**：两层防御——capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Blob 的物理文件本来就按 SHA 内容寻址只存一份；不同设备产生的 metadata 行为保持 mesh 对称不删库，UI 将 15s 内跨 origin 同 SHA 折为一张卡并保留最早的原始文件名。同 origin 主动重复 copy 不折叠
 - **Blob**：内容寻址 BlobStore（linkItem 不 moveItem，见 §"BlobStore 并发竞态"）；lazy paste-back（按需 GET `/blob/<sha>`，TaskGroup 30s 超时 race，见 §"blob 懒拉的不变量" #8）；可选 eager (`mesh.eager_blobs=true`) 拉完元数据顺路拉字节
 - **HMAC 认证**：`<ts>\n<METHOD>\n<path>\n<body_sha256_hex>`。middleware 不读 body（让多 MB blob 不占内存），handler 自己读 body 后再算 sha256 比对 header。WS upgrade 同模板（empty body hash），upgrade 后 frame 不签
 - **OCR**：本机 own-origin image 跑 Vision OCR 写 `text_full` 进 FTS5；markDone 触发 onCursorAdvanced 让对端 < 1s 同步 OCR 结果（共享 wsBroadcaster fan-out 路径），peer FTS5 trigger 自动重 index
@@ -158,7 +158,7 @@ UI 反馈：AppState.recentSkip + SearchView orange skipBanner（✕ 关闭 + 5 
 
 ### SearchProvider 永远走本机 fold-aware（chip 总数对齐）
 
-`SearchProvider.search` 永远走 `SearchAPI.searchHits / count / countByKind`——内部 fold-aware（跨 origin 同 text_full 折一条），无 "raw count vs fold count" 双路径。
+`SearchProvider.search` 永远走 `SearchAPI.searchHits / count / countByKind`——内部 fold-aware（文本跨 origin 同 text_full；blob 按近时间跨 origin 同 SHA），无 "raw count vs fold count" 双路径。
 
 **核心不变量**：mesh 拓扑下 `item` 表混存本机 own + 对端 peer 行，跨 origin 同 text 是常态。raw count 会把 ToDesk/Continuity 副本算一遍跟对端口径不齐——回归测试 `searchProviderTotalCountMatchesFoldedRowCount`。
 
@@ -178,6 +178,8 @@ SQL 端 `fetchHitsRaw` 内 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 算 `_p
 2. **搜索层**（`Search.fetchHitsFolded`）：oversample 后按 `text_full` 跨 origin fold。Winner = `max(capturedAtNs)`，**pinned OR 聚合**（任一条 pinned → fold 结果 pinned=true）。`count` / `countByKind` 同源 fold 保证 list / total / chip 口径一致
 
 为什么要两层：Capture 层不够 —— ToDesk/Continuity 把 mini pasteboard 同步到 MBP，两台 watcher 各抓一条 own-origin 行（不同 origin_device），mini 行通过 PullWorker 进 MBP 的 item 表，搜索时跨 origin 同 text 仍要 fold。Fold 层不够 —— 同设备短时重复 copy 仍插多行，存储白浪费。
+
+Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复制多次，时间线应保留。仅当同 SHA、不同 `origin_device`、UUIDv7 原始 capture 时间差 ≤ 15s 时，判定为 Continuity / 跨设备回环副本。展示代表取最早行以保留 CleanShot 等原始文件名，排序时间取组内最新；删除展示卡必须 tombstone 整个 blob fold group，避免 peer 行立即复活。`captured_at_ns` 会在 paste 后 bump，分组时间必须优先从 UUIDv7 id 取。
 
 **不要回退到固定窗口默认值**：5 分钟窗口在 ToDesk 场景下两端时间错位常超窗，再现"同文本并排两条"问题。
 
@@ -364,18 +366,11 @@ Swift 6 strict concurrency 拒绝同一 iterator 实例 capture 进多个 child 
 
 唯一守得住的路径是**不让 NSImageView / PDFView 持续挂在 hosting view 的 SwiftUI 子树里**——`.id(kindKey)` 切 kind 时 SwiftUI 整体 tear down NSViewRepresentable，AppKit 没东西可推就不 auto-resize。位置：`PreviewOverlay.swift` 的 `PreviewPanelContent.contentBody` + `kindKey`。
 
-### Settings 窗口 traffic lights 自管 placement（macOS 26）
+### Settings 窗口使用 macOS 26 原生 scene
 
-Paste 风格 Settings：sidebar 卡片视觉上**包住** traffic lights（红绿灯漂在 sidebar 卡片内部 ~14px 处）。macOS 26 上**不要**通过 SwiftUI 让卡片扩到 titlebar 区——所有 `safeAreaInsets / safeAreaRegions=[] / .ignoresSafeArea() / wrapper topAnchor 负偏移 / .padding(.top, -32)` 路径都验证失败。根本原因：macOS 26 NSHostingView 在 `fullSizeContentView` 窗口里把 SwiftUI **渲染**硬剪到 `window.contentLayoutRect`（=contentView.frame 减 titlebar 32px），跟 hostingView frame / SwiftUI 报告的 safeArea 都没关系。
+Settings 由 `App.swift` 的 SwiftUI `Settings` scene 托管；页面用系统 `TabView` + `Form` + `Section` + `LabeledContent`。状态栏是 `MenuBarExtra`，菜单从 `SettingsLink` 打开；HUD 齿轮复用 MenuBarExtra environment 里的 `openSettings` action。
 
-**正确姿态**（位置：`AppDelegate.showSettings` + `positionSettingsTrafficLights`）：
-- NSWindow styleMask 含 `.fullSizeContentView`，`titlebarAppearsTransparent = true`，`titleVisibility = .hidden`，**不含** `.resizable`（`maxSize = win.frame.size` 锁尺寸）
-- contentView = `FullBleedHostingView`（NSHostingView 子类 override `safeAreaInsets` 为 0；单靠它**不够**但仍要保留让 SwiftUI 内部布局正确）
-- **关键**：拿 `window.standardWindowButton(.closeButton / .miniaturizeButton / .zoomButton)` 三个按钮，`contentView.addSubview(button, positioned: .above, relativeTo: nil)` 从 frameView 重新挂到 contentView，再 `setFrameOrigin` 手动定位（topInset=40 / leftInset=34 / spacing=25）
-- 补 `TrafficLightGlyphOverlay` 自定义 NSView 覆盖三按钮上方 hover 时自画 ×/-/+ glyph（按钮 reparent 后系统 hover-glyph 路径断了）。`hitTest` 返 nil 让点击穿透到真按钮
-- `windowDidResize` hook 重 position
-
-**不要回退**：`positionSettingsTrafficLights(in:)` 看起来 hacky ~30 行函数但所有 SwiftUI 层"干净方案"都验证过失败。
+**不要回退**到手动 `NSWindow` / `NSHostingView`、自绘 sidebar / 卡片、隐藏系统 traffic lights 后自画的方案。macOS 26 窗口材质、标题栏、交通灯、焦点和窗口生命周期应由系统 Settings scene 管理。
 
 ## 已知环境坑
 

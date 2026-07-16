@@ -4,7 +4,7 @@ import Foundation
 /// 出来,在 DuoPasteCore 单测覆盖四条分支契约。Server / Mac 端不调用本模块.
 ///
 /// **契约**(跟 issue #42 列的四条分支对齐):
-/// 1. `query.isEmpty && qualifiers.isEmpty` → `Item.foldByTextFull` + iOS list 排序
+/// 1. `query.isEmpty && qualifiers.isEmpty` → `Item.foldByTextFull` 展示 dedup + iOS list 排序
 /// 2. `query.isEmpty && !qualifiers.isEmpty` → 先 qualifier filter,后 fold + 排序
 /// 3. `!query.isEmpty && lastServerSearch.q == query && lastServerSearch.qualifiers == qualifiers` →
 ///    server items 已 fold + 已 sort + **已按 qualifier filter**(server #41 透传),

@@ -221,8 +221,8 @@ final class HistoryStore {
     /// 失败的话(网络抖 / Mac 不可达)下一次 /since 拉自然 re-insert——`merge()` 通过
     /// `deleteTracker` 检测到 + 弹 banner 提示用户。**不**回滚乐观删除(内容字段已丢)
     ///
-    /// **Fold-aware cascade**:text-kind(`blob_sha256 == nil && text_full 非空`)→ 把
-    /// `items` 里所有同 text_full active sibling(跨 origin)一并从内存集合移除,
+    /// **Fold-aware cascade**:text-kind 按同 `text_full`；blob-kind 按 15s 内跨 origin
+    /// 同 SHA display cluster，把 `items` 里的 active sibling 一并从内存集合移除，
     /// 跟 server cascade 范围对齐.不然 fold 立刻 elect 另一条同 text 的 sibling 当代表
     /// → 用户感觉"卡片删了又出现"(直到 server cascade tombstone 通过 /since 回流才真消失)
     func removeOptimistic(item: Item) {
