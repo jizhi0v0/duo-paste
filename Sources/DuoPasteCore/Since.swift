@@ -42,13 +42,29 @@ public struct SincePageWire: Codable, Sendable {
     public var items: [Item]
     public var nextCursor: SinceCursor
     public var hasMore: Bool
+    /// Server 当前可由 `/since` 遍历到的 raw item 行数（含 tombstone）。新 server 返回；
+    /// nil 兼容旧 server。Client 用它发现“cursor 已到顶但迟到旧行落在 cursor 之前”的缺口。
+    public var totalCount: Int?
+    /// 返回本页的 server 稳定 device ID。Client 用它把“已见过这个 source 的哪些 ID”
+    /// 与本地多 peer union 分开记账，避免 union 额外行掩盖单一 source 的缺口。
+    public var sourceDeviceID: String?
 
-    public init(ok: Bool, count: Int, items: [Item], nextCursor: SinceCursor, hasMore: Bool) {
+    public init(
+        ok: Bool,
+        count: Int,
+        items: [Item],
+        nextCursor: SinceCursor,
+        hasMore: Bool,
+        totalCount: Int? = nil,
+        sourceDeviceID: String? = nil
+    ) {
         self.ok = ok
         self.count = count
         self.items = items
         self.nextCursor = nextCursor
         self.hasMore = hasMore
+        self.totalCount = totalCount
+        self.sourceDeviceID = sourceDeviceID
     }
 
     enum CodingKeys: String, CodingKey {
@@ -57,6 +73,8 @@ public struct SincePageWire: Codable, Sendable {
         case items
         case nextCursor = "next_cursor"
         case hasMore = "has_more"
+        case totalCount = "total_count"
+        case sourceDeviceID = "source_device_id"
     }
 }
 
@@ -70,11 +88,13 @@ public struct SincePage: Sendable {
     public let items: [Item]
     public let nextCursor: SinceCursor
     public let hasMore: Bool
+    public let totalCount: Int
 
-    public init(items: [Item], nextCursor: SinceCursor, hasMore: Bool) {
+    public init(items: [Item], nextCursor: SinceCursor, hasMore: Bool, totalCount: Int) {
         self.items = items
         self.nextCursor = nextCursor
         self.hasMore = hasMore
+        self.totalCount = totalCount
     }
 }
 
@@ -116,6 +136,9 @@ public struct SinceAPI: Sendable {
             ORDER BY ingested_at_ns ASC, id ASC
             LIMIT ?
         """, arguments: [q.cursor.ingestedAtNs, q.cursor.ingestedAtNs, q.cursor.id, limit])
+        let totalCount = try Int.fetchOne(db, sql: """
+            SELECT COUNT(*) FROM item WHERE ingested_at_ns IS NOT NULL
+        """) ?? 0
 
         let nextCursor: SinceCursor
         if let last = rows.last, let lastNs = last.ingestedAtNs {
@@ -123,6 +146,11 @@ public struct SinceAPI: Sendable {
         } else {
             nextCursor = q.cursor
         }
-        return SincePage(items: rows, nextCursor: nextCursor, hasMore: rows.count >= limit)
+        return SincePage(
+            items: rows,
+            nextCursor: nextCursor,
+            hasMore: rows.count >= limit,
+            totalCount: totalCount
+        )
     }
 }

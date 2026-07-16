@@ -1,9 +1,8 @@
 import SwiftUI
 import DuoPasteCore
 
-/// PIN 配对 sheet。两种入口:
-/// - Bonjour 发现 tap:peer 信息已知,用户手输 PIN
-/// - QR 扫码:全部信息都从 QR 拿到 (prefilledPIN 非 nil),自动 pairing
+/// QR + PIN 配对 sheet。host/port 与 TLS leaf SHA-256 来自眼前 Mac 的 QR，用户再
+/// 手输同屏 PIN。Bonjour-only 不进入此 view，避免无 channel binding 签发 credential。
 ///
 /// 多阶段 loading。PIN 成功并拿到 endpoints 即算配对成功；实际可用性测试和最佳
 /// endpoint 选择交给 PeerSyncCoordinator 在 Settings 里持续展示。
@@ -13,10 +12,11 @@ struct PinPairingSheet: View {
     let host: String
     let port: Int
     let tls: Bool
-    /// QR 入口时传 PIN,sheet 自动开始 pairing 跳过输入阶段
+    let certificateSHA256: String
+    /// 兼容旧调用方的预填入口；现行 QR payload 不含 PIN，因此扫码路径传 nil。
     let prefilledPIN: String?
     @Binding var isPresented: Bool
-    let onPaired: (Data, String, PeerEndpointsPage) -> Void
+    let onPaired: (ClientCredential, String, PeerEndpointsPage) -> Void
 
     @State private var pin: String = ""
     @State private var stage: Stage = .input
@@ -41,6 +41,9 @@ struct PinPairingSheet: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    Text("TLS leaf · \(certificateSHA256.prefix(12))…")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
                 } header: { Text("配对目标") }
 
                 if stage == .input {
@@ -128,10 +131,14 @@ struct PinPairingSheet: View {
         Task { @MainActor in
             do {
                 let resp = try await PinPairingClient.pair(
-                    host: host, port: port, tls: tls, pin: pinCopy
+                    host: host,
+                    port: port,
+                    tls: tls,
+                    pin: pinCopy,
+                    certificateSHA256: certificateSHA256
                 )
                 stage = .probing
-                onPaired(resp.secret, resp.deviceID, resp.endpointsPage)
+                onPaired(resp.credential, resp.deviceID, resp.endpointsPage)
                 stage = .connected
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 isPresented = false

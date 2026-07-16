@@ -15,8 +15,6 @@ struct DuoPasteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        DuoPasteMenuBarExtra()
-
         Settings {
             SettingsView()
         }

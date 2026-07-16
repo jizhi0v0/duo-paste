@@ -5,7 +5,8 @@ import Observation
 /// iOS Settings 端 NWBrowser 浏 `_duopaste._tcp.` 拿本网段 Mac peer 列表。
 /// 跟 Mac BonjourAdvertiser 配对——Mac 那边 publish,这边 browse。
 ///
-/// 用户 tap 一个 peer → 弹 QR 扫描 → 解析 secret + URL 填进 Settings。
+/// 列表只做附近设备发现；用户 tap 会被引导扫描 Mac 同屏 QR，取得 host/port/tls +
+/// leaf pin 后再输入 PIN。Bonjour TXT 本身不作为 credential onboarding trust anchor。
 ///
 /// **生命周期**:Settings 打开就 start(),关掉 stop()。不持久——每次重新打开重新 browse。
 /// NWBrowser 本身是异步事件流,实例 alive 期间 browseResults 列表会随网络变化自动更新
@@ -125,49 +126,5 @@ final class PeerDiscovery {
             d[k] = v
         }
         return d
-    }
-}
-
-/// Mac 端 QR 内容 schema:`{"url":"https://host:8443","secret":"<64hex>","v":"1"}`
-/// 解析失败抛 BadPayload;字段缺失抛 MissingField
-struct PairingPayload: Codable, Equatable {
-    let url: String
-    let secret: String
-    let v: String
-
-    static func parse(_ raw: String) throws -> PairingPayload {
-        guard let data = raw.data(using: .utf8) else {
-            throw PairingPayloadError.notUTF8
-        }
-        let decoded = try JSONDecoder().decode(PairingPayload.self, from: data)
-        // 简单 sanity——secret 必须 32 字节 hex(64 字符 hex)
-        guard decoded.secret.count == 64,
-              decoded.secret.allSatisfy({ $0.isHexDigit }) else {
-            throw PairingPayloadError.badSecret
-        }
-        guard URL(string: decoded.url) != nil else {
-            throw PairingPayloadError.badURL
-        }
-        return decoded
-    }
-}
-
-enum PairingPayloadError: LocalizedError {
-    case notUTF8
-    case badSecret
-    case badURL
-
-    var errorDescription: String? {
-        switch self {
-        case .notUTF8: return "二维码内容不是 UTF-8"
-        case .badSecret: return "secret 不是 64 字符 hex"
-        case .badURL: return "URL 格式非法"
-        }
-    }
-}
-
-private extension Character {
-    var isHexDigit: Bool {
-        ("0"..."9").contains(self) || ("a"..."f").contains(self) || ("A"..."F").contains(self)
     }
 }

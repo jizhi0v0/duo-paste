@@ -275,6 +275,8 @@ public struct SmartTransport: Sendable {
         /// peerIndex 让多 peer 部署能区分哪个 peer 出问题(虽然 reconcile 是全 peer 重 discover)。
         /// nil = 不接,PullWorker 内部 callback 也 nil
         public let onChosenLikelyDown: (@Sendable (_ peerIndex: Int) -> Void)?
+        public let onPinOperationsResolved: (@Sendable () -> Void)?
+        public let onCredentialRevocationsMerged: (@Sendable (Int) -> Void)?
 
         public init(
             database: DuoPasteCore.Database,
@@ -290,7 +292,9 @@ public struct SmartTransport: Sendable {
             onCatastrophicFailure: @escaping @Sendable () -> Void,
             expectedPeerDeviceIDs: [String?],
             onHealthProbed: (@Sendable (_ peerIndex: Int, _ rttMs: Int64) -> Void)? = nil,
-            onChosenLikelyDown: (@Sendable (_ peerIndex: Int) -> Void)? = nil
+            onChosenLikelyDown: (@Sendable (_ peerIndex: Int) -> Void)? = nil,
+            onPinOperationsResolved: (@Sendable () -> Void)? = nil,
+            onCredentialRevocationsMerged: (@Sendable (Int) -> Void)? = nil
         ) {
             self.database = database
             self.blobs = blobs
@@ -306,6 +310,8 @@ public struct SmartTransport: Sendable {
             self.expectedPeerDeviceIDs = expectedPeerDeviceIDs
             self.onHealthProbed = onHealthProbed
             self.onChosenLikelyDown = onChosenLikelyDown
+            self.onPinOperationsResolved = onPinOperationsResolved
+            self.onCredentialRevocationsMerged = onCredentialRevocationsMerged
         }
 
         public func build(decision: PeerDecision) -> MeshSupervisor.Peer {
@@ -329,6 +335,7 @@ public struct SmartTransport: Sendable {
             let worker = PullWorker(
                 database: database,
                 transport: client,
+                pinTransport: client,
                 selfDeviceID: selfDeviceID,
                 expectedPeerDeviceID: expectedPeerDeviceID,
                 meshStatus: meshStatus,
@@ -338,7 +345,9 @@ public struct SmartTransport: Sendable {
                 evictOnFull: evictOnFull,
                 config: pullWorkerConfig,
                 onHealthProbed: probedCallback,
-                onChosenLikelyDown: downCallback
+                onChosenLikelyDown: downCallback,
+                onPinOperationsResolved: onPinOperationsResolved,
+                onCredentialRevocationsMerged: onCredentialRevocationsMerged
             )
             let wsClient: WSNotificationClient?
             if wsEnabled {

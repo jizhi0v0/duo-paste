@@ -67,9 +67,6 @@ final class PeerSyncCoordinator {
     private var cursor: SinceCursor = .zero
     private var pullTask: Task<Void, Never>?
     private var statusTickTask: Task<Void, Never>?
-    /// in-flight `/search` 请求句柄。用户快速敲字时旧 Task 还在拉就 cancel 它,
-    /// 避免多个 search 并发飞向 Mac 浪费带宽 + Mac CPU + URLSession 连接池抖动
-    private var currentSearchTask: Task<Void, Never>?
     /// inflight pullTask 期间收到 advance → 置 true,task 结束再 kick 一轮
     private var pendingAdvance: Bool = false
     /// 同 id 的 pin fan-out 串行化:`pinFanoutTasks[id]` 是 in-flight loop task。新 toggle 来时
@@ -77,7 +74,11 @@ final class PeerSyncCoordinator {
     /// toggle (AAA→BBB→AAA) 让 fan-out race 出 server 中间态。**最终意图模型**:用户最后一次
     /// 按 = server 最终状态。see `togglePinOnServer` doc
     private var pinFanoutTasks: [String: Task<Void, Never>] = [:]
-    private var pendingPinIntent: [String: Bool] = [:]
+    private struct PendingPinIntent: Sendable {
+        let pinned: Bool
+        let operationID: String
+    }
+    private var pendingPinIntent: [String: PendingPinIntent] = [:]
     /// `applyConnectedStatus` 在 pull 成功时 stamp,heartbeat-stale 检测保护它不被覆盖
     private var lastConnectedStampAt: Date?
     /// 上一次看到 pool 任意 WS .connected 的时间戳。tickStatus 用它判定"全断 > 30s"
@@ -91,6 +92,7 @@ final class PeerSyncCoordinator {
     /// 触发 repickEndpoint() 时从这 re-probe 并按 route hint 选路。nil = 未配对(走 reconfigure 单 URL 路径)
     private var availableEndpoints: [PeerEndpoint] = []
     private var currentSecret: Data?
+    private var currentCredentialToken: String?
     /// 最近一次 endpoint pick 选中的 URL,UI 显示 + 避免 idle 重选时反复切
     private(set) var currentEndpointURL: String?
     private var repickTask: Task<Void, Never>?
@@ -163,6 +165,7 @@ final class PeerSyncCoordinator {
         self.store = store
         self.blobCache = BlobCache()
         self.appIconCache = AppIconCache()
+        self.cursor = store.persistedCursor()
         // 网络变化 → 重新 probe(给 HTTP client URL 更新最佳路径)。WS 不需要触发——
         // pool 里每个 WS 都在自己 backoff/重连,网络变了它们自然在下次 reconnect 时
         // 用新网络重试
@@ -235,11 +238,13 @@ final class PeerSyncCoordinator {
         guard let config else {
             status = .unconfigured
             currentSecret = nil
+            currentCredentialToken = nil
             availableEndpoints = []
             currentEndpointURL = nil
             return
         }
         self.currentSecret = config.sharedSecret
+        self.currentCredentialToken = config.credentialToken
         let manualEP = PeerEndpoint(url: config.baseURL.absoluteString, kind: .tailscale)
         self.availableEndpoints = [manualEP]
         seedProbes(from: [manualEP])
@@ -258,10 +263,11 @@ final class PeerSyncCoordinator {
         guard setHTTPClient(urlString: httpClientURL, secret: secret, reason: "setup") != nil else {
             return
         }
-        self.cursor = .zero
+        self.cursor = store.persistedCursor()
         if case .connected = status {} else if !isElectingRoute { self.status = .connecting }
         let pool = PeerWSPool(
             secret: secret,
+            credentialToken: currentCredentialToken,
             onAdvance: { [weak self] _ in
                 self?.promoteHTTPToPreferredWS(reason: "ws advance")
                 self?.kickPull()
@@ -283,12 +289,17 @@ final class PeerSyncCoordinator {
     /// PIN 配对完成 → 拿 secret + endpoint list,**立刻**对所有 endpoint 开 WS pool
     /// (不等 probe,5s probe 延迟期间用户就能开始看见 WS 连上),probe 并行跑完后更新
     /// HTTP client URL
-    func reconfigureFromPairing(secret: Data, endpoints: [PeerEndpoint]) {
+    func reconfigureFromPairing(
+        secret: Data,
+        credentialToken: String? = nil,
+        endpoints: [PeerEndpoint]
+    ) {
         guard !endpoints.isEmpty else {
             status = .error("Mac 没返回任何 endpoint 候选")
             return
         }
         self.currentSecret = secret
+        self.currentCredentialToken = credentialToken
         self.availableEndpoints = endpoints
         seedProbes(from: endpoints)
         beginRouteElection(reason: "pairing complete")
@@ -343,13 +354,16 @@ final class PeerSyncCoordinator {
         lastRepickStartedAt = Date()
         repickTask?.cancel()
         let endpoints = availableEndpoints
+        let credentialToken = currentCredentialToken
         if shouldSurfaceRouteElection(for: reason) {
             beginRouteElection(reason: reason)
         }
         DebugLog.shared.append("endpoint repick: \(reason) (\(endpoints.count) candidates)")
         repickTask = Task { [weak self] in
             let probes = await EndpointPicker.probeAll(
-                endpoints: endpoints, secret: secret
+                endpoints: endpoints,
+                secret: secret,
+                credentialToken: credentialToken
             ) { @MainActor @Sendable [weak self] p in
                 self?.mergeProbeResult(p)
             }
@@ -480,7 +494,11 @@ final class PeerSyncCoordinator {
         let changed = currentEndpointURL != urlString || client == nil
         guard changed else { return false }
         currentEndpointURL = urlString
-        let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
+        let cfg = PeerConfig(
+            baseURL: url,
+            sharedSecret: secret,
+            credentialToken: currentCredentialToken
+        )
         let newClient = PeerClient(config: cfg)
         self.client = newClient
         blobCache.fetcher = { sha in try await newClient.fetchBlob(sha256: sha) }
@@ -620,6 +638,7 @@ final class PeerSyncCoordinator {
     /// 用户不应看到 banner
     func bumpItemOnServer(id: String) {
         guard let secret = currentSecret else { return }
+        let credentialToken = currentCredentialToken
         var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
         // **无条件** union currentEndpointURL——pool.connected 只返回 WS state==.connected
         // 的路径，currentEndpointURL 的 WS 可能正在 connecting；HTTP /since 走它意味着 Mac DB
@@ -641,7 +660,11 @@ final class PeerSyncCoordinator {
                 for urlString in urls {
                     group.addTask {
                         guard let url = URL(string: urlString) else { return }
-                        let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+                        let client = PeerClient(config: PeerConfig(
+                            baseURL: url,
+                            sharedSecret: secret,
+                            credentialToken: credentialToken
+                        ))
                         do {
                             try await client.bumpItem(id: id)
                             DebugLog.shared.append("bump ok \(String(id.prefix(8))) via \(urlString)")
@@ -662,58 +685,6 @@ final class PeerSyncCoordinator {
         }
     }
 
-    /// 委托 Mac peer 跑 fold-aware 全文搜索。把结果灌进 store.applyServerSearch 让 UI
-    /// 切到 FTS5 结果(跟 Mac UI 口径一致),跨设备 chip 总数对齐。
-    ///
-    /// **qualifier 透传**(issue #41):带 `qualifiers` 时 server-side fold + filter 同 pass,
-    /// 消除 client-side filter pagination 盲区——FTS5 命中 200 但稀疏 qualifier 让前 50 全
-    /// 不匹配的情况下,server 端先 filter 再 limit,UI 不再"勾 chip 看空集"。
-    /// `HistoryStore.filtered` 拿 server 结果时仍 client-side filter 兜底:server 已过滤
-    /// 等于二次过滤是 no-op;老 server 不识别字段时静默忽略 → client-side filter 是唯一
-    /// 防线,行为不回归
-    ///
-    /// 错误处理:失败 swallow + log——HistoryStore.filtered 自然 fallback 到本机 contains。
-    /// 单 endpoint 调用即可(不需要 fanout,搜索结果由任一 connected Mac 提供,内容一致)。
-    /// 选 currentEndpointURL 优先;不可用时取 pool 第一个 connected URL
-    func searchOnServer(q: String, qualifiers: [QueryQualifier] = []) {
-        guard let secret = currentSecret else { return }
-        let urls: [String] = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
-        let chosen = currentEndpointURL ?? urls.first
-        guard let urlString = chosen, let url = URL(string: urlString) else { return }
-        // **取消上一轮**——用户敲字快时旧 Task 还在拉就废掉,只看新 q 的结果。
-        // URLSession.data(for:) 响应 cancellation,Task.cancel() 让正在跑的 HTTP 立即抛错
-        currentSearchTask?.cancel()
-        currentSearchTask = Task { [weak self] in
-            guard let self else { return }
-            let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
-            do {
-                let (items, snippets, total) = try await client.searchItems(
-                    q: q,
-                    qualifiers: qualifiers,
-                    limit: 200
-                )
-                if Task.isCancelled { return }
-                let result = HistoryStore.ServerSearchResult(
-                    q: q,
-                    qualifiers: Set(qualifiers),
-                    items: items,
-                    snippets: snippets,
-                    totalCount: total
-                )
-                await MainActor.run { self.store.applyServerSearch(result) }
-                DebugLog.shared.append("search ok q=\(q) qs=\(qualifiers.count) hits=\(items.count) total=\(total)")
-            } catch is CancellationError {
-                // 用户改了 query 旧 search 被替——正常,不记日志
-            } catch URLError.cancelled {
-                // URLSession 抛的 cancel 同上,nop。注意:ponte / NWHTTPTransport
-                // 路径不一定响应 cancel,但上面 Task.isCancelled check 会兜底挡住
-                // 旧 task 的 applyServerSearch
-            } catch {
-                DebugLog.shared.append("search failed q=\(q): \(error.localizedDescription)")
-            }
-        }
-    }
-
     /// 跨设备 pin:iOS UI 已 store.togglePinOptimistic 立即切 + 重排,这里再 POST /pin
     /// 让 Mac DB 落库 + 推 cursor_advanced 让其他 mirror peer 看到。
     ///
@@ -727,7 +698,9 @@ final class PeerSyncCoordinator {
     /// 串行 + 最终意图 pattern 保证: 用户最后一次按 = server 最终状态(同 PullWorker.wake 心智)
     func togglePinOnServer(id: String, pinned: Bool) {
         // 更新最终意图。task 完成收尾时读这个;若意图跟刚发的 pinned 不一致 → 再发一轮
-        pendingPinIntent[id] = pinned
+        let intent = PendingPinIntent(pinned: pinned, operationID: UUID().uuidString)
+        pendingPinIntent[id] = intent
+        store.markPinPending(id: id, desiredPinned: pinned)
         // 已有同 id task 在跑 → 不重起,让它自己收尾时读 pendingPinIntent
         if pinFanoutTasks[id] != nil {
             DebugLog.shared.append("pin queued behind inflight \(String(id.prefix(8))) latestIntent=\(pinned)")
@@ -746,6 +719,7 @@ final class PeerSyncCoordinator {
             // 清意图占位——若发请求期间用户再按 toggle,会重写这个,loop 下一轮看到新值
             pendingPinIntent.removeValue(forKey: id)
             guard let secret = currentSecret else { return }
+            let credentialToken = currentCredentialToken
             var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
             if let currentEndpointURL {
                 urls.append(currentEndpointURL)
@@ -756,15 +730,24 @@ final class PeerSyncCoordinator {
                 return a < b
             }
             guard !urls.isEmpty else { return }
-            DebugLog.shared.append("pin fanout \(String(id.prefix(8))) pinned=\(intent): \(urls.count) route(s)")
-            await withTaskGroup(of: Void.self) { group in
+            DebugLog.shared.append("pin fanout \(String(id.prefix(8))) pinned=\(intent.pinned): \(urls.count) route(s)")
+            let applied = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
                 for urlString in urls {
                     group.addTask {
-                        guard let url = URL(string: urlString) else { return }
-                        let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+                        guard let url = URL(string: urlString) else { return false }
+                        let client = PeerClient(config: PeerConfig(
+                            baseURL: url,
+                            sharedSecret: secret,
+                            credentialToken: credentialToken
+                        ))
                         do {
-                            try await client.pinItem(id: id, pinned: intent)
-                            DebugLog.shared.append("pin ok \(String(id.prefix(8))) pinned=\(intent) via \(urlString)")
+                            let result = try await client.pinItem(
+                                id: id,
+                                pinned: intent.pinned,
+                                operationID: intent.operationID
+                            )
+                            DebugLog.shared.append("pin \(result == .applied ? "applied" : "pending") \(String(id.prefix(8))) pinned=\(intent.pinned) via \(urlString)")
+                            return result == .applied
                         } catch let error as PeerClientError {
                             switch error {
                             case .itemNotFound, .itemTombstoned:
@@ -775,8 +758,15 @@ final class PeerSyncCoordinator {
                         } catch {
                             DebugLog.shared.append("pin failed \(String(id.prefix(8))) via \(urlString): \(error.localizedDescription)")
                         }
+                        return false
                     }
                 }
+                var anyApplied = false
+                for await result in group { anyApplied = anyApplied || result }
+                return anyApplied
+            }
+            if applied {
+                store.markPinApplied(id: id, desiredPinned: intent.pinned)
             }
             // loop 继续:若发请求期间用户再 toggle,pendingPinIntent[id] 非空再发一轮
         }
@@ -791,6 +781,7 @@ final class PeerSyncCoordinator {
     /// 跟 bumpItemOnServer 同源 fanout 路径——多 endpoint 并发,best-effort
     func deleteItemOnServer(id: String) {
         guard let secret = currentSecret else { return }
+        let credentialToken = currentCredentialToken
         var urls = wsPool?.connectedHTTPURLsByDevice(prefer: currentEndpointURL) ?? []
         if let currentEndpointURL {
             urls.append(currentEndpointURL)
@@ -807,7 +798,11 @@ final class PeerSyncCoordinator {
                 for urlString in urls {
                     group.addTask {
                         guard let url = URL(string: urlString) else { return }
-                        let client = PeerClient(config: PeerConfig(baseURL: url, sharedSecret: secret))
+                        let client = PeerClient(config: PeerConfig(
+                            baseURL: url,
+                            sharedSecret: secret,
+                            credentialToken: credentialToken
+                        ))
                         do {
                             try await client.deleteItem(id: id)
                             DebugLog.shared.append("delete ok \(String(id.prefix(8))) via \(urlString)")
@@ -871,6 +866,7 @@ final class PeerSyncCoordinator {
         currentEndpointURL = nil
         availableEndpoints = []
         currentSecret = nil
+        currentCredentialToken = nil
         lastProbes = []
         lastRTT = [:]
         status = .unconfigured
@@ -892,7 +888,9 @@ final class PeerSyncCoordinator {
         }
         guard let client else { return }
         pendingAdvance = false
-        let startCursor = cursor
+        // BGAppRefreshTask may have advanced the shared SQLite cursor while this actor was suspended.
+        let startCursor = store.persistedCursor()
+        cursor = startCursor
         DebugLog.shared.append("pull start cursor=(\(startCursor.ingestedAtNs),\(startCursor.id)) url=\(currentEndpointURL ?? "?")")
         isPulling = true
         pullTask = Task { [weak self] in
@@ -918,40 +916,25 @@ final class PeerSyncCoordinator {
     }
 
     private func runPull(client: PeerClient, from startCursor: SinceCursor) async {
-        var cursor = startCursor
-        var pages = 0
         let maxPages = 200 // 100k items 上限,正常用例远到不了
-        // **持久化 store 到磁盘**:store.merge 只更新 actor 内存,DuoPasteApp scenePhase
-        // .background 才触发 persist 是不够的——iOS 用户右滑关 app (force quit) 系统直接
-        // kill 进程不走 .background 通知,内存里 PullWorker 拉到的 pinned/new items/
-        // soft delete 全丢。defer 让 success / throw / cancel 三条出口都 persist——
-        // 第 N 页 throw 时 catch 走 recordConnectionProblem,前 N-1 页已 store.merge 到内存
-        // 也要落盘(cursor 已每页 save,如果磁盘 items 没补上会让 UI 跟 cursor 错位,下次冷启
-        // 看到空白 + cursor 跳过那些页永远拿不回来)。
-        //
-        // 跟 BackgroundPullService.runOnce 共享 itemsFile 有理论 race,实测窗口极小:iOS
-        // 前台时 BGAppRefreshTask 不调度,只在切到 background 一段时间后才跑;两条路径都用
-        // atomic write,内容差异最多一次拉取增量,跟 NSCachesDirectory 可被系统 evict 的设计
-        // 哲学一致(cursor=.zero 全拉兜底)
-        defer { store.persist() }
         do {
-            while !Task.isCancelled, pages < maxPages {
-                let page = try await client.fetchSince(cursor: cursor, limit: 500)
-                pages += 1
-                DebugLog.shared.append("pull page \(pages): items=\(page.items.count) hasMore=\(page.hasMore) next=(\(page.nextCursor.ingestedAtNs),\(page.nextCursor.id))")
-                // 每页就 merge,UI 渐进刷新(不等全部拉完才一次性显示)
-                store.merge(page.items)
-                cursor = page.nextCursor
-                self.cursor = cursor
-                // 持久化 cursor → 后台 BGAppRefreshTask 从这里继续拉,不重头
-                PersistedCursor(
-                    ingestedAtNs: cursor.ingestedAtNs,
-                    id: cursor.id,
-                    updatedAtUnix: Int64(Date().timeIntervalSince1970)
-                ).save()
-                if !page.hasMore { break }
-            }
-            DebugLog.shared.append("pull done pages=\(pages) storeItems=\(store.items.count)")
+            let report = try await store.synchronizeMetadata(
+                client: client,
+                pageLimit: 500,
+                maxPages: maxPages
+            )
+            cursor = report.finalCursor
+            await store.refreshActiveSearch()
+            let serverCountLabel = report.serverTotalCount.map(String.init) ?? "unknown"
+            let trackedCountLabel = report.sourceTrackedItemCount.map(String.init) ?? "unknown"
+            let sourceLabel = report.sourceDeviceID ?? "legacy"
+            DebugLog.shared.append(
+                "pull done incrementalPages=\(report.incrementalPages) " +
+                "backfillPages=\(report.backfillPages) local=\(report.localTotalCount) " +
+                "server=\(serverCountLabel) source=\(sourceLabel) tracked=\(trackedCountLabel) " +
+                "start=(\(startCursor.ingestedAtNs),\(startCursor.id)) " +
+                "final=(\(report.finalCursor.ingestedAtNs),\(report.finalCursor.id))"
+            )
             applyConnectedStatus()
         } catch is CancellationError {
             // 静默

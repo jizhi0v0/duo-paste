@@ -66,15 +66,54 @@ public enum Admin {
     // MARK: - mesh-doctor
 
     /// 单个 peer 的 doctor 报告。
-    public struct PeerDoctorReport: Sendable, Equatable {
+    public struct PeerDoctorReport: Sendable, Equatable, Codable {
         public let url: URL
         /// config 里写死的 expected device_id（mesh-init 时显式传），nil 走学习模式
         public let expectedDeviceID: String?
         /// /health 探测结果。reachable 时填 (deviceID, nowMs, skewMs)，不可达填 reason
-        public enum HealthOutcome: Sendable, Equatable {
+        public enum HealthOutcome: Sendable, Equatable, Codable {
             case ok(deviceID: String, nowMs: Int64, skewMs: Int64)
             case unreachable(reason: String)
             case rejected(reason: String)
+
+            private enum CodingKeys: String, CodingKey {
+                case status, deviceID, nowMs, skewMs, reason
+            }
+
+            private enum Status: String, Codable { case ok, unreachable, rejected }
+
+            public func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                switch self {
+                case .ok(let deviceID, let nowMs, let skewMs):
+                    try c.encode(Status.ok, forKey: .status)
+                    try c.encode(deviceID, forKey: .deviceID)
+                    try c.encode(nowMs, forKey: .nowMs)
+                    try c.encode(skewMs, forKey: .skewMs)
+                case .unreachable(let reason):
+                    try c.encode(Status.unreachable, forKey: .status)
+                    try c.encode(reason, forKey: .reason)
+                case .rejected(let reason):
+                    try c.encode(Status.rejected, forKey: .status)
+                    try c.encode(reason, forKey: .reason)
+                }
+            }
+
+            public init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                switch try c.decode(Status.self, forKey: .status) {
+                case .ok:
+                    self = .ok(
+                        deviceID: try c.decode(String.self, forKey: .deviceID),
+                        nowMs: try c.decode(Int64.self, forKey: .nowMs),
+                        skewMs: try c.decode(Int64.self, forKey: .skewMs)
+                    )
+                case .unreachable:
+                    self = .unreachable(reason: try c.decode(String.self, forKey: .reason))
+                case .rejected:
+                    self = .rejected(reason: try c.decode(String.self, forKey: .reason))
+                }
+            }
         }
         public let health: HealthOutcome
         /// 跟 expectedDeviceID 是否匹配（health=ok 时才有意义）。
@@ -90,7 +129,7 @@ public enum Admin {
         public let currentTransport: String?
     }
 
-    public struct PullCursorSnapshot: Sendable, Equatable {
+    public struct PullCursorSnapshot: Sendable, Equatable, Codable {
         public let peerDeviceID: String
         public let cursorNs: Int64
         public let cursorID: String
@@ -98,8 +137,9 @@ public enum Admin {
     }
 
     /// mesh-doctor 总报告。
-    public struct MeshDoctorReport: Sendable, Equatable {
+    public struct MeshDoctorReport: Sendable, Equatable, Codable {
         public let selfDeviceID: String
+        public let tlsCertificate: TLSCertificateState
         public let peers: [PeerDoctorReport]
         /// 本机当前 max(ingested_at_ns)，让操作员对端 cursor 跟这个数比看追平程度
         public let selfMaxIngestedNs: Int64
@@ -131,7 +171,8 @@ public enum Admin {
         blobs: BlobStore,
         healthProbe: @Sendable (URL) async -> HealthProbeOutcome,
         nowNs: @Sendable () -> Int64 = { Clock.nowNs() },
-        transportLabels: [URL: String] = [:]
+        transportLabels: [URL: String] = [:],
+        tlsCertificate: TLSCertificateState = .notConfigured
     ) async throws -> MeshDoctorReport {
         let db = try Database(path: dbPath)
         let cursorRows: [PullCursorSnapshot] = try await db.pool.read { conn -> [PullCursorSnapshot] in
@@ -191,11 +232,32 @@ public enum Admin {
 
         return MeshDoctorReport(
             selfDeviceID: selfDeviceID,
+            tlsCertificate: tlsCertificate,
             peers: peerReports,
             selfMaxIngestedNs: selfMax,
             missingBlobsTotal: missingTotal,
             missingBlobsSamples: missingSamples
         )
+    }
+
+    public static func encodeMeshDoctorJSON(_ report: MeshDoctorReport) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(report)
+    }
+
+    public static func meshDoctorHasIssues(_ report: MeshDoctorReport) -> Bool {
+        if report.tlsCertificate.requiresAttention || report.missingBlobsTotal > 0 { return true }
+        return report.peers.contains { peer in
+            switch peer.health {
+            case .ok:
+                return peer.deviceIDMatches == false
+            case .unreachable, .rejected:
+                return true
+            }
+        }
     }
 
     /// 生成 32 字节随机 secret，写到 path（hex 编码 + 0600 权限）。

@@ -1,5 +1,14 @@
 # Storage mode — full mirror（默认）/ optimized（按需）+ LRU 驱逐
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
+> 2026-07-16 运行期修正：full mirror 的 blob hydration 已从每页内同步等待改为 actor 管理的
+> 后台队列。metadata page commit 后立即继续 `/since` 分页；慢 blob/404 不再冻结 cursor。
+> 回归测试 `slowBlobHydrationDoesNotBlockMetadataPagination` 锁定该不变量。
+
 ## Context
 
 **Mesh 拓扑下当前 blob 同步语义有错位**。`mesh.eager_blobs` 默认 `false` 让 PullWorker 只同步元数据不拉字节，「真要粘的那一刻」走 lazy GET `/blob/<sha>` 拉。设计动机是 M2 primary/client 时代的省存储省带宽——client 是「远程偶尔粘贴」的角色。
@@ -97,7 +106,7 @@
 - 默认 `.full` 让升级用户**立刻**得到正确语义
 - 测试：`MeshConfigDecodingTests` 加 5 个用例（新 key / 老 key true/false / 都缺 / 老新都有冲突取新值）
 
-**风险**：用户升级后 PullWorker 突然开始 eager 拉字节；下一次 tick 会狂拉 missing blobs（取决于本机缺多少）。但 lazy 路径 5s 超时 + transient 不阻塞 cursor，所以最坏只是慢一会儿，不会卡死
+**风险**：用户升级后 PullWorker 会把 missing blobs 加入后台 hydration 队列（取决于本机缺多少），短时间产生较多流量；metadata 分页不等待该队列，blob 的 5s 超时、404 或 transient 均不阻塞 cursor。
 
 ### PR 2 — `mesh-fetch-missing` 一次性 catch-up CLI
 
@@ -246,7 +255,7 @@ launchctl kickstart -k gui/$UID/io.duopaste.agent
 ## 已知坑（写代码时记住）
 
 - **`install-agent.sh` 后必须 `codesign --force --sign -`**（见 [memory: install-agent.sh 后必须 codesign --force](../../.claude/projects/-Users-bobby-Developer-jizhi0v0-duo-paste/memory/feedback_install_codesign.md)）——SwiftPM 增量 build 出来的 linker-signed adhoc 二进制 macOS 26 taskgate 会 SIGKILL
-- **PR 1 升级后第一次 tick 会狂拉**——如果用户本机缺很多 peer blob，第一次 pull tick 会同步拉一堆字节。fetchBlobsEager 已经 concurrency 限制 + 失败不抛，所以最坏只是慢；但日志会刷很多 `eager blob get ...`
+- **PR 1 升级后第一次 tick 会集中排队 hydration**——如果用户本机缺很多 peer blob，会产生一批后台下载；metadata cursor 已与下载解耦，失败不抛到分页路径，但日志仍可能集中出现 blob get 结果。
 - **catch-up CLI 走 HMAC 跟 daemon 同一份 shared-secret**——CLI 进程读 `~/Library/Application Support/duo-paste/shared-secret` 同路径；不要走 keychain（daemon 才用 keychain，CLI 简单读文件）
 - **UI fetcher 注入要顺路传** `storageMode`——别再加单独的 `@EnvironmentObject` 或全局，已经够乱了；直接通过 `SearchView` / `PreviewPanelController` init 参数传
 

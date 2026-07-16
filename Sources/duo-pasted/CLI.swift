@@ -5,9 +5,8 @@ import DuoPasteSync
 /// 一次性命令行入口，在 SwiftUI App 接管 NSApp 之前被 App.swift 拦截。
 /// 实际逻辑都在 `DuoPasteCore.Admin`（可单测）；这里只解析 argv + 打印 + exit。
 ///
-/// PR 4 之后只剩 `init-secret` + `retry-failed-ocr`。push 链路相关命令
-/// （retry-failed / audit-push / promote-to-primary / migrate-primary）随
-/// PushWorker / RemoteIngester / Admin.promote/migrate 一起删。
+/// 这里只暴露现行 mesh、维护与灾难恢复命令。旧 push / primary 生命周期命令已经随
+/// PushWorker / RemoteIngester / Admin.promote/migrate 一起删除。
 enum CLI {
     static func dispatchAndExitIfApplicable(args: [String] = CommandLine.arguments) {
         guard args.count >= 2 else { return }
@@ -25,8 +24,16 @@ enum CLI {
             runMeshInit(args: rest)
         case "mesh-doctor":
             runMeshDoctor(args: rest)
+        case "diagnostics-export":
+            runDiagnosticsExport(args: rest)
         case "mesh-fetch-missing":
             runMeshFetchMissing(args: rest)
+        case "snapshot-list":
+            runSnapshotList(args: rest)
+        case "snapshot-verify":
+            runSnapshotVerify(args: rest)
+        case "snapshot-restore":
+            runSnapshotRestore(args: rest)
         case "admin-soft-delete":
             runAdminSoftDelete(args: rest)
         case "ponte-self":
@@ -80,16 +87,24 @@ enum CLI {
                                   默认 serve_host=0.0.0.0 / serve_port=8443，给原值不变。
                                   --serve-tls 开 TLS（peer URL 用 https://）；要配
                                   --tls-cert / --tls-key（PEM 路径，文件不存在直接 throw）。
-                                  通常先 `tailscale cert <hostname>` 拿一对 cert。
+                                  Ponte 双路由需使用同时包含 tailnet 与 sgponte SAN 的 cert。
                                   完成后需手动重启 daemon 让新 config 生效。
                                   daemon 必须先停（先 launchctl bootout）。
                                   --allow-missing-blobs 跳过 blob 缺失预检（默认拒）。
                                   --dry-run 跑预检 + 算 result 但不真写 config。
 
-          mesh-doctor             探所有 peer /health + 对账本机 pull_cursor + 算本机 BlobStore
-                                  缺字节统计。**只读**，不动 DB / config / blobs。
+          mesh-doctor [--json]    探所有 peer /health、对账 pull_cursor、BlobStore 缺字节，
+                                  并报告本机 leaf certificate 的 SAN / 到期日 / 30·7·1 天
+                                  warning。**只读**，不动 DB / config / blobs。--json 输出
+                                  稳定机器可读 schema。
                                   退出码 0=都健康；1=任一 peer unreachable / device_id 不匹配 /
-                                  blob 缺失 → 给脚本接管。
+                                  blob 缺失 / TLS 证书需关注 → 给脚本接管。
+
+          diagnostics-export [OUTPUT_DIR]
+                                  导出安全诊断目录（默认当前目录）：mesh-doctor.json、SQLite
+                                  quick_check、版本、脱敏 config、白名单运维日志。绝不包含
+                                  shared-secret、device credential/token、TLS 私钥、
+                                  数据库/剪贴板正文或 blob 字节。
 
           mesh-fetch-missing [--dry-run] [--concurrency N] [--peer URL]
                                   一次性 catch-up：扫本机所有 peer-origin 缺字节的
@@ -98,6 +113,21 @@ enum CLI {
                                   eager_blobs=false）升到新默认 full 后跑一次补历史。
                                   默认 concurrency=4。--peer 限定单个 peer URL（默认按
                                   config peers 顺序尝试每个）。--dry-run 只列缺失不拉。
+
+          snapshot-list           列出 snapshot，并逐份报告 integrity、item、tombstone、
+                                  active blob 引用和本机缺失 blob 数。只读。
+
+          snapshot-verify [PATH|latest]
+                                  对指定 snapshot（默认 latest）跑 PRAGMA integrity_check，
+                                  并输出 item/tombstone/blob 恢复统计。只读。
+
+          snapshot-restore <PATH|latest> [--peer URL]
+                           [--expected-device-id ID] [--dry-run]
+                                  先把 snapshot 恢复到 staging candidate、跑现行 migration
+                                  与完整性检查；--peer 显式开启 DR-only 全量回填，允许从
+                                  健康 peer 找回本机 own-origin 行和缺失 blob。真实提交要求
+                                  daemon 已 bootout，先留 safety backup，再原子换库；任一步
+                                  失败 live DB 不变。--dry-run 完整演练但不提交。
 
           ponte-self [--verbose]  从 ~/Library/Application Support/com.nssurge.surge-mac/
                                   SGCore.plist 推断本机 Surge Ponte 主机名（按 hw.model
@@ -121,6 +151,221 @@ enum CLI {
             FileHandle.standardError.write(Data("init-secret failed: \(error)\n".utf8))
             exit(1)
         }
+    }
+
+    private static func runSnapshotList(args: [String]) {
+        guard args.isEmpty else {
+            FileHandle.standardError.write(Data("snapshot-list: 不接受参数\n".utf8))
+            exit(1)
+        }
+        let paths = Paths.makeDefault()
+        let blobs = BlobStore(root: paths.blobsDir)
+        do {
+            let entries = try Snapshot.list(snapshotsDir: paths.snapshotsDir)
+            guard !entries.isEmpty else {
+                print("snapshot-list: (empty) · \(paths.snapshotsDir.path)")
+                exit(0)
+            }
+            var failed = false
+            print("snapshot-list · \(entries.count) snapshot(s)")
+            for entry in entries {
+                do {
+                    let report = try Snapshot.verify(at: entry.url, blobStores: [blobs])
+                    print("  ✓ \(entry.url.lastPathComponent) · \(formatSnapshotReport(report))")
+                } catch {
+                    failed = true
+                    print("  ✗ \(entry.url.lastPathComponent) · \(error)")
+                }
+            }
+            exit(failed ? 1 : 0)
+        } catch {
+            FileHandle.standardError.write(Data("snapshot-list failed: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func runSnapshotVerify(args: [String]) {
+        guard args.count <= 1 else {
+            FileHandle.standardError.write(Data(
+                "snapshot-verify: 最多一个 PATH|latest 参数\n".utf8
+            ))
+            exit(1)
+        }
+        let paths = Paths.makeDefault()
+        do {
+            let url = try Snapshot.resolve(args.first, snapshotsDir: paths.snapshotsDir)
+            let report = try Snapshot.verify(
+                at: url,
+                blobStores: [BlobStore(root: paths.blobsDir)]
+            )
+            print("snapshot-verify ✓")
+            print("  file: \(url.path)")
+            print("  \(formatSnapshotReport(report))")
+            if !report.missingBlobSamples.isEmpty {
+                print("  missing samples: \(report.missingBlobSamples.joined(separator: ", "))")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("snapshot-verify failed: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func runSnapshotRestore(args: [String]) {
+        var source: String?
+        var peerURL: URL?
+        var expectedPeerDeviceID: String?
+        var dryRun = false
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--peer":
+                guard i + 1 < args.count,
+                      let url = URL(string: args[i + 1]),
+                      let scheme = url.scheme?.lowercased(),
+                      ["http", "https"].contains(scheme),
+                      url.host != nil
+                else {
+                    FileHandle.standardError.write(Data(
+                        "snapshot-restore: --peer 需要合法 http/https URL\n".utf8
+                    ))
+                    exit(1)
+                }
+                peerURL = url
+                i += 2
+            case "--expected-device-id":
+                guard i + 1 < args.count, !args[i + 1].isEmpty else {
+                    FileHandle.standardError.write(Data(
+                        "snapshot-restore: --expected-device-id 缺值\n".utf8
+                    ))
+                    exit(1)
+                }
+                expectedPeerDeviceID = args[i + 1]
+                i += 2
+            case "--dry-run":
+                dryRun = true
+                i += 1
+            case let value where !value.hasPrefix("-"):
+                guard source == nil else {
+                    FileHandle.standardError.write(Data(
+                        "snapshot-restore: 只接受一个 PATH|latest\n".utf8
+                    ))
+                    exit(1)
+                }
+                source = value
+                i += 1
+            default:
+                FileHandle.standardError.write(Data(
+                    "snapshot-restore: 未知参数 \(args[i])\n".utf8
+                ))
+                exit(1)
+            }
+        }
+        guard source != nil else {
+            FileHandle.standardError.write(Data(
+                "snapshot-restore: 缺 PATH|latest\n".utf8
+            ))
+            exit(1)
+        }
+        if expectedPeerDeviceID != nil && peerURL == nil {
+            FileHandle.standardError.write(Data(
+                "snapshot-restore: --expected-device-id 只能与 --peer 一起使用\n".utf8
+            ))
+            exit(1)
+        }
+
+        let paths = Paths.makeDefault()
+        let liveBlobs = BlobStore(root: paths.blobsDir)
+        let liveBefore = try? Snapshot.verify(at: paths.mainDB, blobStores: [liveBlobs])
+        let prepared: Snapshot.PreparedRecovery
+        do {
+            let snapshotURL = try Snapshot.resolve(source, snapshotsDir: paths.snapshotsDir)
+            prepared = try Snapshot.prepareRecovery(from: snapshotURL, livePaths: paths)
+        } catch {
+            FileHandle.standardError.write(Data("snapshot-restore prepare failed: \(error)\n".utf8))
+            exit(1)
+        }
+        defer { Snapshot.discardRecovery(prepared) }
+
+        var refill: DisasterRecovery.Report?
+        do {
+            if let peerURL {
+                let secret = try SharedSecret.load(from: paths.sharedSecretFile)
+                let client = HTTPPeerClient(
+                    baseURL: peerURL,
+                    auth: HMACAuth(secret: secret),
+                    session: PonteSession.session(for: peerURL, fallback: .shared)
+                )
+                let stagedBlobs = BlobStore(root: prepared.stagingPaths.blobsDir)
+                let capturedPrepared = prepared
+                let capturedExpectedPeerDeviceID = expectedPeerDeviceID
+                let selfDeviceID = try DeviceID.load(at: paths.deviceIDFile)
+                refill = try runBlocking { @Sendable in
+                    try await DisasterRecovery.refill(
+                        databasePath: capturedPrepared.stagingPaths.mainDB,
+                        selfDeviceID: selfDeviceID,
+                        expectedPeerDeviceID: capturedExpectedPeerDeviceID,
+                        existingBlobs: liveBlobs,
+                        stagingBlobs: stagedBlobs,
+                        transport: client
+                    )
+                }
+            }
+            let candidate = try Snapshot.verify(
+                at: prepared.stagingPaths.mainDB,
+                blobStores: [liveBlobs, BlobStore(root: prepared.stagingPaths.blobsDir)]
+            )
+            print("snapshot-restore \(dryRun ? "dry-run" : "candidate") ✓")
+            print("  source: \(prepared.sourceSnapshot.path)")
+            if let liveBefore {
+                print("  live before: \(formatSnapshotReport(liveBefore))")
+            } else {
+                print("  live before: unreadable / missing（将由 snapshot 恢复）")
+            }
+            print("  snapshot: \(formatSnapshotReport(prepared.sourceReport))")
+            if let refill {
+                print("  peer: \(refill.peerDeviceID) · pages=\(refill.pages) rows=\(refill.rowsSeen)")
+                print("  refill: inserted=\(refill.inserted) updated=\(refill.updated) skipped=\(refill.skippedOlderOrEqual) own-origin=\(refill.ownOriginRecovered)")
+                print("  blobs: fetched=\(refill.fetchedBlobs) peer-missing=\(refill.peerMissingBlobs)")
+            }
+            print("  candidate: \(formatSnapshotReport(candidate))")
+            if dryRun {
+                print("  live DB 未修改")
+                exit(0)
+            }
+
+            let daemonRunning = LaunchAgent.isRunning(label: LaunchAgent.duoPastedLabel)
+            let committed = try Snapshot.commitRecovery(
+                prepared,
+                daemonRunning: daemonRunning,
+                daemonLabel: LaunchAgent.duoPastedLabel
+            )
+            print("snapshot-restore done ✓")
+            print("  restored: \(formatSnapshotReport(committed.restored))")
+            print("  merged blobs: \(committed.mergedBlobCount)")
+            print("  safety backup: \(committed.safetyBackup.path)")
+            print("  下一步：重启 daemon，再跑 snapshot-verify / mesh-doctor 复核")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "snapshot-restore failed（live DB 未替换）: \(error)\n".utf8
+            ))
+            exit(1)
+        }
+    }
+
+    private static func formatSnapshotReport(_ report: Snapshot.VerificationReport) -> String {
+        let mib = Double(report.sizeBytes) / 1_048_576.0
+        return String(
+            format: "integrity=%@ · %.2f MiB · item=%d active=%d tombstone=%d blob=%d missing=%d",
+            report.integrityResult,
+            mib,
+            report.itemCount,
+            report.activeItemCount,
+            report.tombstoneCount,
+            report.activeBlobCount,
+            report.missingBlobCount
+        )
     }
 
     private static func runPonteSelf(args: [String]) {
@@ -417,8 +662,8 @@ enum CLI {
     }
 
     private static func runMeshDoctor(args: [String]) {
-        // mesh-doctor 当前没参数（未来可加 --json / --peer 限定）
-        if !args.isEmpty {
+        let json = args == ["--json"]
+        if !args.isEmpty && !json {
             FileHandle.standardError.write(Data("mesh-doctor: 未知参数 \(args.joined(separator: " "))\n".utf8))
             exit(1)
         }
@@ -438,6 +683,33 @@ enum CLI {
             FileHandle.standardError.write(Data("mesh-doctor: 读 device-id 失败：\(error)\n".utf8))
             exit(1)
         }
+        let report: Admin.MeshDoctorReport
+        do {
+            report = try buildMeshDoctorReport(paths: paths, config: cfg, deviceID: deviceID)
+        } catch {
+            FileHandle.standardError.write(Data("mesh-doctor failed: \(error)\n".utf8))
+            exit(1)
+        }
+        if json {
+            do {
+                let data = try Admin.encodeMeshDoctorJSON(report)
+                FileHandle.standardOutput.write(data)
+                FileHandle.standardOutput.write(Data("\n".utf8))
+            } catch {
+                FileHandle.standardError.write(Data("mesh-doctor JSON encode failed: \(error)\n".utf8))
+                exit(1)
+            }
+        } else {
+            printMeshDoctorReport(report)
+        }
+        exit(meshDoctorExitCode(report))
+    }
+
+    private static func buildMeshDoctorReport(
+        paths: Paths,
+        config cfg: Config,
+        deviceID: String
+    ) throws -> Admin.MeshDoctorReport {
         let blobs = BlobStore(root: paths.blobsDir)
         let secret: Data?
         do {
@@ -496,24 +768,112 @@ enum CLI {
         } else {
             transportLabels = [:]
         }
-        let report: Admin.MeshDoctorReport
-        do {
-            report = try runBlocking { @Sendable in
+        let tlsState: TLSCertificateState
+        if cfg.serveTLS, let path = cfg.tlsCertPath {
+            do {
+                tlsState = .inspected(try TLSCertificateInspector.inspect(at: URL(fileURLWithPath: path)))
+            } catch {
+                tlsState = .unreadable(String(describing: error))
+            }
+        } else if cfg.serveTLS {
+            tlsState = .unreadable("serve_tls=true 但 tls_cert_path 缺失")
+        } else {
+            tlsState = .notConfigured
+        }
+
+        return try runBlocking { @Sendable in
                 try await Admin.meshDoctor(
                     selfDeviceID: deviceID,
                     peers: cfg.peers,
                     dbPath: paths.mainDB,
                     blobs: blobs,
                     healthProbe: probe,
-                    transportLabels: transportLabels
+                    transportLabels: transportLabels,
+                    tlsCertificate: tlsState
                 )
-            }
-        } catch {
-            FileHandle.standardError.write(Data("mesh-doctor failed: \(error)\n".utf8))
+        }
+    }
+
+    private static func runDiagnosticsExport(args: [String]) {
+        guard args.count <= 1, args.first.map({ !$0.hasPrefix("-") }) ?? true else {
+            FileHandle.standardError.write(Data(
+                "diagnostics-export: 最多接受一个 OUTPUT_DIR\n".utf8
+            ))
             exit(1)
         }
-        printMeshDoctorReport(report)
-        exit(meshDoctorExitCode(report))
+        let paths = Paths.makeDefault()
+        let config: Config
+        let deviceID: String
+        do {
+            config = try Config.load(from: paths.configFile)
+            deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
+        } catch {
+            FileHandle.standardError.write(Data("diagnostics-export bootstrap failed: \(error)\n".utf8))
+            exit(1)
+        }
+
+        let parent: URL
+        if let raw = args.first {
+            parent = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+        } else {
+            parent = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        }
+        let destination = parent.appendingPathComponent(
+            "duo-paste-diagnostics-\(diagnosticTimestamp())",
+            isDirectory: true
+        )
+        do {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            let report = try buildMeshDoctorReport(paths: paths, config: config, deviceID: deviceID)
+            let result = try DiagnosticBundleExporter.export(
+                to: destination,
+                config: config,
+                meshDoctorReport: report,
+                databasePath: paths.mainDB,
+                logFiles: diagnosticLogFiles(),
+                version: diagnosticVersionInfo()
+            )
+            print("diagnostics-export ✓")
+            print("  directory: \(result.directory.path)")
+            print("  files: \(result.relativeFiles.count)")
+            print("  excluded: shared-secret / private keys / clipboard content / blobs")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("diagnostics-export failed: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func diagnosticLogFiles() -> [URL] {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/duo-paste", isDirectory: true)
+        return ["duo-pasted.out.log", "duo-pasted.err.log"].map { root.appendingPathComponent($0) }
+    }
+
+    private static func diagnosticVersionInfo() -> DiagnosticBundleExporter.VersionInfo {
+        DiagnosticBundleExporter.VersionInfo(
+            appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development",
+            buildVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development",
+            osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            architecture: runtimeArchitecture()
+        )
+    }
+
+    private static func runtimeArchitecture() -> String {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x86_64"
+        #else
+        return "unknown"
+        #endif
+    }
+
+    private static func diagnosticTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
     }
 
     /// async → sync 桥。CLI 路径上没有 runtime；用 DispatchSemaphore + 一个分离 task
@@ -534,6 +894,18 @@ enum CLI {
         lines.append("mesh-doctor")
         lines.append("  self device_id: \(r.selfDeviceID)")
         lines.append("  self max ingested_at_ns: \(r.selfMaxIngestedNs)")
+        switch r.tlsCertificate.state {
+        case .notConfigured:
+            lines.append("  tls certificate: (not configured)")
+        case .unreadable:
+            lines.append("  tls certificate: ✗ unreadable — \(r.tlsCertificate.error ?? "unknown")")
+        case .inspected:
+            if let leaf = r.tlsCertificate.leaf {
+                lines.append("  tls certificate: \(tlsExpiryLabel(leaf))")
+                lines.append("    SAN: \(leaf.dnsSANs.isEmpty ? "(none)" : leaf.dnsSANs.joined(separator: ", "))")
+                lines.append("    not_after: \(ISO8601DateFormatter().string(from: leaf.notAfter))")
+            }
+        }
         lines.append("  peers: \(r.peers.count)")
         for peer in r.peers {
             lines.append("")
@@ -862,15 +1234,17 @@ enum CLI {
 
     /// 退出码：任一 peer unreachable/rejected/device_id 不匹配 / blob 缺失 → 1。便于脚本管控
     private static func meshDoctorExitCode(_ r: Admin.MeshDoctorReport) -> Int32 {
-        if r.missingBlobsTotal > 0 { return 1 }
-        for peer in r.peers {
-            switch peer.health {
-            case .ok:
-                if peer.deviceIDMatches == false { return 1 }
-            case .unreachable, .rejected:
-                return 1
-            }
+        Admin.meshDoctorHasIssues(r) ? 1 : 0
+    }
+
+    private static func tlsExpiryLabel(_ report: TLSCertificateReport) -> String {
+        switch report.expiryStatus {
+        case .valid: return "✓ valid · \(report.daysRemaining)d remaining"
+        case .expiresWithin30Days: return "⚠ expires within 30 days · \(report.daysRemaining)d remaining"
+        case .expiresWithin7Days: return "⚠ expires within 7 days · \(report.daysRemaining)d remaining"
+        case .expiresWithin1Day: return "⚠ expires within 1 day"
+        case .expired: return "✗ expired"
+        case .notYetValid: return "✗ not yet valid"
         }
-        return 0
     }
 }

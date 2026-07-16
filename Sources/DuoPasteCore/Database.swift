@@ -558,6 +558,93 @@ public struct Database: Sendable {
             """)
         }
 
+        // v13: owner-routed pin/unpin command queue + idempotency receipts（roadmap R0.2）。
+        // `item` wire/schema 不变，旧 client 继续只读 Item；新 daemon 用两张旁路表把
+        // 非 origin 的绝对 pin 意图持久化并投递给 origin。
+        m.registerMigration("v13_owner_routed_pin_operations") { db in
+            try db.execute(sql: """
+                CREATE TABLE pin_operation (
+                    operation_id          TEXT PRIMARY KEY,
+                    item_id               TEXT NOT NULL UNIQUE,
+                    origin_device         TEXT NOT NULL,
+                    desired_pinned        INTEGER NOT NULL CHECK (desired_pinned IN (0, 1)),
+                    state                 TEXT NOT NULL CHECK (state IN ('pending', 'awaiting_replay')),
+                    owner_ingested_at_ns  INTEGER,
+                    created_at_ns         INTEGER NOT NULL,
+                    updated_at_ns         INTEGER NOT NULL,
+                    attempt_count         INTEGER NOT NULL DEFAULT 0,
+                    last_error            TEXT,
+                    FOREIGN KEY (item_id) REFERENCES item(id) ON DELETE CASCADE
+                ) STRICT;
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_pin_operation_route
+                    ON pin_operation(origin_device, state, created_at_ns);
+            """)
+            try db.execute(sql: """
+                CREATE TABLE pin_operation_receipt (
+                    operation_id          TEXT PRIMARY KEY,
+                    item_id               TEXT NOT NULL,
+                    desired_pinned        INTEGER NOT NULL CHECK (desired_pinned IN (0, 1)),
+                    applied_ingested_at_ns INTEGER NOT NULL,
+                    applied_at_ns         INTEGER NOT NULL
+                ) STRICT;
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_pin_receipt_item
+                    ON pin_operation_receipt(item_id, applied_at_ns DESC);
+            """)
+        }
+
+        // v14: PIN 配对客户端的独立 device credential metadata + 永久撤销 tombstone。
+        // request secret 与密封 token 只存在客户端 Keychain / 请求内，服务端 DB 绝不落盘；
+        // 任一 mesh Mac 用 shared-secret 根密钥解封 token 后即可验证请求。
+        m.registerMigration("v14_device_credentials") { db in
+            try db.execute(sql: """
+                CREATE TABLE device_credential (
+                    credential_id    TEXT PRIMARY KEY,
+                    device_id        TEXT NOT NULL,
+                    display_name     TEXT NOT NULL,
+                    platform         TEXT NOT NULL,
+                    issuer_device_id TEXT NOT NULL,
+                    issued_at_ms     INTEGER NOT NULL,
+                    first_seen_at_ms INTEGER NOT NULL,
+                    last_active_at_ms INTEGER
+                ) STRICT;
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_device_credential_activity
+                    ON device_credential(last_active_at_ms DESC, issued_at_ms DESC);
+            """)
+            try db.execute(sql: """
+                CREATE TABLE device_credential_revocation (
+                    credential_id       TEXT PRIMARY KEY,
+                    revoked_at_ms       INTEGER NOT NULL,
+                    revoked_by_device_id TEXT NOT NULL
+                ) STRICT;
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_device_credential_revoked_at
+                    ON device_credential_revocation(revoked_at_ms DESC);
+            """)
+        }
+
+        // v15: iOS full-history mirror 的 per-source membership ledger。
+        //
+        // iOS item 表是多 Mac 的 union，不能拿 union 总行数跟某一个 `/since.total_count`
+        // 比：另一台 peer 的额外行会掩盖当前 source 新增但落在 cursor 之前的迟到旧行。
+        // 每次从 source 看见 item 就记 (source,id)；terminal page 后精确比较该 source 的
+        // ledger count 与 server total_count，不等才做 zero-cursor 非破坏 backfill。
+        m.registerMigration("v15_mirror_source_membership") { db in
+            try db.execute(sql: """
+                CREATE TABLE mirror_source_item (
+                    source_device_id TEXT NOT NULL,
+                    item_id          TEXT NOT NULL,
+                    PRIMARY KEY (source_device_id, item_id)
+                ) STRICT;
+            """)
+        }
+
         return m
     }
 
@@ -869,50 +956,9 @@ public struct Database: Sendable {
         }
     }
 
-    /// 跨 origin 版 setPinned——给 `POST /pin/<id>` HTTP handler 用(HTTP 语义是
-    /// "set 绝对值",iOS / 远端调用方明确传 `pinned=true/false`)。**Mac 进程内 UI**
-    /// 走独立的 [togglePinAny](单 writer tx 原子 read+flip+write),跟 HTTP 路径职责
-    /// 分清——本函数保留给"已知目标值"语义的调用方,不适合做 UI 的 read-modify-write
-    /// (两步走在并发场景有 TOCTOU race,详见 [togglePinAny] doc)。
-    ///
-    /// **不带** own-origin guard,跟 `bumpCapturedAt`/`softDelete` 心智一致(任意 peer
-    /// 改任意 origin 行)。理由:mesh 拓扑下 mirror 行占多数(iOS 100%,多 Mac peer 也
-    /// 大头是另一台的 mirror),强制 own-origin 等于 UI 上 90%+ 卡不可 pin。严格
-    /// own-origin 语义历史上由独立 `setPinned` 函数提供,已删,future 需要可通过加
-    /// `requireOwnOrigin: Bool` 参数恢复。
-    ///
-    /// 已知 limitation:
-    /// 1. 本机 mirror 行 pin 后,**对端 origin 设备**不会收到回传——PullWorker.applyPage
-    ///    跳过自家 origin 的行(`origin_device == self → continue`)
-    /// 2. **其他 mirror peer** 会通过 /since 看到 pin 状态,本机 fold-aware 搜索 `pinned OR
-    ///    聚合` 让"内容 pinned"语义在本机 + 其他 mirror peer 自然成立。**但**:`applyPage`
-    ///    走 INSERT OR REPLACE 全列覆盖(包括 pinned 列),一旦 origin 设备后续对该 row 做
-    ///    任何 bump `ingested_at_ns` 的操作(POST /bump = bumpCapturedAt / 文本永久 dedup
-    ///    merge bump / OCR markDone 回放 / softDelete tombstone 等),origin 视角下
-    ///    pinned=false 会带新 ingested_at_ns 通过 /since 推到其他 mirror peer,触发整行覆盖
-    ///    把跨 origin 打的 pin 静默抹掉。用户感知 = "我置顶的某条几小时后自己掉下去了"
-    /// 3. origin 设备本地仍看到非 pinned(同 #1)
-    ///
-    /// 真正双向回传 + 字段级 OR-merge(pinned 列不被回放覆盖)要等 `/update` 路由(本函数即
-    /// 雏形)。中期 mitigation 选项:applyPage 对 pinned 列走 take-max/OR-merge 而非 REPLACE。
-    ///
-    /// **注意**:OR-merge 让 unpin 操作无法跨 mirror peer 传播(本机 unpin=false 会被对端
-    /// pinned=true 吃掉),要么接受这个 trade-off,要么等 `/update` 路由做真正的字段级
-    /// last-writer-wins。
-    ///
-    /// 不变量:
-    /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增
-    /// - tombstone (deleted_at_ns 非 nil) 拒 pin,抛 `.deleted`
-    /// - 不存在的 id 抛 `.notFound`
-    /// - 已是目标状态 = noop 不 bump cursor,返回 nil(handler 当 200 OK 处理)。**不**抛
-    ///   `.alreadyPinned` 这种独立 error —— pin 是幂等切换,"已是目标"语义跟 `bumpCapturedAt`
-    ///   的"id 还存在"一样自然,跟 `softDelete.alreadyDeleted` 不同(那里是"二次删除"明确异常)
-    /// - **不动 captured_at_ns / origin_device**:pin 是元数据切换不是顺序变化。跟
-    ///   `bumpCapturedAt`(改 captured_at_ns)/`softDelete`(写 deleted_at_ns)区别:这俩
-    ///   会让对端列表重排,pin 让对端通过 `pinned DESC` 排序自然 promote(captured_at_ns
-    ///   保留原值,unpin 后回到原位置不变)
-    ///
-    /// Returns: 新 ingested_at_ns；已是目标状态时返 nil（不 bump cursor 防止退化成无意义 fan-out）
+    /// Legacy 直接 mutator，仅保留给历史单测/诊断。生产 pin 必须走
+    /// `submitPinIntent` / `togglePinIntent` 的 owner-routed operation；调用本函数修改
+    /// mirror 行会重新引入 roadmap R0.2 的整行覆盖丢 pin 问题。
     public func setPinnedAny(id: String, pinned: Bool, now: Int64) async throws -> Int64? {
         try await pool.write { db in
             guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {
@@ -932,25 +978,8 @@ public struct Database: Sendable {
         }
     }
 
-    /// 原子 toggle item.pinned——在**单一 writer tx** 内 read → flip → write,
-    /// 关闭 [getPinned] + [setPinnedAny] 两步走的 TOCTOU race window:
-    /// 旧两步实现下并发 ⌘P 两 Task 都能在 A commit 前 reader-snapshot 看到 pinned=false →
-    /// 都算 target=true → A 写 true / B noop → 净翻一次。本函数让 toggle 在 writer tx
-    /// 内完成,GRDB 串行 writer queue 天然 race-free。
-    ///
-    /// 跨 origin 生效(同 [setPinnedAny] 哲学):不带 own-origin guard,本机 mirror 行也能翻。
-    /// 同款 limitation 也适用——本机翻 mirror 行不回传 origin 设备 + origin 后续 bump
-    /// 通过 INSERT OR REPLACE 抹掉跨 origin pin。详见 setPinnedAny doc。
-    ///
-    /// 不变量:
-    /// - **writer tx 内调 nextIngestNs**——保 /since cursor 单增
-    /// - tombstone (deleted_at_ns 非 nil) 拒 toggle,抛 `.deleted`
-    /// - 不存在的 id 抛 `.notFound`
-    /// - **不动 captured_at_ns / origin_device**:pin 是元数据切换不是顺序变化
-    ///
-    /// Returns: `(newPinned, newIngestNs)`——newPinned 是翻**后**的值,调用方用来 fan-out
-    /// 给对端推 cursor_advanced。**永远不返 nil**(getPinned + setPinnedAny 那种"已是目标"
-    /// noop 在 toggle 语义下不可能发生——每次 toggle 都翻反)
+    /// Legacy 直接 toggle，仅保留给历史单测。生产 Mac UI 走 `togglePinIntent`，它同时
+    /// 保留 writer-tx 原子 toggle 与 owner routing 两个不变量。
     public func togglePinAny(id: String, now: Int64) async throws -> (newPinned: Bool, newIngest: Int64) {
         try await pool.write { db in
             guard let row = try Item.filter(Column("id") == id).fetchOne(db) else {

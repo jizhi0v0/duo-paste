@@ -39,14 +39,24 @@ struct HistoryCellView: View {
             // 仅 body 路径挂 overlay,**不**放进 cardSurface 自身:长按 contextMenu preview
             // 复用 cardSurface 就天然不带 pin 装饰
             .overlay(alignment: .topTrailing) {
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(Color.accentColor)
-                    .rotationEffect(.degrees(45))
-                    .padding(.top, 6)
-                    .padding(.trailing, 6)
-                    .opacity(item.pinned ? 1 : 0)
-                    .allowsHitTesting(false)
+                VStack(alignment: .trailing, spacing: 3) {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(Color.accentColor)
+                        .rotationEffect(.degrees(45))
+                        .opacity(item.pinned ? 1 : 0)
+                    if store.isPinPending(item.id) {
+                        Text("等待同步")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                }
+                .padding(.top, 6)
+                .padding(.trailing, 6)
+                .allowsHitTesting(false)
             }
             // pinned 切换走 smooth 动画——gradient 渐显/渐隐 ~250ms,不"硬切"
             .animation(.smooth(duration: 0.25), value: item.pinned)

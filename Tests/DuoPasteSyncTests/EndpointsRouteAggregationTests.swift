@@ -10,38 +10,8 @@ import DuoPasteCore
 /// - device_id 字段返本机
 /// - 老 client 不解 meshPeers 也能 decode(向前兼容)
 
-private typealias DuoDB = DuoPasteCore.Database
-
-private func makeFixture() throws -> (DuoDB, BlobStore, HMACAuth, Int) {
-    let secret = Data(repeating: 0xEE, count: 32)
-    let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-endpoints-route-\(UUID().uuidString)", isDirectory: true)
-    let paths = Paths(root: root)
-    paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB)
-    let blobs = BlobStore(root: paths.blobsDir)
-    try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
-    let auth = HMACAuth(secret: secret)
-    let port = Int.random(in: 19500..<19800)
-    return (db, blobs, auth, port)
-}
-
-private func waitReady(baseURL: URL, auth: HMACAuth) async -> Bool {
-    for _ in 0..<50 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        var req = URLRequest(url: baseURL.appendingPathComponent("health"))
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = auth.sign(timestampMs: ts, method: "GET", path: "/health",
-                            bodyHashHex: HMACAuth.emptyBodyHashHex)
-        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
-        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
-        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
-        if let (_, resp) = try? await URLSession.shared.data(for: req),
-           let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-            return true
-        }
-    }
-    return false
+private func makeFixture() throws -> TestSyncServerFixture {
+    try TestSyncServerFixture(prefix: "duo-endpoints-route", secretByte: 0xEE)
 }
 
 private func getEndpoints(baseURL: URL, auth: HMACAuth) async throws -> (Int, Data) {
@@ -60,22 +30,20 @@ private func getEndpoints(baseURL: URL, auth: HMACAuth) async throws -> (Int, Da
 @Suite(.serialized)
 struct EndpointsRouteAggregationTests {
     @Test func endpointsReturnsSelfDeviceIDAndNoMeshByDefault() async throws {
-        let (db, blobs, auth, port) = try makeFixture()
+        let fixture = try makeFixture()
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let server = SyncServer(
             deviceID: "self-mac",
             database: db, blobs: blobs,
-            host: "127.0.0.1", port: port,
+            host: "127.0.0.1", port: 0,
             auth: auth,
             endpointsProvider: {
                 [PeerEndpoint(url: "https://self.example:8443", kind: .tailscale, preferred: true)]
             }
         )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReady(baseURL: base, auth: auth))
-
-        let (status, data) = try await getEndpoints(baseURL: base, auth: auth)
+        let (status, data) = try await fixture.withServer(server) { base in
+            try await getEndpoints(baseURL: base, auth: auth)
+        }
         #expect(status == 200)
         let page = try JSONDecoder().decode(PeerEndpointsPage.self, from: data)
         #expect(page.deviceID == "self-mac")
@@ -84,7 +52,8 @@ struct EndpointsRouteAggregationTests {
     }
 
     @Test func endpointsAggregatesMeshPeersWhenProviderReturnsList() async throws {
-        let (db, blobs, auth, port) = try makeFixture()
+        let fixture = try makeFixture()
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let meshList = [
             MeshPeerEntry(
                 peerDeviceID: "peer-Z",
@@ -96,19 +65,16 @@ struct EndpointsRouteAggregationTests {
         let server = SyncServer(
             deviceID: "self-mac",
             database: db, blobs: blobs,
-            host: "127.0.0.1", port: port,
+            host: "127.0.0.1", port: 0,
             auth: auth,
             endpointsProvider: {
                 [PeerEndpoint(url: "https://self.example:8443", kind: .tailscale, preferred: true)]
             },
             meshEndpointsProvider: { meshList }
         )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReady(baseURL: base, auth: auth))
-
-        let (status, data) = try await getEndpoints(baseURL: base, auth: auth)
+        let (status, data) = try await fixture.withServer(server) { base in
+            try await getEndpoints(baseURL: base, auth: auth)
+        }
         #expect(status == 200)
         let page = try JSONDecoder().decode(PeerEndpointsPage.self, from: data)
         #expect(page.deviceID == "self-mac")

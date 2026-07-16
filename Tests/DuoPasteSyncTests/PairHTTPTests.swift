@@ -8,44 +8,82 @@ import DuoPasteCore
 /// /pair 不走 HMAC,但 path 里 pin 必须 6 位数字,且成功响应必须原子包含 endpoints。
 /// /endpoints 仍单独存在并走 HMAC,供后续刷新候选使用。
 
-private typealias DuoDB = DuoPasteCore.Database
-
-private func makePairServerFixture() throws -> (DuoDB, BlobStore, HMACAuth, Int, Data) {
+private func makePairServerFixture() throws -> (TestSyncServerFixture, Data) {
     let secret = Data(repeating: 0xCE, count: 32)
-    let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-pair-http-\(UUID().uuidString)", isDirectory: true)
-    let paths = Paths(root: root)
-    paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB)
-    let blobs = BlobStore(root: paths.blobsDir)
-    try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
-    let auth = HMACAuth(secret: secret)
-    let port = Int.random(in: 19200..<19500)
-    return (db, blobs, auth, port, secret)
+    let fixture = try TestSyncServerFixture(prefix: "duo-pair-http", secretByte: 0xCE)
+    return (fixture, secret)
 }
 
-private func waitReadyPair(baseURL: URL, auth: HMACAuth) async -> Bool {
-    for _ in 0..<60 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        var req = URLRequest(url: baseURL.appendingPathComponent("health"))
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = auth.sign(timestampMs: ts, method: "GET", path: "/health",
-                            bodyHashHex: HMACAuth.emptyBodyHashHex)
-        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
-        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
-        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
-        if let (_, resp) = try? await URLSession.shared.data(for: req),
-           let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-            return true
-        }
-    }
-    return false
+private func withPairServer<Value>(
+    fixture: TestSyncServerFixture,
+    deviceID: String = "p",
+    endpoints: [PeerEndpoint] = [],
+    pairingService: PairingService? = nil,
+    credentialAuthenticator: DeviceCredentialAuthenticator? = nil,
+    requirePairingTLS: Bool = true,
+    operation: (URL) async throws -> Value
+) async throws -> Value {
+    let server = SyncServer(
+        deviceID: deviceID,
+        database: fixture.database,
+        blobs: fixture.blobs,
+        host: "127.0.0.1",
+        port: 0,
+        auth: fixture.auth,
+        credentialAuthenticator: credentialAuthenticator,
+        endpointsProvider: { endpoints },
+        pairingService: pairingService,
+        requirePairingTLS: requirePairingTLS
+    )
+    return try await fixture.withServer(server, operation: operation)
 }
 
 @Suite(.serialized)
 struct PairHTTPTests {
+    @Test func newPairingReturnsIndependentCredentialWithoutRootSecret() async throws {
+        let (fixture, rootSecret) = try makePairServerFixture()
+        let pairing = PairingService(
+            secretsProvider: { rootSecret },
+            pinGenerator: { "515151" }
+        )
+        _ = await pairing.generatePIN()
+        let authenticator = DeviceCredentialAuthenticator(
+            database: fixture.database,
+            rootSecret: rootSecret
+        )
+
+        let (data, response) = try await withPairServer(
+            fixture: fixture,
+            deviceID: "mac-new",
+            pairingService: pairing,
+            credentialAuthenticator: authenticator,
+            requirePairingTLS: false
+        ) { base in
+            var request = URLRequest(url: base.appendingPathComponent("pair/515151"))
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "client_device_id": "ios-a",
+                "client_name": "iPhone A",
+                "platform": "ios",
+            ])
+            return try await URLSession.shared.data(for: request)
+        }
+
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(json["secret"] == nil, "new pairing must never return mesh root secret")
+        let credential = try #require(json["credential"] as? [String: Any])
+        let secretHex = try #require(credential["secret"] as? String)
+        let token = try #require(credential["token"] as? String)
+        #expect(secretHex.count == 64)
+        #expect(token.hasPrefix("dpc1."))
+        #expect(secretHex != rootSecret.map { String(format: "%02x", $0) }.joined())
+        #expect((credential["id"] as? String)?.isEmpty == false)
+    }
+
     @Test func pairReturns200WithSecretOnCorrectPIN() async throws {
-        let (db, blobs, auth, port, secret) = try makePairServerFixture()
+        let (fixture, secret) = try makePairServerFixture()
         let endpoints = [
             PeerEndpoint(url: "https://mbp.example:8443", kind: .tailscale, preferred: true),
             PeerEndpoint(url: "https://mbp.sgponte:8443", kind: .ponte),
@@ -56,29 +94,26 @@ struct PairHTTPTests {
             pinGenerator: { "424242" }
         )
         _ = await pairing.generatePIN()
+        let authenticator = DeviceCredentialAuthenticator(
+            database: fixture.database,
+            rootSecret: secret
+        )
 
-        let server = SyncServer(
+        let (data, resp) = try await withPairServer(
+            fixture: fixture,
             deviceID: "mac-test",
-            database: db,
-            blobs: blobs,
-            host: "127.0.0.1",
-            port: port,
-            auth: auth,
-            endpointsProvider: { endpoints },
+            endpoints: endpoints,
             pairingService: pairing,
+            credentialAuthenticator: authenticator,
             // 测试用 plain HTTP；显式 opt-out TLS 护栏（生产路径默 true）
             requirePairingTLS: false
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        // 不带 HMAC 直接 POST /pair/<pin>
-        var req = URLRequest(url: base.appendingPathComponent("pair/424242"))
-        req.httpMethod = "POST"
-        req.httpBody = Data()
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        ) { base in
+            // 不带 HMAC 直接 POST /pair/<pin>
+            var req = URLRequest(url: base.appendingPathComponent("pair/424242"))
+            req.httpMethod = "POST"
+            req.httpBody = Data()
+            return try await URLSession.shared.data(for: req)
+        }
         let http = resp as! HTTPURLResponse
         #expect(http.statusCode == 200)
         let dict = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
@@ -96,7 +131,7 @@ struct PairHTTPTests {
     }
 
     @Test func pairReturns401OnPINMismatch() async throws {
-        let (db, blobs, auth, port, secret) = try makePairServerFixture()
+        let (fixture, secret) = try makePairServerFixture()
         let pairing = PairingService(
             pinLifetimeSec: 60,
             secretsProvider: { secret },
@@ -104,96 +139,73 @@ struct PairHTTPTests {
         )
         _ = await pairing.generatePIN()
 
-        let server = SyncServer(
-            deviceID: "p", database: db, blobs: blobs,
-            host: "127.0.0.1", port: port, auth: auth,
+        let (_, resp) = try await withPairServer(
+            fixture: fixture,
             pairingService: pairing,
             requirePairingTLS: false
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        var req = URLRequest(url: base.appendingPathComponent("pair/999999"))
-        req.httpMethod = "POST"
-        req.httpBody = Data()
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        ) { base in
+            var req = URLRequest(url: base.appendingPathComponent("pair/999999"))
+            req.httpMethod = "POST"
+            req.httpBody = Data()
+            return try await URLSession.shared.data(for: req)
+        }
         let http = resp as! HTTPURLResponse
         #expect(http.statusCode == 401)
     }
 
     @Test func pairReturns503WhenServiceNil() async throws {
-        let (db, blobs, auth, port, _) = try makePairServerFixture()
+        let (fixture, _) = try makePairServerFixture()
         // 没注入 pairingService → 503
-        let server = SyncServer(
-            deviceID: "p", database: db, blobs: blobs,
-            host: "127.0.0.1", port: port, auth: auth
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        var req = URLRequest(url: base.appendingPathComponent("pair/123456"))
-        req.httpMethod = "POST"
-        req.httpBody = Data()
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let (_, resp) = try await withPairServer(fixture: fixture) { base in
+            var req = URLRequest(url: base.appendingPathComponent("pair/123456"))
+            req.httpMethod = "POST"
+            req.httpBody = Data()
+            return try await URLSession.shared.data(for: req)
+        }
         let http = resp as! HTTPURLResponse
         #expect(http.statusCode == 503)
     }
 
     @Test func pairReturns400OnNon6DigitPIN() async throws {
-        let (db, blobs, auth, port, secret) = try makePairServerFixture()
+        let (fixture, secret) = try makePairServerFixture()
         let pairing = PairingService(secretsProvider: { secret })
-        let server = SyncServer(
-            deviceID: "p", database: db, blobs: blobs,
-            host: "127.0.0.1", port: port, auth: auth,
+        try await withPairServer(
+            fixture: fixture,
             pairingService: pairing,
             requirePairingTLS: false
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        for bad in ["abc", "12345", "12345678", "abcdef"] {
-            var req = URLRequest(url: base.appendingPathComponent("pair/\(bad)"))
-            req.httpMethod = "POST"
-            req.httpBody = Data()
-            let (_, resp) = try await URLSession.shared.data(for: req)
-            let http = resp as! HTTPURLResponse
-            #expect(http.statusCode == 400, "bad pin \(bad)")
+        ) { base in
+            for bad in ["abc", "12345", "12345678", "abcdef"] {
+                var req = URLRequest(url: base.appendingPathComponent("pair/\(bad)"))
+                req.httpMethod = "POST"
+                req.httpBody = Data()
+                let (_, resp) = try await URLSession.shared.data(for: req)
+                let http = resp as! HTTPURLResponse
+                #expect(http.statusCode == 400, "bad pin \(bad)")
+            }
         }
     }
 
     @Test func endpointsReturnsConfiguredList() async throws {
-        let (db, blobs, auth, port, _) = try makePairServerFixture()
+        let (fixture, _) = try makePairServerFixture()
         let endpoints = [
             PeerEndpoint(url: "https://test.example:8443", kind: .tailscale, preferred: true),
             PeerEndpoint(url: "https://test.local:8443", kind: .local),
         ]
-        let server = SyncServer(
-            deviceID: "p", database: db, blobs: blobs,
-            host: "127.0.0.1", port: port, auth: auth,
-            endpointsProvider: { endpoints }
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        // 加 HMAC
-        var req = URLRequest(url: base.appendingPathComponent("endpoints"))
-        req.httpMethod = "GET"
         let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = auth.sign(timestampMs: ts, method: "GET", path: "/endpoints",
+        let sig = fixture.auth.sign(timestampMs: ts, method: "GET", path: "/endpoints",
                             bodyHashHex: HMACAuth.emptyBodyHashHex)
-        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
-        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
-        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await withPairServer(
+            fixture: fixture,
+            endpoints: endpoints
+        ) { base in
+            // 加 HMAC
+            var req = URLRequest(url: base.appendingPathComponent("endpoints"))
+            req.httpMethod = "GET"
+            req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
+            req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
+            req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+            return try await URLSession.shared.data(for: req)
+        }
         let http = resp as! HTTPURLResponse
         #expect(http.statusCode == 200)
         let page = try JSONDecoder().decode(PeerEndpointsPage.self, from: data)
@@ -206,7 +218,7 @@ struct PairHTTPTests {
     /// PR-E 回归：plain HTTP daemon 默认拒 /pair——secret hex 不该走未加密链路。
     /// 不消耗 PIN（attacker 也不能通过 503 vs 401 反推 TLS 状态后再针对）
     @Test func pairReturns503WhenTLSRequiredButMissing() async throws {
-        let (db, blobs, auth, port, secret) = try makePairServerFixture()
+        let (fixture, secret) = try makePairServerFixture()
         let pairing = PairingService(
             pinLifetimeSec: 60,
             secretsProvider: { secret },
@@ -215,20 +227,15 @@ struct PairHTTPTests {
         _ = await pairing.generatePIN()
         // 注意：**不**传 requirePairingTLS=false，默认 true → 必须 TLS 才允 /pair。
         // 但本测试用 plain HTTP server（tls=nil）→ pair 路由应拒
-        let server = SyncServer(
-            deviceID: "p", database: db, blobs: blobs,
-            host: "127.0.0.1", port: port, auth: auth,
+        let (_, resp) = try await withPairServer(
+            fixture: fixture,
             pairingService: pairing
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        var req = URLRequest(url: base.appendingPathComponent("pair/424242"))
-        req.httpMethod = "POST"
-        req.httpBody = Data()
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        ) { base in
+            var req = URLRequest(url: base.appendingPathComponent("pair/424242"))
+            req.httpMethod = "POST"
+            req.httpBody = Data()
+            return try await URLSession.shared.data(for: req)
+        }
         let http = resp as! HTTPURLResponse
         #expect(http.statusCode == 503, "plain HTTP /pair 必须 503，实际 \(http.statusCode)")
 
@@ -238,21 +245,13 @@ struct PairHTTPTests {
     }
 
     @Test func endpointsRejectsWithoutHMAC() async throws {
-        let (db, blobs, auth, port, _) = try makePairServerFixture()
-        let server = SyncServer(
-            deviceID: "p", database: db, blobs: blobs,
-            host: "127.0.0.1", port: port, auth: auth,
-            endpointsProvider: { [] }
-        )
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPair(baseURL: base, auth: auth))
-
-        // 不加 HMAC headers
-        var req = URLRequest(url: base.appendingPathComponent("endpoints"))
-        req.httpMethod = "GET"
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let (fixture, _) = try makePairServerFixture()
+        let (_, resp) = try await withPairServer(fixture: fixture) { base in
+            // 不加 HMAC headers
+            var req = URLRequest(url: base.appendingPathComponent("endpoints"))
+            req.httpMethod = "GET"
+            return try await URLSession.shared.data(for: req)
+        }
         let http = resp as! HTTPURLResponse
         #expect(http.statusCode == 401)
     }

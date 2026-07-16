@@ -3,8 +3,8 @@ import AVFoundation
 import UIKit
 import DuoPasteCore
 
-/// 摄像头扫 Mac QR → 解析 JSON {host, port, tls, pin} → 直接 PinPairingClient.pair。
-/// 用户体验:扫一下就配对成功,中间无手动输 PIN 步骤(PIN 已经在 QR 里)。
+/// 摄像头扫 Mac QR → 解析 JSON {host, port, tls}，再由配对 sheet 要求用户输入
+/// Mac 同屏显示的 6 位 PIN。QR 与 PIN 分离，避免一张截图同时泄露两个因子。
 ///
 /// 权限:NSCameraUsageDescription Info.plist 必填,否则 startRunning() 静默挂
 struct QRScannerView: View {
@@ -58,8 +58,11 @@ struct QRScannerView: View {
 
     private func handleScan(_ raw: String) {
         guard !didReport else { return }
-        guard let payload = QRPayload.parse(raw) else {
-            error = "QR 内容无效 — 不是 DuoPaste 配对码"
+        let payload: QRPayload
+        do {
+            payload = try QRPayload.parse(raw)
+        } catch {
+            self.error = error.localizedDescription
             return
         }
         didReport = true
@@ -69,40 +72,47 @@ struct QRScannerView: View {
     }
 }
 
-/// Mac QR payload schema:`{"host":"x.local","port":8443,"tls":true,"v":1}`。
+/// Mac QR v2 payload schema 附带 `cert_sha256`，把眼前 Mac 的 TLS leaf identity
+/// 绑定进 pairing handshake。
 /// **故意不含 PIN**——QR 泄露 ≠ 配对失守,PIN 在 Mac 屏幕另一区域显示让用户手输,
 /// 两道防线分开
 struct QRPayload: Equatable {
     let host: String
     let port: Int
     let tls: Bool
+    let certificateSHA256: String
 
-    static func parse(_ raw: String) -> QRPayload? {
-        guard let data = raw.data(using: .utf8),
-              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+    enum ParseError: LocalizedError {
+        case invalid
+        case macUpgradeRequired
+        case httpsRequired
+
+        var errorDescription: String? {
+            switch self {
+            case .invalid: "QR 内容无效 — 不是 DuoPaste 配对码"
+            case .macUpgradeRequired: "Mac 配对码版本过旧，请先升级 Mac 端 DuoPaste"
+            case .httpsRequired: "Mac 未提供带 TLS leaf 绑定的安全配对码"
+            }
         }
-        guard let host = dict["host"] as? String, !host.isEmpty else {
-            return nil
-        }
-        // 防御性 host 校验：恶意 QR 让 host 含控制字符 / 空格 / ":" / "/" 等，
-        // URLComponents 兜底会拒大部分，但显式 reject 让攻击面更小（payload 落入
-        // PinPairingClient.pair 前就拦下）
-        guard Self.isValidHostString(host) else { return nil }
-        let port = (dict["port"] as? Int) ?? 8443
-        guard (1..<65536).contains(port) else { return nil }
-        let tls = (dict["tls"] as? Bool) ?? true
-        return QRPayload(host: host, port: port, tls: tls)
     }
 
-    /// host 合法字符：a-z / A-Z / 0-9 / `.` / `-` / `:`（IPv6 wrapper bracketed 用）。
-    /// 不允许空格、控制字符、`/`、`?`、`#` 等 URL-special。长度上限 253 (RFC 1035)
-    private static func isValidHostString(_ host: String) -> Bool {
-        guard host.count <= 253 else { return false }
-        let allowed = CharacterSet(charactersIn:
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:_[]"
+    static func parse(_ raw: String) throws -> QRPayload {
+        let wire: PairingQRPayload
+        do {
+            wire = try PairingQRPayload.parse(raw)
+        } catch {
+            throw ParseError.invalid
+        }
+        guard wire.version >= 2 else { throw ParseError.macUpgradeRequired }
+        guard wire.tls,
+              let certificateSHA256 = wire.normalizedCertificateSHA256,
+              wire.isChannelBound else { throw ParseError.httpsRequired }
+        return QRPayload(
+            host: wire.host,
+            port: wire.port,
+            tls: true,
+            certificateSHA256: certificateSHA256
         )
-        return host.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }
 

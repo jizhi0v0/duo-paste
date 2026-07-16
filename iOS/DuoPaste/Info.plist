@@ -34,7 +34,7 @@
 		<string>_duopaste._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>扫描 Mac 显示的配对二维码,自动填好 peer URL + secret。</string>
+	<string>扫描 Mac 显示的配对二维码，读取 peer 地址并校验 TLS 身份。</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>在同 Wi-Fi 网段发现 Mac daemon 让配对零手填。</string>
 	<key>UIApplicationSceneManifest</key>

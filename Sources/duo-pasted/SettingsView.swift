@@ -48,6 +48,32 @@ struct SettingsView: View {
             }
         }
         .frame(width: 760, height: 620)
+        .background(SettingsWindowProbe())
+    }
+}
+
+/// 把 SwiftUI `Settings` scene 托管的真实 NSWindow 暴露给 AppDelegate。
+///
+/// App 是 `.accessory` activation policy，单靠 `showSettingsWindow:` selector 只保证
+/// Settings scene 被创建/复用，不保证窗口排到其它 app 前面。这里保存弱引用，让 menubar
+/// 和搜索窗齿轮入口都能精确前置 Settings，而不用按窗口标题或 `NSApp.windows` 顺序猜。
+@MainActor
+enum SettingsWindowBridge {
+    weak static var window: NSWindow?
+}
+
+private struct SettingsWindowProbe: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        SettingsWindowProbeView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class SettingsWindowProbeView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        SettingsWindowBridge.window = window
     }
 }
 
@@ -122,6 +148,10 @@ final class SettingsModel {
         return img
     }
 
+    var pairingChannelBindingReady: Bool {
+        PairingQR.payload(config: config) != nil
+    }
+
     /// 后台预生成 QR cache,非阻塞。idempotent——重复调用如果 fingerprint 一致直接返回
     func prewarmPairingQR() {
         let cfg = config
@@ -142,6 +172,7 @@ final class SettingsModel {
     /// 所以重复调用安全。sheet 关掉后再 prewarm 一次让连续开关都瞬间显示
     func prewarmPIN() {
         pinPrewarmTask?.cancel()
+        guard pairingChannelBindingReady else { return }
         pinPrewarmTask = Task { @MainActor [weak self] in
             guard let service = AppDelegate.shared?.pairingService else { return }
             let (pin, sec) = await service.generatePIN()
@@ -176,18 +207,26 @@ final class SettingsModel {
     var needsRestart: Bool {
         guard isDirty else { return false }
         var a = config
+        var b = initial
         a.hotkey = initial.hotkey
-        return a != initial
+        // 排除列表由 watcher + CaptureService 双 gate 热重载，不需要重启。
+        a.capture.excludedBundleIDs = initial.capture.excludedBundleIDs
+        b.capture.excludedBundleIDs = initial.capture.excludedBundleIDs
+        return a != b
     }
 
     func apply() {
         let hotkeyChanged = config.hotkey != initial.hotkey
+        let captureExclusionsChanged = config.capture.excludedBundleIDs != initial.capture.excludedBundleIDs
         let restartNeeded = needsRestart
         do {
             try Config.write(config, to: configPath)
             initial = config
             if hotkeyChanged {
                 AppDelegate.shared?.reloadHotkey()
+            }
+            if captureExclusionsChanged {
+                AppDelegate.shared?.reloadCapturePolicy()
             }
             statusMessage = restartNeeded ? "已应用 · 部分字段需重启 daemon 生效" : "已应用 · 立即生效"
             statusIsError = false
@@ -220,6 +259,26 @@ final class SettingsModel {
 
     func restartDaemon() {
         AppDelegate.shared?.restartDaemon()
+    }
+
+    @discardableResult
+    func addExcludedBundleID(_ raw: String) -> Bool {
+        let bundleID = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundleID.isEmpty,
+              !bundleID.contains(where: { $0.isWhitespace }),
+              !config.capture.excludedBundleIDs.contains(where: {
+                  $0.caseInsensitiveCompare(bundleID) == .orderedSame
+              })
+        else { return false }
+        config.capture.excludedBundleIDs.append(bundleID)
+        config.capture.excludedBundleIDs.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return true
+    }
+
+    func removeExcludedBundleID(_ bundleID: String) {
+        config.capture.excludedBundleIDs.removeAll {
+            $0.caseInsensitiveCompare(bundleID) == .orderedSame
+        }
     }
 
     // MARK: - OCR 队列状态 + 操作
@@ -530,6 +589,7 @@ private func hotkeyDisplay(_ config: Config.HotkeyConfig) -> String {
 private struct GeneralPane: View {
     @Bindable var model: SettingsModel
     var appState: AppState?
+    @State private var excludedBundleIDDraft = ""
 
     var body: some View {
         Form {
@@ -608,6 +668,62 @@ private struct GeneralPane: View {
                 SettingsNoteRow(text: "超过上限时 capture 跳过入库，剪贴板本身仍可 Cmd+V 粘贴。")
             }
 
+            SettingsGroup(title: "应用排除") {
+                SettingsRow(
+                    title: "从运行中的应用添加",
+                    subtitle: "命中后不会读取正文、写数据库、存 blob、OCR 或同步",
+                    isFirst: true
+                ) {
+                    Menu("选择应用…") {
+                        if runningApplications.isEmpty {
+                            Text("没有可选的运行中应用")
+                        } else {
+                            ForEach(runningApplications) { app in
+                                Button {
+                                    model.addExcludedBundleID(app.bundleID)
+                                } label: {
+                                    Text("\(app.name) — \(app.bundleID)")
+                                }
+                                .disabled(model.config.capture.excludedBundleIDs.contains(where: {
+                                    $0.caseInsensitiveCompare(app.bundleID) == .orderedSame
+                                }))
+                            }
+                        }
+                    }
+                    .frame(width: 220)
+                }
+
+                SettingsRow(title: "手动添加 bundle ID") {
+                    HStack(spacing: 8) {
+                        TextField("com.example.App", text: $excludedBundleIDDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 220)
+                            .onSubmit { addExcludedBundleIDDraft() }
+                        GlassActionButton(
+                            title: "添加",
+                            isProminent: false,
+                            isDisabled: excludedBundleIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ) {
+                            addExcludedBundleIDDraft()
+                        }
+                    }
+                }
+
+                ForEach(model.config.capture.excludedBundleIDs, id: \.self) { bundleID in
+                    SettingsRow(title: bundleID) {
+                        Button {
+                            model.removeExcludedBundleID(bundleID)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("从排除列表移除")
+                    }
+                }
+
+                SettingsNoteRow(text: "列表保存后立即生效；排除只影响 duo-paste 历史，系统剪贴板与 Cmd+V 完全不受影响。")
+            }
+
             IOSPairingGroup(model: model)
         }
         .formStyle(.grouped)
@@ -625,6 +741,32 @@ private struct GeneralPane: View {
             get: { model.config.capture.maxTextBytes / 1024 },
             set: { model.config.capture.maxTextBytes = max(1, $0) * 1024 }
         )
+    }
+
+    private struct RunningApplication: Identifiable {
+        let bundleID: String
+        let name: String
+        var id: String { bundleID.lowercased() }
+    }
+
+    private var runningApplications: [RunningApplication] {
+        var seen = Set<String>()
+        return NSWorkspace.shared.runningApplications.compactMap { app in
+            guard app.activationPolicy == .regular,
+                  let bundleID = app.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !bundleID.isEmpty
+            else { return nil }
+            let key = bundleID.lowercased()
+            guard seen.insert(key).inserted else { return nil }
+            return RunningApplication(bundleID: bundleID, name: app.localizedName ?? bundleID)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func addExcludedBundleIDDraft() {
+        if model.addExcludedBundleID(excludedBundleIDDraft) {
+            excludedBundleIDDraft = ""
+        }
     }
 }
 
@@ -1164,6 +1306,10 @@ private struct AboutPane: View {
     @State private var blobsTotalBytes: Int64?
     @State private var diskAvailableBytes: Int64?
     @State private var checkTick = 0   // bump 后让「上次检查」字符串重算（见 lastUpdateCheckString）
+    @State private var tlsCertificateState: TLSCertificateState = .notConfigured
+    @State private var deviceCredentials: [DeviceCredentialRecord] = []
+    @State private var credentialLoadError: String?
+    @State private var credentialRevokingID: String?
 
     var body: some View {
         Form {
@@ -1183,6 +1329,37 @@ private struct AboutPane: View {
                 SettingsRow(title: "存储模式") {
                     Text(storageModeDisplay).foregroundStyle(.secondary)
                 }
+            }
+
+            SettingsGroup(title: "已配对设备") {
+                if deviceCredentials.isEmpty {
+                    SettingsRow(title: "设备", subtitle: credentialLoadError, isFirst: true) {
+                        Text(credentialLoadError == nil ? "暂无独立凭据" : "读取失败")
+                            .foregroundStyle(credentialLoadError == nil ? Color.secondary : Color.red)
+                    }
+                } else {
+                    ForEach(Array(deviceCredentials.enumerated()), id: \.element.id) { index, record in
+                        SettingsRow(
+                            title: record.claims.displayName,
+                            subtitle: credentialSubtitle(record),
+                            isFirst: index == 0
+                        ) {
+                            if record.isRevoked {
+                                Text("已撤销")
+                                    .foregroundStyle(.red)
+                            } else {
+                                GlassActionButton(
+                                    title: credentialRevokingID == record.id ? "撤销中…" : "撤销",
+                                    isProminent: false,
+                                    isDisabled: credentialRevokingID != nil
+                                ) {
+                                    revokeCredential(record)
+                                }
+                            }
+                        }
+                    }
+                }
+                SettingsNoteRow(text: "撤销只影响这一份 iOS 凭据；其他 iOS 与 Mac mesh 继续可用。")
             }
 
             // 软件更新——仅当 bundle 嵌了 Sparkle（SUFeedURL 存在）才显。DP_NO_SPARKLE
@@ -1217,6 +1394,66 @@ private struct AboutPane: View {
                         .toggleStyle(.switch)
                     }
                 }
+            }
+
+            SettingsGroup(title: "TLS 证书") {
+                switch tlsCertificateState.state {
+                case .notConfigured:
+                    SettingsRow(title: "状态", isFirst: true) {
+                        Text("未启用 HTTPS")
+                            .foregroundStyle(.secondary)
+                    }
+                case .unreadable:
+                    SettingsRow(title: "状态", isFirst: true) {
+                        Text("无法读取")
+                            .foregroundStyle(.red)
+                    }
+                    SettingsNoteRow(text: tlsCertificateState.error ?? "leaf certificate 无法解析")
+                case .inspected:
+                    if let leaf = tlsCertificateState.leaf {
+                        SettingsRow(title: "状态", isFirst: true) {
+                            Text(tlsExpiryDisplay(leaf))
+                                .foregroundStyle(tlsExpiryColor(leaf.expiryStatus))
+                                .monospacedDigit()
+                        }
+                        SettingsRow(title: "到期日") {
+                            Text(Self.certificateDateFormatter.string(from: leaf.notAfter))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        SettingsRow(title: "DNS SAN") {
+                            Text(leaf.dnsSANs.isEmpty ? "(none)" : leaf.dnsSANs.joined(separator: "\n"))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                SettingsBlock {
+                    HStack {
+                        Spacer()
+                        GlassActionButton(title: "重新检查", isProminent: false) {
+                            refreshTLSCertificate()
+                        }
+                    }
+                }
+                SettingsNoteRow(text: "到期前 30 / 7 / 1 天逐级预警；mkcert leaf 不会自动续期。")
+            }
+
+            SettingsGroup(title: "安全诊断") {
+                SettingsBlock(isFirst: true) {
+                    HStack {
+                        Text("mesh-doctor、quick_check、版本、脱敏 config 与白名单运维日志")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        GlassActionButton(title: "导出诊断包…", isProminent: false) {
+                            AppDelegate.shared?.showDiagnosticExportDialog()
+                        }
+                    }
+                }
+                SettingsNoteRow(text: "固定排除 shared-secret、device credential/token、TLS 私钥、数据库/剪贴板正文、preview、blob 与缩略图字节。")
             }
 
             SettingsGroup(title: "Blob 补齐") {
@@ -1272,7 +1509,11 @@ private struct AboutPane: View {
             }
         }
         .formStyle(.grouped)
-        .task { await subscribeStorageStats() }
+        .task {
+            refreshTLSCertificate()
+            await refreshDeviceCredentials()
+            await subscribeStorageStats()
+        }
     }
 
     private var sparkleEnabled: Bool {
@@ -1335,6 +1576,87 @@ private struct AboutPane: View {
     private var storageModeDisplay: String {
         AppDelegate.shared?.dependencies?.config.mesh.storageMode.description ?? "—"
     }
+
+    private func refreshTLSCertificate() {
+        guard let config = AppDelegate.shared?.dependencies?.config else {
+            tlsCertificateState = .unreadable("daemon 未启动")
+            return
+        }
+        tlsCertificateState = AppDelegate.tlsCertificateState(for: config)
+    }
+
+    private func refreshDeviceCredentials() async {
+        do {
+            deviceCredentials = try await AppDelegate.shared?.listDeviceCredentials() ?? []
+            credentialLoadError = nil
+        } catch {
+            credentialLoadError = String(describing: error)
+        }
+    }
+
+    private func revokeCredential(_ record: DeviceCredentialRecord) {
+        guard credentialRevokingID == nil else { return }
+        credentialRevokingID = record.id
+        Task { @MainActor in
+            defer { credentialRevokingID = nil }
+            do {
+                try await AppDelegate.shared?.revokeDeviceCredential(record.id)
+                await refreshDeviceCredentials()
+            } catch {
+                credentialLoadError = "撤销失败：\(error)"
+            }
+        }
+    }
+
+    private func credentialSubtitle(_ record: DeviceCredentialRecord) -> String {
+        let platform = record.claims.platform.uppercased()
+        let lastActive: String
+        if let ms = record.lastActiveAtMs {
+            lastActive = "最后活跃 \(Self.credentialDateFormatter.string(from: Date(timeIntervalSince1970: Double(ms) / 1_000)))"
+        } else {
+            lastActive = "尚未使用"
+        }
+        return "\(platform) · \(lastActive) · \(record.claims.deviceID)"
+    }
+
+    private static let credentialDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private func tlsExpiryDisplay(_ leaf: TLSCertificateReport) -> String {
+        switch leaf.expiryStatus {
+        case .valid:
+            return "有效 · 剩余 \(leaf.daysRemaining) 天"
+        case .expiresWithin30Days:
+            return "⚠ 30 天内到期 · 剩余 \(leaf.daysRemaining) 天"
+        case .expiresWithin7Days:
+            return "⚠ 7 天内到期 · 剩余 \(leaf.daysRemaining) 天"
+        case .expiresWithin1Day:
+            return "⚠ 1 天内到期"
+        case .expired:
+            return "已过期"
+        case .notYetValid:
+            return "尚未生效"
+        }
+    }
+
+    private func tlsExpiryColor(_ status: TLSCertificateReport.ExpiryStatus) -> Color {
+        switch status {
+        case .valid: .green
+        case .expiresWithin30Days: .orange
+        case .expiresWithin7Days, .expiresWithin1Day, .expired, .notYetValid: .red
+        }
+    }
+
+    private static let certificateDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     private func runFetchMissing() {
         guard let deps = AppDelegate.shared?.dependencies,
@@ -1609,9 +1931,9 @@ private struct NativeGlassButtonChrome: ViewModifier {
     }
 }
 
-/// macOS 26 原生 Liquid Glass 二态选择按钮。两态始终使用同一个 `.glass(.regular)`
-/// 样式，只切换 Glass tint；避免 `.glass` / `.glassProminent` 不同 intrinsic padding
-/// 造成点击时按钮高度跳变。材质、按压、hover 全交给系统。
+/// macOS 26 原生 Liquid Glass 二态选择按钮。选中态必须用 `.glassProminent`：
+/// `.glass(.regular.tint(...))` 在当前系统上仍会渲染成近乎无色的普通玻璃，深色模式下
+/// 看不出哪个选项被选中。固定外层高度消除两种原生 style 的 intrinsic padding 差异。
 private struct GlassChoiceButton: View {
     let title: String
     let isSelected: Bool
@@ -1620,13 +1942,27 @@ private struct GlassChoiceButton: View {
     @ViewBuilder
     var body: some View {
         if #available(macOS 26.0, *) {
-            button.buttonStyle(.glass(
-                .regular.tint(isSelected ? Color.accentColor : nil)
-            ))
+            if isSelected {
+                button
+                    .buttonStyle(.glassProminent)
+                    .tint(.accentColor)
+                    .frame(height: 28)
+            } else {
+                button
+                    .buttonStyle(.glass)
+                    .frame(height: 28)
+            }
         } else {
-            button
-                .buttonStyle(.bordered)
-                .tint(isSelected ? Color.accentColor : nil)
+            if isSelected {
+                button
+                    .buttonStyle(.borderedProminent)
+                    .tint(.accentColor)
+                    .frame(height: 28)
+            } else {
+                button
+                    .buttonStyle(.bordered)
+                    .frame(height: 28)
+            }
         }
     }
 
@@ -1639,40 +1975,50 @@ private struct GlassChoiceButton: View {
     }
 }
 
-// MARK: - iOS PIN 配对(Bonjour + PIN)
+// MARK: - iOS PIN 配对(QR leaf pin + 独立 PIN)
 
-/// QR payload 不含 PIN(故意——QR 被截图 ≠ 配对失守,见 IOSPairingPINSheet 注释),所以
-/// QR 内容只依赖 host/port/tls,可以脱离 sheet 生命周期常驻 SettingsModel cache
+/// QR v2 payload 不含 PIN/credential，只含 endpoint + 当前 TLS leaf SHA-256。扫码把
+/// certificate identity 带到 iOS，手输 PIN 再授权一次签发；两条通道缺一不可。
 private enum PairingQR {
     /// 复用单例:每次 new CIContext 会启动 Metal device(~50-150ms)
     private static let ciContext = CIContext()
 
     static func fingerprint(for cfg: Config) -> String {
-        "\(resolveHost(cfg: cfg))|\(cfg.servePort)|\(cfg.serveTLS)"
+        if let payload = payload(config: cfg) {
+            return "\(payload.host)|\(payload.port)|\(payload.certificateSHA256 ?? "")"
+        }
+        return "unavailable|\(cfg.serve)|\(cfg.serveTLS)|\(cfg.tlsCertPath ?? "")"
     }
 
-    /// 选 host:tlsCertPath 文件 stem(Tailscale FQDN,跨 LAN 通) → fallback .local
-    static func resolveHost(cfg: Config) -> String {
-        if let cert = cfg.tlsCertPath {
-            let stem = (cert as NSString).lastPathComponent
-                .replacingOccurrences(of: ".crt", with: "")
-            if !stem.isEmpty { return stem }
-        }
-        let hn = Host.current().localizedName ?? Host.current().name ?? "mac"
-        return hn.hasSuffix(".local") ? hn : "\(hn).local"
+    /// Pairing 发生在用户眼前的 Mac/iPhone，同 LAN `.local` 可达性最稳；TLS identity
+    /// 已由 QR leaf pin 保证，不再从证书文件名猜 hostname。
+    static func resolveHost(cfg _: Config) -> String {
+        EndpointDiscovery.preferredLocalHostname()
+    }
+
+    static func payload(config: Config) -> PairingQRPayload? {
+        guard config.serve,
+              config.serveTLS,
+              let certificatePath = config.tlsCertPath
+        else { return nil }
+        let certificateURL = URL(fileURLWithPath: certificatePath)
+        guard
+              (try? TLSCertificateInspector.inspect(at: certificateURL)) != nil,
+              let fileData = try? Data(contentsOf: certificateURL),
+              let leafDER = try? PairingCertificatePin.certificateDER(from: fileData)
+        else { return nil }
+        let sha256 = PairingCertificatePin.sha256Hex(certificateDER: leafDER)
+        return try? PairingQRPayload.bound(
+            host: resolveHost(cfg: config),
+            port: config.servePort,
+            certificateSHA256: sha256
+        )
     }
 
     /// 同步生成 QR 图——CIContext 复用后 ~10ms,可 detached task 调
     static func generate(config: Config) -> NSImage? {
-        let payload: [String: Any] = [
-            "host": resolveHost(cfg: config),
-            "port": config.servePort,
-            "tls": config.serveTLS,
-            "v": 1,
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
-            return nil
-        }
+        guard let payload = payload(config: config),
+              let data = try? payload.encodedData() else { return nil }
         guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
         filter.setValue(data, forKey: "inputMessage")
         filter.setValue("M", forKey: "inputCorrectionLevel")
@@ -1685,7 +2031,7 @@ private enum PairingQR {
 }
 
 /// daemon 在 serve=true 时通过 BonjourAdvertiser 广播 `_duopaste._tcp`,iOS Settings
-/// 端 NWBrowser 浏到本机后用户 tap → 输 6 位 PIN → POST /pair/<pin> 拿 secret + endpoints。
+/// 端扫码取得 endpoint + leaf pin，再输 6 位 PIN → POST /pair/<pin> 拿 credential + endpoints。
 /// 60s expiry + 5 次错误封锁,PIN 用过即失效
 @MainActor
 private struct IOSPairingGroup: View {
@@ -1704,12 +2050,14 @@ private struct IOSPairingGroup: View {
             }
             SettingsRow(title: "PIN 配对") {
                 GlassActionButton(title: "显示配对码", isProminent: true,
-                                  isDisabled: !model.config.serve) {
+                                  isDisabled: !model.pairingChannelBindingReady) {
                     showPIN = true
                 }
                 .controlSize(.small)
             }
-            SettingsNoteRow(text: "iOS Settings 选「发现的 Mac」对应一行 → 输入这边显示的 6 位数字 → 自动获取 secret + 候选 endpoints。PIN 60s 失效,错 5 次封锁")
+            SettingsNoteRow(text: model.pairingChannelBindingReady
+                ? "iOS 必须扫描此 Mac 的 QR，再输入同屏 6 位 PIN。QR 绑定当前 TLS leaf；PIN 60s 失效，错 5 次封锁。"
+                : "安全配对需要 serve=true、HTTPS 和可读取的 tls_cert_path；条件不满足时不会生成 QR/PIN。")
         }
         .sheet(isPresented: $showPIN) {
             IOSPairingPINSheet(model: model, isPresented: $showPIN)
@@ -1761,7 +2109,7 @@ private struct IOSPairingPINSheet: View {
                     .foregroundStyle(.green)
                     .frame(width: 260, height: 260)
             } else if let qrImage {
-                // QR 码 — iOS 扫这个拿 host;PIN 用户手输让 QR 泄露 ≠ 配对失守
+                // QR 带 endpoint + leaf pin；PIN 仍由用户从同屏手输。
                 Image(nsImage: qrImage)
                     .interpolation(.none)
                     .resizable()
@@ -1770,8 +2118,17 @@ private struct IOSPairingPINSheet: View {
                     .background(Color.white)
                     .padding(8)
             } else {
-                // QR cache miss + 仍在生成:统一 spinner,不留空白窗格
-                ProgressView().frame(width: 260, height: 260)
+                VStack(spacing: 10) {
+                    Image(systemName: "lock.trianglebadge.exclamationmark")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.orange)
+                    Text("无法生成安全配对码")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("检查 HTTPS 与 tls_cert_path 后重开此窗口")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 260, height: 260)
             }
 
             // PIN 文本(成功后隐藏)
@@ -1792,7 +2149,7 @@ private struct IOSPairingPINSheet: View {
             }
 
             if paired {
-                Text("iOS 已拿到 secret + endpoints,正在连接…")
+                Text("iOS 已拿到独立凭据 + endpoints，正在连接…")
                     .foregroundStyle(.secondary)
                     .font(.system(size: 12))
             } else if let errorText {
@@ -1848,6 +2205,10 @@ private struct IOSPairingPINSheet: View {
             if qrImage == nil {
                 qrImage = model.pairingQRImage()
             }
+            guard qrImage != nil else {
+                errorText = "安全配对需要 HTTPS 与可读取的 leaf certificate"
+                return
+            }
             if pin != nil, secondsLeft > 0 {
                 // init 已经从 cache 拿到 PIN → 直接启 countdown + polling 跳过 actor hop
                 startCountdown()
@@ -1861,7 +2222,7 @@ private struct IOSPairingPINSheet: View {
             refreshTask = nil
             pollTask?.cancel()
             pollTask = nil
-            qrImage = nil  // 防 secret-containing image 在 onDisappear 残留 memory
+            qrImage = nil
             // cancel + prewarm 必须串行:两者都派 Task 到 PairingService actor,
             // 独立 Task 的 actor 入队顺序无保证,可能让新生成的 PIN 被旧 cancel 干掉。
             // 串到一个 Task 里 await cancel 完成再 prewarm,actor 顺序自然保证
@@ -1881,15 +2242,16 @@ private struct IOSPairingPINSheet: View {
         }
         errorText = nil
         paired = false
+        qrImage = model.pairingQRImage()
+        guard qrImage != nil else {
+            errorText = "TLS leaf 不可读取，已停止生成 PIN"
+            return
+        }
         Task { @MainActor in
             let (newPin, sec) = await service.generatePIN()
             self.pin = newPin
             self.secondsLeft = sec
             self.sessionStartedAt = Date()
-            // QR cache miss(prewarm 没赶上 / 配置变了)兜底现场生成
-            if qrImage == nil {
-                qrImage = model.pairingQRImage()
-            }
             startCountdown()
             startPollingForConsumption()
         }

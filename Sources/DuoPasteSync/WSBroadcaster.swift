@@ -85,7 +85,7 @@ public actor WSBroadcaster {
     ///
     /// **`onSlowKick` 也调一次**——同 broadcast 慢消费者踢的语义保持一致：让 server 端
     /// onUpgrade 闭包尽快收尾不卡 inbound iterator
-    func rotateAllConnections() async {
+    public func rotateAllConnections() async {
         guard !connections.isEmpty else { return }
         let snapshot = connections
         log("rotating \(snapshot.count) connection(s) for auth refresh")

@@ -53,6 +53,7 @@ private func insert(_ db: DuoDB, _ items: [Item]) throws {
     let page = try SinceAPI(database: db).fetch(SinceQuery())
     #expect(page.items.map(\.id) == ["a", "b", "c"])
     #expect(page.hasMore == false)
+    #expect(page.totalCount == 3)
     #expect(page.nextCursor.ingestedAtNs == 30)
     #expect(page.nextCursor.id == "c")
 }
@@ -94,6 +95,8 @@ private func insert(_ db: DuoDB, _ items: [Item]) throws {
     let p2 = try api.fetch(SinceQuery(cursor: p1.nextCursor, limit: 2))
     #expect(p2.items.map(\.id) == ["c"])
     #expect(p2.hasMore == false)
+    #expect(p1.totalCount == 3)
+    #expect(p2.totalCount == 3)
 }
 
 @Test func sinceTiebreaksOnIdForSameNs() throws {
@@ -125,6 +128,27 @@ private func insert(_ db: DuoDB, _ items: [Item]) throws {
     #expect(p.items.isEmpty)
     #expect(p.hasMore == false)
     #expect(p.nextCursor == cursor)
+}
+
+@Test func sinceWireDecodesLegacyServerWithoutCountOrSourceIdentity() throws {
+    let wire = SincePageWire(
+        ok: true,
+        count: 0,
+        items: [],
+        nextCursor: .zero,
+        hasMore: false,
+        totalCount: 42,
+        sourceDeviceID: "new-server"
+    )
+    let encoded = try JSONEncoder().encode(wire)
+    var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    object.removeValue(forKey: "total_count")
+    object.removeValue(forKey: "source_device_id")
+
+    let legacy = try JSONSerialization.data(withJSONObject: object)
+    let decoded = try JSONDecoder().decode(SincePageWire.self, from: legacy)
+    #expect(decoded.totalCount == nil)
+    #expect(decoded.sourceDeviceID == nil)
 }
 
 @Test func sinceLimitClampsToMax() throws {

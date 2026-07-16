@@ -5,8 +5,8 @@ import Foundation
 /// 缺文件 → 全默认值（standalone 模式，等价于 M1 行为）；
 /// 文件存在但 JSON 解析失败 / 字段组合非法 → 启动 fast-fail，不静默吃掉错误。
 public struct Config: Codable, Sendable, Equatable {
-    /// 是否启动 Hummingbird server（暴露 /ingest /search /since /blob /health）。
-    /// primary 角色为 true；standalone / 纯 client 为 false。
+    /// 是否启动 Hummingbird mesh server（暴露 health / sync / mutation 等路由）。
+    /// mesh 中每台 Mac 都为 true；standalone 默认为 false。
     public var serve: Bool
 
     /// server 监听 host。默认 127.0.0.1（仅本机）；上线时改 0.0.0.0 让 tailnet 可达。
@@ -19,10 +19,10 @@ public struct Config: Codable, Sendable, Equatable {
     /// false → HTTP（依赖 Tailscale WG 加密）。
     public var serveTLS: Bool
 
-    /// PEM 证书路径。`tailscale cert <hostname>` 输出的 `<hostname>.crt`。
+    /// PEM 证书路径。Ponte 双路由场景必须包含 tailnet + Ponte host 两个 SAN。
     public var tlsCertPath: String?
 
-    /// PEM 私钥路径。`tailscale cert <hostname>` 输出的 `<hostname>.key`。
+    /// PEM 私钥路径，与 `tlsCertPath` 的叶子证书匹配。
     public var tlsKeyPath: String?
 
     /// Mesh 拓扑下的对端 peer 列表。每台机器把别的所有 mac 写到这里——本机会为
@@ -50,22 +50,19 @@ public struct Config: Codable, Sendable, Equatable {
     /// 捕获字节守门。意外 Cmd+C 巨型对象（4K 长截图 / Cmd+A 大日志）→ 跳过入库，
     /// macOS 剪贴板自身正常工作（Cmd+V 立刻粘贴），只是不进 duo-paste 历史。
     ///
-    /// 默认：blob 32MB / text 512KB。涵盖正常截图 + 留头部缓冲到 server cap
-    /// (/blob=64MB, /ingest=1MB)。详见 CLAUDE.md "capture cap 默认值"。
+    /// 默认：blob 32MB / text 512KB。涵盖正常截图并避免意外巨物进入历史。
     ///
-    /// **作用域**：这是 *per-device capture policy*，不是 sync-wide invariant。Primary 的
-    /// /ingest / /blob handler 不重新校验单字段大小——只校验 body 总上限
-    /// (ingestBodyLimit=1MB / blobBodyLimit=64MB)。所以理论上 A 设备配 max_text_kb=900
-    /// 推一条 900KB 文本，primary + 别的 client mirror 都接受。HMAC 签名 + 共享 secret
-    /// 是已认证内部边界，threat model 允许 trust——server 总上限挡住极端 DoS 即可。
+    /// **作用域**：这是 per-device capture policy，不是 sync-wide invariant。各 owner
+    /// 可按设备调整；peer 通过 `/since` 接收已认证的历史元数据，blob 再按需懒拉。
     public struct CaptureLimits: Codable, Sendable, Equatable {
         /// Blob (image / binary 等通过 pasteboard 拿到字节流的类型) 上限，字节。
         public var maxBlobBytes: Int
         /// Text (text/rtf/html/url) UTF-8 字节上限。
-        /// 注意：跟 server `/ingest` body 1MB 上限留头部缓冲——
-        /// JSON 编码 + 元数据（id / origin_device / source_app / preview...）
-        /// 大约占 200B-1KB + escape 膨胀 ~1.3x，512KB 文本编码后 body 约 700KB。
+        /// 上限按 UTF-8 原始内容计算；默认 512KB，给 item 元数据和编码开销留余量。
         public var maxTextBytes: Int
+        /// 永不进入 duo-paste 历史的 source app bundle IDs。per-device 配置；匹配忽略
+        /// 大小写与首尾空白。跳过不影响系统 pasteboard / Cmd+V。
+        public var excludedBundleIDs: [String]
         /// Blob (image / 同 sha 字节) 合并窗口（秒）。窗口内同 kind+blob_sha256 的重复粘贴
         /// 只刷 captured_at_ns，不插新行。默认 300（5 分钟）。
         /// 注意：**只**作用于 blob 路径（ingestBlob）；text 走 `textMergeWindowSec` 独立配置，
@@ -80,19 +77,22 @@ public struct Config: Codable, Sendable, Equatable {
             maxBlobBytes: 32 * 1024 * 1024,
             maxTextBytes: 512 * 1024,
             mergeWindowSec: 300,
-            textMergeWindowSec: nil
+            textMergeWindowSec: nil,
+            excludedBundleIDs: []
         )
 
         public init(
             maxBlobBytes: Int,
             maxTextBytes: Int,
             mergeWindowSec: Int = 300,
-            textMergeWindowSec: Int? = nil
+            textMergeWindowSec: Int? = nil,
+            excludedBundleIDs: [String] = []
         ) {
             self.maxBlobBytes = maxBlobBytes
             self.maxTextBytes = maxTextBytes
             self.mergeWindowSec = mergeWindowSec
             self.textMergeWindowSec = textMergeWindowSec
+            self.excludedBundleIDs = excludedBundleIDs
         }
 
         enum CodingKeys: String, CodingKey {
@@ -100,6 +100,7 @@ public struct Config: Codable, Sendable, Equatable {
             case maxTextKB = "max_text_kb"
             case mergeWindowSec = "merge_window_sec"
             case textMergeWindowSec = "text_merge_window_sec"
+            case excludedBundleIDs = "excluded_bundle_ids"
         }
 
         public init(from decoder: Decoder) throws {
@@ -112,6 +113,10 @@ public struct Config: Codable, Sendable, Equatable {
             // 文本合并窗口缺省 nil = 永久。显式给 null / 不写 → nil。
             // contains() 判断让"key 存在但值为 null"也能映射到 nil（decodeIfPresent 会返回 nil）
             self.textMergeWindowSec = try c.decodeIfPresent(Int.self, forKey: .textMergeWindowSec)
+            self.excludedBundleIDs = try c.decodeIfPresent(
+                [String].self,
+                forKey: .excludedBundleIDs
+            ) ?? []
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -120,6 +125,7 @@ public struct Config: Codable, Sendable, Equatable {
             try c.encode(maxTextBytes / 1024, forKey: .maxTextKB)
             try c.encode(mergeWindowSec, forKey: .mergeWindowSec)
             try c.encodeIfPresent(textMergeWindowSec, forKey: .textMergeWindowSec)
+            try c.encode(excludedBundleIDs, forKey: .excludedBundleIDs)
         }
     }
 
@@ -548,6 +554,7 @@ public struct Config: Codable, Sendable, Equatable {
         } else {
             captureDict.removeValue(forKey: "text_merge_window_sec")
         }
+        captureDict["excluded_bundle_ids"] = cfg.capture.excludedBundleIDs
         dict[CodingKeys.capture.rawValue] = captureDict
 
         // hotkey 同款 nested merge——用户/未来可能加 description / disabled 之类字段
@@ -648,6 +655,20 @@ public struct Config: Codable, Sendable, Equatable {
             throw ConfigError.invalidCombination(
                 "capture.text_merge_window_sec 必须 >= 0 或省略（省略=永久 dedup）"
             )
+        }
+        var seenExcludedBundleIDs = Set<String>()
+        for raw in capture.excludedBundleIDs {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+                throw ConfigError.invalidCombination(
+                    "capture.excluded_bundle_ids 必须是非空且不含空白的 bundle ID：\(raw)"
+                )
+            }
+            if !seenExcludedBundleIDs.insert(trimmed.lowercased()).inserted {
+                throw ConfigError.invalidCombination(
+                    "capture.excluded_bundle_ids 重复：\(trimmed)"
+                )
+            }
         }
         if serve && !(1...65535).contains(servePort) {
             throw ConfigError.invalidCombination("serve_port 超界 (1-65535)：\(servePort)")

@@ -14,7 +14,8 @@ BUNDLE_NAME="DuoPaste"
 APP="$HOME/Applications/$BUNDLE_NAME.app"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/duo-paste"
-SIGN_IDENTITY="Developer ID Application: BO LI (RS59HDH7Y3)"
+# 可由开发者覆盖；默认值保持生产发布签名，确保既有 TCC 授权不漂移。
+SIGN_IDENTITY="${DP_SIGN_IDENTITY:-Developer ID Application: BO LI (RS59HDH7Y3)}"
 LEGACY_INSTALL_DIR="$HOME/Applications/duo-paste"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 

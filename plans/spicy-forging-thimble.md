@@ -1,5 +1,10 @@
 # 文本 dedup：合并而非堆积重复行
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 当前 duo-paste 对**重复文本**有两种"漏网"路径，造成搜索结果里同字面值出现多条，挤压剪贴板列表心智：

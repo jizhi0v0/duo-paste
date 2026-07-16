@@ -9,22 +9,8 @@ import DuoPasteCore
 /// noop 路径(已是目标状态)200 但**不**调 onItemMutated 也**不** fan-out——cursor 没动,
 /// fan-out 等于让 peer pull 空页浪费 RTT。
 
-private typealias DuoDB = DuoPasteCore.Database
-
-private func makePinServerFixture(items: [Item]) throws -> (DuoDB, BlobStore, HMACAuth, Int) {
-    let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-pin-http-\(UUID().uuidString)", isDirectory: true)
-    let paths = Paths(root: root)
-    paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB)
-    try db.pool.write { conn in
-        for it in items { try it.insert(conn) }
-    }
-    let blobs = BlobStore(root: paths.blobsDir)
-    try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
-    let auth = HMACAuth(secret: Data(repeating: 0xCD, count: 32))
-    let port = Int.random(in: 20500..<21500)
-    return (db, blobs, auth, port)
+private func makePinServerFixture(items: [Item]) throws -> TestSyncServerFixture {
+    try TestSyncServerFixture(prefix: "duo-pin-http", items: items, secretByte: 0xCD)
 }
 
 private func pinItemFixture(id: String, pinned: Bool = false, originDevice: String = "mac-self", deletedAtNs: Int64? = nil) -> Item {
@@ -59,34 +45,25 @@ private final class PinCallbackBox: @unchecked Sendable {
     }
 }
 
-private func waitReadyPin(baseURL: URL, auth: HMACAuth) async -> Bool {
-    for _ in 0..<50 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        var req = URLRequest(url: baseURL.appendingPathComponent("health"))
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = auth.sign(timestampMs: ts, method: "GET", path: "/health",
-                            bodyHashHex: HMACAuth.emptyBodyHashHex)
-        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
-        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
-        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
-        if let (_, resp) = try? await URLSession.shared.data(for: req),
-           let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-            return true
-        }
-    }
-    return false
-}
-
-private func postPin(baseURL: URL, auth: HMACAuth, id: String, pinnedQ: String, tamperSig: Bool = false)
+private func postPin(
+    baseURL: URL,
+    auth: HMACAuth,
+    id: String,
+    pinnedQ: String,
+    operationID: String? = nil,
+    tamperSig: Bool = false
+)
 async throws -> (Int, [String: Any]) {
+    var queryItems = [URLQueryItem(name: "pinned", value: pinnedQ)]
+    if let operationID { queryItems.append(URLQueryItem(name: "operation_id", value: operationID)) }
     var sigComp = URLComponents()
     sigComp.path = "/pin/\(id)"
-    sigComp.queryItems = [URLQueryItem(name: "pinned", value: pinnedQ)]
+    sigComp.queryItems = queryItems
     let signedPath = HMACAuth.canonicalPath("/pin/\(id)", query: sigComp.percentEncodedQuery)
 
     var urlComp = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
     urlComp.path = "/pin/\(id)"
-    urlComp.queryItems = [URLQueryItem(name: "pinned", value: pinnedQ)]
+    urlComp.queryItems = queryItems
     let url = urlComp.url!
 
     var req = URLRequest(url: url)
@@ -109,20 +86,18 @@ async throws -> (Int, [String: Any]) {
 struct PinHTTPTests {
     /// own-origin 行 0→1 切换:DB 落 pinned=1 + bump ingested_at_ns + onItemMutated 收到事件
     @Test func pinHTTPFlipsRowFromZeroToOne() async throws {
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let fixture = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let broadcaster = WSBroadcaster(rotationIntervalSec: 0)
         let callback = PinCallbackBox()
         let server = SyncServer(deviceID: "mac-self", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth, broadcaster: broadcaster,
+                                host: "127.0.0.1", port: 0, auth: auth, broadcaster: broadcaster,
                                 onItemMutated: { id, ingestedAtNs in
                                     callback.append(id: id, ingestedAtNs: ingestedAtNs)
                                 })
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
-
-        let (status, body) = try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "1")
+        let (status, body) = try await fixture.withServer(server) { base in
+            try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "1")
+        }
         #expect(status == 200)
         #expect(body["ok"] as? Bool == true)
         #expect(body["pinned"] as? Bool == true)
@@ -141,81 +116,108 @@ struct PinHTTPTests {
         #expect(callback.snapshot().first?.1 == newIngest)
     }
 
-    /// 已 pinned=1 → 1 noop:200 + noop=true,**不** onItemMutated 也**不** bump ingested_at_ns
-    @Test func pinHTTPNoOpWhenAlreadyAtTargetState() async throws {
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [pinItemFixture(id: "row-1", pinned: true)])
+    /// 首次绝对值 command 即使已是目标也 bump 一次，确保 requester cursor 能观察 replay。
+    @Test func pinHTTPAtTargetStillCreatesCanonicalReplay() async throws {
+        let fixture = try makePinServerFixture(items: [pinItemFixture(id: "row-1", pinned: true)])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let callback = PinCallbackBox()
         let server = SyncServer(deviceID: "mac-self", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth,
+                                host: "127.0.0.1", port: 0, auth: auth,
                                 onItemMutated: { id, ingestedAtNs in
                                     callback.append(id: id, ingestedAtNs: ingestedAtNs)
                                 })
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
-
-        let (status, body) = try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "1")
+        let (status, body) = try await fixture.withServer(server) { base in
+            try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "1")
+        }
         #expect(status == 200)
-        #expect(body["noop"] as? Bool == true)
+        #expect(body["state"] as? String == "applied")
         #expect(body["pinned"] as? Bool == true)
-        #expect(body["ingested_at_ns"] == nil)
+        #expect(body["ingested_at_ns"] != nil)
 
         let after = try await db.pool.read { conn in
             try Item.filter(Column("id") == "row-1").fetchOne(conn)!
         }
-        #expect(after.ingestedAtNs == 100)  // 未 bump
-        #expect(callback.snapshot().isEmpty)  // noop 不调 onItemMutated
+        #expect((after.ingestedAtNs ?? 0) > 100)
+        #expect(callback.snapshot().count == 1)
     }
 
-    /// mirror 行(origin != self)也能 pin —— setPinnedAny 不带 own-origin guard
-    @Test func pinHTTPAcceptsMirrorOriginRow() async throws {
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [
+    /// mirror 行只乐观更新 + 持久化 command，不能 bump 本机 cursor 冒充 owner。
+    @Test func pinHTTPQueuesMirrorOriginRowForOwner() async throws {
+        let fixture = try makePinServerFixture(items: [
             pinItemFixture(id: "mirror-1", originDevice: "other-device")
         ])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let server = SyncServer(deviceID: "mac-self", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
-
-        let (status, body) = try await postPin(baseURL: base, auth: auth, id: "mirror-1", pinnedQ: "1")
-        #expect(status == 200)
+                                host: "127.0.0.1", port: 0, auth: auth)
+        let (status, body) = try await fixture.withServer(server) { base in
+            try await postPin(baseURL: base, auth: auth, id: "mirror-1", pinnedQ: "1")
+        }
+        #expect(status == 202)
+        #expect(body["state"] as? String == "pending")
         #expect(body["pinned"] as? Bool == true)
         let after = try await db.pool.read { conn in
             try Item.filter(Column("id") == "mirror-1").fetchOne(conn)!
         }
         #expect(after.pinned == true)
         #expect(after.originDevice == "other-device")  // origin 不动
+        #expect(after.ingestedAtNs == 100)
+        #expect(try await db.pendingPinItemIDs() == Set(["mirror-1"]))
+    }
+
+    @Test func pinHTTPDuplicateOperationIDReturnsSameReceiptWithoutSecondBump() async throws {
+        let fixture = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
+        let callback = PinCallbackBox()
+        let server = SyncServer(
+            deviceID: "mac-self", database: db, blobs: blobs,
+            host: "127.0.0.1", port: 0, auth: auth,
+            onItemMutated: { callback.append(id: $0, ingestedAtNs: $1) }
+        )
+        let (first, second) = try await fixture.withServer(server) { base in
+            let first = try await postPin(
+                baseURL: base, auth: auth, id: "row-1", pinnedQ: "1", operationID: "stable-op"
+            )
+            let second = try await postPin(
+                baseURL: base, auth: auth, id: "row-1", pinnedQ: "1", operationID: "stable-op"
+            )
+            return (first, second)
+        }
+        #expect(first.0 == 200)
+        #expect(second.0 == 200)
+        #expect(second.1["duplicate"] as? Bool == true)
+        #expect(first.1["ingested_at_ns"] as? Int == second.1["ingested_at_ns"] as? Int)
+        #expect(callback.snapshot().count == 1)
     }
 
     /// 错误 query: pinned 缺失 / 非 0/1 → 400
     @Test func pinHTTPReturns400ForInvalidPinnedQuery() async throws {
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let fixture = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
+                                host: "127.0.0.1", port: 0, auth: auth)
 
         // pinned=2 → 400(只接受 0/1)
-        let (status, _) = try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "2")
+        let (status, _) = try await fixture.withServer(server) { base in
+            try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "2")
+        }
         #expect(status == 400)
     }
 
     /// bad signature → 401
     @Test func pinHTTPRejectsBadSignature() async throws {
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let fixture = try makePinServerFixture(items: [pinItemFixture(id: "row-1")])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
-
-        let (status, _) = try await postPin(baseURL: base, auth: auth, id: "row-1", pinnedQ: "1", tamperSig: true)
+                                host: "127.0.0.1", port: 0, auth: auth)
+        let (status, _) = try await fixture.withServer(server) { base in
+            try await postPin(
+                baseURL: base,
+                auth: auth,
+                id: "row-1",
+                pinnedQ: "1",
+                tamperSig: true
+            )
+        }
         #expect(status == 401)
 
         // DB 状态没变
@@ -227,30 +229,26 @@ struct PinHTTPTests {
 
     /// 不存在的 id → 404
     @Test func pinHTTPReturns404ForUnknownID() async throws {
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [])
+        let fixture = try makePinServerFixture(items: [])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
-
-        let (status, _) = try await postPin(baseURL: base, auth: auth, id: "ghost", pinnedQ: "1")
+                                host: "127.0.0.1", port: 0, auth: auth)
+        let (status, _) = try await fixture.withServer(server) { base in
+            try await postPin(baseURL: base, auth: auth, id: "ghost", pinnedQ: "1")
+        }
         #expect(status == 404)
     }
 
     /// tombstone → 410(client 当幂等"已删除"swallow)
     @Test func pinHTTPReturns410ForTombstone() async throws {
         let dead = pinItemFixture(id: "dead-1", deletedAtNs: 200)
-        let (db, blobs, auth, port) = try makePinServerFixture(items: [dead])
+        let fixture = try makePinServerFixture(items: [dead])
+        let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
         let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadyPin(baseURL: base, auth: auth))
-
-        let (status, _) = try await postPin(baseURL: base, auth: auth, id: "dead-1", pinnedQ: "1")
+                                host: "127.0.0.1", port: 0, auth: auth)
+        let (status, _) = try await fixture.withServer(server) { base in
+            try await postPin(baseURL: base, auth: auth, id: "dead-1", pinnedQ: "1")
+        }
         #expect(status == 410)
     }
 }

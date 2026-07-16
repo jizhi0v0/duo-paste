@@ -1,5 +1,10 @@
 # macOS "Open With" 菜单——技术调研
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 研究范围：搜索结果右键菜单加 Finder 风格的"用 XXX 打开"。目标 macOS 14+（实际跑 macOS 26 SDK）。仅基于 Apple 公开文档 / Apple Forum (Quinn) / WWDC 资料 / 真实开源项目代码（SwiftDefaultApps、ghostty、xc）。
 
 ---

@@ -46,6 +46,9 @@ final class AppState {
     /// 临时一次性提示（lazy blob 部分失败等场景），3s 自动清掉。
     /// 不持久化；SearchView 顶部以 caption 形态短暂显示
     var recentNotice: String?
+    /// owner-routed pin command 尚未从 canonical owner replay 回来的 item。
+    /// 卡片显示“等待同步”；daemon 重启后从 v13 pin_operation 表恢复。
+    var pendingPinItemIDs: Set<String> = []
 
     // MARK: - slash 补全菜单状态
     /// 搜索框输入 `/xxx` 时弹的补全菜单是否显示。SearchView 监听 query 变化时按当前 token
@@ -256,6 +259,8 @@ final class AppState {
     /// 5 分钟内有值 → SearchView 顶部黄色 banner；用户能手动 ✕ 关闭立即清掉。
     /// 不持久化——重启就清，是 "刚才有点东西没存下来" 的实时提示。
     var recentSkip: SkipNotice?
+    /// 当前进程内的临时捕获暂停。故意不写配置：daemon 重启即恢复，避免永久漏记。
+    var capturePause: CapturePause?
 
     /// blob 懒拉状态。`.fetching` 时 panel 顶部 spinner overlay；
     /// `.failed` 时 banner 显示错误文案 + 用户 Esc 或 Enter 重试
@@ -287,6 +292,12 @@ final class AppState {
     }
 
     let deps: AppDependencies
+    @ObservationIgnored private var capturePolicy: CapturePolicy
+    @ObservationIgnored private var capturePauseExpiryTask: Task<Void, Never>?
+    /// AppDelegate 注入，用于同步菜单栏图标 / 状态菜单。
+    @ObservationIgnored var onCapturePauseChanged: ((CapturePause?) -> Void)?
+    /// 非 owner Mac 新建 pin operation 后立即唤醒对应 mesh worker（生产由 AppDelegate 注入）。
+    @ObservationIgnored var onPinOperationQueued: (() -> Void)?
 
     /// PR cloudy-mirroring-walnut PR 3：optimized storage_mode 下 UI 路径（缩略图 /
     /// 空格预览）触发按需 lazy GET /blob/<sha>。由 AppDelegate.setupPasteBlobFetcher 设置；
@@ -387,63 +398,102 @@ final class AppState {
         self.recentSkip = nil
     }
 
-    /// 切换 item 的 pinned 状态。**跨 origin 生效**——本机 own-origin 行 + 对端 mirror 行
-    /// 都能 pin/unpin，跟 iOS 长按 / HTTP `POST /pin/<id>` 心智一致(`Database.togglePinAny`
-    /// 跟 `setPinnedAny` 同款不带 own-origin guard)。
-    ///
-    /// 行为细节：
-    /// - 单一 writer tx 内 read → flip → write(`Database.togglePinAny`)→ broadcaster fan-out
-    ///   (detach) + refresh
-    /// - tombstone / 未知 id → silently no-op(UI 列表本就不展示这两类，触发到 = race),
-    ///   refresh 让本机 UI 跟 DB 对齐
-    ///
-    /// 已知 limitation:
-    /// 1. **对端 origin 设备**不会收到回传更新——`PullWorker.applyPage` 跳过自家 origin 行
-    /// 2. **其他 mirror peer** 会通过 /since 看到 pin 状态,本机 fold-aware 搜索 `pinned OR 聚合`
-    ///    让搜索语义在本机 + 其他 mirror peer 自然成立。**但**一旦 origin 设备后续对该 row 做
-    ///    任何 bump `ingested_at_ns` 的操作(POST /bump / 文本 dedup merge / OCR markDone /
-    ///    softDelete 等),origin 视角下 pinned=false 会通过 /since 推到其他 mirror peer,触发
-    ///    `applyPage` 的 INSERT OR REPLACE 整行覆盖,跨 origin 打的 pin 被静默抹掉
-    /// 3. (仅当 iOS 配对的 Mac ≠ row 的 origin Mac 时触发,即 ≥2 Mac mesh 部署;单 Mac + iOS 不撞)
-    ///    iOS 已通过 POST /pin 把某 mirror 行 pin 后,**origin Mac** 上 item.pinned 仍是 false——
-    ///    用户在 origin Mac ⌘P 想"取消置顶"会翻成 true,反向把 own-origin 也 pin 上
-    ///    (需要再按一次 ⌘P 才真正 unpin)
-    ///
-    /// 真正双向回传 + 字段级 OR-merge(让 pinned 不被回放抹掉)要等 `/update` 路由。
-    ///
-    /// 调用方:SearchPanelController 的 ⌘P key monitor + SearchView contextMenu。async 执行
-    /// (Task @MainActor):writer tx 异步等 < 1ms,broadcaster fan-out 走独立 Task fire-and-forget
-    /// 不阻塞 refresh(跟 Server.swift /pin handler 同款 fire-and-forget 模式,慢 peer 不让 UI 等)
-    ///
-    /// **原子 togglePinAny 在单一 writer tx 内 read+flip+write,并发 ⌘P 也 race-free**——
-    /// 旧两步实现(getPinned snapshot read → setPinnedAny write)在并发场景下两个 Task 都能
-    /// 在 A commit 前 reader-snapshot 看到 pinned=false → 都算 target=true → A 写 true /
-    /// B noop → 净翻一次,正是 stale-snapshot bug。togglePinAny 把整个 read-modify-write
-    /// 塞进 GRDB 串行 writer queue 天然 race-free。
+    // MARK: - Capture privacy / pause
+
+    func updateExcludedBundleIDs(_ bundleIDs: [String]) {
+        capturePolicy = CapturePolicy(excludedBundleIDs: bundleIDs)
+    }
+
+    /// watcher 的 pre-extraction gate 与 AppDelegate 的 defense-in-depth 共用同一决策。
+    func captureDecision(
+        sourceAppBundleID: String?,
+        now: Date = Date()
+    ) -> CapturePolicy.Decision {
+        expireCapturePauseIfNeeded(now: now)
+        return capturePolicy.decision(
+            sourceAppBundleID: sourceAppBundleID,
+            pause: capturePause,
+            now: now
+        )
+    }
+
+    func shouldCapture(sourceAppBundleID: String?, now: Date = Date()) -> Bool {
+        captureDecision(sourceAppBundleID: sourceAppBundleID, now: now) == .allow
+    }
+
+    func activeCapturePause(now: Date = Date()) -> CapturePause? {
+        expireCapturePauseIfNeeded(now: now)
+        return capturePause
+    }
+
+    func pauseCapture(for duration: TimeInterval, now: Date = Date()) {
+        guard duration > 0 else {
+            resumeCapture()
+            return
+        }
+        setCapturePause(.until(now.addingTimeInterval(duration)), now: now)
+    }
+
+    func pauseCaptureUntilResumed() {
+        setCapturePause(.untilResumed)
+    }
+
+    func resumeCapture() {
+        capturePauseExpiryTask?.cancel()
+        capturePauseExpiryTask = nil
+        guard capturePause != nil else { return }
+        capturePause = nil
+        onCapturePauseChanged?(nil)
+    }
+
+    private func setCapturePause(_ pause: CapturePause, now: Date = Date()) {
+        capturePauseExpiryTask?.cancel()
+        capturePauseExpiryTask = nil
+        capturePause = pause
+        onCapturePauseChanged?(pause)
+
+        guard let deadline = pause.deadline else { return }
+        let delay = max(0, deadline.timeIntervalSince(now))
+        let nanoseconds = UInt64(min(delay, TimeInterval(UInt64.max) / 1_000_000_000) * 1_000_000_000)
+        capturePauseExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled, self?.capturePause == pause else { return }
+            self?.resumeCapture()
+        }
+    }
+
+    private func expireCapturePauseIfNeeded(now: Date) {
+        guard let pause = capturePause, !pause.isActive(at: now) else { return }
+        resumeCapture()
+    }
+
+    /// owner-routed pin toggle。writer tx 内原子读取/翻转：own-origin 直接 canonical apply，
+    /// mirror 行只乐观显示并持久化 operation，PullWorker 定向投递 owner；重试按 UUID 幂等。
     func togglePin(_ item: Item) {
         let id = item.id
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                // 原子 toggle:单一 writer tx 内 read+flip+write,关 race。代替旧的
-                // getPinned + setPinnedAny 两步走(两步在并发 ⌘P 下仍 TOCTOU race——
-                // 两 Task 都能在 A commit 前 reader-snapshot 看到 pinned=false → 都算
-                // target=true → A 写 / B noop → 净翻一次,正是想修的 stale-snapshot bug)
-                let (_, newIngest) = try await self.deps.database.togglePinAny(
+                let (_, result) = try await self.deps.database.togglePinIntent(
                     id: id,
+                    operationID: UUID().uuidString,
+                    selfDeviceID: self.deps.deviceID,
                     now: Clock.nowNs()
                 )
-                // fan-out 起独立 Task 出去,不阻塞 refresh——WSBroadcaster 单 peer write 慢的话最长
-                // perBroadcastTimeoutNs(默 2s),不能让 UI pin 视觉反馈被拖到这之后。Server.swift
-                // /pin / /bump / /item DELETE 三个 handler + CaptureService / OCRWorker hook
-                // 全部用同款 fire-and-forget 模式
-                let broadcaster = self.deps.wsBroadcaster
-                let deviceID = self.deps.deviceID
-                Task {
-                    await broadcaster.broadcastCursorAdvanced(
-                        deviceID: deviceID,
-                        latestIngestedAtNs: newIngest
-                    )
+                switch result {
+                case .applied(_, let newIngest, let duplicate):
+                    if !duplicate {
+                        let broadcaster = self.deps.wsBroadcaster
+                        let deviceID = self.deps.deviceID
+                        Task {
+                            await broadcaster.broadcastCursorAdvanced(
+                                deviceID: deviceID,
+                                latestIngestedAtNs: newIngest
+                            )
+                        }
+                    }
+                case .pending:
+                    self.onPinOperationQueued?()
                 }
                 await self.refresh()
             } catch BumpError.notFound {
@@ -553,6 +603,7 @@ final class AppState {
 
     init(deps: AppDependencies) {
         self.deps = deps
+        self.capturePolicy = CapturePolicy(excludedBundleIDs: deps.config.capture.excludedBundleIDs)
         // 同步预填本地最新 listLimit 条，避免 panel 首次打开 SwiftUI 第一帧渲染
         // 时 results=[] → 看到 "0 条" 闪一下。Panel 触发 .task 后会异步 refresh
         // 一次（可能从 remote 拿更新），把这里的结果替换/扩展。
@@ -728,6 +779,10 @@ final class AppState {
         }
         if self.fileSubKindCounts != outcome.fileSubKindCounts {
             self.fileSubKindCounts = outcome.fileSubKindCounts
+        }
+        if let pending = try? await deps.database.pendingPinItemIDs(),
+           self.pendingPinItemIDs != pending {
+            self.pendingPinItemIDs = pending
         }
         // 每次 refresh 顺便快照 mesh 时钟偏移——PullWorker 在后台 30s 一次刷新，
         // SearchView banner 用 worst-case（所有 peer 中绝对值最大那个）

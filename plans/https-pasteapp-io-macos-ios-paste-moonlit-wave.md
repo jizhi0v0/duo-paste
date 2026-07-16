@@ -1,5 +1,10 @@
 # duo-paste：自托管多 Mac 剪贴板历史
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 替换 Paste.app。当前痛点：

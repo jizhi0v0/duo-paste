@@ -7,10 +7,8 @@ struct HistoryView: View {
     /// 搜索框 plain text —— 纯内容搜索,不再解析 `/xxx`(iOS 上下拉 Menu 多选 +
     /// chip 行的入口比 slash 顺手,见 filterMenu)
     @State private var searchText: String = ""
-    /// **只**给 server search debounce 用——本机 contains filter 同步走,
-    /// 不再压在 debounce 后面让首字符延迟 150ms。新键进来 cancel 旧 task,
-    /// 250ms 静默期满才打 /search 降 server QPS。issue #44
-    @State private var serverSearchTask: Task<Void, Never>?
+    /// 本地 SQLite FTS debounce。新键进来 cancel 旧 task，250ms 静默后才跑查询。
+    @State private var localSearchTask: Task<Void, Never>?
 
     var body: some View {
         // **per-body-call cache**:filtered 只读一次,避免**同一次 body 调用**内多次读
@@ -42,21 +40,17 @@ struct HistoryView: View {
             .onChange(of: searchText) { _, new in
                 // **本机 filter 同步** ——`store.query` mutate 让 `filtered` 重算
                 // (items × O(N) contains,iOS 数据集 1-2k 量级一帧内完成),首字符
-                // 输入即时反馈。`clearServerSearch()` 同步清旧响应让 filtered 走
-                // contains fallback,避免显示过期的远端 hit。
-                // **只对 server search debounce** —— `scheduleServerSearch` 250ms
-                // 静默期满才打 /search,降 server QPS。issue #44
+                // 输入即时反馈。同步清旧响应，250ms 后从本地 SQLite/FTS 取权威结果。
                 store.query = new
-                store.clearServerSearch()
-                scheduleServerSearch()
+                store.clearLocalSearch()
+                scheduleLocalSearch()
             }
-            // qualifier 变化也要重打 server search——server 把 qualifier 透传进 SearchAPI,
-            // chip 选择跟 server fold + filter 同 pass(issue #41 消除 client-side pagination 盲区)。
+            // qualifier-only 查询也必须走完整 SQLite archive，不能只筛最近 1000 条 projection。
             // 用 hashValue 让 Set<QueryQualifier> 变化能稳定触发(Set 本身 Equatable 但 SwiftUI
             // onChange 要求 Sendable + Hashable; Set<Hashable> 自动满足),无 query 时跳过
             .onChange(of: store.activeQualifiers) { _, _ in
-                store.clearServerSearch()
-                scheduleServerSearch()
+                store.clearLocalSearch()
+                scheduleLocalSearch()
             }
             .toolbar { fullToolbar }
             .toolbarBackground(.visible, for: .navigationBar)
@@ -184,32 +178,25 @@ struct HistoryView: View {
         ("音频", .fileSubKind(.audio)),
     ]
 
-    /// **只 debounce server search** —— 本机 filter 已经在 `.onChange(of: searchText)`
-    /// 里同步走 (`store.query = new`),这里 250ms 静默后才打远端 /search。
-    ///
-    /// **不变量**:新字符进来必须 cancel 之前的 server task,否则用户快敲三个字
-    /// "abc" 会让 "a" / "ab" / "abc" 三发 /search 全打过去(只想要 "abc" 那发)。
+    /// Debounce local FTS so fast typing only runs the final query. Empty text + selected qualifier
+    /// still searches SQLite, because matching rows may be older than the bounded recent projection.
     ///
     /// **qualifier snapshot at Task creation**:`activeQualifiers` 一次性 capture 进
     /// `qualifiersSnapshot` 常量,跨 await 边界稳定不被新一轮 chip toggle 写花。
     /// query 本身不 snapshot ——cancel 已经把旧 task 干掉,task body 内读 `searchText`
     /// 拿到当前最新键即可(store.query 同步路径不再依赖这个 task)。
     ///
-    /// **为什么 250ms 不是 100/150**:抠用户感知的话本机 filter 已经即时了,server
-    /// search 多等几十 ms 用户根本感知不到,但 QPS 砍掉 60-70%。如果实测 250ms
-    /// 短到 sleep 切首字母 / 中文输入法 commit 还是会多打一发,可以拉到 400ms。
-    /// issue #44 + #41(qualifier 透传)
-    private func scheduleServerSearch() {
-        serverSearchTask?.cancel()
+    private func scheduleLocalSearch() {
+        localSearchTask?.cancel()
         // qualifier snapshot 跟 task 出生那刻同步——跨 await 边界要稳定状态,
         // 不能后续读 store.activeQualifiers 时被新一轮 chip toggle 写花
         let qualifiersSnapshot = Array(store.activeQualifiers)
-        serverSearchTask = Task { @MainActor in
+        localSearchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             if Task.isCancelled { return }
             let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            coordinator.searchOnServer(q: trimmed, qualifiers: qualifiersSnapshot)
+            guard !trimmed.isEmpty || !qualifiersSnapshot.isEmpty else { return }
+            await store.searchLocal(q: trimmed, qualifiers: qualifiersSnapshot)
         }
     }
 

@@ -297,11 +297,15 @@ final class PeerWebSocket {
         let ts = Int64(Date().timeIntervalSince1970 * 1000)
         let bodyHash = HMACAuth.emptyBodyHashHex
         let sig = auth.sign(timestampMs: ts, method: "GET", path: path, bodyHashHex: bodyHash)
-        wsOptions.setAdditionalHeaders([
+        var headers = [
             (HMACAuth.timestampHeader, String(ts)),
             (HMACAuth.bodyHashHeader, bodyHash),
             (HMACAuth.signatureHeader, sig),
-        ])
+        ]
+        if let token = config.credentialToken {
+            headers.append((HMACAuth.credentialTokenHeader, token))
+        }
+        wsOptions.setAdditionalHeaders(headers)
 
         let params: NWParameters = isTLS
             ? NWParameters(tls: tlsOptions!, tcp: NWProtocolTCP.Options())

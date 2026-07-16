@@ -4,37 +4,8 @@ import GRDB
 import DuoPasteCore
 @testable import DuoPasteSync
 
-private typealias DuoDB = DuoPasteCore.Database
-
-private func makeFixture() throws -> (DuoDB, BlobStore, HMACAuth, Int) {
-    let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-icon-http-\(UUID().uuidString)", isDirectory: true)
-    let paths = Paths(root: root)
-    paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB)
-    let blobs = BlobStore(root: paths.blobsDir)
-    try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
-    let auth = HMACAuth(secret: Data(repeating: 0xAB, count: 32))
-    let port = Int.random(in: 19000..<20000)
-    return (db, blobs, auth, port)
-}
-
-private func waitReady(baseURL: URL, auth: HMACAuth) async -> Bool {
-    for _ in 0..<50 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        var req = URLRequest(url: baseURL.appendingPathComponent("health"))
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = auth.sign(timestampMs: ts, method: "GET", path: "/health",
-                            bodyHashHex: HMACAuth.emptyBodyHashHex)
-        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
-        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
-        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
-        if let (_, resp) = try? await URLSession.shared.data(for: req),
-           let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-            return true
-        }
-    }
-    return false
+private func makeFixture() throws -> TestSyncServerFixture {
+    try TestSyncServerFixture(prefix: "duo-icon-http")
 }
 
 private func getAppIcon(
@@ -58,61 +29,49 @@ private func getAppIcon(
 }
 
 @Test func appIconHTTPReturnsPNGForKnownBundle() async throws {
-    let (db, blobs, auth, port) = try makeFixture()
+    let fixture = try makeFixture()
+    let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
     let pngBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03])
     let store = AppIconStore(database: db) { bid in
         bid == "com.apple.Safari" ? pngBytes : nil
     }
     let server = SyncServer(
         deviceID: "p", database: db, blobs: blobs,
-        host: "127.0.0.1", port: port, auth: auth, appIconStore: store
+        host: "127.0.0.1", port: 0, auth: auth, appIconStore: store
     )
-    let serverTask = Task { try? await server.run() }
-    defer { serverTask.cancel() }
-    let base = URL(string: "http://127.0.0.1:\(port)")!
-    #expect(await waitReady(baseURL: base, auth: auth))
-
-    let (status, body, ctype) = try await getAppIcon(
-        baseURL: base, auth: auth, bundleID: "com.apple.Safari"
-    )
+    let (status, body, ctype) = try await fixture.withServer(server) { base in
+        try await getAppIcon(baseURL: base, auth: auth, bundleID: "com.apple.Safari")
+    }
     #expect(status == 200)
     #expect(body == pngBytes)
     #expect(ctype == "image/png")
 }
 
 @Test func appIconHTTPReturns404ForUnknownBundle() async throws {
-    let (db, blobs, auth, port) = try makeFixture()
+    let fixture = try makeFixture()
+    let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
     let store = AppIconStore(database: db) { _ in nil }
     let server = SyncServer(
         deviceID: "p", database: db, blobs: blobs,
-        host: "127.0.0.1", port: port, auth: auth, appIconStore: store
+        host: "127.0.0.1", port: 0, auth: auth, appIconStore: store
     )
-    let serverTask = Task { try? await server.run() }
-    defer { serverTask.cancel() }
-    let base = URL(string: "http://127.0.0.1:\(port)")!
-    #expect(await waitReady(baseURL: base, auth: auth))
-
-    let (status, _, _) = try await getAppIcon(
-        baseURL: base, auth: auth, bundleID: "com.nonexistent"
-    )
+    let (status, _, _) = try await fixture.withServer(server) { base in
+        try await getAppIcon(baseURL: base, auth: auth, bundleID: "com.nonexistent")
+    }
     #expect(status == 404)
 }
 
 @Test func appIconHTTPRejectsBadSignature() async throws {
-    let (db, blobs, auth, port) = try makeFixture()
+    let fixture = try makeFixture()
+    let (db, blobs, auth) = (fixture.database, fixture.blobs, fixture.auth)
     let store = AppIconStore(database: db) { _ in Data([0x89, 0x50]) }
     let server = SyncServer(
         deviceID: "p", database: db, blobs: blobs,
-        host: "127.0.0.1", port: port, auth: auth, appIconStore: store
+        host: "127.0.0.1", port: 0, auth: auth, appIconStore: store
     )
-    let serverTask = Task { try? await server.run() }
-    defer { serverTask.cancel() }
-    let base = URL(string: "http://127.0.0.1:\(port)")!
-    #expect(await waitReady(baseURL: base, auth: auth))
-
     let badAuth = HMACAuth(secret: Data(repeating: 0xFF, count: 32))
-    let (status, _, _) = try await getAppIcon(
-        baseURL: base, auth: badAuth, bundleID: "com.apple.Safari"
-    )
+    let (status, _, _) = try await fixture.withServer(server) { base in
+        try await getAppIcon(baseURL: base, auth: badAuth, bundleID: "com.apple.Safari")
+    }
     #expect(status == 401)
 }

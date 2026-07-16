@@ -1,10 +1,106 @@
 import Foundation
+import Security
 import DuoPasteCore
 
 struct PeerConfig: Sendable, Equatable {
     let baseURL: URL
-    /// 32 字节 HMAC secret（已 hex-decode）。
+    /// legacy shared-secret 或独立 device request secret（均为 32 字节）。
     let sharedSecret: Data
+    /// 非 nil 时服务端只走 device credential 验证，不允许降级 legacy。
+    let credentialToken: String?
+
+    nonisolated init(baseURL: URL, sharedSecret: Data, credentialToken: String? = nil) {
+        self.baseURL = baseURL
+        self.sharedSecret = sharedSecret
+        self.credentialToken = credentialToken
+    }
+}
+
+struct ClientCredential: Codable, Equatable, Sendable {
+    let credentialID: String?
+    let requestSecret: Data
+    let token: String?
+}
+
+/// request secret + token 的唯一持久化位置。AfterFirstUnlock 让 BGAppRefresh 在设备
+/// 解锁过一次后仍可拉取，同时 ThisDeviceOnly 防止凭据随备份迁移到另一台 iPhone。
+enum ClientCredentialKeychain {
+    private static let service = "io.duopaste.ios.credentials"
+    private static let credentialAccount = "active-device-credential"
+    private static let deviceIDAccount = "stable-device-id"
+
+    static func load() throws -> ClientCredential? {
+        guard let data = try read(account: credentialAccount) else { return nil }
+        return try JSONDecoder().decode(ClientCredential.self, from: data)
+    }
+
+    static func save(_ credential: ClientCredential) throws {
+        guard credential.requestSecret.count == 32 else { throw KeychainError.invalidCredential }
+        try write(try JSONEncoder().encode(credential), account: credentialAccount)
+    }
+
+    static func delete() throws {
+        try remove(account: credentialAccount)
+    }
+
+    static func stableDeviceID() throws -> String {
+        if let data = try read(account: deviceIDAccount),
+           let value = String(data: data, encoding: .utf8), !value.isEmpty {
+            return value
+        }
+        let value = UUID().uuidString.lowercased()
+        try write(Data(value.utf8), account: deviceIDAccount)
+        return value
+    }
+
+    private static func read(account: String) throws -> Data? {
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw KeychainError.status(status)
+        }
+        return data
+    }
+
+    private static func write(_ data: Data, account: String) throws {
+        try remove(account: account)
+        var query = baseQuery(account: account)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+    }
+
+    private static func remove(account: String) throws {
+        let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.status(status)
+        }
+    }
+
+    private static func baseQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    enum KeychainError: LocalizedError {
+        case invalidCredential
+        case status(OSStatus)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidCredential: "设备凭据格式非法"
+            case .status(let status): "Keychain 错误 \(status)"
+            }
+        }
+    }
 }
 
 /// 启动时 AppStorage 配对数据校验结果——`reason` 非 nil 时 SettingsView 红色横幅展示,
@@ -100,7 +196,7 @@ extension PeerConfig {
               bytes.count == 32 else {
             throw PeerConfigError.malformedSecretHex
         }
-        return PeerConfig(baseURL: url, sharedSecret: bytes)
+        return PeerConfig(baseURL: url, sharedSecret: bytes, credentialToken: nil)
     }
 }
 

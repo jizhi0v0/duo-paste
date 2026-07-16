@@ -1,5 +1,10 @@
 # Mesh + WebSocket 重构
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 当前 primary/client 架构（mini = primary，MBP = client）在 daily-driver 长期使用中暴露**多设备搜索结果和总数不一致**的心智负担问题。代码层面盘清四个根因，全部跟"中心化 primary + 异步 push/pull 双管道"模型相关：

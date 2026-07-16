@@ -1,11 +1,11 @@
 import Foundation
 
 /// Mac daemon 起 `_duopaste._tcp` Bonjour 广播 + TXT record(device_id + tls 标记)。
-/// iOS 端 NWBrowser 浏到这个 → 显示在 Settings 的"发现的 Mac"列表 → 用户 tap 选择 →
-/// 扫描 Mac 显示的 QR 完成 secret 配对。
+/// iOS 端 NWBrowser 浏到这个 → 显示在 Settings 的"发现的 Mac"列表；用户 tap 只会被
+/// 引导扫描目标 Mac 同屏 QR，Bonjour endpoint 不能直接提交 PIN。
 ///
-/// 限本网段(Bonjour 不跨 WAN);跟"不走公网"原则一致——secret 通过 QR 扫描而非
-/// 网络传输,合法用户物理在 Mac 前才能拿到 secret。
+/// QR v2 只传 endpoint + 当前 TLS leaf SHA-256，不传 PIN/secret/token。leaf pin 与独立
+/// 显示的 PIN 两条通道缺一不可，合法用户必须物理在 Mac 前完成 onboarding。
 ///
 /// **用 NetService 而非 NWListener** —— NWListener.service 强制绑定 listener 自己的 port,
 /// 不能"通告 X 不绑 X"。SyncServer 已经占了 8443,所以走 NetService.publish 在 mDNS 层

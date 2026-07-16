@@ -41,16 +41,19 @@ final class PeerWSPool {
     /// 不再走 snapshot() 全 6 个 sub WS 遍历(每行渲染读 78 个 Observable 让 SwiftUI 冻僵)
     var sockets: [String: PeerWebSocket] = [:]
     private let secret: Data
+    private let credentialToken: String?
     private let onAdvance: @MainActor (Int64) -> Void
     private let onEndpointsChanged: @MainActor () -> Void
     private var lastEndpoints: [PeerEndpoint] = []
 
     init(
         secret: Data,
+        credentialToken: String? = nil,
         onAdvance: @escaping @MainActor (Int64) -> Void,
         onEndpointsChanged: @escaping @MainActor () -> Void = {}
     ) {
         self.secret = secret
+        self.credentialToken = credentialToken
         self.onAdvance = onAdvance
         self.onEndpointsChanged = onEndpointsChanged
     }
@@ -75,7 +78,11 @@ final class PeerWSPool {
         // 2) 没在 sockets 里的全开 WS
         for ep in endpoints where sockets[ep.url] == nil {
             guard let url = URL(string: ep.url) else { continue }
-            let cfg = PeerConfig(baseURL: url, sharedSecret: secret)
+            let cfg = PeerConfig(
+                baseURL: url,
+                sharedSecret: secret,
+                credentialToken: credentialToken
+            )
             let ws = PeerWebSocket(
                 config: cfg,
                 onAdvance: { [weak self] ns in

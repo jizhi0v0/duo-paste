@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ocrWorker?.wake()
     }
     private var panel: SearchPanelController!
+    private var statusBar: StatusBarController!
     private var watcher: PasteboardWatcher!
     private var hotkey: GlobalHotKey!
     private var snapshotScheduler: SnapshotScheduler!
@@ -30,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// daemon 启动时构造一份。Mac Settings"显示配对码"调它 generatePIN(),
     /// /pair/<pin> 路由调它 validateAndConsumePIN
     private(set) var pairingService: PairingService?
+    /// 新 PIN 客户端的独立 credential 签发/验签入口。只在 serve + shared-secret 可用时存在。
+    private(set) var credentialAuthenticator: DeviceCredentialAuthenticator?
     /// MeshSupervisor 起来后构造,周期 fetch mesh peer 的 /endpoints,聚合给本机
     /// /endpoints 路由暴露 + snapshot 变化时通过 wsBroadcaster 推 endpoints_changed
     private var meshEndpointsCache: MeshEndpointsCache?
@@ -54,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var exportGeneration = 0
     private var exportProgressKey = 0
     private var exportIsVacuuming = false
+    private var diagnosticExportInFlight = false
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -96,11 +100,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ) { [weak self] in
                 self?.panel.toggle()
             }
-            StatusBarState.shared.hotkey = cfg.hotkey
+            statusBar?.updateOpenSearchHotkey(cfg.hotkey)
             fputs("hotkey re-registered: \(cfg.hotkey.modifiers.joined(separator: "+"))+\(cfg.hotkey.key)\n", stderr)
         } catch {
             fputs("reloadHotkey: register 失败：\(error)\n", stderr)
         }
+    }
+
+    /// Settings 对 excluded_bundle_ids 的热重载：AppState 先更新让 watcher gate 立即生效，
+    /// CaptureService 随后更新第二道零写入门。其他 capture limits 仍按原约定需重启。
+    func reloadCapturePolicy() {
+        let cfg: Config
+        do {
+            cfg = try Config.load(from: deps.paths.configFile)
+        } catch {
+            fputs("reloadCapturePolicy: 读 config 失败：\(error)\n", stderr)
+            return
+        }
+        state.updateExcludedBundleIDs(cfg.capture.excludedBundleIDs)
+        let service = deps.captureService
+        Task {
+            await service.updateExcludedBundleIDs(cfg.capture.excludedBundleIDs)
+        }
+        fputs("capture exclusions reloaded: \(cfg.capture.excludedBundleIDs.count) bundle id(s)\n", stderr)
+    }
+
+    func pauseCapture(minutes: Int) {
+        state.pauseCapture(for: TimeInterval(max(1, minutes) * 60))
+    }
+
+    func pauseCaptureUntilResumed() {
+        state.pauseCaptureUntilResumed()
+    }
+
+    func resumeCapture() {
+        state.resumeCapture()
+    }
+
+    func listDeviceCredentials() async throws -> [DeviceCredentialRecord] {
+        try await deps.database.listDeviceCredentials()
+    }
+
+    func revokeDeviceCredential(_ credentialID: String) async throws {
+        if let credentialAuthenticator {
+            _ = try await credentialAuthenticator.revoke(
+                credentialID: credentialID,
+                revokedByDeviceID: deps.deviceID
+            )
+        } else {
+            _ = try await deps.database.revokeDeviceCredential(
+                credentialID: credentialID,
+                revokedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                revokedByDeviceID: deps.deviceID
+            )
+        }
+        // 已建立连接没有新的 HTTP/WS handshake；立即 rotation 才能让被撤销设备失效。
+        await deps.wsBroadcaster.rotateAllConnections()
     }
 
     /// SettingsView「立即重启 daemon」按钮调用——退出让 launchd KeepAlive 自动 respawn
@@ -117,24 +172,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        openSettingsWhenReady(attempt: 0)
-    }
-
-    private func openSettingsWhenReady(attempt: Int) {
-        if let openSettings = StatusBarState.shared.openSettings {
-            openSettings()
+        if bringSettingsWindowForward() {
             return
         }
 
-        // MenuBarExtra label 会安装 scene environment 的 openSettings action。
-        // daemon 重启后自动恢复 Settings 可能早于 label 首帧，短暂等待即可。
+        // `.accessory` app 在未激活时发送 Settings selector，responder chain 可能报告
+        // handled 但不真正 materialize scene。先激活保证首次创建发生；窗口挂载后
+        // `bringSettingsWindowForward()` 还会再激活一次并明确 order front。
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Settings scene 由 SwiftUI 注册在 responder chain。从 NSMenu tracking loop 返回后
+        // 发 selector，让系统继续管理单例窗口、标题栏和 TabView 外观。首次创建是异步的，
+        // 等 SettingsWindowProbe 拿到真实 NSWindow 后再 activate + order front。
+        let selectors = ["showSettingsWindow:", "showPreferencesWindow:"]
+        for name in selectors {
+            if NSApp.sendAction(NSSelectorFromString(name), to: nil, from: nil) {
+                bringSettingsWindowForwardWhenReady(attempt: 0)
+                return
+            }
+        }
+        fputs("settings: Settings scene selector unavailable\n", stderr)
+    }
+
+    @discardableResult
+    private func bringSettingsWindowForward() -> Bool {
+        guard let window = SettingsWindowBridge.window else { return false }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        return true
+    }
+
+    private func bringSettingsWindowForwardWhenReady(attempt: Int) {
+        if bringSettingsWindowForward() {
+            return
+        }
         guard attempt < 20 else {
-            fputs("settings: openSettings action unavailable after 1s\n", stderr)
+            fputs("settings: Settings window unavailable after 1s\n", stderr)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.openSettingsWhenReady(attempt: attempt + 1)
+            self?.bringSettingsWindowForwardWhenReady(attempt: attempt + 1)
         }
     }
 
@@ -234,16 +312,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         case .vacuuming:
                             self?.exportIsVacuuming = true
                             if self?.currentExportTask?.isCancelled == true {
-                                StatusBarState.shared.exportProgressText = "等待 VACUUM 完成后取消…"
+                                self?.statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
                             } else {
-                                StatusBarState.shared.exportProgressText = "正在生成 SQLite 副本…"
+                                self?.statusBar?.setExportProgress("正在生成 SQLite 副本…")
                             }
                         case .exporting:
                             self?.exportIsVacuuming = false
-                            StatusBarState.shared.exportProgressText = "取消导出 (\(p.current)/\(p.total))"
+                            self?.statusBar?.setExportProgress("取消导出 (\(p.current)/\(p.total))")
                         case .copyingBlobs:
                             self?.exportIsVacuuming = false
-                            StatusBarState.shared.exportProgressText = "取消导出 (复制 \(p.current)/\(p.total))"
+                            self?.statusBar?.setExportProgress("取消导出 (复制 \(p.current)/\(p.total))")
                         }
                     }
                 }
@@ -288,13 +366,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         currentExportTask = task
-        StatusBarState.shared.exportProgressText = "取消导出…"
+        statusBar?.setExportProgress("取消导出…")
     }
 
     func cancelExport() {
         currentExportTask?.cancel()
         if exportIsVacuuming {
-            StatusBarState.shared.exportProgressText = "等待 VACUUM 完成后取消…"
+            statusBar?.setExportProgress("等待 VACUUM 完成后取消…")
+        }
+    }
+
+    /// Settings「导出安全诊断包」。与历史 Exporter 完全分开：只把 mesh-doctor、
+    /// quick_check、版本、脱敏 config 和白名单日志交给 DiagnosticBundleExporter。
+    func showDiagnosticExportDialog() {
+        guard !diagnosticExportInFlight, let deps else { return }
+
+        let panel = NSOpenPanel()
+        panel.message = "选择安全诊断包的导出目录"
+        panel.prompt = "导出诊断包"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let parent = panel.url else { return }
+
+        let destination = parent.appendingPathComponent(
+            "duo-paste-diagnostics-\(Self.exportTimestamp())",
+            isDirectory: true
+        )
+        diagnosticExportInFlight = true
+
+        let config = deps.config
+        let deviceID = deps.deviceID
+        let databasePath = deps.paths.mainDB
+        let blobs = deps.blobs
+        let secret = try? SharedSecret.load(from: deps.paths.sharedSecretFile)
+        let logsRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/duo-paste", isDirectory: true)
+        let logFiles = ["duo-pasted.out.log", "duo-pasted.err.log"].map {
+            logsRoot.appendingPathComponent($0)
+        }
+        let tlsState = Self.tlsCertificateState(for: config)
+        let version = Self.diagnosticVersionInfo()
+        let syncSession = AppDependencies.syncURLSession
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let probe: @Sendable (URL) async -> Admin.HealthProbeOutcome = { url in
+                    guard let secret else {
+                        return .unreachable(reason: "shared-secret 未配置")
+                    }
+                    let client = HTTPPeerClient(
+                        baseURL: url,
+                        auth: HMACAuth(secret: secret),
+                        session: PonteSession.session(for: url, fallback: syncSession)
+                    )
+                    do {
+                        let response = try await client.fetchPrimaryHealth()
+                        switch response.outcome {
+                        case .ok(let id, let nowMs, _): return .ok(deviceID: id, nowMs: nowMs)
+                        case .unreachable(let reason): return .unreachable(reason: reason)
+                        case .rejected(let reason): return .rejected(reason: reason)
+                        }
+                    } catch {
+                        return .unreachable(reason: String(describing: error))
+                    }
+                }
+                let doctor = try await Admin.meshDoctor(
+                    selfDeviceID: deviceID,
+                    peers: config.peers,
+                    dbPath: databasePath,
+                    blobs: blobs,
+                    healthProbe: probe,
+                    tlsCertificate: tlsState
+                )
+                let result = try DiagnosticBundleExporter.export(
+                    to: destination,
+                    config: config,
+                    meshDoctorReport: doctor,
+                    databasePath: databasePath,
+                    logFiles: logFiles,
+                    version: version
+                )
+                await MainActor.run {
+                    guard let self else { return }
+                    self.diagnosticExportInFlight = false
+                    let alert = NSAlert()
+                    alert.alertStyle = .informational
+                    alert.messageText = "安全诊断包已导出"
+                    alert.informativeText = "不含 shared-secret、私钥、剪贴板正文或 blob。\n位置：\(result.directory.path)"
+                    alert.addButton(withTitle: "在 Finder 中显示")
+                    alert.addButton(withTitle: "好")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: result.directory.path)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.diagnosticExportInFlight = false
+                    let alert = NSAlert()
+                    alert.alertStyle = .critical
+                    alert.messageText = "诊断包导出失败"
+                    alert.informativeText = String(describing: error)
+                    alert.runModal()
+                }
+            }
         }
     }
 
@@ -302,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         exportGeneration += 1
         exportProgressKey = 0
         exportIsVacuuming = false
-        StatusBarState.shared.exportProgressText = nil
+        statusBar?.setExportProgress(nil)
         currentExportTask = nil
     }
 
@@ -313,7 +489,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return f.string(from: Date())
     }
 
+    static func tlsCertificateState(for config: Config, now: Date = Date()) -> TLSCertificateState {
+        guard config.serveTLS else { return .notConfigured }
+        guard let path = config.tlsCertPath else {
+            return .unreadable("serve_tls=true 但 tls_cert_path 缺失")
+        }
+        do {
+            return .inspected(try TLSCertificateInspector.inspect(
+                at: URL(fileURLWithPath: path),
+                now: now
+            ))
+        } catch {
+            return .unreadable(String(describing: error))
+        }
+    }
+
+    private static func diagnosticVersionInfo() -> DiagnosticBundleExporter.VersionInfo {
+        #if arch(arm64)
+        let architecture = "arm64"
+        #elseif arch(x86_64)
+        let architecture = "x86_64"
+        #else
+        let architecture = "unknown"
+        #endif
+        return DiagnosticBundleExporter.VersionInfo(
+            appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development",
+            buildVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development",
+            osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            architecture: architecture
+        )
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // 只保留 Settings scene + AppKit NSStatusItem 时，SwiftUI 没有常驻的可见 scene。
+        // 应用被激活后若仍无窗口，AppKit 可能把它当作可 automatic termination
+        // 的普通 UI app，以 exit 0 收掉。duo-paste 是 launchd 托管的常驻 daemon，
+        // capture / sync / hotkey 都必须在无窗口时继续运行，因此显式禁用自动终止。
+        ProcessInfo.processInfo.disableAutomaticTermination("duo-paste background daemon")
         // 早一点切 accessory，避免 Dock 闪一下
         NSApp.setActivationPolicy(.accessory)
     }
@@ -333,7 +545,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         state = AppState(deps: deps)
-        StatusBarState.shared.hotkey = deps.config.hotkey
+        state.onPinOperationQueued = { [weak self] in
+            self?.meshSupervisor?.wakeAll()
+        }
         panel = SearchPanelController(
             state: state,
             onPaste: { [weak self] items in self?.pasteBack(items) },
@@ -363,9 +577,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         )
+        statusBar = StatusBarController(hotkey: deps.config.hotkey)
+        state.onCapturePauseChanged = { [weak self] pause in
+            self?.statusBar.updateCapturePause(pause)
+        }
+        statusBar.updateCapturePause(state.capturePause)
         watcher = PasteboardWatcher(
             maxRawRTFBytes: deps.config.capture.maxTextBytes,
             maxBlobBytes: deps.config.capture.maxBlobBytes,
+            shouldCapture: { [weak self] bundleID in
+                self?.state.shouldCapture(sourceAppBundleID: bundleID) ?? true
+            },
             onCapture: { [weak self] captured in
                 self?.handleCapture(captured)
             }
@@ -603,7 +825,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 },
                 expectedPeerDeviceIDs: cfg.peers.map { $0.deviceID },
                 onHealthProbed: onHealthProbedCb,
-                onChosenLikelyDown: onChosenLikelyDownCb
+                onChosenLikelyDown: onChosenLikelyDownCb,
+                onPinOperationsResolved: { [weak appState] in
+                    Task { @MainActor in
+                        await appState?.refresh()
+                    }
+                },
+                onCredentialRevocationsMerged: { [broadcaster = deps.wsBroadcaster] _ in
+                    Task { await broadcaster.rotateAllConnections() }
+                }
             )
             let supervisorPeers = decisions.map { builder.build(decision: $0) }
             // reconcile 完后 hop 回 main actor 写 AppState,SwiftUI 自动刷新 SettingsView
@@ -736,6 +966,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 secretsProvider: { try SharedSecret.load(from: secretPath) }
             )
             self.pairingService = pairingService
+            let credentialAuthenticator = DeviceCredentialAuthenticator(
+                database: deps.database,
+                rootSecret: secret
+            )
+            self.credentialAuthenticator = credentialAuthenticator
             // endpointsProvider:每次 /endpoints 调用现算(EndpointDiscovery 读 cfg + SurgePonte)
             let configCopy = cfg
             let endpointsProvider: @Sendable () -> [PeerEndpoint] = {
@@ -756,6 +991,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 host: cfg.serveHost,
                 port: cfg.servePort,
                 auth: auth,
+                credentialAuthenticator: credentialAuthenticator,
                 tls: tls,
                 broadcaster: deps.wsBroadcaster,
                 appIconStore: appIconStore,
@@ -764,6 +1000,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pairingService: pairingService,
                 onItemMutated: { _, _ in
                     Task { @MainActor in
+                        await AppDelegate.shared?.state.refresh()
+                    }
+                },
+                onPinOperationQueued: {
+                    Task { @MainActor in
+                        AppDelegate.shared?.meshSupervisor?.wakeAll()
                         await AppDelegate.shared?.state.refresh()
                     }
                 }
@@ -783,28 +1025,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleCapture(_ captured: CapturedPasteboard) {
+        // watcher 已在正文 extraction 前拦一次；这里再判一次，覆盖设置热重载 / 暂停恰好
+        // 发生在 extraction 与回调之间的竞态，也保护未来可能绕过 watcher 的调用方。
+        guard state.shouldCapture(sourceAppBundleID: captured.sourceAppBundleID) else { return }
+        let pause = state.activeCapturePause()
         Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await self.deps.captureService.ingest(captured)
-                // 体积超限：在 AppState 留个标记 → SearchView 黄 banner 提示。
-                // 这是 cap 的可见出口——光 stderr log 用户感知不到，但搜索时找不到
-                // 刚复制的东西会以为"是不是 daemon 挂了"。
-                if case .skippedTooLarge(let kind, let bytes, let limit) = result.outcome {
+                let result = try await self.deps.captureService.ingest(captured, pause: pause)
+                switch result.outcome {
+                case .inserted:
+                    await self.state.refresh()
+                    // image kind 入库后 wake OCR worker 缩短延迟（避免等 5min idle）
+                    if result.item?.ocrState == .pending {
+                        self.ocrWorker?.wake()
+                    }
+                case .mergedWithPrevious:
+                    await self.state.refresh()
+                case .skippedTooLarge(let kind, let bytes, let limit):
+                    // 体积超限：留可见提示；pasteboard 本身仍可直接 Cmd+V。
                     let appStateKind: AppState.SkipNotice.Kind = (kind == .text) ? .text : .blob
                     self.state.recordSkip(kind: appStateKind, bytes: bytes, limit: limit)
                     fputs("capture skipped (too large): \(kind) \(bytes)B > \(limit)B\n", stderr)
-                }
-                await self.state.refresh()
-                // image kind 入库后 wake OCR worker 缩短延迟（避免等 5min idle）
-                // OCRWorker 可处理范围 = image kind OR (file kind + image_mime + has_blob)
-                // 同 OCRWorker.fetchPending / Admin.ocrScopeSQL 口径——CleanShot 截图走 file
-                // 路径入库,标 ocr_state=pending,但旧 wake 条件 kind==.image 不命中,worker
-                // 进 idleIntervalSec=300s sleep 让新截图卡 pending 等长时间。改用 ocr_state
-                // 直接判断,未来 OCRWorker scope 扩展时 wake 条件自动跟随
-                if case .inserted = result.outcome,
-                   result.item?.ocrState == .pending {
-                    self.ocrWorker?.wake()
+                case .skippedEmpty, .skippedExcludedApp, .skippedPaused:
+                    // 隐私 gate / 空 payload 不刷新 UI、不唤醒 OCR；service 也不会广播 mesh。
+                    break
                 }
             } catch {
                 fputs("ingest error: \(error)\n", stderr)

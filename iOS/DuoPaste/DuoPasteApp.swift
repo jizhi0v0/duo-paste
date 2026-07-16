@@ -28,14 +28,14 @@ struct DuoPasteApp: App {
 
     @AppStorage("peerURL") private var peerURL: String = ""
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
+    @AppStorage("credentialPresent") private var credentialPresent: Bool = false
     /// PIN 配对后持久化 — 重启 app 从这恢复 endpoint list + 网络变重 probe
     @AppStorage("peerEndpointsJSON") private var peerEndpointsJSON: String = ""
 
     init() {
         UILatencyLog.mark("app init begin")
         let store = HistoryStore()
-        // restore() 必须在 PeerSyncCoordinator 起 reconfigure 之前——否则 /since pull 跟
-        // 持久化文件 merge 时拿不到旧 cursor 之前的内容,首次 launch 重 pull 大量
+        // 打开 SQLite mirror + 一次性导入旧 JSON，必须先于 coordinator 读取 cursor。
         store.restore()
         _store = State(initialValue: store)
         _coordinator = State(initialValue: PeerSyncCoordinator(store: store))
@@ -58,12 +58,39 @@ struct DuoPasteApp: App {
                 .environment(coordinator.appIconCache)
                 .environment(shareCoord)
                 .task {
+                    let storedCredential: ClientCredential?
+                    do {
+                        if let existing = try ClientCredentialKeychain.load() {
+                            storedCredential = existing
+                            credentialPresent = true
+                            if !sharedSecretHex.isEmpty { sharedSecretHex = "" }
+                        } else if let legacy = Data(hexString: sharedSecretHex), legacy.count == 32 {
+                            // 一次性升级旧 @AppStorage 明文 secret → ThisDeviceOnly Keychain。
+                            let migrated = ClientCredential(
+                                credentialID: nil,
+                                requestSecret: legacy,
+                                token: nil
+                            )
+                            try ClientCredentialKeychain.save(migrated)
+                            sharedSecretHex = ""
+                            credentialPresent = true
+                            storedCredential = migrated
+                        } else {
+                            storedCredential = nil
+                        }
+                    } catch {
+                        coordinator.setPairingDataIssue("Keychain 凭据读取失败：\(error.localizedDescription)")
+                        DebugLog.shared.append("credential keychain load failed: \(error)")
+                        return
+                    }
+                    let validationSecretHex = storedCredential?.requestSecret
+                        .map { String(format: "%02x", $0) }.joined() ?? ""
                     // 启动恢复:PairingDataValidator 把"全空 / valid PIN 配对 / valid advanced /
                     // invalid + reason" 四态分清。invalid 时 setPairingDataIssue 写 reason 让
                     // SettingsView 红色横幅展示——不再 try? 静默吞导致 "app 启动后什么都不响应"
                     let status = PairingDataValidator.validate(
                         endpointsJSON: peerEndpointsJSON,
-                        secretHex: sharedSecretHex,
+                        secretHex: validationSecretHex,
                         peerURL: peerURL
                     )
                     switch status {
@@ -71,10 +98,18 @@ struct DuoPasteApp: App {
                         coordinator.setPairingDataIssue(nil)
                     case .validPaired(let secret, let endpoints):
                         coordinator.setPairingDataIssue(nil)
-                        coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
+                        coordinator.reconfigureFromPairing(
+                            secret: secret,
+                            credentialToken: storedCredential?.token,
+                            endpoints: endpoints
+                        )
                     case .validAdvanced(let cfg):
                         coordinator.setPairingDataIssue(nil)
-                        coordinator.reconfigure(cfg)
+                        coordinator.reconfigure(PeerConfig(
+                            baseURL: cfg.baseURL,
+                            sharedSecret: cfg.sharedSecret,
+                            credentialToken: storedCredential?.token
+                        ))
                     case .invalid(let reason):
                         coordinator.setPairingDataIssue(reason)
                         DebugLog.shared.append("pairing data invalid at launch: \(reason)")
@@ -83,15 +118,12 @@ struct DuoPasteApp: App {
                 .onChange(of: scenePhase) { _, phase in
                     switch phase {
                     case .background:
-                        // app 进后台:持久化 + 申请下次 background refresh
-                        store.persist()
+                        // SQLite 每页已原子持久化；这里只申请下次 background refresh。
                         BackgroundPullService.scheduleNext()
                     case .active:
-                        // 回前台:磁盘可能被 BG task 更新,merge 一次让 UI 显示最新
-                        if let data = try? Data(contentsOf: HistoryStore.itemsFile),
-                           let restored = try? JSONDecoder().decode([Item].self, from: data) {
-                            store.merge(restored)
-                        }
+                        // 回前台:BG task 可能已更新 SQLite，刷新 bounded projection + active FTS。
+                        store.refreshFromMirror()
+                        Task { await store.refreshActiveSearch() }
                         // 通知 coordinator 给 heartbeat 检测加 grace,避免后台返回橙字误报
                         coordinator.applicationDidBecomeActive()
                     default:

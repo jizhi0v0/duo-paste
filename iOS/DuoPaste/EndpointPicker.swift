@@ -33,6 +33,7 @@ enum EndpointPicker {
     static func probeAll(
         endpoints: [PeerEndpoint],
         secret: Data,
+        credentialToken: String? = nil,
         timeoutSec: TimeInterval = 12,
         onProbe: (@MainActor @Sendable (Probe) -> Void)? = nil
     ) async -> [Probe] {
@@ -41,7 +42,12 @@ enum EndpointPicker {
         return await withTaskGroup(of: Probe.self, returning: [Probe].self) { group in
             for ep in endpoints {
                 group.addTask {
-                    await probe(endpoint: ep, auth: auth, timeoutSec: timeoutSec)
+                    await probe(
+                        endpoint: ep,
+                        auth: auth,
+                        credentialToken: credentialToken,
+                        timeoutSec: timeoutSec
+                    )
                 }
             }
             var results: [Probe] = []
@@ -80,9 +86,15 @@ enum EndpointPicker {
     static func pickBest(
         endpoints: [PeerEndpoint],
         secret: Data,
+        credentialToken: String? = nil,
         timeoutSec: TimeInterval = 12
     ) async -> PeerEndpoint? {
-        let probes = await probeAll(endpoints: endpoints, secret: secret, timeoutSec: timeoutSec)
+        let probes = await probeAll(
+            endpoints: endpoints,
+            secret: secret,
+            credentialToken: credentialToken,
+            timeoutSec: timeoutSec
+        )
         return probes.first(where: { $0.ok })?.endpoint
     }
 
@@ -98,7 +110,12 @@ enum EndpointPicker {
 
     // MARK: - 内部
 
-    private static func probe(endpoint: PeerEndpoint, auth: HMACAuth, timeoutSec: TimeInterval) async -> Probe {
+    private static func probe(
+        endpoint: PeerEndpoint,
+        auth: HMACAuth,
+        credentialToken: String?,
+        timeoutSec: TimeInterval
+    ) async -> Probe {
         guard let url = URL(string: endpoint.url + "/health") else {
             return Probe(endpoint: endpoint, rttMs: -1)
         }
@@ -111,6 +128,9 @@ enum EndpointPicker {
         req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+        if let credentialToken {
+            req.setValue(credentialToken, forHTTPHeaderField: HMACAuth.credentialTokenHeader)
+        }
 
         // 探活走 NWHTTPTransport(NWConnection)——**跟 WS 同一传输栈**。这是关键:UI 把
         // probe RTT 显示在 WS 状态(绿/橙)旁边,用户预期两者一致。iOS cellular 上 URLSession

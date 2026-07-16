@@ -11,6 +11,10 @@ public struct CaptureResult: Sendable {
         /// `bytes` 是观察到的实际大小，`limit` 是当时生效的阈值，`kind` 区分 text/blob。
         /// macOS pasteboard 自身**不**受影响，Cmd+V 仍可正常粘贴——只是不进 duo-paste 历史。
         case skippedTooLarge(kind: SkipKind, bytes: Int, limit: Int)
+        /// source app 命中 capture.excluded_bundle_ids；在任何 DB/blob 写入前返回。
+        case skippedExcludedApp(bundleID: String)
+        /// 当前 daemon 处于临时暂停；在任何 DB/blob 写入前返回。
+        case skippedPaused
     }
 
     public enum SkipKind: Sendable, Equatable {
@@ -35,6 +39,8 @@ public actor CaptureService {
     public let textMergeWindowNs: Int64?
     /// 捕获字节守门 + 合并窗口配置源。
     public let limits: Config.CaptureLimits
+    /// 动态可热更新的 app 排除策略。limits 是启动快照不能改，因此单独保存 mutable policy。
+    private var capturePolicy: CapturePolicy
     /// PR 3 mesh 通知钩子。primary 路径 / merge bump-ingestNs 路径 commit 后触发，
     /// 闭包参数 = 这次刷新的 ingested_at_ns。生产 AppDelegate 注入"投递到 WSBroadcaster"
     /// 闭包；standalone / client / 测试默认 no-op。
@@ -73,11 +79,33 @@ public actor CaptureService {
             self.textMergeWindowNs = nil  // 永久 dedup
         }
         self.limits = limits
+        self.capturePolicy = CapturePolicy(excludedBundleIDs: limits.excludedBundleIDs)
         self.onCursorAdvanced = onCursorAdvanced
     }
 
+    /// Settings 应用 excluded_bundle_ids 后热更新，不必为纯隐私列表重启 daemon。
+    public func updateExcludedBundleIDs(_ bundleIDs: [String]) {
+        self.capturePolicy = CapturePolicy(excludedBundleIDs: bundleIDs)
+    }
+
     @discardableResult
-    public func ingest(_ captured: CapturedPasteboard) throws -> CaptureResult {
+    public func ingest(
+        _ captured: CapturedPasteboard,
+        pause: CapturePause? = nil,
+        now: Date = Date()
+    ) throws -> CaptureResult {
+        switch capturePolicy.decision(
+            sourceAppBundleID: captured.sourceAppBundleID,
+            pause: pause,
+            now: now
+        ) {
+        case .allow:
+            break
+        case .excludedApp(let bundleID):
+            return CaptureResult(outcome: .skippedExcludedApp(bundleID: bundleID), item: nil)
+        case .paused:
+            return CaptureResult(outcome: .skippedPaused, item: nil)
+        }
         // M1 阶段：.file 只记录文件路径（文本形式），不读文件字节。
         // 真正读取并存为 blob 留到 M2/3 视体积策略再做。
         if captured.blob != nil {
@@ -271,7 +299,7 @@ public actor CaptureService {
         switch outcome {
         case .inserted, .mergedWithPrevious:
             onCursorAdvanced(ns)
-        case .skippedEmpty, .skippedTooLarge:
+        case .skippedEmpty, .skippedTooLarge, .skippedExcludedApp, .skippedPaused:
             return
         }
     }

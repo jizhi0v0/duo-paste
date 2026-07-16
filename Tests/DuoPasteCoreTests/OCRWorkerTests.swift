@@ -388,10 +388,14 @@ private actor OCRCursorAdvancedRecorder {
     // 插入新 image 并 wake
     try seedItem(env, id: "fresh", originDevice: env.deviceID, blobSha: sha)
     w.wake()
-    // 给 worker 一点时间处理。CI 上 50ms × 20 = 1s 偶发抢不到 CPU，放宽到 3s 总
-    // budget（60 × 50ms）让 wake → tick → DB write 链路在慢机器上也稳
+    // 等最终可观察状态而不是 recognizer 已被调用。recorder 先于 markDone 更新，若在它
+    // 刚变为 1 时 stop worker，会取消尚未提交的 DB write，制造测试自己的竞态。
     for _ in 0..<60 {
-        if await recorder.count() > 0 { break }
+        if let item = try fetchItem(env, id: "fresh"),
+           item.ocrState == .done,
+           item.extractedText == "woke" {
+            break
+        }
         try await Task.sleep(nanoseconds: 50_000_000)
     }
     await w.stop()

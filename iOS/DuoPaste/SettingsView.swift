@@ -6,9 +6,9 @@ struct SettingsView: View {
     @Environment(ShareCoordinator.self) private var shareCoord
     @AppStorage("peerURL") private var peerURL: String = ""
     @AppStorage("sharedSecretHex") private var sharedSecretHex: String = ""
+    @AppStorage("credentialPresent") private var credentialPresent: Bool = false
     @AppStorage("peerEndpointsJSON") private var peerEndpointsJSON: String = ""
-    /// 配对完成时存的显示名(Bonjour 路径 = peer.displayName,QR 路径 = host),
-    /// 让"已配对的 Mac"行可读
+    /// 配对完成时存 QR host，让"已配对的 Mac"行可读。
     @AppStorage("pairedDisplayName") private var pairedDisplayName: String = ""
     /// 配对完成时存的对端 device_id 头 8 字符,辅助显示
     @AppStorage("pairedDeviceID") private var pairedDeviceID: String = ""
@@ -16,13 +16,12 @@ struct SettingsView: View {
     @State private var alertText: String?
     @State private var showAlert: Bool = false
     @State private var discovery = PeerDiscovery()
-    @State private var selectedPeer: PeerDiscovery.DiscoveredPeer?
     @State private var qrPayload: QRPayload?
     @State private var showQRScanner: Bool = false
 
     /// 是否已配对(有 secret + endpoints)。配对 ≠ 连接——可以已配对+离线
     private var isPaired: Bool {
-        !sharedSecretHex.isEmpty && !peerEndpointsJSON.isEmpty
+        credentialPresent && !peerEndpointsJSON.isEmpty
     }
 
     /// 是否真连上了
@@ -56,32 +55,18 @@ struct SettingsView: View {
             .navigationTitle("设置")
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarBackground(.visible, for: .tabBar)
-            .sheet(item: $selectedPeer) { peer in
-                PinPairingSheet(
-                    displayName: peer.displayName,
-                    host: peer.host,
-                    port: peer.port,
-                    tls: peer.tls,
-                    prefilledPIN: nil,
-                    isPresented: bonjourSheetBinding
-                ) { secret, deviceID, page in
-                    handlePairingSuccess(
-                        secret: secret, deviceID: deviceID,
-                        page: page, displayName: peer.displayName
-                    )
-                }
-            }
             .sheet(item: $qrPayload) { payload in
                 PinPairingSheet(
                     displayName: payload.host,
                     host: payload.host,
                     port: payload.port,
                     tls: payload.tls,
+                    certificateSHA256: payload.certificateSHA256,
                     prefilledPIN: nil,
                     isPresented: qrSheetBinding
-                ) { secret, deviceID, page in
+                ) { credential, deviceID, page in
                     handlePairingSuccess(
-                        secret: secret, deviceID: deviceID,
+                        credential: credential, deviceID: deviceID,
                         page: page, displayName: payload.host
                     )
                 }
@@ -99,10 +84,6 @@ struct SettingsView: View {
             .onAppear { if !isPaired { discovery.start() } }
             .onDisappear { discovery.stop() }
         }
-    }
-
-    private var bonjourSheetBinding: Binding<Bool> {
-        Binding(get: { selectedPeer != nil }, set: { if !$0 { selectedPeer = nil } })
     }
 
     private var qrSheetBinding: Binding<Bool> {
@@ -217,7 +198,7 @@ struct SettingsView: View {
         } header: {
             Text("已配对")
         } footer: {
-            Text("左滑取消配对。取消后 secret 本地清空,需重新走 PIN 配对。Mac 端无需通知——HMAC 失效后请求自动 401。")
+            Text("左滑取消配对。取消后本机 Keychain 凭据清空，需重新扫码 + PIN 配对。")
         }
     }
 
@@ -344,7 +325,8 @@ struct SettingsView: View {
             } else {
                 ForEach(discovery.peers) { peer in
                     Button {
-                        selectedPeer = peer
+                        alertText = "已发现 \(peer.displayName)。为防主动中间人截获凭据，请打开这台 Mac 的 DuoPaste Settings → iOS 配对，并扫描同屏 QR；Bonjour + PIN 不再直接签发凭据。"
+                        showAlert = true
                     } label: {
                         HStack {
                             Image(systemName: peer.tls ? "lock.fill" : "lock.open")
@@ -360,7 +342,7 @@ struct SettingsView: View {
                                 }
                             }
                             Spacer()
-                            Image(systemName: "chevron.right")
+                            Image(systemName: "qrcode.viewfinder")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -369,7 +351,7 @@ struct SettingsView: View {
         } header: {
             Text("配对")
         } footer: {
-            Text("配对任一 Mac 即可——mesh 里其他设备的地址会自动透传过来,网络变化时自动选择最佳连接。")
+            Text("Bonjour 仅用于确认附近 Mac；安全配对必须扫描 Mac 同屏 QR 绑定 TLS leaf，再输入 PIN。配对任一 Mac 后，mesh 地址会自动透传。")
         }
     }
 
@@ -420,11 +402,18 @@ struct SettingsView: View {
 
     /// 配对成功 → 持久化全部 + coordinator 接管 probe + route hint 选路
     private func handlePairingSuccess(
-        secret: Data, deviceID: String,
+        credential: ClientCredential, deviceID: String,
         page: PeerEndpointsPage, displayName: String
     ) {
-        let secretHex = secret.map { String(format: "%02x", $0) }.joined()
-        sharedSecretHex = secretHex
+        do {
+            try ClientCredentialKeychain.save(credential)
+        } catch {
+            presentAlert("设备凭据写入 Keychain 失败：\(error.localizedDescription)")
+            return
+        }
+        credentialPresent = true
+        // 旧版曾把 mesh root 明文放 UserDefaults；新配对后明确清空。
+        sharedSecretHex = ""
         pairedDisplayName = displayName
         pairedDeviceID = String(deviceID.prefix(36))
         let flat = PeerSyncCoordinator.flattenEndpoints(page)
@@ -432,28 +421,38 @@ struct SettingsView: View {
            let json = String(data: data, encoding: .utf8) {
             peerEndpointsJSON = json
         }
-        coordinator.reconfigureFromPairing(secret: secret, endpoints: flat)
+        coordinator.reconfigureFromPairing(
+            secret: credential.requestSecret,
+            credentialToken: credential.token,
+            endpoints: flat
+        )
     }
 
     /// 重新连接——用 AppStorage 里保存的 secret + endpoints,coordinator 走 probe + Mac hint 选最佳路线
     private func reconnect() {
-        guard !sharedSecretHex.isEmpty, !peerEndpointsJSON.isEmpty else {
+        guard credentialPresent, !peerEndpointsJSON.isEmpty else {
             presentAlert("配对信息丢失,请重新走 PIN 配对")
             return
         }
         guard let data = peerEndpointsJSON.data(using: .utf8),
               let endpoints = try? JSONDecoder().decode([PeerEndpoint].self, from: data),
-              let secret = Data(hexString: sharedSecretHex) else {
+              let credential = try? ClientCredentialKeychain.load() else {
             presentAlert("配对数据损坏,请取消配对后重新走 PIN")
             return
         }
-        coordinator.reconfigureFromPairing(secret: secret, endpoints: endpoints)
+        coordinator.reconfigureFromPairing(
+            secret: credential.requestSecret,
+            credentialToken: credential.token,
+            endpoints: endpoints
+        )
     }
 
     /// 取消配对——比"断开"更彻底:走 coordinator.reset() 清所有 config + runtime,
     /// 再清 AppStorage,回到未配对界面
     private func unpair() {
         coordinator.reset()
+        try? ClientCredentialKeychain.delete()
+        credentialPresent = false
         sharedSecretHex = ""
         peerURL = ""
         peerEndpointsJSON = ""
@@ -472,4 +471,3 @@ struct SettingsView: View {
 extension QRPayload: Identifiable {
     var id: String { "\(host):\(port)" }
 }
-

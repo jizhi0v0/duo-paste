@@ -16,9 +16,21 @@ private actor CallCounter {
 
 /// 一个共享 actor 跑测试期间的 fake PullWorker 寿命跟踪——不真起 runLoop，
 /// 但记录 start/stop 调用让测试断言生命周期管理正确
-private actor BuildLog {
-    private(set) var builds: [Int] = []        // 每次 buildPeer 被调时记 peerIndex
-    func record(_ idx: Int) { builds.append(idx) }
+private final class BuildLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var builds: [Int] = []        // 每次 buildPeer 被调时记 peerIndex
+
+    func record(_ idx: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        builds.append(idx)
+    }
+
+    func snapshot() -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return builds
+    }
 }
 
 @Suite(.serialized)
@@ -80,7 +92,7 @@ struct MeshSupervisorReconcileTests {
         let buildLog = BuildLog()
         let buildPeer: @Sendable (SmartTransport.PeerDecision) -> MeshSupervisor.Peer = { d in
             // 这条不该被调（决策没变）；若被调测试会失败
-            Task { await buildLog.record(d.peerIndex) }
+            buildLog.record(d.peerIndex)
             return MeshSupervisor.Peer(worker: PullWorker(
                 database: try! makeMemoryDB(),
                 transport: NoopTransport(),
@@ -112,7 +124,7 @@ struct MeshSupervisorReconcileTests {
         let workers = await supervisor.workers
         #expect(workers.count == 1)
         #expect(workers[0] === initialWorker)
-        #expect(await buildLog.builds.isEmpty)
+        #expect(buildLog.snapshot().isEmpty)
     }
 
     @Test func reconcileURLChangeRebuildsAffectedPeerOnly() async throws {
@@ -140,7 +152,7 @@ struct MeshSupervisorReconcileTests {
 
         let buildLog = BuildLog()
         let buildPeer: @Sendable (SmartTransport.PeerDecision) -> MeshSupervisor.Peer = { d in
-            Task { await buildLog.record(d.peerIndex) }
+            buildLog.record(d.peerIndex)
             if d.peerIndex == 0 {
                 return MeshSupervisor.Peer(worker: newWorkerA)
             }
@@ -166,7 +178,7 @@ struct MeshSupervisorReconcileTests {
         #expect(workers.count == 2)
         #expect(workers[0] === newWorkerA, "peer 0 应该是新 worker")
         #expect(workers[1] === oldWorkerB, "peer 1 决策没变，应该保留老 worker")
-        let builds = await buildLog.builds
+        let builds = buildLog.snapshot()
         #expect(builds == [0], "只 peer 0 应被重建")
 
         // currentDecisions 应该更新到 newDecisionA

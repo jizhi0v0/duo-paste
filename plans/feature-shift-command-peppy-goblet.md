@@ -1,5 +1,10 @@
 # Search Panel 多选 Paste
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 当前 Search Panel 只支持单选——`AppState.selectedID: String?` 单 id，箭头 / 单击只改 selectedID，Enter / 双击 `pasteBack(_ item: Item)` 写一条到 NSPasteboard。

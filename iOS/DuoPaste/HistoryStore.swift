@@ -2,15 +2,22 @@ import Foundation
 import Observation
 import DuoPasteCore
 
-/// 主进程持有的全局 Item 集合。Coordinator 从 peer 拉到新页就 merge() 进来。
-/// 没本地 GRDB——重启丢全部内存数据,下次 launch 从 cursor=.zero 重新拉。
-/// (后续要加 GRDB mirror 时把 merge() 改成走 db,搜索改成 SearchAPI)
+/// iOS full-history SQLite mirror 的 MainActor UI projection。
+/// `items` 只保留最近 1000 条供首页渲染；完整 metadata、cursor 与 FTS 都住在
+/// `MetadataMirrorStore`。Coordinator/BackgroundPullService 共用同一个 SQLite page apply。
 @Observable
 @MainActor
 final class HistoryStore {
+    nonisolated static let displayLimit = 1_000
+    private nonisolated let mirror: MetadataMirrorStore?
+
+    init(mirror: MetadataMirrorStore? = HistoryStore.openMirrorOrNil()) {
+        self.mirror = mirror
+    }
+
     /// 显示用,按 captured_at_ns DESC + pinned-first 排好序的列表。
     private(set) var items: [Item] = []
-    /// 搜索框文本。空 → 全列表;非空 → 优先用 server 端 FTS5 结果,失败 fallback 本机 contains。
+    /// 搜索框文本。非空文本或 qualifier 由本机 SQLite FTS/SearchAPI 返回。
     var query: String = ""
 
     /// 已激活的 slash qualifier —— `HistoryView.filterChipRow` 直接读写本字段(Mail 风格
@@ -32,8 +39,7 @@ final class HistoryStore {
     /// 内存态,不持久化——重启回零;qualifier 是探索性筛选不是用户长期 preference
     var activeQualifiers: Set<QueryQualifier> = []
 
-    /// Mac peer 远端 `/search` 返回的最新结果。query 非空时优先用它显示——FTS5 + fold-aware,
-    /// 跟 Mac UI 口径一致。query 切换 / coordinator 失败时清掉走 fallback。
+    /// 本机 SQLite FTS 返回的最新结果。它和 Mac 直接使用同一个 `SearchAPI` 实现。
     /// **匹配**靠 `q` + `qualifiers` 联合判断是否对得上当前 store.query;
     /// 不一致 → 不用(过期),走 fallback. **qualifier snapshot**(review #48 Minor 1):
     /// 用户取消 chip → `activeQualifiers` 变小 → onChange 250ms debounce 后才发新一轮
@@ -41,42 +47,44 @@ final class HistoryStore {
     /// 再 client-side filter (更宽的 qualifier),等于双重过滤 → 显示比"应该出现"少 → 闪烁。
     /// 把 qualifiers 也存进 cache,dispatch 时 strict 比对让 stale cache 不命中,自然走
     /// contains fallback 直到新一轮 /search 返回
-    struct ServerSearchResult: Equatable, Sendable {
+    struct LocalSearchResult: Equatable, Sendable {
         let q: String
         let qualifiers: Set<QueryQualifier>
         let items: [Item]
         let snippets: [String: String]
         let totalCount: Int
     }
-    private(set) var lastServerSearch: ServerSearchResult?
+    private(set) var lastLocalSearch: LocalSearchResult?
 
     /// SwiftUI 直接绑这个——过滤 + fold 后的列表。
     /// - 空 query + 空 qualifier → 全列表(本机 fold)
-    /// - 空 query + 有 qualifier → 本机 items 过 qualifier filter
-    /// - 有 query 命中最近 server 搜索 → 用 server fold-aware items(server 已 fold,不再二次 fold);
-    ///   有 qualifier 时再 client-side filter 一遍(双层防御兜底,详 client-side fallback 注释)
-    /// - 否则 → 本机 contains fallback + qualifier filter 后 fold
+    /// - 非空 query 或 qualifier → 完整 SQLite mirror 上的 SearchAPI 结果
+    /// - debounce 尚未返回 → 最近 1000 条 projection 上临时 contains/filter，不阻塞输入
     ///
     /// **Fold 契约定义在 `Item.foldByTextFull`(DuoPasteCore)**——跨 origin 同 text_full
     /// 折一条,winner = max(captured_at_ns),pinned OR 聚合。修 Continuity / ToDesk 把同
     /// 文本镜到两台 Mac 后 iOS 看见两张卡(两个不同 origin_device)而 Mac UI 只一张的不对齐.
     /// 排序契约在本路径单独应用:(pinned DESC, captured_at_ns DESC)——Mac fold 多一层
-    /// prefix24h boost,iOS 列表无 query 时不需要;有 query 走 server search 路径就有了
+    /// prefix24h boost,iOS 列表无 query 时不需要;有 query 走本机 SearchAPI 就有了
     ///
     /// **Qualifier 语义**:OR 起来——`/pdf /video` 匹配 (kind=file 且 subkind=pdf) OR
     /// (kind=file 且 subkind=video)。空集合等于不过滤。跟 Mac SearchAPI 契约对齐。
     ///
-    /// **Client-side fallback**(issue #41):新 server `/search` 接 `kinds/file_sub_kinds/
-    /// text_suffixes` query 参数透传 qualifier,server-side fold + filter 同 pass 消除
-    /// pagination 盲区。**仍保留 client-side qualifier filter** 是双层防御:
-    /// (a) 老 server(没合 #41)不识别字段静默忽略,这层兜底让 chip 还能用;
-    /// (b) 新 server 已 filter → client-side filter 是 idempotent no-op,代价 = O(N=已 filter 结果)
-    /// 几乎免费。两边语义同源(`QueryQualifier.matches` 跟 `SearchAPI` filter 是同一 OR 契约)
+    /// `HistoryFilterDispatch.ServerSearchContext` 是历史命名；这里把本地结果适配给同一纯
+    /// dispatch 函数，网络搜索已经不存在。
     var filtered: [Item] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let needsDatabaseSearch = !trimmed.isEmpty || !activeQualifiers.isEmpty
+        if needsDatabaseSearch,
+           let local = lastLocalSearch,
+           local.q == trimmed,
+           local.qualifiers == activeQualifiers {
+            return local.items
+        }
         // 实际 dispatch 逻辑住在 DuoPasteCore.HistoryFilterDispatch——纯函数,4 条分支
         // 契约直接在 DuoPasteCoreTests 覆盖,改 dispatch 单测先 fail. 这里只做"把
         // store 里 @Observable 字段转纯数据 + 调 dispatch"的胶水
-        let cache = lastServerSearch.map {
+        let cache = lastLocalSearch.map {
             HistoryFilterDispatch.ServerSearchContext(
                 q: $0.q,
                 qualifiers: $0.qualifiers,
@@ -91,18 +99,53 @@ final class HistoryStore {
         )
     }
 
-    /// coordinator 拉完 /search 把结果灌进来。**只在 `q` + `qualifiers` 仍匹配当前 store
-    /// 状态时**应用——拉结果回来时用户可能已经改了 query 或 toggle 了 chip,旧响应丢弃
-    /// 避免闪现错的命中
-    func applyServerSearch(_ r: ServerSearchResult) {
-        guard r.q == query, r.qualifiers == activeQualifiers else { return }
-        lastServerSearch = r
+    /// 250ms debounce 后在 utility thread 跑本地 FTS。响应回来时再次核对 query + qualifier
+    /// snapshot，取消/过期结果都不会污染当前 UI。
+    func searchLocal(q: String, qualifiers: [QueryQualifier]) async {
+        let trimmed = q.trimmingCharacters(in: .whitespacesAndNewlines)
+        let qualifierSet = Set(qualifiers)
+        guard !trimmed.isEmpty || !qualifierSet.isEmpty else {
+            lastLocalSearch = nil
+            return
+        }
+        guard let mirror else { return }
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try mirror.search(text: trimmed, qualifiers: qualifiers, limit: 500)
+            }.value
+            try Task.checkCancellation()
+            guard query.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed,
+                  activeQualifiers == qualifierSet else { return }
+            var patched = result.items.filter { !optimisticallyDeletedIDs.contains($0.id) }
+            for index in patched.indices {
+                if let desired = pendingPinTargets[patched[index].id] {
+                    patched[index].pinned = desired
+                }
+                if let optimisticNs = optimisticCapturedAtNs[patched[index].id] {
+                    patched[index].capturedAtNs = max(patched[index].capturedAtNs, optimisticNs)
+                }
+            }
+            patched.sort(by: Self.iosListOrder)
+            lastLocalSearch = LocalSearchResult(
+                q: trimmed,
+                qualifiers: qualifierSet,
+                items: patched,
+                snippets: result.snippets,
+                totalCount: result.totalCount
+            )
+        } catch is CancellationError {
+            // New keystroke/qualifier superseded this query.
+        } catch {
+            DebugLog.shared.append("local mirror search failed: \(error)")
+        }
     }
 
-    /// query 变化时调,清掉旧 server 结果让 filtered 暂时走 contains fallback——
-    /// coordinator 异步拉新一轮 server 结果,中间这段时间用户不会看到上一轮的命中残影
-    func clearServerSearch() {
-        lastServerSearch = nil
+    func refreshActiveSearch() async {
+        await searchLocal(q: query, qualifiers: Array(activeQualifiers))
+    }
+
+    func clearLocalSearch() {
+        lastLocalSearch = nil
     }
 
     // MARK: - 删除失败追踪
@@ -116,6 +159,22 @@ final class HistoryStore {
     /// 这里只展示提示——条目本身已被 /since 重新 insert 回 `items`,无法回滚乐观删除
     /// (内容字段已丢),用户看到提示后自行决定重试或忽略
     private(set) var deleteFailureMessage: String?
+    /// iOS 本地乐观 pin 尚未得到 owner canonical 确认的绝对值意图。
+    private var pendingPinTargets: [String: Bool] = [:]
+    /// 最近页之外的 FTS 命中同样可以被乐观 bump/delete；overlay 不能只依赖 `items`。
+    private var optimisticCapturedAtNs: [String: Int64] = [:]
+    private var optimisticallyDeletedIDs: Set<String> = []
+
+    func isPinPending(_ id: String) -> Bool { pendingPinTargets[id] != nil }
+
+    func markPinPending(id: String, desiredPinned: Bool) {
+        pendingPinTargets[id] = desiredPinned
+    }
+
+    func markPinApplied(id: String, desiredPinned: Bool) {
+        guard pendingPinTargets[id] == desiredPinned else { return }
+        pendingPinTargets.removeValue(forKey: id)
+    }
 
     /// peer 拉到一批 item 时调。按 id 去重,tombstone (deletedAtNs 非空) 直接移除。
     /// 重排序:pinned DESC,captured_at_ns DESC。
@@ -133,15 +192,31 @@ final class HistoryStore {
         let outcome = deleteTracker.observeIncoming(incoming)
         var byID: [String: Item] = [:]
         for it in items { byID[it.id] = it }
-        for it in incoming {
+        for incomingItem in incoming {
+            var it = incomingItem
             if it.isTombstone {
                 byID.removeValue(forKey: it.id)
+                pendingPinTargets.removeValue(forKey: it.id)
+                optimisticCapturedAtNs.removeValue(forKey: it.id)
+                optimisticallyDeletedIDs.remove(it.id)
                 continue
             }
             // grace 窗口内 in-flight /since 带回同 text_full sibling → skip 不入库
             // (Mac cascade tombstone 还在路上,先压住不让 fold 闪回)
             if outcome.skipIds.contains(it.id) {
                 continue
+            }
+            if let desired = pendingPinTargets[it.id] {
+                if it.pinned == desired {
+                    // owner-routed command 已通过 Mac `/since` 回放到 iOS。
+                    pendingPinTargets.removeValue(forKey: it.id)
+                } else {
+                    // pending window 保护 optimistic UI，不让旧 canonical 行造成闪回。
+                    it.pinned = desired
+                }
+            }
+            if let optimisticNs = optimisticCapturedAtNs[it.id] {
+                it.capturedAtNs = max(it.capturedAtNs, optimisticNs)
             }
             if let existing = byID[it.id], existing.capturedAtNs > it.capturedAtNs {
                 var merged = it
@@ -151,7 +226,8 @@ final class HistoryStore {
                 byID[it.id] = it
             }
         }
-        items = byID.values.sorted(by: Self.iosListOrder)
+        for id in outcome.resurrectedIds { optimisticallyDeletedIDs.remove(id) }
+        items = Array(byID.values.sorted(by: Self.iosListOrder).prefix(Self.displayLimit))
         let resurrectedCount = outcome.resurrectedIds.count
         if resurrectedCount > 0 {
             deleteFailureMessage = resurrectedCount == 1
@@ -167,11 +243,30 @@ final class HistoryStore {
     /// 保 max(本机, incoming) 不掉刚顶的位置;Mac 没 bump(UCB 没透)本机顶一直在
     func bumpToFront(id: String) {
         let nowNs = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
-        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
-        // 已经在第一位且不 pinned 顶 → 没必要重排
-        if idx == 0 && !items[idx].pinned { return }
-        items[idx].capturedAtNs = nowNs
+        optimisticCapturedAtNs[id] = nowNs
+        if let idx = items.firstIndex(where: { $0.id == id }) {
+            items[idx].capturedAtNs = nowNs
+        } else if let item = lastLocalSearch?.items.first(where: { $0.id == id }) {
+            var promoted = item
+            promoted.capturedAtNs = nowNs
+            items.append(promoted)
+        } else {
+            return
+        }
         items.sort(by: Self.iosListOrder)
+        items = Array(items.prefix(Self.displayLimit))
+        if let r = lastLocalSearch, let index = r.items.firstIndex(where: { $0.id == id }) {
+            var patched = r.items
+            patched[index].capturedAtNs = nowNs
+            patched.sort(by: Self.iosListOrder)
+            lastLocalSearch = LocalSearchResult(
+                q: r.q,
+                qualifiers: r.qualifiers,
+                items: patched,
+                snippets: r.snippets,
+                totalCount: r.totalCount
+            )
+        }
     }
 
     /// 用户长按"置顶/取消置顶"路径——本机乐观立即切 `pinned` + 重排,coordinator 异步
@@ -185,19 +280,20 @@ final class HistoryStore {
     /// Returns: 切换后的 pinned 值;item 不存在返 nil(调用方 swallow,不上 server)
     @discardableResult
     func togglePinOptimistic(id: String) -> Bool? {
-        guard let idx = items.firstIndex(where: { $0.id == id }) else { return nil }
-        let newPinned = !items[idx].pinned
-        items[idx].pinned = newPinned
+        let current = items.first(where: { $0.id == id })
+            ?? lastLocalSearch?.items.first(where: { $0.id == id })
+        guard let current else { return nil }
+        let newPinned = !current.pinned
+        if let idx = items.firstIndex(where: { $0.id == id }) {
+            items[idx].pinned = newPinned
+        }
         items.sort(by: Self.iosListOrder)
-        // 同步 patch `lastServerSearch.items`——非空 query 下 `filtered` 直接返 cached
-        // server-search 列表,不走 items 路径。不 patch 这里会让 search state 下 pin toggle
-        // 看不到变化,直到下一次 /since merge 才反映。删除 cache 会让 UI 闪回 contains
-        // fallback,patch 才是正确做法
-        if let r = lastServerSearch, let i = r.items.firstIndex(where: { $0.id == id }) {
+        // 同步 patch 本地 FTS result，避免搜索状态下等待 canonical /since 回放才更新。
+        if let r = lastLocalSearch, let i = r.items.firstIndex(where: { $0.id == id }) {
             var patched = r.items
             patched[i].pinned = newPinned
             patched.sort(by: Self.iosListOrder)
-            lastServerSearch = ServerSearchResult(
+            lastLocalSearch = LocalSearchResult(
                 q: r.q,
                 qualifiers: r.qualifiers,
                 items: patched,
@@ -227,7 +323,18 @@ final class HistoryStore {
     /// → 用户感觉"卡片删了又出现"(直到 server cascade tombstone 通过 /since 回流才真消失)
     func removeOptimistic(item: Item) {
         let idsToRemove = deleteTracker.markDeleted(item, in: items)
+        optimisticallyDeletedIDs.formUnion(idsToRemove)
         items.removeAll { idsToRemove.contains($0.id) }
+        if let r = lastLocalSearch {
+            let patched = r.items.filter { !idsToRemove.contains($0.id) }
+            lastLocalSearch = LocalSearchResult(
+                q: r.q,
+                qualifiers: r.qualifiers,
+                items: patched,
+                snippets: r.snippets.filter { !idsToRemove.contains($0.key) },
+                totalCount: max(0, r.totalCount - (r.items.count - patched.count))
+            )
+        }
     }
 
     /// 用户点 banner ✕ 或 5s 自动消时调
@@ -240,74 +347,138 @@ final class HistoryStore {
         items = []
         query = ""
         activeQualifiers = []
+        pendingPinTargets.removeAll()
+        optimisticCapturedAtNs.removeAll()
+        optimisticallyDeletedIDs.removeAll()
+        lastLocalSearch = nil
     }
 
-    // MARK: - 磁盘持久化
+    // MARK: - SQLite mirror / legacy migration
 
-    /// 持久化文件:Caches/HistoryStore/items.json + cursor.json。NSCachesDirectory 可被
-    /// 系统在压力下回收(可接受——下次启动 from cursor=.zero 重新拉满 history)
     nonisolated static var persistenceDir: URL {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         let dir = base.appendingPathComponent("HistoryStore", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
+    nonisolated static var mirrorFile: URL { persistenceDir.appendingPathComponent("mirror.sqlite") }
+    /// Pre-R2.1 files. They remain named here solely for one-time verified migration.
     nonisolated static var itemsFile: URL { persistenceDir.appendingPathComponent("items.json") }
     nonisolated static var cursorFile: URL { persistenceDir.appendingPathComponent("cursor.json") }
 
-    /// 限 maxItems(默 1000)防文件无限增长。debounce 在调用方控制——
-    /// 每条 merge 都写盘太频繁,DuoPasteApp 控制按 scenePhase / 阶段触发
-    func persist(maxItems: Int = 1000) {
-        let snapshot = Array(items.prefix(maxItems))
-        let url = Self.itemsFile
-        Task.detached(priority: .utility) {
-            do {
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.sortedKeys]
-                let data = try encoder.encode(snapshot)
-                try data.write(to: url, options: .atomic)
-            } catch {
-                DebugLog.shared.append("HistoryStore.persist failed: \(error)")
-            }
+    nonisolated static func openMirror() throws -> MetadataMirrorStore {
+        try MetadataMirrorStore(path: mirrorFile)
+    }
+
+    private nonisolated static func openMirrorOrNil() -> MetadataMirrorStore? {
+        do {
+            return try openMirror()
+        } catch {
+            DebugLog.shared.append("HistoryStore mirror open failed: \(error)")
+            return nil
         }
     }
 
-    /// app launch 调一次:读 items.json → 填 self.items。失败/不存在 → 留空走正常 /since 拉。
-    /// **必须**在 coordinator.reconfigure 前调,否则 /since 拉的页跟磁盘已有 merge 时拿不到
-    /// 旧 cursor 之前的内容(BGAppRefreshTask 写了但 coordinator 不知道,会重 pull 大量)
+    /// App launch: import the old bounded JSON cache for instant continuity, verify every decoded ID
+    /// exists in SQLite, then delete both legacy files. The old cursor is never imported because it
+    /// may have advanced past metadata truncated by the 1000-row cap.
     func restore() {
-        guard let data = try? Data(contentsOf: Self.itemsFile),
-              let restored = try? JSONDecoder().decode([Item].self, from: data) else {
-            DebugLog.shared.append("HistoryStore.restore: no cached items")
+        guard let mirror else {
+            if let data = try? Data(contentsOf: Self.itemsFile),
+               let restored = try? JSONDecoder().decode([Item].self, from: data) {
+                items = Array(restored.sorted(by: Self.iosListOrder).prefix(Self.displayLimit))
+            }
             return
         }
-        self.items = restored
-        DebugLog.shared.append("HistoryStore.restore: items=\(restored.count)")
+        let legacyExists = FileManager.default.fileExists(atPath: Self.itemsFile.path)
+        if legacyExists {
+            do {
+                let data = try Data(contentsOf: Self.itemsFile)
+                let legacy = try JSONDecoder().decode([Item].self, from: data)
+                _ = try mirror.importLegacyItems(legacy)
+                guard try mirror.containsItemIDs(Set(legacy.map(\.id))) else {
+                    throw HistoryStoreError.legacyVerificationFailed
+                }
+                try FileManager.default.removeItem(at: Self.itemsFile)
+                try? FileManager.default.removeItem(at: Self.cursorFile)
+                DebugLog.shared.append("HistoryStore migrated legacy JSON items=\(legacy.count); cursor reset for full refill")
+            } catch {
+                // Keep the source files for a later retry; never silently claim a successful upgrade.
+                DebugLog.shared.append("HistoryStore legacy migration failed: \(error)")
+            }
+        } else {
+            // A cursor without its bounded item cache is unusable and dangerous; SQLite owns cursor now.
+            try? FileManager.default.removeItem(at: Self.cursorFile)
+        }
+
+        refreshFromMirror()
+    }
+
+    func refreshFromMirror() {
+        guard let mirror else { return }
+        do {
+            var recent = try mirror.recentItems(limit: Self.displayLimit)
+            recent.removeAll { optimisticallyDeletedIDs.contains($0.id) }
+            for index in recent.indices {
+                if let desired = pendingPinTargets[recent[index].id] {
+                    recent[index].pinned = desired
+                }
+                if let optimisticNs = optimisticCapturedAtNs[recent[index].id] {
+                    recent[index].capturedAtNs = max(recent[index].capturedAtNs, optimisticNs)
+                }
+            }
+            items = recent.sorted(by: Self.iosListOrder)
+        } catch {
+            DebugLog.shared.append("HistoryStore refresh mirror failed: \(error)")
+        }
+    }
+
+    func persistedCursor() -> SinceCursor {
+        guard let mirror else { return .zero }
+        do { return try mirror.cursor() }
+        catch {
+            DebugLog.shared.append("HistoryStore cursor read failed: \(error)")
+            return .zero
+        }
+    }
+
+    @discardableResult
+    func applyPage(items incoming: [Item], nextCursor: SinceCursor) async throws -> SinceCursor {
+        guard let mirror else { throw HistoryStoreError.mirrorUnavailable }
+        let persisted = try await Task.detached(priority: .utility) {
+            try mirror.applyPage(items: incoming, nextCursor: nextCursor)
+        }.value
+        merge(incoming)
+        return persisted
+    }
+
+    /// 前台与 BG pull 的统一 gap-safe 路径。正常先从持久化 cursor 增量拉；server
+    /// `total_count` 暴露迟到旧行缺口时，Core 自动从 zero 做非破坏性 backfill。
+    func synchronizeMetadata(
+        client: PeerClient,
+        pageLimit: Int = 500,
+        maxPages: Int = 200
+    ) async throws -> MetadataMirrorSyncReport {
+        guard let mirror else { throw HistoryStoreError.mirrorUnavailable }
+        let report = try await mirror.synchronize(
+            pageLimit: pageLimit,
+            maxPages: maxPages
+        ) { cursor, limit in
+            try await client.fetchSince(cursor: cursor, limit: limit)
+        }
+        refreshFromMirror()
+        return report
     }
 }
 
-/// 给后台 pull task 用的"上次 sync 到哪了"持久化。背景 task 在没 PeerSyncCoordinator
-/// 内存状态时也能从这恢复 cursor 继续拉,不重头 pull。
-struct PersistedCursor: Codable {
-    let ingestedAtNs: Int64
-    let id: String
-    let updatedAtUnix: Int64
+private enum HistoryStoreError: LocalizedError {
+    case mirrorUnavailable
+    case legacyVerificationFailed
 
-    static func load() -> PersistedCursor? {
-        guard let data = try? Data(contentsOf: HistoryStore.cursorFile),
-              let c = try? JSONDecoder().decode(PersistedCursor.self, from: data) else {
-            return nil
-        }
-        return c
-    }
-
-    func save() {
-        let url = HistoryStore.cursorFile
-        do {
-            let data = try JSONEncoder().encode(self)
-            try data.write(to: url, options: .atomic)
-        } catch {
-            DebugLog.shared.append("PersistedCursor.save failed: \(error)")
+    var errorDescription: String? {
+        switch self {
+        case .mirrorUnavailable: return "本地 SQLite mirror 无法打开"
+        case .legacyVerificationFailed: return "旧 JSON 导入后 ID 校验失败"
         }
     }
 }

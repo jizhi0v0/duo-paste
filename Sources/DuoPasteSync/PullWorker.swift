@@ -83,6 +83,9 @@ public actor PullWorker {
 
     private let database: DuoPasteCore.Database
     private let transport: SinceTransport
+    /// 同一个 peer HTTP client 的 owner-routed pin command 能力。nil 保持老测试/只读 transport。
+    private let pinTransport: PinOperationTransport?
+    private let revocationTransport: DeviceCredentialRevocationTransport?
     private let selfDeviceID: String
     /// 期望的 peer device_id。nil → 首次启动学习模式（用 /health 返回的 device_id 当 cursor PK）；
     /// 非 nil → 严格模式（/health 返回的 device_id 跟它对不上立刻 transient skip，
@@ -116,9 +119,16 @@ public actor PullWorker {
     /// PeerBuilder 注入 → MeshSupervisor.reconcileTransports()(自带 ReconcileGate 防 storm),
     /// 让 chosen URL 烂掉时 quick recovery 不必等周期 5min reconcile。nil = 不接 → no-op
     private let onChosenLikelyDown: (@Sendable () -> Void)?
+    /// canonical replay 清掉本机 pin pending 后刷新 Mac UI 的轻量回调。
+    private let onPinOperationsResolved: (@Sendable () -> Void)?
+    private let onCredentialRevocationsMerged: (@Sendable (Int) -> Void)?
 
     private var runTask: Task<Void, Never>?
     private var currentSleep: Task<Void, Error>?
+    /// Full mirror 的 blob hydration 独立于 metadata pagination。否则一页里只要有大文件
+    /// 或慢链路，`fetchBlobsFull` 的 await 就会把后续 `/since` cursor 永久堵在半路。
+    private var blobHydrationTask: Task<Void, Never>?
+    private var pendingBlobSHAs = Set<String>()
     private var consecutiveTransientFailures = 0
     /// 当前 tick 锚定的 peer device_id。reconcilePeer 学到 / 严格模式从 init 注入。
     /// 用于 setLastPullNs / setClockSkewMs 等 MeshStatus per-peer 调用。
@@ -127,6 +137,8 @@ public actor PullWorker {
     public init(
         database: DuoPasteCore.Database,
         transport: SinceTransport,
+        pinTransport: PinOperationTransport? = nil,
+        revocationTransport: DeviceCredentialRevocationTransport? = nil,
         selfDeviceID: String,
         expectedPeerDeviceID: String? = nil,
         meshStatus: MeshStatus,
@@ -140,10 +152,15 @@ public actor PullWorker {
             FileHandle.standardError.write(Data("pull: \(msg)\n".utf8))
         },
         onHealthProbed: (@Sendable (Int64) -> Void)? = nil,
-        onChosenLikelyDown: (@Sendable () -> Void)? = nil
+        onChosenLikelyDown: (@Sendable () -> Void)? = nil,
+        onPinOperationsResolved: (@Sendable () -> Void)? = nil,
+        onCredentialRevocationsMerged: (@Sendable (Int) -> Void)? = nil
     ) {
         self.database = database
         self.transport = transport
+        self.pinTransport = pinTransport
+        self.revocationTransport = revocationTransport
+            ?? (transport as? any DeviceCredentialRevocationTransport)
         self.selfDeviceID = selfDeviceID
         self.expectedPeerDeviceID = expectedPeerDeviceID
         self.meshStatus = meshStatus
@@ -156,6 +173,8 @@ public actor PullWorker {
         self.log = log
         self.onHealthProbed = onHealthProbed
         self.onChosenLikelyDown = onChosenLikelyDown
+        self.onPinOperationsResolved = onPinOperationsResolved
+        self.onCredentialRevocationsMerged = onCredentialRevocationsMerged
     }
 
     public func start() {
@@ -168,6 +187,9 @@ public actor PullWorker {
     public func stop() {
         currentSleep?.cancel()
         currentSleep = nil
+        blobHydrationTask?.cancel()
+        blobHydrationTask = nil
+        pendingBlobSHAs.removeAll()
         runTask?.cancel()
         runTask = nil
     }
@@ -326,6 +348,28 @@ public actor PullWorker {
             return result
         }
 
+        // 2a. 永久撤销 tombstone gossip。它是认证控制面，不得因旧 peer 404 或短暂失败
+        // 阻塞 item / pin 增量同步；成功 merge 后回调旋转本机 WS 让现存连接重新认证。
+        _ = await syncCredentialRevocations()
+
+        // 2b. 该 worker 已由 /health 锚定到 owner device，只投递 origin_device 匹配的
+        // pending pin command。放在 /since 之前：owner apply 后同一 tick 的增量拉即可观察
+        // canonical replay 并清掉“等待同步”。
+        if let pinTransport {
+            do {
+                let pinHadTransient = try await drainPinOperations(
+                    to: currentPeerID,
+                    transport: pinTransport
+                )
+                result.hadTransient = result.hadTransient || pinHadTransient
+            } catch is CancellationError {
+                return result
+            } catch {
+                log("pin operation drain failed: \(error)")
+                result.hadTransient = true
+            }
+        }
+
         // 3. 读 cursor
         let cursor: SinceCursor
         do {
@@ -355,10 +399,12 @@ public actor PullWorker {
                 result.skippedDedup = applied.dedupSkipped
                 result.skippedPasteEcho = applied.pasteEchoSkipped
                 result.hasMore = page.hasMore
-                // storage_mode=.full 路径：tx 已提交、cursor 已推进，full 失败不回滚 mirror。
-                // 顺序故意——blob 字节是"用户体验加速"，不是 mirror 正确性的一部分。
-                // .optimized 模式 fetchBlobsFull 内部 guard short-circuit return no-op
-                await fetchBlobsFull(applied.mirroredShas)
+                if applied.pinOperationsResolved > 0 {
+                    onPinOperationsResolved?()
+                }
+                // storage_mode=.full 路径：metadata tx/cursor 优先，blob hydration 放到独立
+                // task。大文件/慢链路不能阻塞 has_more 的下一页；字节失败也不回滚 mirror。
+                enqueueBlobHydration(applied.mirroredShas)
             } catch {
                 log("apply page failed: \(error)")
                 result.hadTransient = true
@@ -371,6 +417,32 @@ public actor PullWorker {
             result.hadTransient = true
         }
         return result
+    }
+
+    @discardableResult
+    func syncCredentialRevocations() async -> Int {
+        guard let revocationTransport else { return 0 }
+        do {
+            switch try await revocationTransport.fetchDeviceCredentialRevocations() {
+            case .ok(let revocations):
+                let changed = try await database.mergeDeviceCredentialRevocations(revocations)
+                if changed > 0 { onCredentialRevocationsMerged?(changed) }
+                return changed
+            case .unsupported:
+                return 0
+            case .rejected(let reason):
+                log("credential revocations rejected: \(reason)")
+                return 0
+            case .unreachable(let reason):
+                log("credential revocations unreachable: \(reason)")
+                return 0
+            }
+        } catch is CancellationError {
+            return 0
+        } catch {
+            log("credential revocations failed: \(error)")
+            return 0
+        }
     }
 
     /// 比对该 peer 在 pull_cursor 里的 persisted device_id 跟新探测到的 currentPeerID。
@@ -455,6 +527,7 @@ public actor PullWorker {
         var written: Int
         var dedupSkipped: Int
         var pasteEchoSkipped: Int
+        var pinOperationsResolved: Int
         /// 这一页实际写入 mirror 的行里**有 blob 字节需求**的 sha 集合（去重）。
         /// 包含：deleted_at_ns IS NULL（tombstone 不需要字节）+ blob_sha256 非空 +
         /// item.kind 含 image/file（其它 kind 即使 sha 非空也不该有 blob 上传过）。
@@ -476,6 +549,7 @@ public actor PullWorker {
             var written = 0
             var dedupSkipped = 0
             var pasteEchoSkipped = 0
+            var pinOperationsResolved = 0
             var mirroredShas: Set<String> = []
             for item in page.items {
                 // 跳过自家 origin —— 本机 own 行已在 item 表，回推会被 INSERT OR IGNORE 兜底但
@@ -552,6 +626,7 @@ public actor PullWorker {
                 // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump /
                 // OCR done 回放 extracted_text）。PR 4 已删 push_state / push_attempts /
                 // last_push_error 列。v9 加 extracted_text + extracted_text_source 两列。
+                let activePin = try DuoPasteCore.Database.activePinOperation(db, itemID: item.id)
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO item
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
@@ -572,12 +647,20 @@ public actor PullWorker {
                     item.blobSha256,
                     item.blobSize,
                     item.blobMime,
-                    item.pinned ? 1 : 0,
+                    (activePin?.desiredPinned ?? item.pinned) ? 1 : 0,
                     item.deletedAtNs,
                     item.ocrState?.rawValue,
                     item.extractedText,
                     item.extractedTextSource?.rawValue,
                 ])
+                if try DuoPasteCore.Database.resolvePinOperationReplayIfNeeded(
+                    db,
+                    operation: activePin,
+                    incoming: item,
+                    now: now
+                ) {
+                    pinOperationsResolved += 1
+                }
                 written += 1
                 // 收集本页 blob 需求集合（eager 阶段后处理）。kind=image/file 才有意义；
                 // 软删行（tombstone）跳过——它代表"peer 上已删"，没字节也合理
@@ -599,9 +682,60 @@ public actor PullWorker {
                 written: written,
                 dedupSkipped: dedupSkipped,
                 pasteEchoSkipped: pasteEchoSkipped,
+                pinOperationsResolved: pinOperationsResolved,
                 mirroredShas: mirroredShas
             )
         }
+    }
+
+    /// Returns true when at least one delivery failed transiently. Deterministic rejects are persisted
+    /// in last_error but do not force the whole pull worker into network backoff.
+    private func drainPinOperations(
+        to ownerDeviceID: String,
+        transport: PinOperationTransport
+    ) async throws -> Bool {
+        let operations = try await database.pendingPinOperations(originDevice: ownerDeviceID)
+        var hadTransient = false
+        for operation in operations {
+            if Task.isCancelled { throw CancellationError() }
+            let remote = try await transport.submitPinOperation(operation)
+            switch remote.outcome {
+            case .applied(let ingestedAtNs):
+                try await database.markPinOperationDelivered(
+                    operationID: operation.operationID,
+                    ownerIngestedAtNs: ingestedAtNs,
+                    now: nowNs()
+                )
+            case .pending:
+                try await database.markPinOperationFailed(
+                    operationID: operation.operationID,
+                    reason: "configured peer is not canonical owner",
+                    now: nowNs()
+                )
+            case .notFound:
+                try await database.markPinOperationFailed(
+                    operationID: operation.operationID,
+                    reason: "owner does not have item yet",
+                    now: nowNs()
+                )
+            case .tombstoned:
+                try await database.discardPinOperation(operationID: operation.operationID)
+            case .rejected(let reason):
+                try await database.markPinOperationFailed(
+                    operationID: operation.operationID,
+                    reason: reason,
+                    now: nowNs()
+                )
+            case .unreachable(let reason):
+                hadTransient = true
+                try await database.markPinOperationFailed(
+                    operationID: operation.operationID,
+                    reason: reason,
+                    now: nowNs()
+                )
+            }
+        }
+        return hadTransient
     }
 
     /// `storage_mode=.full` 路径：拉这一页 mirror 行涉及的 blob 字节到本机 BlobStore。
@@ -609,6 +743,30 @@ public actor PullWorker {
     /// 在 applyPage tx 内 commit）。下次 tick 这些 sha 仍 missing 会再次尝试——指数 backoff
     /// 由整体 tick 层接管（transient 失败时整体 tick 标 hadTransient），full 阶段不自己重试。
     /// `.optimized` 模式 short-circuit return——UI 按需走 lazy 路径
+    private func enqueueBlobHydration(_ shas: Set<String>) {
+        guard config.storageMode == .full,
+              blobFetcher != nil,
+              blobs != nil,
+              !shas.isEmpty else {
+            return
+        }
+        pendingBlobSHAs.formUnion(shas)
+        guard blobHydrationTask == nil else { return }
+        blobHydrationTask = Task { [weak self] in
+            await self?.drainBlobHydrationQueue()
+        }
+    }
+
+    private func drainBlobHydrationQueue() async {
+        defer { blobHydrationTask = nil }
+        while !Task.isCancelled {
+            let batch = pendingBlobSHAs
+            pendingBlobSHAs.removeAll(keepingCapacity: true)
+            guard !batch.isEmpty else { return }
+            await fetchBlobsFull(batch)
+        }
+    }
+
     private func fetchBlobsFull(_ shas: Set<String>) async {
         guard config.storageMode == .full,
               let fetcher = blobFetcher,

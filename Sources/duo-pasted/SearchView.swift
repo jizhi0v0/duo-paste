@@ -482,6 +482,7 @@ struct SearchView: View {
             // banner 用 overlay 浮在 header 上方,不占主体高度。
             // padding.top 让位给 header(42) + filterBar(30) = 72
             VStack(spacing: 4) {
+                capturePauseBanner
                 noticeBanner
                 pasteProgressBanner
                 skipBanner
@@ -1033,7 +1034,8 @@ struct SearchView: View {
                             blobs: state.deps.blobs,
                             fetcher: state.pasteBlobFetcher,
                             storageMode: state.deps.config.mesh.storageMode,
-                            blobInventoryPulse: state.blobInventoryPulse
+                            blobInventoryPulse: state.blobInventoryPulse,
+                            isPinPending: state.pendingPinItemIDs.contains(item.id)
                         )
                         // **不再 .equatable()**:EquatableView 包装 + LazyHStack cell pool +
                         // 长按 45ms 快速 selectedIDs 切换三者撞车,cell slot 复用时旧 view
@@ -1392,6 +1394,34 @@ struct SearchView: View {
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.primary.opacity(0.06))
+        }
+    }
+
+    /// 暂停是持续状态，不走 3s/5min 一次性 notice。AppState 的 expiry task 到点清空，
+    /// 手动恢复也同步清；banner 明确系统剪贴板仍正常，避免被误解成 Cmd+V 失效。
+    @ViewBuilder
+    private var capturePauseBanner: some View {
+        if let pause = state.capturePause, pause.isActive() {
+            HStack(spacing: 6) {
+                Image(systemName: "pause.circle.fill")
+                Text(capturePauseDescription(pause))
+                Spacer()
+            }
+            .font(.caption)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.22))
+        }
+    }
+
+    private func capturePauseDescription(_ pause: CapturePause) -> String {
+        switch pause {
+        case .until(let deadline):
+            let minutes = max(1, Int(ceil(deadline.timeIntervalSinceNow / 60)))
+            return "剪贴板历史捕获已暂停 · 约 \(minutes) 分钟后恢复；Cmd+V 正常"
+        case .untilResumed:
+            return "剪贴板历史捕获已暂停 · 请从菜单栏手动恢复；Cmd+V 正常"
         }
     }
 
@@ -1768,6 +1798,7 @@ private struct ItemCard: View, Equatable {
             && lhs.snippet == rhs.snippet
             && lhs.storageMode == rhs.storageMode
             && lhs.blobInventoryPulse == rhs.blobInventoryPulse
+            && lhs.isPinPending == rhs.isPinPending
     }
 
     let item: Item
@@ -1789,6 +1820,8 @@ private struct ItemCard: View, Equatable {
     /// AppState.blobInventoryPulse 透传——补齐缺失 blob 后 bump 让本卡 .task 重 fire 走
     /// decode 路径。光靠 ImageThumbnailCache.invalidateAll 不够（.task id 不变不会 re-fire）
     let blobInventoryPulse: Int
+    /// owner 暂时离线 / canonical replay 尚未回来时显示明确状态。
+    let isPinPending: Bool
 
     /// 缩略图状态。.task 异步加载完 set;LazyHStack 卡滚出视野 unload 时 cancel + 重置
     @State private var thumbnail: NSImage?
@@ -2029,6 +2062,12 @@ private struct ItemCard: View, Equatable {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer(minLength: 0)
+            if isPinPending {
+                Text("等待同步")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+            }
             if let idx = index {
                 indexBadge(idx)
             }

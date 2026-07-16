@@ -171,78 +171,29 @@ actor PeerClient {
         }
     }
 
-    // MARK: - GET /search?q=<text>
-
-    /// 委托 Mac peer 跑 fold-aware 全文搜索——iOS 本地没 GRDB/FTS5,query 非空时走这条
-    /// 拿到跨设备口径一致的命中。返回 (items, snippets, totalCount)。
-    ///
-    /// snippets: id → 含 STX/ETX(0x02/0x03) 控制字符的高亮片段;query 为空时空 map。
-    /// totalCount: fold 后 limit/offset 之前的真实总数,UI 显"共 N 条"
-    ///
-    /// **qualifier 透传**(issue #41):传 `qualifiers` 让 server 端把 chip filter 也带进
-    /// SearchAPI,fold + filter 在同一 pass 里——消除 client-side filter pagination 盲区
-    /// (FTS5 命中 200 条但只返前 50,稀疏 qualifier 让客户端展示空集而库里其实有)。
-    /// 老 server 不识别这些字段会静默忽略,client-side `HistoryStore.filtered` 兜底过滤
-    /// 仍能工作,行为不回归
-    func searchItems(
-        q: String,
-        qualifiers: [QueryQualifier] = [],
-        limit: Int = 200,
-        offset: Int = 0
-    ) async throws -> (items: [Item], snippets: [String: String], totalCount: Int) {
-        // query items 顺序固定——签名 path 一致性硬不变量(跟 /since 同源)。
-        // qualifier 字段在 limit/offset 之后追加,新增字段不影响老 client 签名路径
-        var qi: [URLQueryItem] = []
-        if !q.isEmpty { qi.append(URLQueryItem(name: "q", value: q)) }
-        qi.append(URLQueryItem(name: "limit", value: String(limit)))
-        if offset > 0 { qi.append(URLQueryItem(name: "offset", value: String(offset))) }
-        if !qualifiers.isEmpty {
-            let wire = QueryQualifier.encodeToWire(qualifiers)
-            if let kinds = wire.kinds {
-                qi.append(URLQueryItem(name: "kinds", value: kinds))
-            }
-            if let subs = wire.fileSubKinds {
-                qi.append(URLQueryItem(name: "file_sub_kinds", value: subs))
-            }
-            if let suffixes = wire.textSuffixes {
-                qi.append(URLQueryItem(name: "text_suffixes", value: suffixes))
-            }
-        }
-        var sigComp = URLComponents()
-        sigComp.path = "/search"
-        sigComp.queryItems = qi
-        let signedPath = HMACAuth.canonicalPath("/search", query: sigComp.percentEncodedQuery)
-
-        var urlComp = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false) ?? URLComponents()
-        urlComp.path = (urlComp.path) + "/search"
-        urlComp.queryItems = qi
-        guard let url = urlComp.url else { throw URLError(.badURL) }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        sign(&req, method: "GET", signedPath: signedPath, bodyHash: HMACAuth.emptyBodyHashHex)
-        let (data, resp) = try await data(for: req)
-        try Self.requireOK(resp)
-        let page = try decoder.decode(SearchPageWire.self, from: data)
-        var snippets: [String: String] = [:]
-        for hit in page.items {
-            if let s = hit.snippet { snippets[hit.item.id] = s }
-        }
-        return (page.items.map(\.item), snippets, page.count)
-    }
-
     // MARK: - POST /pin/<id>?pinned=1|0
 
-    /// 跨 origin 切 item.pinned。Mac server 调 `database.setPinnedAny`,本机生效 + 通过
-    /// /since 同步给其他 mirror peer(已知 limitation:不回传 origin 设备,本机 fold
-    /// "pinned OR" 让搜索语义对齐——见 server 端 `/pin/:id` 路由 doc)。
+    /// owner-routed pin command。operation ID 在所有 fan-out route 间稳定；非 owner Mac
+    /// 返回 pending 并持久化转发，owner 返回 applied receipt。
     ///
-    /// body 空,id + query 都被 HMAC 签名所覆盖(canonicalPath 同 /search 处理 query)。
+    /// body 空,id + query 都被 HMAC canonicalPath 签名所覆盖。
     /// 错误处理:404 → `.itemNotFound`(本机视图比 Mac 新,swallow);410 → `.itemTombstoned`
     /// (Mac 已删,UI 应自然 reconcile);200 noop=true 是幂等成功,跟 200 普通成功语义等价
-    func pinItem(id: String, pinned: Bool) async throws {
+    enum PinItemResult: Sendable, Equatable {
+        case applied
+        case pending
+    }
+
+    private struct PinItemResponse: Decodable {
+        let state: String?
+    }
+
+    func pinItem(id: String, pinned: Bool, operationID: String) async throws -> PinItemResult {
         let q = pinned ? "1" : "0"
-        let qi = [URLQueryItem(name: "pinned", value: q)]
+        let qi = [
+            URLQueryItem(name: "pinned", value: q),
+            URLQueryItem(name: "operation_id", value: operationID),
+        ]
         var sigComp = URLComponents()
         sigComp.path = "/pin/\(id)"
         sigComp.queryItems = qi
@@ -257,10 +208,13 @@ actor PeerClient {
         req.httpMethod = "POST"
         req.httpBody = Data()
         sign(&req, method: "POST", signedPath: signedPath, bodyHash: HMACAuth.emptyBodyHashHex)
-        let (_, resp) = try await data(for: req)
+        let (data, resp) = try await data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw PeerClientError.nonHTTP }
         switch http.statusCode {
-        case 200...299: return
+        case 200...299:
+            // 老 daemon 没 state 字段但仍返回 2xx：按 applied 兼容读取。
+            let state = try? decoder.decode(PinItemResponse.self, from: data).state
+            return state == "pending" ? .pending : .applied
         case 404: throw PeerClientError.itemNotFound
         case 410: throw PeerClientError.itemTombstoned
         default: throw PeerClientError.httpStatus(http.statusCode)
@@ -306,6 +260,9 @@ actor PeerClient {
         req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
         req.setValue(bodyHash, forHTTPHeaderField: HMACAuth.bodyHashHeader)
         req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
+        if let token = config.credentialToken {
+            req.setValue(token, forHTTPHeaderField: HMACAuth.credentialTokenHeader)
+        }
     }
 
     private func data(for req: URLRequest) async throws -> (Data, URLResponse) {

@@ -7,24 +7,6 @@ import DuoPasteCore
 /// P0-2 GET /search?q=<text>:iOS client 用——本机 SearchAPI fold-aware 搜索 + count。
 /// 验证:HMAC 通过 + fold-aware(跨 origin 同 text 折一条)+ snippet 标记 + 空 q 走列表。
 
-private typealias DuoDB = DuoPasteCore.Database
-
-private func makeSearchServerFixture(items: [Item]) throws -> (DuoDB, BlobStore, HMACAuth, Int) {
-    let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-search-http-\(UUID().uuidString)", isDirectory: true)
-    let paths = Paths(root: root)
-    paths.ensureExists()
-    let db = try DuoDB(path: paths.mainDB)
-    try db.pool.write { conn in
-        for it in items { try it.insert(conn) }
-    }
-    let blobs = BlobStore(root: paths.blobsDir)
-    try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
-    let auth = HMACAuth(secret: Data(repeating: 0xCD, count: 32))
-    let port = Int.random(in: 19500..<20500)
-    return (db, blobs, auth, port)
-}
-
 private func textItem(id: String, origin: String, text: String, capturedAtNs: Int64) -> Item {
     Item(
         id: id,
@@ -35,24 +17,6 @@ private func textItem(id: String, origin: String, text: String, capturedAtNs: In
         preview: text,
         textFull: text
     )
-}
-
-private func waitReadySearch(baseURL: URL, auth: HMACAuth) async -> Bool {
-    for _ in 0..<50 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        var req = URLRequest(url: baseURL.appendingPathComponent("health"))
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = auth.sign(timestampMs: ts, method: "GET", path: "/health",
-                            bodyHashHex: HMACAuth.emptyBodyHashHex)
-        req.setValue(String(ts), forHTTPHeaderField: HMACAuth.timestampHeader)
-        req.setValue(HMACAuth.emptyBodyHashHex, forHTTPHeaderField: HMACAuth.bodyHashHeader)
-        req.setValue(sig, forHTTPHeaderField: HMACAuth.signatureHeader)
-        if let (_, resp) = try? await URLSession.shared.data(for: req),
-           let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-            return true
-        }
-    }
-    return false
 }
 
 private func getSearch(
@@ -95,6 +59,42 @@ async throws -> (Int, [String: Any]) {
     return (http.statusCode, json)
 }
 
+private func requestSearch(
+    items: [Item],
+    q: String?,
+    limit: Int? = nil,
+    kinds: String? = nil,
+    fileSubKinds: String? = nil,
+    textSuffixes: String? = nil,
+    tamperSig: Bool = false
+) async throws -> (Int, [String: Any]) {
+    let fixture = try TestSyncServerFixture(
+        prefix: "duo-search-http",
+        items: items,
+        secretByte: 0xCD
+    )
+    let server = SyncServer(
+        deviceID: "p",
+        database: fixture.database,
+        blobs: fixture.blobs,
+        host: "127.0.0.1",
+        port: 0,
+        auth: fixture.auth
+    )
+    return try await fixture.withServer(server) { baseURL in
+        try await getSearch(
+            baseURL: baseURL,
+            auth: fixture.auth,
+            q: q,
+            limit: limit,
+            kinds: kinds,
+            fileSubKinds: fileSubKinds,
+            textSuffixes: textSuffixes,
+            tamperSig: tamperSig
+        )
+    }
+}
+
 /// 通用 file item 工厂——给 qualifier filter 测试用。textFull 走 LIKE 后缀路径,
 /// blobMime 走 SearchAPI subKindSQL 走 mime 路径
 private func fileItem(
@@ -131,15 +131,7 @@ struct SearchHTTPTests {
             textItem(id: "b", origin: "mac-1", text: "goodbye world", capturedAtNs: 200),
             textItem(id: "c", origin: "mac-1", text: "another item",  capturedAtNs: 300),
         ]
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: "world")
+        let (status, body) = try await requestSearch(items: items, q: "world")
         #expect(status == 200)
         #expect(body["ok"] as? Bool == true)
         #expect(body["count"] as? Int == 2)
@@ -159,15 +151,7 @@ struct SearchHTTPTests {
             textItem(id: "own", origin: "mac-self",  text: "duplicate",  capturedAtNs: 100),
             textItem(id: "peer", origin: "mac-other", text: "duplicate", capturedAtNs: 200),
         ]
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: "duplicate")
+        let (status, body) = try await requestSearch(items: items, q: "duplicate")
         #expect(status == 200)
         #expect(body["count"] as? Int == 1)
         let arr = body["items"] as? [[String: Any]] ?? []
@@ -180,15 +164,7 @@ struct SearchHTTPTests {
             textItem(id: "mid", origin: "mac-1", text: "middle", capturedAtNs: 200),
             textItem(id: "new", origin: "mac-1", text: "newest", capturedAtNs: 300),
         ]
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: nil)
+        let (status, body) = try await requestSearch(items: items, q: nil)
         #expect(status == 200)
         #expect(body["count"] as? Int == 3)
         let arr = body["items"] as? [[String: Any]] ?? []
@@ -203,15 +179,7 @@ struct SearchHTTPTests {
         var dead = textItem(id: "dead", origin: "mac-1", text: "lost", capturedAtNs: 100)
         dead.deletedAtNs = 150
         let live = textItem(id: "live", origin: "mac-1", text: "lost", capturedAtNs: 200)
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: [dead, live])
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: "lost")
+        let (status, body) = try await requestSearch(items: [dead, live], q: "lost")
         #expect(status == 200)
         // tombstone 不参与 fold,只命中 live 那条
         #expect(body["count"] as? Int == 1)
@@ -220,17 +188,8 @@ struct SearchHTTPTests {
     }
 
     @Test func searchRejectsBadSignature() async throws {
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: [
-            textItem(id: "a", origin: "p", text: "x", capturedAtNs: 100)
-        ])
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, _) = try await getSearch(baseURL: base, auth: auth, q: "x", tamperSig: true)
+        let items = [textItem(id: "a", origin: "p", text: "x", capturedAtNs: 100)]
+        let (status, _) = try await requestSearch(items: items, q: "x", tamperSig: true)
         #expect(status == 401)
     }
 
@@ -247,16 +206,8 @@ struct SearchHTTPTests {
             url.kind = .url
             items.append(url)
         }
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
         // 空 query + kinds=url → 只返 url
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: nil, kinds: "url")
+        let (status, body) = try await requestSearch(items: items, q: nil, kinds: "url")
         #expect(status == 200)
         #expect(body["count"] as? Int == 5)
         let arr = body["items"] as? [[String: Any]] ?? []
@@ -272,15 +223,7 @@ struct SearchHTTPTests {
         items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/doc.pdf", blobMime: "application/pdf", capturedAtNs: 100))
         items.append(fileItem(id: "mp4-1", textFull: "/Users/bob/clip.mp4", blobMime: "video/mp4", capturedAtNs: 200))
         items.append(fileItem(id: "mp3-1", textFull: "/Users/bob/song.mp3", blobMime: "audio/mpeg", capturedAtNs: 300))
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: nil, fileSubKinds: "pdf")
+        let (status, body) = try await requestSearch(items: items, q: nil, fileSubKinds: "pdf")
         #expect(status == 200)
         #expect(body["count"] as? Int == 1)
         let arr = body["items"] as? [[String: Any]] ?? []
@@ -295,16 +238,8 @@ struct SearchHTTPTests {
         url.kind = .url
         items.append(url)
         items.append(fileItem(id: "pdf-1", textFull: "/path/doc.pdf", blobMime: "application/pdf", capturedAtNs: 300))
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(
-            baseURL: base, auth: auth, q: nil,
+        let (status, body) = try await requestSearch(
+            items: items, q: nil,
             kinds: "url", fileSubKinds: "pdf"
         )
         #expect(status == 200)
@@ -323,16 +258,8 @@ struct SearchHTTPTests {
         items.append(fileItem(id: "java-1", textFull: "/Users/bob/Main.java", capturedAtNs: 100))
         items.append(fileItem(id: "py-1", textFull: "/Users/bob/script.py", capturedAtNs: 200))
         items.append(fileItem(id: "swift-1", textFull: "/Users/bob/App.swift", capturedAtNs: 300))
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(
-            baseURL: base, auth: auth, q: nil,
+        let (status, body) = try await requestSearch(
+            items: items, q: nil,
             textSuffixes: ".java,.py"
         )
         #expect(status == 200)
@@ -347,16 +274,8 @@ struct SearchHTTPTests {
         var items: [Item] = []
         items.append(fileItem(id: "java-1", textFull: "/Users/bob/Main.java", capturedAtNs: 100))
         items.append(fileItem(id: "py-1", textFull: "/Users/bob/x.py", capturedAtNs: 200))
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(
-            baseURL: base, auth: auth, q: nil,
+        let (status, body) = try await requestSearch(
+            items: items, q: nil,
             textSuffixes: "java"  // 没 dot
         )
         #expect(status == 200)
@@ -370,17 +289,9 @@ struct SearchHTTPTests {
         var items: [Item] = []
         items.append(textItem(id: "t-1", origin: "mac-1", text: "hello", capturedAtNs: 100))
         items.append(textItem(id: "t-2", origin: "mac-1", text: "world", capturedAtNs: 200))
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
         // bogus kind → kinds 解析后为空数组 → 不 filter,跟没 kinds 等价
-        let (status, body) = try await getSearch(
-            baseURL: base, auth: auth, q: nil, kinds: "bogus_kind"
+        let (status, body) = try await requestSearch(
+            items: items, q: nil, kinds: "bogus_kind"
         )
         #expect(status == 200)
         #expect(body["count"] as? Int == 2)
@@ -393,16 +304,8 @@ struct SearchHTTPTests {
             textItem(id: "a", origin: "mac-1", text: "hello world", capturedAtNs: 100),
             textItem(id: "b", origin: "mac-1", text: "another", capturedAtNs: 200),
         ]
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
         // 仅 q,不发任何 qualifier query param
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: "hello")
+        let (status, body) = try await requestSearch(items: items, q: "hello")
         #expect(status == 200)
         #expect(body["count"] as? Int == 1)
         #expect((body["items"] as? [[String: Any]])?.first?["id"] as? String == "a")
@@ -428,21 +331,13 @@ struct SearchHTTPTests {
         // 干扰项:非图片 file
         items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/doc.pdf", blobMime: "application/pdf", capturedAtNs: 300))
 
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
         // 走 iOS 真路径:encodeToWire([.imageMerged]) → 拿到 wire 串直接打 server
         let wire = QueryQualifier.encodeToWire([.imageMerged])
         #expect(wire.kinds == "image", "encodeToWire contract changed?")
         #expect(wire.fileSubKinds == "imageFile", "encodeToWire contract changed?")
 
-        let (status, body) = try await getSearch(
-            baseURL: base, auth: auth, q: nil,
+        let (status, body) = try await requestSearch(
+            items: items, q: nil,
             kinds: wire.kinds, fileSubKinds: wire.fileSubKinds
         )
         #expect(status == 200)
@@ -459,17 +354,9 @@ struct SearchHTTPTests {
         var items: [Item] = []
         items.append(fileItem(id: "imgfile-1", textFull: "/Users/bob/p.png", blobMime: "image/png", capturedAtNs: 100))
         items.append(fileItem(id: "pdf-1", textFull: "/Users/bob/d.pdf", blobMime: "application/pdf", capturedAtNs: 200))
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
         for variant in ["imageFile", "imagefile", "IMAGEFILE", "image_file", "image-file"] {
-            let (status, body) = try await getSearch(
-                baseURL: base, auth: auth, q: nil, fileSubKinds: variant
+            let (status, body) = try await requestSearch(
+                items: items, q: nil, fileSubKinds: variant
             )
             #expect(status == 200, "variant \(variant) status")
             #expect(body["count"] as? Int == 1, "variant \(variant) count")
@@ -483,15 +370,7 @@ struct SearchHTTPTests {
         let items = (1...10).map { i in
             textItem(id: "row-\(i)", origin: "p", text: "text-\(i)", capturedAtNs: Int64(i))
         }
-        let (db, blobs, auth, port) = try makeSearchServerFixture(items: items)
-        let server = SyncServer(deviceID: "p", database: db, blobs: blobs,
-                                host: "127.0.0.1", port: port, auth: auth)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-        let base = URL(string: "http://127.0.0.1:\(port)")!
-        #expect(await waitReadySearch(baseURL: base, auth: auth))
-
-        let (status, body) = try await getSearch(baseURL: base, auth: auth, q: nil, limit: 99999)
+        let (status, body) = try await requestSearch(items: items, q: nil, limit: 99999)
         #expect(status == 200)
         // 实际只有 10 条,limit clamp 没影响结果
         #expect(body["count"] as? Int == 10)

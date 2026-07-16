@@ -1,5 +1,10 @@
 # 多重身份分类 + OCR 前向兼容设计
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 截图里观察到两个分类违和：

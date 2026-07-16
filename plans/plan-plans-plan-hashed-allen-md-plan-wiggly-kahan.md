@@ -1,5 +1,10 @@
 # 三端删除一致性 — 7 步实施版
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 > 执行版 of `plans/plan-hashed-allen.md`。每步独立 commit + 测试通过才走下一步。代码位置已对照当前 HEAD 验证。
 
 ## Context

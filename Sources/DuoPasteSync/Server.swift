@@ -6,10 +6,12 @@ import HummingbirdTLS
 import HummingbirdWebSocket
 import NIOSSL
 import HTTPTypes
+import ServiceLifecycle
+import UnixSignals
 import DuoPasteCore
 
-/// 包装 Hummingbird Application 的启动入口。M2 当前暴露 `/health` + `/ingest`，
-/// 后续 `/search /since /blob` 在同一个 Router 上追加。
+/// 包装 Hummingbird Application 的 mesh server 启动入口。
+/// 每台启用 `serve` 的 Mac 都暴露 health、增量同步、blob、mutation、配对与 WS 路由。
 ///
 /// 用法：
 ///
@@ -24,11 +26,12 @@ public struct SyncServer: Sendable {
     public let port: Int
     public let blobs: BlobStore
     public let auth: HMACAuth
+    public let credentialAuthenticator: DeviceCredentialAuthenticator?
     /// 为空 → HTTP（依赖 Tailscale WG 加密）；非空 → HTTPS（PEM cert+key 路径）。
     public let tls: TLSPaths?
     /// PR 3 WebSocket 通知层。`/sync/ws` 接到 Upgrade 后把 outbound writer 注册进去，
     /// CaptureService 完成 writer tx 调 `broadcaster.broadcastCursorAdvanced(...)` fan-out。
-    /// nil → server 不支持 WS（standalone primary / 测试），仍能正常 serve HTTP。
+    /// nil → server 不支持 WS（standalone / 测试），仍能正常 serve HTTP。
     public let broadcaster: WSBroadcaster?
 
     public struct TLSPaths: Sendable {
@@ -61,15 +64,17 @@ public struct SyncServer: Sendable {
     /// 没启用 pairing)
     public let pairingService: PairingService?
 
-    /// 本机 HTTP `/bump` / `DELETE /item` / `POST /pin` 落库后的回调——签名 (id, newIngestedAtNs)。
-    /// Mac daemon 用它刷新本机 UI(让 SearchView 即时反映"复制即顶"/"刚删"/"刚切 pin")。
-    /// **noop 路径不调**:setPinnedAny 已是目标状态时返 nil,handler 不调 onItemMutated
-    /// 测试/headless server 默认 no-op。WS broadcaster 只通知 peer,不会自动刷新本进程 SwiftUI state。
+    /// 本机 `/bump` / `DELETE /item` / owner `/pin` canonical 落库后的回调。
+    /// 非 owner pin queue 走 `onPinOperationQueued`；duplicate receipt 不重复回调。
     public let onItemMutated: @Sendable (String, Int64) -> Void
+
+    /// 非 owner 收到 pin command 并持久化后唤醒 mesh workers，缩短离线恢复后的投递延迟。
+    public let onPinOperationQueued: @Sendable () -> Void
 
     /// `/pair/<pin>` 路由是否要求本机起 TLS。默 true。
     ///
-    /// **为什么硬护栏**：/pair response body 含 `secret: hex` 明文（iOS 拿来当 HMAC 主密钥）。
+    /// **为什么硬护栏**：/pair response body 含独立 request secret + credential token
+    /// （旧 iOS rolling-upgrade 路径仍可能拿 legacy secret）。
     /// 当 daemon 跑 plain HTTP（`tls == nil`），即便 PIN 单次有效 + 5 次封锁，secret 仍会
     /// 落到任意 LAN 中间人手里（咖啡馆 AP / 公司透明代理 / 路由器被攻陷场景）。Tailscale
     /// 网络下走 WG 加密所以 plain HTTP 也安全，但 iOS 配对路径常走 .local 或直连 IP——
@@ -85,6 +90,7 @@ public struct SyncServer: Sendable {
         host: String,
         port: Int,
         auth: HMACAuth,
+        credentialAuthenticator: DeviceCredentialAuthenticator? = nil,
         tls: TLSPaths? = nil,
         broadcaster: WSBroadcaster? = nil,
         ponteHostProvider: @escaping @Sendable () -> String? = { SurgePonte.discoverSelfHostname() },
@@ -93,6 +99,7 @@ public struct SyncServer: Sendable {
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil,
         onItemMutated: @escaping @Sendable (String, Int64) -> Void = { _, _ in },
+        onPinOperationQueued: @escaping @Sendable () -> Void = {},
         requirePairingTLS: Bool = true
     ) {
         self.deviceID = deviceID
@@ -101,6 +108,7 @@ public struct SyncServer: Sendable {
         self.host = host
         self.port = port
         self.auth = auth
+        self.credentialAuthenticator = credentialAuthenticator
         self.tls = tls
         self.broadcaster = broadcaster
         self.ponteHostProvider = ponteHostProvider
@@ -109,19 +117,27 @@ public struct SyncServer: Sendable {
         self.meshEndpointsProvider = meshEndpointsProvider
         self.pairingService = pairingService
         self.onItemMutated = onItemMutated
+        self.onPinOperationQueued = onPinOperationQueued
         self.requirePairingTLS = requirePairingTLS
         // 显式配 pairingService 但跑 plain HTTP 且未 opt-out → 启动时即拉响警报，
         // 不要等 /pair 真被打了才拒。运维侧能立刻看到 stderr 修配置
         if requirePairingTLS, tls == nil, pairingService != nil {
             FileHandle.standardError.write(Data(
-                "WARN: /pair enabled on plain HTTP — secret would leak in plaintext; route will return 503 until TLS is configured\n".utf8
+                "WARN: /pair enabled on plain HTTP — credentials would leak in plaintext; route will return 503 until TLS is configured\n".utf8
             ))
         }
     }
 
-    public func run() async throws {
+    /// 启动 server。`onServerListening` 在 socket bind 成功后回传真实端口；生产默认忽略，
+    /// 测试用 `port = 0` 配合该回调取得系统分配端口，避免先猜端口再轮询 `/health`。
+    public func run(
+        onServerListening: @escaping @Sendable (Int) -> Void = { _ in }
+    ) async throws {
         let router = Router()
-        router.add(middleware: HMACAuthMiddleware(auth: auth))
+        router.add(middleware: HMACAuthMiddleware(
+            auth: auth,
+            credentialAuthenticator: credentialAuthenticator
+        ))
         // 启动时一次性发现本机 Surge Ponte 主机名（没装 Surge → nil）。结果常驻 server 生命周期，
         // 不每个 /health 重读 plist。SGCore.plist 真改了要重启 daemon 才会刷新，可接受——
         // Surge 配置变更本来就属于运维事件
@@ -139,9 +155,11 @@ public struct SyncServer: Sendable {
             endpointsProvider: endpointsProvider,
             meshEndpointsProvider: meshEndpointsProvider,
             pairingService: pairingService,
+            credentialAuthenticator: credentialAuthenticator,
             // requirePairingTLS=true 且本机没起 TLS → handler 直接 503 不消耗 PIN
             pairingDisabled: (requirePairingTLS && tls == nil),
-            onItemMutated: onItemMutated
+            onItemMutated: onItemMutated,
+            onPinOperationQueued: onPinOperationQueued
         )
 
         let serverConfig = ApplicationConfiguration(
@@ -155,6 +173,7 @@ public struct SyncServer: Sendable {
         if let broadcaster {
             let wsRouter = Self.makeWebSocketRouter(
                 auth: auth,
+                credentialAuthenticator: credentialAuthenticator,
                 deviceID: deviceID,
                 database: database,
                 broadcaster: broadcaster
@@ -172,9 +191,14 @@ public struct SyncServer: Sendable {
             let app = Application(
                 router: router,
                 server: serverBuilder,
-                configuration: serverConfig
+                configuration: serverConfig,
+                onServerRunning: { channel in
+                    if let actualPort = channel.localAddress?.port {
+                        onServerListening(actualPort)
+                    }
+                }
             )
-            try await app.runService()
+            try await Self.runApplication(app)
             return
         }
 
@@ -183,12 +207,44 @@ public struct SyncServer: Sendable {
             let app = Application(
                 router: router,
                 server: try .tls(.http1(), tlsConfiguration: tlsConfig),
-                configuration: serverConfig
+                configuration: serverConfig,
+                onServerRunning: { channel in
+                    if let actualPort = channel.localAddress?.port {
+                        onServerListening(actualPort)
+                    }
+                }
             )
-            try await app.runService()
+            try await Self.runApplication(app)
         } else {
-            let app = Application(router: router, configuration: serverConfig)
-            try await app.runService()
+            let app = Application(
+                router: router,
+                configuration: serverConfig,
+                onServerRunning: { channel in
+                    if let actualPort = channel.localAddress?.port {
+                        onServerListening(actualPort)
+                    }
+                }
+            )
+            try await Self.runApplication(app)
+        }
+    }
+
+    /// 显式把 Task cancellation 转成 ServiceLifecycle graceful shutdown。测试 fixture
+    /// 会 await server task 收尾，因此每个 case 结束时 listener / DB reader 都已释放；生产
+    /// 仍保留 SIGTERM/SIGINT 触发的同一条 graceful shutdown 路径。
+    private static func runApplication<App: ApplicationProtocol>(_ app: App) async throws {
+        let serviceGroup = ServiceGroup(
+            configuration: .init(
+                services: [app],
+                gracefulShutdownSignals: [.sigterm, .sigint],
+                logger: app.logger
+            )
+        )
+        let runTask = Task { try await serviceGroup.run() }
+        try await withTaskCancellationHandler {
+            try await runTask.value
+        } onCancel: {
+            Task { await serviceGroup.triggerGracefulShutdown() }
         }
     }
 
@@ -203,12 +259,16 @@ public struct SyncServer: Sendable {
     /// inbound 才能让 close 信号传播；defer unregister 保证连接关闭时 broadcaster 清理。
     static func makeWebSocketRouter(
         auth: HMACAuth,
+        credentialAuthenticator: DeviceCredentialAuthenticator? = nil,
         deviceID: String,
         database: DuoPasteCore.Database,
         broadcaster: WSBroadcaster
     ) -> Router<BasicWebSocketRequestContext> {
         let wsRouter = Router(context: BasicWebSocketRequestContext.self)
-        wsRouter.middlewares.add(HMACAuthMiddleware<BasicWebSocketRequestContext>(auth: auth))
+        wsRouter.middlewares.add(HMACAuthMiddleware<BasicWebSocketRequestContext>(
+            auth: auth,
+            credentialAuthenticator: credentialAuthenticator
+        ))
         wsRouter.ws("/sync/ws") { _, _ in
             .upgrade([:])
         } onUpgrade: { inbound, outbound, _ in
@@ -302,11 +362,13 @@ public struct SyncServer: Sendable {
         endpointsProvider: @escaping @Sendable () -> [PeerEndpoint] = { [] },
         meshEndpointsProvider: @escaping @Sendable () async -> [MeshPeerEntry]? = { nil },
         pairingService: PairingService? = nil,
+        credentialAuthenticator: DeviceCredentialAuthenticator? = nil,
         /// /pair 路由禁用（不消耗 PIN，直接 503）。生产路径在 SyncServer.init 内根据
         /// `requirePairingTLS && tls == nil` 推导——plain HTTP daemon 不该暴露 secret 明文。
         /// 测试场景默 false 不动行为
         pairingDisabled: Bool = false,
-        onItemMutated: @escaping @Sendable (String, Int64) -> Void = { _, _ in }
+        onItemMutated: @escaping @Sendable (String, Int64) -> Void = { _, _ in },
+        onPinOperationQueued: @escaping @Sendable () -> Void = {}
     ) {
         router.get("/health") { _, _ -> Response in
             var payload: [String: String] = [
@@ -323,6 +385,24 @@ public struct SyncServer: Sendable {
             var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
             resp.headers[.contentType] = "application/json"
             return resp
+        }
+
+        // 小规模永久 tombstone 全量返回。Mac mesh 仍用 legacy root HMAC 拉取；旧 peer
+        // 没这条 route 会 404，PullWorker 把它当 rolling-upgrade unsupported。
+        router.get("/auth/revocations") { _, _ -> Response in
+            do {
+                let page = DeviceCredentialRevocationsPage(
+                    revocations: try await database.listDeviceCredentialRevocations()
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(page)
+                var response = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                response.headers[.contentType] = "application/json"
+                return response
+            } catch {
+                return errorJSON(.internalServerError, "revocations failed: \(error)")
+            }
         }
 
         // GET /blob/{sha256}：取 blob bytes。
@@ -483,20 +563,9 @@ public struct SyncServer: Sendable {
             }
         }
 
-        // POST /pin/{id}?pinned=1|0:切换 item.pinned。跨 origin 生效(走
-        // database.setPinnedAny,不带 own-origin guard,跟 /bump /item DELETE 心智一致)。
-        // iOS 长按"置顶/取消置顶"路径专用。**Mac UI 路径**(AppState.togglePin / SearchView
-        // contextMenu / ⌘P)走进程内 database.setPinnedAny + broadcaster fan-out 同款语义,
-        // 不走 HTTP 自环;严格 own-origin 变体 database.setPinned 现状无生产调用。
-        //
-        // query 里读 pinned:`pinned=1` → 置顶,`pinned=0` → 取消。空 / 其它值返 400。
-        // 不接受 body(空 body hash),id 跟 query 都被 HMAC 签名所覆盖。已是目标状态返 200
-        // (handler 当幂等成功),已 tombstoned 返 410,未知 id 返 404。
-        //
-        // **已知 limitation**(完整列表写在 setPinnedAny doc):跨 origin pin 不回传 origin
-        // 设备 + origin 后续任何 ingested_at_ns bump 会通过 /since INSERT OR REPLACE 把
-        // 其他 mirror peer 上跨 origin 打的 pin 静默抹掉。本机 fold 路径"pinned OR 聚合"
-        // 让搜索语义本机 + 其他 mirror peer 一致(但不能 hold 住 origin 后续 mutation 的覆盖)
+        // POST /pin/{id}?pinned=1|0&operation_id=<uuid>：owner-routed 绝对值命令。
+        // operation_id 可选以兼容旧 iOS；缺失时本机生成。owner canonical apply + receipt；
+        // 非 owner 只乐观更新并持久化 pending，由绑定 owner peer 的 PullWorker 投递。
         router.post("/pin/:id") { request, context -> Response in
             guard let id = context.parameters.get("id"), !id.isEmpty else {
                 return errorJSON(.badRequest, "missing id")
@@ -511,6 +580,11 @@ public struct SyncServer: Sendable {
             default:
                 return errorJSON(.badRequest, "pinned must be 0 or 1")
             }
+            let operationID = request.uri.queryParameters.get("operation_id").map { String($0) }
+                ?? UUID().uuidString
+            guard !operationID.isEmpty, operationID.utf8.count <= 128 else {
+                return errorJSON(.badRequest, "invalid operation_id")
+            }
             let bodyBuf = try await request.body.collect(upTo: 16 * 1024)
             let bodyHash = HMACAuth.sha256Hex(Data(buffer: bodyBuf))
             guard let bodyHashHeaderName = HTTPField.Name(HMACAuth.bodyHashHeader) else {
@@ -522,46 +596,67 @@ public struct SyncServer: Sendable {
             }
             let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
             do {
-                // setPinnedAny 已是目标状态 → 返回 nil。当幂等成功处理：不 fan-out 也不
-                // 推 cursor_advanced(因为本机 ingested_at_ns 没动)。response 仍 200 让
-                // iOS 端把 UI 跟 server 状态对齐
-                let newIngest = try await database.setPinnedAny(id: id, pinned: pinned, now: now)
-                if let newIngest {
-                    onItemMutated(id, newIngest)
-                    if let broadcaster {
-                        Task {
-                            await broadcaster.broadcastCursorAdvanced(
-                                deviceID: deviceID,
-                                latestIngestedAtNs: newIngest
-                            )
+                let result = try await database.submitPinIntent(
+                    id: id,
+                    pinned: pinned,
+                    operationID: operationID,
+                    selfDeviceID: deviceID,
+                    now: now
+                )
+                switch result {
+                case .applied(_, let newIngest, let duplicate):
+                    if !duplicate {
+                        onItemMutated(id, newIngest)
+                        if let broadcaster {
+                            Task {
+                                await broadcaster.broadcastCursorAdvanced(
+                                    deviceID: deviceID,
+                                    latestIngestedAtNs: newIngest
+                                )
+                            }
                         }
                     }
-                    let payload: [String: Any] = ["ok": true, "ingested_at_ns": newIngest, "pinned": pinned]
+                    let payload: [String: Any] = [
+                        "ok": true,
+                        "state": "applied",
+                        "operation_id": operationID,
+                        "ingested_at_ns": newIngest,
+                        "pinned": pinned,
+                        "duplicate": duplicate,
+                    ]
                     let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-                    var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
-                    resp.headers[.contentType] = "application/json"
-                    return resp
-                } else {
-                    // noop:已是目标状态。**不** onItemMutated / broadcaster fan-out ——
-                    // ingested_at_ns 没动,对端 /since 看不到新东西,推 cursor_advanced 等于
-                    // 浪费 RTT 让 peer pull 空页。响应仍带 pinned 让 client 对齐 UI
-                    let payload: [String: Any] = ["ok": true, "pinned": pinned, "noop": true]
+                    var response = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
+                    response.headers[.contentType] = "application/json"
+                    return response
+                case .pending:
+                    onPinOperationQueued()
+                    let payload: [String: Any] = [
+                        "ok": true,
+                        "state": "pending",
+                        "operation_id": operationID,
+                        "pinned": pinned,
+                    ]
                     let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-                    var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
-                    resp.headers[.contentType] = "application/json"
-                    return resp
+                    var response = Response(status: .accepted, body: .init(byteBuffer: .init(bytes: data)))
+                    response.headers[.contentType] = "application/json"
+                    return response
                 }
             } catch BumpError.notFound {
                 return errorJSON(.notFound, "item not found")
             } catch BumpError.deleted {
                 return errorJSON(.gone, "item is tombstoned")
+            } catch PinOperationError.operationIDConflict {
+                return errorJSON(.conflict, "operation_id payload conflict")
+            } catch PinOperationError.invalidOperationID {
+                return errorJSON(.badRequest, "invalid operation_id")
             } catch {
                 return errorJSON(.internalServerError, "pin failed: \(error)")
             }
         }
 
         // POST /pair/{pin}:iOS PIN 配对入口。**无 HMAC**(AuthMiddleware 白名单跳过)。
-        // 校验 PIN → 原子返回 shared-secret hex + 当前 endpoints page。
+        // 校验 PIN → 新客户端原子返回独立 credential + endpoints；空 body 旧客户端
+        // 继续返回 legacy shared-secret（rolling upgrade）。
         //
         // 安全:
         // - PIN 单次有效 + 60s expiry + 5 次错误封锁(都在 PairingService 里)
@@ -587,11 +682,43 @@ public struct SyncServer: Sendable {
                   pin.allSatisfy({ $0.isASCII && $0.isNumber }) else {
                 return errorJSON(.badRequest, "pin must be 6 digits")
             }
-            // body 必须空(或忽略)——drain 避免 hbws 投诉
-            _ = try? await request.body.collect(upTo: 1024)
+            let requestBody: Data
+            do {
+                let buffer = try await request.body.collect(upTo: 8 * 1024)
+                requestBody = Data(buffer.readableBytesView)
+            } catch {
+                return errorJSON(.contentTooLarge, "pairing metadata too large")
+            }
+            let clientInfo: PairingClientInfo?
+            if requestBody.isEmpty {
+                clientInfo = nil
+            } else {
+                do {
+                    clientInfo = try JSONDecoder().decode(PairingClientInfo.self, from: requestBody)
+                } catch {
+                    return errorJSON(.badRequest, "invalid pairing metadata")
+                }
+            }
             do {
                 let secret = try await service.validateAndConsumePIN(pin)
-                let hex = secret.map { String(format: "%02x", $0) }.joined()
+                let legacySecret: String?
+                let credential: PairCredentialWire?
+                if let clientInfo, let credentialAuthenticator {
+                    let issued = try await credentialAuthenticator.issue(
+                        client: clientInfo,
+                        issuerDeviceID: deviceID
+                    )
+                    legacySecret = nil
+                    credential = PairCredentialWire(
+                        id: issued.credentialID,
+                        secret: issued.requestSecret.map { String(format: "%02x", $0) }.joined(),
+                        token: issued.token
+                    )
+                } else {
+                    // 空 body = 旧 iOS；rolling upgrade 期间继续给 legacy shared-secret。
+                    legacySecret = secret.map { String(format: "%02x", $0) }.joined()
+                    credential = nil
+                }
                 let page = PeerEndpointsPage(
                     deviceID: deviceID,
                     endpoints: endpointsProvider(),
@@ -600,7 +727,8 @@ public struct SyncServer: Sendable {
                 )
                 let payload = PairResponseWire(
                     ok: true,
-                    secret: hex,
+                    secret: legacySecret,
+                    credential: credential,
                     deviceID: deviceID,
                     endpointsPage: page
                 )
@@ -666,6 +794,8 @@ public struct SyncServer: Sendable {
                         "id": page.nextCursor.id,
                     ],
                     "has_more": page.hasMore,
+                    "total_count": page.totalCount,
+                    "source_device_id": deviceID,
                 ]
                 let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
                 var resp = Response(status: .ok, body: .init(byteBuffer: .init(bytes: data)))
@@ -832,14 +962,22 @@ public struct SyncServer: Sendable {
 
 private struct PairResponseWire: Encodable {
     let ok: Bool
-    let secret: String
+    let secret: String?
+    let credential: PairCredentialWire?
     let deviceID: String
     let endpointsPage: PeerEndpointsPage
 
     enum CodingKeys: String, CodingKey {
         case ok
         case secret
+        case credential
         case deviceID = "device_id"
         case endpointsPage = "endpoints_page"
     }
+}
+
+private struct PairCredentialWire: Encodable {
+    let id: String
+    let secret: String
+    let token: String
 }

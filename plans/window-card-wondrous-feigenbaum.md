@@ -1,5 +1,10 @@
 # 搜索 card 右键菜单 — Open With / 文本编辑器
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 搜索 panel 的每张 card 目前**完全没有右键菜单**（`SearchView.swift:813-849` 只有双击 paste / 单击 select / Cmd 多选 / Shift 区间选）。用户希望右键 card 能"用 XXX 打开"，类似 Finder 的 Open With。

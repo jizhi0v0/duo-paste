@@ -20,6 +20,9 @@ public struct HMACAuth: Sendable {
     public static let timestampHeader = "X-DP-Timestamp"
     public static let bodyHashHeader  = "X-DP-Body-SHA256"
     public static let signatureHeader = "X-DP-Auth"
+    /// 独立客户端 credential 的 mesh-root 密封 token。Header 一旦出现，服务端必须
+    /// 只走 device credential 校验，失败时不能回退 shared-secret（防 downgrade）。
+    public static let credentialTokenHeader = "X-DP-Credential"
 
     /// 空 body 的 sha256 hex，固定值，常用——客户端 GET 请求填这个。
     public static let emptyBodyHashHex =

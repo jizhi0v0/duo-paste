@@ -13,6 +13,7 @@ import DuoPasteCore
 /// 伪造一个合法签名但发任意 body。`HMACAuth.verifyBodyHash(...)` 工具方法待加。
 public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
     public let auth: HMACAuth
+    public let credentialAuthenticator: DeviceCredentialAuthenticator?
     public let now: @Sendable () -> Int64
     /// 路径前缀白名单——这些路径**跳过** HMAC 校验,handler 自己处理 auth(典型:`/pair/`
     /// PIN 配对路径,iOS 还没有 secret 不能签名,走 PIN + rate-limit 替代)
@@ -20,10 +21,12 @@ public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
 
     public init(
         auth: HMACAuth,
+        credentialAuthenticator: DeviceCredentialAuthenticator? = nil,
         now: @escaping @Sendable () -> Int64 = { Self.currentMs() },
         skipPathPrefixes: [String] = ["/pair/"]
     ) {
         self.auth = auth
+        self.credentialAuthenticator = credentialAuthenticator
         self.now = now
         self.skipPathPrefixes = skipPathPrefixes
     }
@@ -58,14 +61,35 @@ public struct HMACAuthMiddleware<Context: RequestContext>: RouterMiddleware {
         // `HMACAuth.canonicalPath` 走同一份拼接 helper
         let path = HMACAuth.canonicalPath(request.uri.path, query: request.uri.query)
 
-        let ok = auth.verify(
-            timestampMs: ts,
-            method: method,
-            path: path,
-            bodyHashHex: bodyHash,
-            signatureHex: sig,
-            nowMs: now()
-        )
+        let nowMs = now()
+        let credentialName = HTTPField.Name(HMACAuth.credentialTokenHeader)
+        let credentialToken = credentialName.flatMap { request.headers[$0] }
+        // Header 出现就只走 credential 路径；token 损坏/撤销/服务端尚未升级都不能
+        // 回退 shared-secret，否则攻击者可借双栈兼容制造 downgrade。
+        let ok: Bool
+        if let credentialToken {
+            guard let credentialAuthenticator else {
+                return Self.unauth("credential auth unsupported")
+            }
+            ok = await credentialAuthenticator.verify(
+                token: credentialToken,
+                timestampMs: ts,
+                method: method,
+                path: path,
+                bodyHashHex: bodyHash,
+                signatureHex: sig,
+                nowMs: nowMs
+            )
+        } else {
+            ok = auth.verify(
+                timestampMs: ts,
+                method: method,
+                path: path,
+                bodyHashHex: bodyHash,
+                signatureHex: sig,
+                nowMs: nowMs
+            )
+        }
         if !ok {
             // 失败时 dump server 看到的 raw URI 字节 + 重组后的 path——encoding 不一致时
             // 直接看出哪一侧解码漂移。raw URI 用 string 字段（Hummingbird 没 decode 过）

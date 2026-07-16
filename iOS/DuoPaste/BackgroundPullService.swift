@@ -3,8 +3,8 @@ import BackgroundTasks
 import DuoPasteCore
 
 /// iOS BGAppRefreshTask 后台 pull——app 后台挂起期间,系统**可能**每 N 分钟唤醒一次让我们
-/// 跑 ~30s 工作。当前用法:读 AppStorage 里的 peer config + persisted cursor → 拉 /since
-/// 几页 → 把 incoming items merge 到 HistoryStore 持久化文件 + bump cursor。
+/// 跑 ~30s 工作。当前用法:读 AppStorage 里的 peer config + SQLite cursor → 拉 /since
+/// 几页 → 通过与前台完全相同的 `MetadataMirrorStore.applyPage` 原子写 rows + cursor。
 ///
 /// 这条路径**纯后台**——没 UI,没 NSPasteboard,没 BlobCache。新 image 行不拉 blob 字节
 /// (没空,30s 跑完整 blob fetch 不现实);用户回前台 tap 那条 image 时再 lazy fetch。
@@ -74,64 +74,36 @@ enum BackgroundPullService {
 
     private static func runPull() async throws {
         let defs = UserDefaults.standard
-        guard let url = defs.string(forKey: "peerURL"),
-              let secret = defs.string(forKey: "sharedSecretHex"),
-              !url.isEmpty, !secret.isEmpty else {
+        guard let credential = try ClientCredentialKeychain.load() else {
             throw BackgroundPullError.notConfigured
         }
-        let cfg = try PeerConfig.parse(urlString: url, secretHex: secret)
+        let configuredURL = defs.string(forKey: "peerURL") ?? ""
+        let endpointURL: String
+        if !configuredURL.isEmpty {
+            endpointURL = configuredURL
+        } else if let json = defs.string(forKey: "peerEndpointsJSON"),
+                  let data = json.data(using: .utf8),
+                  let endpoints = try? JSONDecoder().decode([PeerEndpoint].self, from: data),
+                  let first = endpoints.first {
+            endpointURL = first.url
+        } else {
+            throw BackgroundPullError.notConfigured
+        }
+        guard let url = URL(string: endpointURL) else { throw BackgroundPullError.notConfigured }
+        let cfg = PeerConfig(
+            baseURL: url,
+            sharedSecret: credential.requestSecret,
+            credentialToken: credential.token
+        )
         let client = PeerClient(config: cfg)
 
-        var cursor: SinceCursor
-        if let saved = PersistedCursor.load() {
-            cursor = SinceCursor(ingestedAtNs: saved.ingestedAtNs, id: saved.id)
-        } else {
-            cursor = .zero
+        let mirror = try HistoryStore.openMirror()
+        _ = try await mirror.synchronize(
+            pageLimit: pageLimit,
+            maxPages: maxPages
+        ) { cursor, limit in
+            try await client.fetchSince(cursor: cursor, limit: limit)
         }
-        // 读已 persisted items(可能从前一次 BG 写)
-        var current: [Item] = []
-        if let data = try? Data(contentsOf: HistoryStore.itemsFile),
-           let restored = try? JSONDecoder().decode([Item].self, from: data) {
-            current = restored
-        }
-        var byID: [String: Item] = [:]
-        for it in current { byID[it.id] = it }
-
-        var pages = 0
-        while !Task.isCancelled, pages < maxPages {
-            let page = try await client.fetchSince(cursor: cursor, limit: pageLimit)
-            pages += 1
-            for it in page.items {
-                if it.isTombstone {
-                    byID.removeValue(forKey: it.id)
-                } else if let existing = byID[it.id], existing.capturedAtNs > it.capturedAtNs {
-                    var merged = it
-                    merged.capturedAtNs = existing.capturedAtNs
-                    byID[it.id] = merged
-                } else {
-                    byID[it.id] = it
-                }
-            }
-            cursor = page.nextCursor
-            PersistedCursor(
-                ingestedAtNs: cursor.ingestedAtNs,
-                id: cursor.id,
-                updatedAtUnix: Int64(Date().timeIntervalSince1970)
-            ).save()
-            if !page.hasMore { break }
-        }
-
-        // 排序 + 截断 + 落盘。HistoryStore.merge 同款逻辑 inlined(不依赖 store
-        // 实例——后台 task 没 SwiftUI 上下文)
-        let sorted = byID.values.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            return a.capturedAtNs > b.capturedAtNs
-        }
-        let trimmed = Array(sorted.prefix(1000))
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(trimmed)
-        try data.write(to: HistoryStore.itemsFile, options: .atomic)
     }
 }
 

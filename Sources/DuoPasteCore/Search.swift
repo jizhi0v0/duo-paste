@@ -155,6 +155,27 @@ public struct SearchAPI: Sendable {
     /// （跨 origin 同 text_full 折一条，pinned OR 聚合）→ 后置 kinds/pinnedOnly 过滤 →
     /// 排序契约（pinned/prefix24h/captured DESC）→ LIMIT/OFFSET。
     static func fetchHitsFolded(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
+        // Exact empty-result fast path for qualifier searches. Fold can change the representative
+        // row and OR pinned state, but it cannot synthesize a kind/sub-kind/suffix that no raw hit
+        // has. Probing the indexed SQL predicates first avoids decoding/folding 100k rows for a
+        // sparse chip that has zero matches. `pinnedOnly + qualifiers` is excluded because the pin
+        // and qualifier may live on different siblings of one fold group.
+        if !q.pinnedOnly,
+           (!q.kinds.isEmpty || !q.fileSubKinds.isEmpty || !q.textFullSuffixes.isEmpty) {
+            let probe = SearchQuery(
+                text: q.text,
+                fromNs: q.fromNs,
+                toNs: q.toNs,
+                kinds: q.kinds,
+                fileSubKinds: q.fileSubKinds,
+                textFullSuffixes: q.textFullSuffixes,
+                pinnedOnly: false,
+                includeDeleted: q.includeDeleted,
+                limit: 1,
+                offset: 0
+            )
+            if try fetchHitsRaw(db, query: probe).isEmpty { return [] }
+        }
         // pinnedOnly / kinds 必须在 text-fold **之后**按 winner 行的字段过滤——fold 会做 pinned
         // OR 聚合，过滤依据必须是聚合后 winner。否则：跨 origin 同文本一边 pinned=true 一边
         // false，子查询带 `pinned=1` 过滤后只剩 pinned 那条参与 fold，winner 不变；但 list /

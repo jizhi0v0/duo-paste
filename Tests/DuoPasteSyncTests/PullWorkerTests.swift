@@ -640,7 +640,8 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
 
 @Test func pullWorkerHTTPEndToEnd() async throws {
     // 起 in-process primary server → client PullWorker 真打 HTTP → 验证 mirror 落行 + cursor
-    let primaryDB = try makeClientDB()  // role 不影响这里——直接 INSERT
+    let fixture = try TestSyncServerFixture(prefix: "duo-pull-e2e")
+    let primaryDB = fixture.database  // role 不影响这里——直接 INSERT
     let primaryDeviceID = "primary-e2e"
     try await primaryDB.pool.write { conn in
         let it1 = Item(id: "a", originDevice: "other-mac", capturedAtNs: 100, ingestedAtNs: 100,
@@ -650,40 +651,24 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         try it1.insert(conn)
         try it2.insert(conn)
     }
-    let blobs = BlobStore(root: FileManager.default.temporaryDirectory
-        .appendingPathComponent("duo-pull-e2e-blobs-\(UUID().uuidString)"))
-    try FileManager.default.createDirectory(at: blobs.root, withIntermediateDirectories: true)
-    let secret = Data(repeating: 0xAB, count: 32)
-    let auth = HMACAuth(secret: secret)
-    let port = Int.random(in: 19000..<20000)
-    let server = SyncServer(deviceID: primaryDeviceID, database: primaryDB, blobs: blobs,
-                            host: "127.0.0.1", port: port, auth: auth)
-    let serverTask = Task { try? await server.run() }
-    defer { serverTask.cancel() }
-    // 等 server 起：用 HTTPPeerClient.fetchPrimaryHealth() 轮询
-    let probe = HTTPPeerClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!, auth: auth)
-    var ready = false
-    for _ in 0..<50 {
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        if let r = try? await probe.fetchPrimaryHealth(),
-           case .ok = r.outcome { ready = true; break }
-    }
-    #expect(ready)
-    let clientDB = try makeClientDB()
-    let baseURL = URL(string: "http://127.0.0.1:\(port)")!
-    let httpClient = HTTPPeerClient(baseURL: baseURL, auth: auth)
-    let status = MeshStatus()
-    let worker = PullWorker(
-        database: clientDB,
-        transport: httpClient,
-        selfDeviceID: "client-self",
-        meshStatus: status,
-        config: PullWorker.Config(intervalSec: 60)
-    )
-    await runWorkerBriefly(worker, ms: 600)
-
-    let ids = try await clientDB.pool.read { conn in
-        try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
+    let server = SyncServer(deviceID: primaryDeviceID, database: primaryDB, blobs: fixture.blobs,
+                            host: "127.0.0.1", port: 0, auth: fixture.auth)
+    let (ids, status) = try await fixture.withServer(server) { baseURL in
+        let clientDB = try makeClientDB()
+        let httpClient = HTTPPeerClient(baseURL: baseURL, auth: fixture.auth)
+        let status = MeshStatus()
+        let worker = PullWorker(
+            database: clientDB,
+            transport: httpClient,
+            selfDeviceID: "client-self",
+            meshStatus: status,
+            config: PullWorker.Config(intervalSec: 60)
+        )
+        await runWorkerBriefly(worker, ms: 600)
+        let ids = try await clientDB.pool.read { conn in
+            try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
+        }
+        return (ids, status)
     }
     #expect(ids == ["a", "b"])
     // MeshStatus 学习模式：PullWorker 用 /health 学到的 peer device_id 注册状态

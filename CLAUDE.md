@@ -1,21 +1,29 @@
 - **同步路径**：每个 peer 一对 `(PullWorker, WSNotificationClient)`。PullWorker 周期 `/since` 拉对端增量到本机 item 表（origin=对端 device_id）；WSNotificationClient 订 `/sync/ws` cursor_advanced 帧 → 收到 `worker.wake()` 跳过 sleep（< 1s 延迟）。WS 断了退化为周期 pull
-- **HTTP routes**：`GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /sync/ws`（Upgrade）+ `GET /app_icon/<bundleID>` + `POST /bump/<id>`（跨设备一致"复制即顶"：iOS tap → Mac DB bump captured/ingested_at_ns → broadcaster fan-out → 其他 peer 通过 PullWorker 看到）。无 push / 远端搜索路径（`POST /ingest` / `PUT/HEAD /blob` / `GET /search` 已下线）
+- **HTTP routes**：`GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /app_icon/<bundleID>` + `GET /search` + `GET /endpoints` + `GET /auth/revocations` + `POST /bump/<id>` + `POST /pin/<id>` + `POST /pair/<pin>` + `DELETE /item/<id>`；WebSocket = `/sync/ws`。无 push/ingest 路径
 - **CaptureService**：永远走 `Database.nextIngestNs` stamp（writer tx 内）；merge candidate 带 `origin_device == selfDeviceID` 过滤防 bump 对端行；commit 后回调 `onCursorAdvanced` 让 server 端 `WSBroadcaster` fan-out
-- **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → content-fold（文本跨 origin 同 text_full；blob 同 SHA 仅折叠 15s 内跨 origin 副本）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量。`SearchProvider.Mode` 仅 `.local` / `.mesh(stalenessSec:)`，永远走本机 fold 不打远端
+- **Pin/unpin owner routing**：pin 是带稳定 `operation_id` 的绝对值命令。只有 `item.origin_device` owner 能 canonical 修改 `item.pinned + ingested_at_ns`；非 owner 只做 optimistic UI + 写 v13 `pin_operation`，绑定 owner 的 PullWorker 投递。owner 的 `pin_operation_receipt` 保证重试不二次执行；requester 看到达到 receipt cursor 的 `/since` canonical replay 才清“等待同步”。禁止回退到 mirror 整行广播、wall-clock LWW 或 pinned OR merge（OR 会吞 unpin）
+- **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → content-fold（文本跨 origin 同 text_full；blob 同 SHA 仅折叠 15s 内跨 origin 副本）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量。Mac `SearchProvider.Mode` 仅 `.local` / `.mesh(stalenessSec:)`；iOS 也直接对本机 `MetadataMirrorStore` 调同一个 `SearchAPI`，History UI 不调用远端 `/search`
 - **跨设备 dedup**：两层防御——capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Blob 的物理文件本来就按 SHA 内容寻址只存一份；不同设备产生的 metadata 行为保持 mesh 对称不删库，UI 将 15s 内跨 origin 同 SHA 折为一张卡并保留最早的原始文件名。同 origin 主动重复 copy 不折叠
-- **Blob**：内容寻址 BlobStore（linkItem 不 moveItem，见 §"BlobStore 并发竞态"）；lazy paste-back（按需 GET `/blob/<sha>`，TaskGroup 30s 超时 race，见 §"blob 懒拉的不变量" #8）；可选 eager (`mesh.eager_blobs=true`) 拉完元数据顺路拉字节
-- **HMAC 认证**：`<ts>\n<METHOD>\n<path>\n<body_sha256_hex>`。middleware 不读 body（让多 MB blob 不占内存），handler 自己读 body 后再算 sha256 比对 header。WS upgrade 同模板（empty body hash），upgrade 后 frame 不签
+- **Blob**：内容寻址 BlobStore（linkItem 不 moveItem，见 §"BlobStore 并发竞态"）；`mesh.storage_mode=full`（默认）同步元数据后拉齐字节，`optimized` 才在 paste/preview 时按需 GET `/blob/<sha>`（TaskGroup 30s 超时 race，见 §"blob 懒拉的不变量" #8）
+- **HMAC + device credential 认证**：canonical string 仍是 `<ts>\n<METHOD>\n<path>\n<body_sha256_hex>`。可信 Mac 可用 mesh 根 secret；iOS 用独立 request secret 签名并携 `X-DP-Credential` 密封 token。请求一旦带 token 就只能走 credential 验证，任何失败都不得降级根 secret。middleware 不读 body，handler 读完后必须复核 body hash；WS upgrade 同模板，upgrade 后 frame 不签
+- **iOS pairing channel binding**：Mac QR v2 只含 endpoint + 当前 TLS leaf DER SHA-256，PIN 仍独立显示；iOS `/pair` 必须用 `PinnedCertificateDelegate` 在发送 PIN 前精确匹配 leaf。Bonjour 只发现/引导扫码，v1/HTTP/无 pin 不得降级直配。leaf 轮换使旧 QR 失效但不撤销已有 credential；QR cache key 必须跟证书内容变化
 - **OCR**：本机 own-origin image 跑 Vision OCR 写 `text_full` 进 FTS5；markDone 触发 onCursorAdvanced 让对端 < 1s 同步 OCR 结果（共享 wsBroadcaster fan-out 路径），peer FTS5 trigger 自动重 index
-- **mesh-doctor CLI**：探 /health (deviceID + skewMs vs expected) + pull_cursor + max(ingested_at_ns) + missing blob 统计。只读。退出码 0=健康，任一异常 → 1
-- **WS auth rotation**：`mesh.ws_rotation_sec`（默 4h，0 关）WSBroadcaster 每周期主动 close 所有连接；合法 client backoff 重连 + 重 HMAC upgrade。shared-secret 被窃取后的监听窗口 ≤ 这个值
+- **mesh-doctor CLI**：探 /health (deviceID + skewMs vs expected) + pull_cursor + max(ingested_at_ns) + missing blob，并检查本机 leaf certificate 的 DNS SAN、not-before/not-after 与 30/7/1 天 inclusive warning；`--json` 输出 Codable schema。只读。任一 peer/blob/TLS 异常退出 1
+- **安全诊断包**：`diagnostics-export` 与 Settings → 关于共用 `DiagnosticBundleExporter` 固定白名单，只含 mesh doctor JSON、只读 `quick_check`、版本、重新编码的脱敏 config、manifest 和白名单运维日志。禁止接入历史 `Exporter`、SharedSecret、device credential/token、BlobStore 或私钥；目录 0700、文件 0600
+- **WS auth rotation**：`WSBroadcaster.rotationIntervalSec` 内部默认 4h（已不从 config 暴露）并周期主动 close 所有连接；单设备撤销或收到新撤销 tombstone 时也立即 rotate。合法 client backoff 重连并重新认证，被撤销 credential 不能恢复连接
 - **依赖**：GRDB 7 + Hummingbird 2 + HummingbirdTLS + hummingbird-websocket（具体版本看 Package.resolved）
-- **测试**：~270，PullWorker / BlobLazyPull **已知偶发并发 flake**（端口/SQLite 竞争，全集挂、单跑必绿），用 `swift test --filter PullWorkerTests` / `--filter BlobLazyPullTests` 单独验证
+- **测试**：HTTP/WS 集成测试统一使用系统分配端口和真实 bind readiness；`TestSyncServerFixture` 负责隔离 DB/blob、超时与 graceful shutdown。禁止重新引入随机端口或 readiness sleep
+- **灾难恢复**：`snapshot-list` / `snapshot-verify` 只读；`snapshot-restore` 永远先在 `.snapshot-recovery-*` staging 库跑 migration、`integrity_check` 和可选 peer catch-up，daemon 未 bootout 时拒绝真实提交。提交前保留 `snapshots/recovery-safety-*/db`，DB 目录用同卷 `RENAME_SWAP` 原子换入，换入后重开验证，失败 swap 回旧库。只有一次性 `DisasterRecovery.refill` 可接收 active own-origin；普通 PullWorker guard 禁止放宽
 - **iOS 端**：
   - **WS zombie 检测**：URLSessionWebSocketTask 没协议层 PING，走应用层 `WSMessage.ping/.pong`——`PeerWebSocket.pingLoop` 每 30s ping，10s 内没 pong 抛 `WSError.pongTimeout` 重连。`PeerSyncCoordinator` 5s tick + 90s heartbeat staleness 兜底降级到 `.error("链路无响应")`
   - **POST /bump 客户端**：`HistoryCellView.triggerCopy` 先 `store.bumpToFront` 乐观顶 + UCB 写 pasteboard，**再** `coordinator.bumpItemOnServer` async 让 Mac DB 也顶。404/410 swallow
-  - **Bonjour + QR 配对**：Mac `BonjourAdvertiser` publish `_duopaste._tcp` + Settings 二维码（60s 倒计时，含 url + secret hex）；iOS `PeerDiscovery` NWBrowser + `QRScannerView` AVCaptureSession。Info.plist 需 `NSBonjourServices=_duopaste._tcp` / `NSCameraUsageDescription` / `NSLocalNetworkUsageDescription`
+  - **POST /pin 客户端**：一次用户动作对所有 Mac route fan-out 同一个 operation ID。owner 返回 applied 即清 pending；非 owner 返回 pending 时卡片显示“等待同步”，后续 canonical `/since` 行确认目标值再清。旧 daemon 2xx 无 `state` 按 applied 兼容
+  - **Bonjour + QR 配对**：Mac `BonjourAdvertiser` publish `_duopaste._tcp` 仅供发现；Settings QR v2 含 host/port/tls + `cert_sha256`，6 位 PIN 独立显示且 60s 轮换，secret/PIN/token 绝不进 QR。iOS `PeerDiscovery` 只引导 `QRScannerView` 扫码，`PinnedCertificateDelegate` 验 leaf 后才提交 PIN。Info.plist 需 `NSBonjourServices=_duopaste._tcp` / `NSCameraUsageDescription` / `NSLocalNetworkUsageDescription`
+  - **每设备凭据**：新 PIN body 带 stable device ID/name/platform，response 只给独立 request secret + AES-GCM token，不返回 mesh 根 secret。secret/token 仅存 `ClientCredentialKeychain`（AfterFirstUnlockThisDeviceOnly）；旧 `sharedSecretHex` 只作一次迁移源，迁移成功必须清 UserDefaults。所有 HTTP probe/request 与 WS upgrade 必须同时透传 token
+  - **完整 metadata mirror**：`Caches/HistoryStore/mirror.sqlite` 保存完整 item + FTS + `ios-metadata-mirror` cursor；`HistoryStore.items` 只加载最近 1000 条作为 bounded UI projection，不是同步上限。非空 query 和 qualifier-only 都在 detached task 里走本机 `SearchAPI`，断网时语义不降级为 contains
   - **BlobCache 磁盘 + LRU**：`Caches/Blobs/v1/<ab>/<cd>/<sha>.bin` 三层目录持久化跨启动。500MB cap 按 mtime 升序 evict。Detached IO 避免大图同步读卡 main actor
-  - **后台 pull**：`BackgroundPullService` 用 BGAppRefreshTask（id `io.duopaste.ios.background-pull`，Info.plist 配 `BGTaskSchedulerPermittedIdentifiers` + `UIBackgroundModes=fetch`），系统 best-effort 唤醒拉 /since + 持久化 `Caches/HistoryStore/items.json`。app `scenePhase=.active` 时 merge 磁盘到 store。WS 后台不能跑（iOS 限制）降级周期 HTTP pull
+  - **前后台统一 pull**：前台 WS 只唤醒 `/since`；`PeerSyncCoordinator` 与 BGAppRefreshTask（id `io.duopaste.ios.background-pull`）都调用 `MetadataMirrorStore.applyPage`，item rows + 二元 cursor 在同一个 writer transaction 提交，cursor 只单调前进。app 回前台从 SQLite 刷新 bounded projection；WS 后台不能跑（iOS 限制）时降级周期 HTTP pull
+  - **旧 JSON 一次性迁移**：升级时 `items.json` 只做 `INSERT OR IGNORE`，逐 ID 校验 SQLite 成功后才删除。旧 `cursor.json` 绝不沿用——它可能已经越过被 1000 条 cap 丢掉的历史，SQLite 首轮必须从 zero 全量重拉。blob 仍由独立 500MB LRU 管理
 
 ## 架构与 Non-Goals
 
@@ -38,11 +46,16 @@
 ### CLI 子命令
 
 ```sh
-~/Applications/duo-paste/duo-pasted --help                  # 子命令列表
-~/Applications/duo-paste/duo-pasted init-secret             # 首次部署：生成 32 字节 shared secret
-~/Applications/duo-paste/duo-pasted mesh-init --peer URL... # 切到 mesh 拓扑
-~/Applications/duo-paste/duo-pasted mesh-doctor             # 探所有 peer + cursor 对账（只读）
-~/Applications/duo-paste/duo-pasted retry-failed-ocr        # OCR failed/skipped 翻回 pending
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted --help
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted init-secret
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted mesh-init --peer URL...
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted mesh-doctor
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted mesh-doctor --json
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted diagnostics-export ~/Desktop
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted snapshot-list
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted snapshot-verify latest
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted snapshot-restore latest --peer URL --dry-run
+~/Applications/DuoPaste.app/Contents/MacOS/duo-pasted retry-failed-ocr
 ```
 
 无参 → SwiftUI daemon 流程（LaunchAgent 调用方式）。子命令在 SwiftUI 接管 NSApp 之前 exit。
@@ -96,6 +109,7 @@ CA root 位置 `mkcert -CAROOT`（默 `~/Library/Application Support/mkcert/`）
 - `db/main.sqlite` 主 DB（含 FTS5）
 - `blobs/<ab>/<cd>/<sha256>.<ext>` 内容寻址 blob
 - `snapshots/duo-paste-YYYYMMDD-HHmmss.sqlite` 小时级 snapshot
+- `snapshots/recovery-safety-*/db/` 恢复提交前的原 DB 安全副本（不会被 snapshot prune）
 - `device-id` 本机稳定 UUID
 
 部署产物：`~/Applications/DuoPaste.app` (`…/Contents/MacOS/duo-pasted`) + `~/Library/LaunchAgents/io.duopaste.agent.plist` + 日志 `~/Library/Logs/duo-paste/duo-pasted.{out,err}.log`。
@@ -156,6 +170,19 @@ UI 反馈：AppState.recentSkip + SearchView orange skipBanner（✕ 关闭 + 5 
 
 **作用域**：per-device capture policy 不是 sync-wide invariant。peer 间 HMAC + 共享 secret = 已认证内部边界，不重校单字段大小。
 
+### Capture app 排除 + 临时暂停（隐私双 gate）
+
+`config.capture.excluded_bundle_ids` 是 per-device 列表，bundle ID 匹配忽略大小写；Settings 支持从当前运行 app 选或手填，并热重载。暂停只存当前 daemon 进程，菜单栏支持 5 分钟 / 30 分钟 / 直到手动恢复；有限期暂停由 `AppState` timer 自动清，daemon 重启也恢复捕获。
+
+必须保留两道门：
+
+1. `PasteboardWatcher.capture()` 在读取 `pasteboard.types` / body 和可疑正文诊断日志**之前**调用动态 gate。
+2. `CaptureService.ingest` 在任何 DB/blob 写入前再次跑 `CapturePolicy`，防未来调用方绕过 watcher。
+
+excluded/paused outcome 不 refresh、不 wake OCR，`CaptureService.broadcastIfNeeded` 不推进 cursor，因此不进入 mesh。任何跳过都不改写 NSPasteboard，Cmd+V 始终正常。concealed/transient marker 对允许捕获的 app 继续在 extract 前跳过；不要把隐私 gate 移到正文读取或日志之后。
+
+回归测试：`CapturePolicyTests.swift`（config、匹配、暂停边界、DB/blob 零写入）与 `PasteboardWatcherCaptureGateTests.swift`（真实 named pasteboard gate 拒绝）。
+
 ### SearchProvider 永远走本机 fold-aware（chip 总数对齐）
 
 `SearchProvider.search` 永远走 `SearchAPI.searchHits / count / countByKind`——内部 fold-aware（文本跨 origin 同 text_full；blob 按近时间跨 origin 同 SHA），无 "raw count vs fold count" 双路径。
@@ -196,7 +223,7 @@ Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复
 - `Sources/duo-pasted/SearchView.swift` 的 `previewText` else 分支
 - `iOS/DuoPaste/Models.swift` 的 `displayPreview`
 
-**已知边界 · iOS cold-launch 老 cache**：`BackgroundPullService` 持久化 items.json，app 升级后 cold-launch 读老 cache 项 textFull 可能 nil → 退 preview → 卡片仍带 `…`，下次 PullWorker 拉新 item 覆盖才修复。不修——schema version invalidate 代价高于收益。
+**iOS 升级边界**：旧 `items.json` 可能缺 `textFull`，只用于 SQLite 首屏 continuity；cursor 从 zero 重拉后 canonical `/since` 行会覆盖它。不得恢复 JSON 持久化或迁移旧 cursor，否则 1000 条 cap 之外的历史会形成永久缺口。
 
 **多段 textFull paragraphStyle 精细应用**：`previewAttributedForTextCard` 的 `firstLineHeadIndent=8`（避开左上 app icon）**必须只应用到第一个 paragraph**——firstLineHeadIndent 是 per-paragraph，整段统一设让多段每段首行 indent 8pt 错位。代码里两个 paragraphStyle (pIndent / pPlain) + 按 `\n` 分隔的 range 精细 addAttribute，**不要回退到单一 paragraphStyle 全 range 应用**。
 
@@ -222,11 +249,11 @@ Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复
 4. **`Config.write` 显式 removeValue 老字段** `primary_url` / `pull`，避免两套字段共存
 5. **TLS 字段一致性**：`--serve-tls` 必须配 `--tls-cert/--tls-key`（或 oldConfig 已有）+ 文件存在性预检。两端 peer URL scheme 必须对齐。回归测试 `meshInitRefusesServeTLSWithoutCertAndKey` / `meshInitRefusesServeTLSWhenCertFileMissing` / `meshInitInheritsTLSFromOldConfigWhenNotGiven`
 6. **不主动改 LaunchAgent**——CLI 是单次 exit 进程，mesh-init 完成后打印 kickstart 提示让用户手动重启
-7. **保留无关字段**——hotkey / capture / ocr / shared_secret_keychain_account 不动；Config.write 走 nested merge 让用户手动加的未知字段也保留。回归测试 `meshInitPreservesUnrelatedConfigFields`
+7. **保留无关字段**——hotkey / capture / ocr 不动；Config.write 走 nested merge 让未来未知字段保留，但会显式洗掉废弃的 `shared_secret_keychain_account`。回归测试 `meshInitPreservesUnrelatedConfigFields`
 
 ### blob 懒拉的不变量
 
-`mesh.eager_blobs`（默 false）+ `AppDelegate.pasteBack` lazy 路径 + `PullWorker.fetchBlobsEager` 三处协同：
+`mesh.storage_mode`（`full` 默认，`optimized` 懒拉）+ `AppDelegate.pasteBack` lazy 路径 + `PullWorker.fetchBlobsEager` 三处协同。`eager_blobs` 只作为老配置 decode 兼容键，写盘时会被清除：
 
 1. **content-addressed 接收方必须重算 sha** —— `HTTPIngestClient.getBlob` 200 时本地重算 SHA256 比 path-sha；不匹配抛 `GetBlobError.shaMismatch`。HMAC 只保 request 完整性不保 response body。`BlobStore.putVerified` 第二层兜底。测试 `putVerifiedRejectsMismatchedSha`
 2. **eager 失败不回滚 mirror** —— `applyPage` 已在 writer tx commit mirror + cursor，**之后**才 `fetchBlobsEager`。eager 失败 only log，下次 tick 自然重试。测试 `eagerBlobsFailureDoesNotRevertMirror`
@@ -250,7 +277,7 @@ Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复
 
 `Config.longLivedConnectionThresholdSec`（默 30s）划分"短闪连失败"vs"长连接合法关"。`setConnected(true)` 记 `currentConnectionStartedAt`；`setConnected(false)` 算 elapsed 达阈值置 `longConnectionThisRound`。runLoop 跑完 `connectOnce` 后 `consume` flag——长连接路径 reset `consecutiveFailures = 0`，短闪连走原 `+=1` + 指数 backoff。
 
-**不要回退到无条件 +1**：旧实现配合 WSBroadcaster `mesh.ws_rotation_sec`（默 4h）主动 close 所有连接，约 60h 后所有长连接 consecutiveFailures 累到 budget=15，触发 `exit(1)`，launchd 重启——每隔几天来一次而没人知道为啥。
+**不要回退到无条件 +1**：旧实现配合 WSBroadcaster 默认 4h 的内部 rotation 主动 close 所有连接，约 60h 后所有长连接 consecutiveFailures 累到 budget=15，触发 `exit(1)`，launchd 重启——每隔几天来一次而没人知道为啥。
 
 回归测试：`longLivedConnectionResetsFailureCounter`。
 
@@ -258,9 +285,17 @@ Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复
 
 `SyncServer.requirePairingTLS`（默 true）+ `tls == nil` 时 `/pair/<pin>` handler 在 PIN 校验**之前**返 503。daemon 启动期若不满足且 `pairingService != nil`，stderr 立刻打 WARN。测试用 `requirePairingTLS: false` 显式 opt-out。
 
-**为什么硬护栏**：`/pair` response body 含 `secret: hex` 明文（iOS HMAC 主密钥）。Tailscale 路径 WG 加密兜底 OK，但 iOS 配对常走 `.local` / 直连 IP——不进 tailnet，secret 明文暴露给 LAN 中间人。PIN 单次 + 5 次封锁挡不住"监听一次成功配对"。
+**为什么硬护栏**：`/pair` response body 含独立 request secret + credential token（legacy 空 body 仍可能返回 mesh root secret）。Tailscale 路径 WG 加密兜底 OK，但 iOS 配对常走 `.local` / 直连 IP——不进 tailnet，纯 HTTP 会把认证能力暴露给被动 LAN 监听者。PIN 单次 + 5 次封锁挡不住“监听一次成功配对”。
+
+**现有边界**：iOS `TrustAnyDelegate` 为兼容 `.local` hostname / 私有 CA 接受任意 leaf，TLS 当前只提供加密，不提供 server identity；PIN 方案不抵抗能终止并实时转发配对请求的主动 MITM。不要把 TLS-only 护栏描述成证书校验或 channel binding。若要收紧，需另做 QR 携带 leaf fingerprint / PAKE 等配对协议升级，不能直接打开系统默认校验而破坏现有 `.local` 与 Ponte 部署。
 
 **不要回退**：未来 daemon 跑 plain HTTP 时必须升级到 TLS 才能用 iOS 配对，不是放宽这条。回归测试 `pairReturns503WhenTLSRequiredButMissing`。
+
+### TLS 到期检查与安全诊断包
+
+`TLSCertificateInspector` 只读取 leaf certificate 公共字段：DNS SAN、not-before、not-after；不接收也不打开 `tls_key_path`。expiry 阈值是 inclusive：剩余 `<=30d` / `<=7d` / `<=1d` 逐级告警，expired 与 not-yet-valid 同样让 `mesh-doctor` 非零退出。时间必须通过 `now` 注入测试，不能用会随年月失效的断言。
+
+`DiagnosticBundleExporter` 是与历史内容导出器完全独立的安全边界：输出文件名固定白名单，config 从已解析的 `Config` 重新编码并移除 URL credentials / 私钥路径，日志只保留明确运维前缀，其他行整行替换。API 不接收 shared secret、device credential/token、私钥 bytes 或 BlobStore，也不复制 DB；SQLite 只执行 read-only `PRAGMA quick_check`。新增输出必须先扩充 sentinel 扫描测试，确认剪贴板正文、blob、root/request secret、credential token 和 PEM 私钥均无法进入包内。回归测试：`TLSCertificateInspectorTests.swift`、`DiagnosticBundleTests.swift`。
 
 ### PullWorker peer 换了的检测（reconcilePeer）
 
@@ -413,4 +448,4 @@ fix 不持久——每次 `rm -rf .build` / `swift package clean` 后按上面 b
 
 ## 构建 / 测试
 
-`swift build` / `swift test` / `swift build -c release`（install 脚本自动跑）。PullWorker / BlobLazyPull 偶发 flake，单跑 `--filter` 必绿。
+`swift build` / `swift test` / `swift build -c release`（install 脚本自动跑）。

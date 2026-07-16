@@ -1,5 +1,10 @@
 # iOS 删除路径 fold-aware 对齐
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 PR #32（已合并 `2f538ec`）让 server side `DELETE /item/<id>` cascade 同 `text_full` 所有 active sibling（跨 origin）。iOS 端已经在 UI 层 `Item.foldByTextFull` 折叠（见 `iOS/DuoPaste/HistoryStore.swift:54`），但 `removeOptimistic(id:)`（同 file:180）只按单 id 移除——同 text_full 的 sibling 仍在 `items` 里，fold 会立刻 elect 另一条当代表 → 用户视感"卡片好像没删掉，几秒后才真消失"（等 `/since` 把 cascade tombstones 拉回 iOS）。

@@ -1,5 +1,10 @@
 # OCR Worker — 截图文字入搜索
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 `hazy-hatching-bentley.md` 第 3 刀已落 schema（PR#17）：v6 migration 加 `ocr_state` 列、`Item.ocrState` 字段、`/since` wire 透传、`CaptureService` 在 image 入库时标 `pending`、`Admin.promoteToPrimary` 搬运 ocr_state。

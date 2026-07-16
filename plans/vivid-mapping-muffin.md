@@ -1,5 +1,10 @@
 # v9 — extracted_text 独立列 + OCR 扩 file+image-blob
 
+> [!CAUTION]
+> **已归档；不可作为部署说明。** 现行部署见 [`README.md`](../README.md) 与
+> [`docs/deploy-multi-mac.md`](../docs/deploy-multi-mac.md)；未来工作只看
+> [`docs/roadmap.md`](../docs/roadmap.md)。
+
 ## Context
 
 **问题**：用户从 Finder / IDE / Slack 复制 `.png` 文件路径,落 `kind=.file`(PasteboardWatcher "文件 URL" 分支)。即使 PasteboardWatcher 单 `.png` 文件**额外**读了字节进 BlobStore(`Sources/DuoPasteCapture/PasteboardWatcher.swift:213`),OCRWorker `fetchPending` 严格只扫 `kind='image'`,这类 file 行从未被 OCR。`text_full` 装的是路径字符串,FTS 搜不到图里的字——存量本机 71 行(`kind='file' AND blob_mime LIKE 'image/%'`)是死索引。

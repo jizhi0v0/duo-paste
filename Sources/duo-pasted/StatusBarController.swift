@@ -1,93 +1,159 @@
-import SwiftUI
+import AppKit
 import DuoPasteCore
 
-/// SwiftUI MenuBarExtra 和 AppDelegate 之间的极小状态桥。
-/// Settings 打开动作必须来自 scene environment，不再依赖 AppKit selector。
+/// AppKit status item controller.
+///
+/// `NSStatusItem.menu` lets AppKit anchor the menu to the status item's actual window for
+/// both primary and secondary clicks. SwiftUI `MenuBarExtra(.menu)` on macOS 26 can route a
+/// secondary click through a context-menu path whose anchor is stale after the item has been
+/// repositioned, leaving the menu detached near the screen's trailing edge.
 @MainActor
-@Observable
-final class StatusBarState {
-    static let shared = StatusBarState()
+final class StatusBarController: NSObject {
+    private let item: NSStatusItem
+    private var openMenuItem: NSMenuItem!
+    private var exportMenuItem: NSMenuItem!
+    private var captureMenuItem: NSMenuItem!
+    private var resumeCaptureMenuItem: NSMenuItem!
 
-    var hotkey: Config.HotkeyConfig = .default
-    var exportProgressText: String?
-    @ObservationIgnored var openSettings: OpenSettingsAction?
-
-    private init() {}
-}
-
-struct DuoPasteMenuBarExtra: Scene {
-    var body: some Scene {
-        MenuBarExtra {
-            StatusMenu()
-        } label: {
-            StatusMenuLabel()
-        }
-        .menuBarExtraStyle(.menu)
+    init(hotkey: Config.HotkeyConfig) {
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
+        setupButton()
+        setupMenu(hotkey: hotkey)
     }
-}
 
-private struct StatusMenuLabel: View {
-    @Environment(\.openSettings) private var openSettings
-
-    var body: some View {
-        Image(systemName: "doc.on.clipboard")
-            .accessibilityLabel("duo-paste")
-            .onAppear {
-                StatusBarState.shared.openSettings = openSettings
-            }
+    func updateOpenSearchHotkey(_ hotkey: Config.HotkeyConfig) {
+        applyHotkey(hotkey, to: openMenuItem)
     }
-}
 
-private struct StatusMenu: View {
-    @Bindable private var state = StatusBarState.shared
-
-    var body: some View {
-        Button("打开搜索") {
-            AppDelegate.shared?.toggleSearch()
+    func setExportProgress(_ text: String?) {
+        if let text {
+            exportMenuItem.title = text
+            exportMenuItem.action = #selector(cancelExport)
+        } else {
+            exportMenuItem.title = "导出…"
+            exportMenuItem.action = #selector(exportData)
         }
-        .keyboardShortcut(hotkeyKey, modifiers: hotkeyModifiers)
+    }
 
-        Divider()
-
-        Button("设置…") {
-            // `.menu` style 的 MenuBarExtra 仍在 AppKit menu tracking loop 里时，
-            // SettingsLink 在 LSUIElement/accessory app 上会出现 action 已发送但窗口
-            // 没有 order front 的情况。先让菜单 action 返回、菜单完成 dismiss，再走
-            // 与搜索窗齿轮相同的 activate + OpenSettingsAction 路径。
-            DispatchQueue.main.async {
-                AppDelegate.shared?.showSettings()
+    func updateCapturePause(_ pause: CapturePause?, now: Date = Date()) {
+        let active = pause?.isActive(at: now) == true
+        if active, let pause {
+            switch pause {
+            case .until(let deadline):
+                let minutes = max(1, Int(ceil(deadline.timeIntervalSince(now) / 60)))
+                captureMenuItem.title = "捕获已暂停 · 约 \(minutes) 分钟"
+            case .untilResumed:
+                captureMenuItem.title = "捕获已暂停 · 等待手动恢复"
             }
+        } else {
+            captureMenuItem.title = "捕获中"
         }
-        .keyboardShortcut(",", modifiers: .command)
+        resumeCaptureMenuItem.isEnabled = active
+        applyStatusIcon(paused: active)
+    }
+
+    private func setupButton() {
+        applyStatusIcon(paused: false)
+    }
+
+    private func applyStatusIcon(paused: Bool) {
+        guard let button = item.button else { return }
+        button.image = NSImage(
+            systemSymbolName: paused ? "pause.circle.fill" : "doc.on.clipboard",
+            accessibilityDescription: paused ? "duo-paste 捕获已暂停" : "duo-paste 正在捕获"
+        )
+        button.image?.isTemplate = true
+    }
+
+    private func setupMenu(hotkey: Config.HotkeyConfig) {
+        let menu = NSMenu()
+
+        let open = NSMenuItem(
+            title: "打开搜索",
+            action: #selector(openSearch),
+            keyEquivalent: ""
+        )
+        open.target = self
+        applyHotkey(hotkey, to: open)
+        menu.addItem(open)
+        openMenuItem = open
+
+        menu.addItem(.separator())
+
+        let capture = NSMenuItem(title: "捕获中", action: nil, keyEquivalent: "")
+        let captureMenu = NSMenu()
+
+        let pause5 = NSMenuItem(title: "暂停 5 分钟", action: #selector(pauseFiveMinutes), keyEquivalent: "")
+        pause5.target = self
+        captureMenu.addItem(pause5)
+
+        let pause30 = NSMenuItem(title: "暂停 30 分钟", action: #selector(pauseThirtyMinutes), keyEquivalent: "")
+        pause30.target = self
+        captureMenu.addItem(pause30)
+
+        let pauseUntilResume = NSMenuItem(title: "暂停直到手动恢复", action: #selector(pauseUntilResumed), keyEquivalent: "")
+        pauseUntilResume.target = self
+        captureMenu.addItem(pauseUntilResume)
+        captureMenu.addItem(.separator())
+
+        let resume = NSMenuItem(title: "恢复捕获", action: #selector(resumeCapture), keyEquivalent: "")
+        resume.target = self
+        resume.isEnabled = false
+        captureMenu.addItem(resume)
+
+        capture.submenu = captureMenu
+        menu.addItem(capture)
+        captureMenuItem = capture
+        resumeCaptureMenuItem = resume
+
+        menu.addItem(.separator())
+
+        let settings = NSMenuItem(
+            title: "设置…",
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        )
+        settings.keyEquivalentModifierMask = [.command]
+        settings.target = self
+        menu.addItem(settings)
 
         if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
-            Button("检查更新…") {
-                UpdaterController.shared.checkForUpdates()
-            }
+            let update = NSMenuItem(
+                title: "检查更新…",
+                action: #selector(checkForUpdates),
+                keyEquivalent: ""
+            )
+            update.target = self
+            menu.addItem(update)
         }
 
-        Button(state.exportProgressText ?? "导出…") {
-            if state.exportProgressText == nil {
-                AppDelegate.shared?.showExportDialog()
-            } else {
-                AppDelegate.shared?.cancelExport()
-            }
-        }
+        let export = NSMenuItem(
+            title: "导出…",
+            action: #selector(exportData),
+            keyEquivalent: ""
+        )
+        export.target = self
+        menu.addItem(export)
+        exportMenuItem = export
 
-        Divider()
+        menu.addItem(.separator())
 
-        Button("退出 duo-paste") {
-            AppDelegate.shared?.confirmQuit()
-        }
-        .keyboardShortcut("q", modifiers: .command)
+        let quit = NSMenuItem(
+            title: "退出 duo-paste",
+            action: #selector(confirmQuit),
+            keyEquivalent: "q"
+        )
+        quit.keyEquivalentModifierMask = [.command]
+        quit.target = self
+        menu.addItem(quit)
+
+        item.menu = menu
     }
 
-    private var hotkeyKey: KeyEquivalent {
-        KeyEquivalent(Character(state.hotkey.key.lowercased()))
-    }
-
-    private var hotkeyModifiers: EventModifiers {
-        state.hotkey.modifiers.reduce(into: EventModifiers()) { result, modifier in
+    private func applyHotkey(_ hotkey: Config.HotkeyConfig, to menuItem: NSMenuItem) {
+        menuItem.keyEquivalent = hotkey.key.lowercased()
+        menuItem.keyEquivalentModifierMask = hotkey.modifiers.reduce(into: []) { result, modifier in
             switch modifier.lowercased() {
             case "cmd", "command": result.insert(.command)
             case "option", "alt": result.insert(.option)
@@ -96,5 +162,48 @@ private struct StatusMenu: View {
             default: break
             }
         }
+    }
+
+    @objc private func openSearch() {
+        AppDelegate.shared?.toggleSearch()
+    }
+
+    @objc private func openSettings() {
+        // Return from AppKit's menu tracking loop before activating the Settings scene.
+        DispatchQueue.main.async {
+            AppDelegate.shared?.showSettings()
+        }
+    }
+
+    @objc private func pauseFiveMinutes() {
+        AppDelegate.shared?.pauseCapture(minutes: 5)
+    }
+
+    @objc private func pauseThirtyMinutes() {
+        AppDelegate.shared?.pauseCapture(minutes: 30)
+    }
+
+    @objc private func pauseUntilResumed() {
+        AppDelegate.shared?.pauseCaptureUntilResumed()
+    }
+
+    @objc private func resumeCapture() {
+        AppDelegate.shared?.resumeCapture()
+    }
+
+    @objc private func checkForUpdates() {
+        UpdaterController.shared.checkForUpdates()
+    }
+
+    @objc private func exportData() {
+        AppDelegate.shared?.showExportDialog()
+    }
+
+    @objc private func cancelExport() {
+        AppDelegate.shared?.cancelExport()
+    }
+
+    @objc private func confirmQuit() {
+        AppDelegate.shared?.confirmQuit()
     }
 }

@@ -25,6 +25,9 @@ private struct FrontAppSnapshot: Sendable {
 /// 改 actor 后所有 NSPasteboard 同步调用都跑在 actor 自家 executor 上,main 不再被牵连。
 public actor PasteboardWatcher {
     public typealias Callback = @MainActor @Sendable (CapturedPasteboard) -> Void
+    /// 在读取任何 pasteboard type / body 前执行的隐私门。bundle ID 来自 changeCount
+    /// 跳变当下绑定的 frontmost app snapshot；false = 本次 changeCount 直接消费但不读取。
+    public typealias CaptureGate = @MainActor @Sendable (String?) -> Bool
 
     /// NSPasteboard 单例 thread-safe（pasteboardd IPC client 内部加锁）。
     /// actor 后台读 + main 写都通过同一进程内代理,无并发问题。
@@ -57,6 +60,7 @@ public actor PasteboardWatcher {
     /// 让别的 actor 方法插入。tick 看到这个 flag 直接 return 跳过那一拍,
     /// 防止 self-write 的 changeCount 跳变被并发 tick 当成新 capture
     private var isPasteBackInFlight: Bool = false
+    private let shouldCapture: CaptureGate
     private let onCapture: Callback
     /// 仅 RTF 路径用于解码前 raw-size 守门，避免 50MB RTF source 被 NSAttributedString 同步
     /// 解析后才走到 CaptureService 的 text byte cap。raw RTF 字节 > 该上限时跳过 decode，
@@ -73,6 +77,7 @@ public actor PasteboardWatcher {
         debounceMs: Int = 500,
         maxRawRTFBytes: Int = 512 * 1024,
         maxBlobBytes: Int = 32 * 1024 * 1024,
+        shouldCapture: @escaping CaptureGate = { _ in true },
         onCapture: @escaping Callback
     ) {
         self.pasteboard = pasteboard
@@ -81,6 +86,7 @@ public actor PasteboardWatcher {
         self.maxRawRTFBytes = maxRawRTFBytes
         self.maxBlobBytes = maxBlobBytes
         self.lastChangeCount = pasteboard.changeCount
+        self.shouldCapture = shouldCapture
         self.onCapture = onCapture
     }
 
@@ -187,23 +193,21 @@ public actor PasteboardWatcher {
     /// 注意：skipMarkerTypes 检测放在这里（不是 changeCount 跳变时刻），因为
     /// debounce 窗口内 app 可能还没写完所有 type marker
     private func capture() async {
-        let capturedAtNs = Clock.nowNs()
+        // frontApp 是 cc 跳变那一刻 main hop 拿到的 snapshot。先消费并跑隐私门，
+        // false 时不碰 pasteboard.types / data / string，也不会把敏感短文本写诊断日志。
+        let frontApp = pendingFrontApp ?? FrontAppSnapshot(bundleID: nil, localizedName: nil, pid: nil)
+        pendingFrontApp = nil
+        let gate = shouldCapture
+        guard await gate(frontApp.bundleID) else { return }
 
         // 跳过特殊标记类型
         if let types = pasteboard.types {
             for t in types where skipMarkerTypes.contains(t.rawValue) {
-                pendingFrontApp = nil
                 return
             }
         }
 
-        // frontApp 是 cc 跳变那一刻 main hop 拿到的 snapshot;capture 直接消费,
-        // 不再额外 hop——避免 debounce 期间 frontmost 切走导致 source_app 错挂。
-        // pending 异常路径（tick 看到 cc==lastCount + deadline 到期）frontApp 为 nil,
-        // extract 仍能继续(只是 bundle/name 列空)
-        let frontApp = pendingFrontApp ?? FrontAppSnapshot(bundleID: nil, localizedName: nil, pid: nil)
-        pendingFrontApp = nil
-
+        let capturedAtNs = Clock.nowNs()
         guard let captured = extract(capturedAtNs: capturedAtNs, frontApp: frontApp) else {
             return
         }
