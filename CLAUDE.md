@@ -196,6 +196,12 @@ excluded/paused outcome 不 refresh、不 wake OCR，`CaptureService.broadcastIf
 
 `AppState.refresh()` 必须先产生同一份 `SearchTimeBounds`，再把它的 `fromNs/toNs` 同时传给 SearchProvider；列表、真实总数、kind chip 和 file sub-kind chip 都从这一个 `SearchQuery` 派生，不能各自重算日期。
 
+### 保存搜索视图：独立本机文件 + 写盘后发布
+
+命名搜索视图住 `~/Library/Application Support/duo-paste/saved-search-views.json`，不塞进 `config.json`，也不进入 DB/mesh。原因：SettingsModel 会持有启动时 Config 快照；若视图是 Config 字段，用户保存新视图后再应用旧 Settings 快照会把它静默覆盖。独立文件是 per-device 单一真相，顶层 schema version 必须先于完整 payload 解码检查，未来版本拒绝降级覆盖。
+
+`AppState.saveCurrentSearchView` / `deleteSavedSearchView` 必须保持 `local library mutation → SavedSearchViewStore atomic write + 0600 → savedSearchViews publish → StatusBar callback` 顺序。**写盘失败绝不能先改内存数组或菜单栏**，否则 UI 显示已保存、重启后却消失。菜单栏只保存稳定 view ID，点击时回 AppState 查当前数组、应用完整 filter 后再打开 panel。
+
 ### 搜索排序契约：pinned > prefix(24h) > time
 
 `(pinned DESC, prefix_score DESC, captured_at_ns DESC)`。prefix_score：preview 以 query 起始 = 2 / text_full 起始 = 1 / 否则 0。**仅对 24h 内项生效**——跨天老内容哪怕起头匹配也走纯时间倒序，剪贴板心智是"搜=找最近用过的"。

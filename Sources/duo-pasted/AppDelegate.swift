@@ -220,6 +220,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel?.toggle()
     }
 
+    func openSavedSearchView(id: String) {
+        guard state.applySavedSearchView(id: id) else {
+            statusBar?.updateSavedSearchViews(state.savedSearchViews)
+            return
+        }
+        panel.show()
+    }
+
     func confirmQuit() {
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -577,9 +585,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         )
-        statusBar = StatusBarController(hotkey: deps.config.hotkey)
+        statusBar = StatusBarController(
+            hotkey: deps.config.hotkey,
+            savedSearchViews: state.savedSearchViews
+        )
         state.onCapturePauseChanged = { [weak self] pause in
             self?.statusBar.updateCapturePause(pause)
+        }
+        state.onSavedSearchViewsChanged = { [weak self] views in
+            self?.statusBar.updateSavedSearchViews(views)
         }
         statusBar.updateCapturePause(state.capturePause)
         watcher = PasteboardWatcher(

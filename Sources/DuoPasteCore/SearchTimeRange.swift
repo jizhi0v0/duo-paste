@@ -85,3 +85,65 @@ public enum SearchTimeRange: Sendable, Equatable, Hashable, Identifiable {
         return Int64(value)
     }
 }
+
+extension SearchTimeRange: Codable {
+    private enum RangeType: String, Codable {
+        case all
+        case day
+        case week
+        case month
+        case custom
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(RangeType.self, forKey: .type) {
+        case .all:
+            self = .all
+        case .day:
+            self = .day
+        case .week:
+            self = .week
+        case .month:
+            self = .month
+        case .custom:
+            let startMs = try container.decode(Int64.self, forKey: .startMs)
+            let endMs = try container.decode(Int64.self, forKey: .endMs)
+            self = .custom(
+                start: Date(timeIntervalSince1970: Double(startMs) / 1_000),
+                end: Date(timeIntervalSince1970: Double(endMs) / 1_000)
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .all:
+            try container.encode(RangeType.all, forKey: .type)
+        case .day:
+            try container.encode(RangeType.day, forKey: .type)
+        case .week:
+            try container.encode(RangeType.week, forKey: .type)
+        case .month:
+            try container.encode(RangeType.month, forKey: .type)
+        case .custom(let start, let end):
+            try container.encode(RangeType.custom, forKey: .type)
+            try container.encode(Self.milliseconds(start), forKey: .startMs)
+            try container.encode(Self.milliseconds(end), forKey: .endMs)
+        }
+    }
+
+    private static func milliseconds(_ date: Date) -> Int64 {
+        let value = date.timeIntervalSince1970 * 1_000
+        if value >= Double(Int64.max) { return Int64.max }
+        if value <= Double(Int64.min) { return Int64.min }
+        return Int64(value)
+    }
+}

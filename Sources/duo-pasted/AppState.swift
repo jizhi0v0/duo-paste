@@ -43,6 +43,8 @@ final class AppState {
     var timeRange: SearchTimeRange = .all
     /// 仅显示已置顶。SearchQuery.pinnedOnly → SQL `pinned = 1`
     var pinnedOnly: Bool = false
+    /// 本机命名搜索视图。只在 SavedSearchViewStore 成功落盘后发布新数组。
+    var savedSearchViews: [SavedSearchView] = []
     /// 临时一次性提示（lazy blob 部分失败等场景），3s 自动清掉。
     /// 不持久化；SearchView 顶部以 caption 形态短暂显示
     var recentNotice: String?
@@ -152,6 +154,63 @@ final class AppState {
         }
     }
 
+    /// 当前 UI 筛选的稳定快照。Set 按 allCases 排序后落盘，避免每次保存得到不同 JSON 顺序。
+    func currentSavedSearchFilter() -> SavedSearchFilter {
+        SavedSearchFilter(
+            query: query,
+            qualifiers: activeQualifiers,
+            kinds: ItemKind.allCases.filter { selectedKinds.contains($0) },
+            fileSubKinds: FileSubKind.allCases.filter { selectedFileSubKinds.contains($0) },
+            timeRange: timeRange,
+            pinnedOnly: pinnedOnly
+        )
+    }
+
+    @discardableResult
+    func saveCurrentSearchView(named name: String) throws -> SavedSearchViewSaveOutcome {
+        var library = SavedSearchViewLibrary(views: savedSearchViews)
+        let outcome = try library.upsert(name: name, filter: currentSavedSearchFilter())
+        // 原子发布顺序：写盘失败时不能让 SearchView / status menu 看到只存在内存的新视图。
+        try savedViewStore.save(library)
+        savedSearchViews = library.views
+        onSavedSearchViewsChanged?(savedSearchViews)
+        return outcome
+    }
+
+    @discardableResult
+    func deleteSavedSearchView(id: String) throws -> Bool {
+        var library = SavedSearchViewLibrary(views: savedSearchViews)
+        guard library.remove(id: id) else { return false }
+        try savedViewStore.save(library)
+        savedSearchViews = library.views
+        onSavedSearchViewsChanged?(savedSearchViews)
+        return true
+    }
+
+    func applySavedSearchView(_ view: SavedSearchView) {
+        query = view.filter.query
+        activeQualifiers = view.filter.qualifiers
+        selectedKinds = Set(view.filter.kinds)
+        selectedFileSubKinds = Set(view.filter.fileSubKinds)
+        timeRange = view.filter.timeRange
+        pinnedOnly = view.filter.pinnedOnly
+        completionMenuVisible = false
+        completionCandidates = []
+        completionHighlight = 0
+        previewShown = false
+    }
+
+    @discardableResult
+    func applySavedSearchView(id: String) -> Bool {
+        guard let view = savedSearchViews.first(where: { $0.id == id }) else { return false }
+        applySavedSearchView(view)
+        return true
+    }
+
+    func isSavedSearchViewActive(_ view: SavedSearchView) -> Bool {
+        currentSavedSearchFilter() == view.filter
+    }
+
     /// 接受补全 —— 把 query 末尾未闭合的 /xxx token 剥掉,候选 qualifier 加进 activeQualifiers。
     /// 不再往 query 字符串里塞 alias 字面量(老姿态),让搜索框只装"搜索文本",chip 体现 qualifier。
     /// SearchPanelController 在 completionMenuVisible 时把 Enter 路由到这里
@@ -259,10 +318,13 @@ final class AppState {
     }
 
     let deps: AppDependencies
+    @ObservationIgnored private let savedViewStore: SavedSearchViewStore
     @ObservationIgnored private var capturePolicy: CapturePolicy
     @ObservationIgnored private var capturePauseExpiryTask: Task<Void, Never>?
     /// AppDelegate 注入，用于同步菜单栏图标 / 状态菜单。
     @ObservationIgnored var onCapturePauseChanged: ((CapturePause?) -> Void)?
+    /// 保存/删除成功后刷新菜单栏 submenu；失败不触发，避免状态不同步。
+    @ObservationIgnored var onSavedSearchViewsChanged: (([SavedSearchView]) -> Void)?
     /// 非 owner Mac 新建 pin operation 后立即唤醒对应 mesh worker（生产由 AppDelegate 注入）。
     @ObservationIgnored var onPinOperationQueued: (() -> Void)?
 
@@ -570,7 +632,15 @@ final class AppState {
 
     init(deps: AppDependencies) {
         self.deps = deps
+        self.savedViewStore = SavedSearchViewStore(fileURL: deps.paths.savedSearchViewsFile)
         self.capturePolicy = CapturePolicy(excludedBundleIDs: deps.config.capture.excludedBundleIDs)
+        do {
+            self.savedSearchViews = try savedViewStore.load().views
+        } catch {
+            self.savedSearchViews = []
+            self.lastError = "保存视图读取失败：\(error.localizedDescription)"
+            fputs("saved-search-views: load failed: \(error)\n", stderr)
+        }
         // 同步预填本地最新 listLimit 条，避免 panel 首次打开 SwiftUI 第一帧渲染
         // 时 results=[] → 看到 "0 条" 闪一下。Panel 触发 .task 后会异步 refresh
         // 一次（可能从 remote 拿更新），把这里的结果替换/扩展。

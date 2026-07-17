@@ -7,13 +7,58 @@ import Foundation
 /// `.imageMerged` case 是产品决策：从用户视角"图片"是一种东西（无论原生剪贴板截图
 /// 还是 Finder 复制的 .png 文件），落地时同时映射到 `.kind(.image)` + `.fileSubKind(.imageFile)`，
 /// 让 SQL 端 OR 拿到两种存储路径。
-public enum QueryQualifier: Equatable, Sendable, Hashable {
+public enum QueryQualifier: Equatable, Sendable, Hashable, Codable {
     case kind(ItemKind)
     case fileSubKind(FileSubKind)
     /// `.java` / `.c` / `.py` 等代码文件——走 textFull suffix LIKE，FTS5 token 化对 `.` 不可靠
     case textSuffix(String)
     /// `/image /img /png /jpg /jpeg /gif /webp /heic` —— 命中 `.kind(.image)` OR `.fileSubKind(.imageFile)`
     case imageMerged
+}
+
+extension QueryQualifier {
+    private enum QualifierType: String, Codable {
+        case kind
+        case fileSubKind = "file_sub_kind"
+        case textSuffix = "text_suffix"
+        case imageMerged = "image_merged"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case value
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(QualifierType.self, forKey: .type) {
+        case .kind:
+            self = .kind(try container.decode(ItemKind.self, forKey: .value))
+        case .fileSubKind:
+            self = .fileSubKind(try container.decode(FileSubKind.self, forKey: .value))
+        case .textSuffix:
+            self = .textSuffix(try container.decode(String.self, forKey: .value))
+        case .imageMerged:
+            self = .imageMerged
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .kind(let kind):
+            try container.encode(QualifierType.kind, forKey: .type)
+            try container.encode(kind, forKey: .value)
+        case .fileSubKind(let subKind):
+            try container.encode(QualifierType.fileSubKind, forKey: .type)
+            try container.encode(subKind, forKey: .value)
+        case .textSuffix(let suffix):
+            try container.encode(QualifierType.textSuffix, forKey: .type)
+            try container.encode(suffix, forKey: .value)
+        case .imageMerged:
+            try container.encode(QualifierType.imageMerged, forKey: .type)
+        }
+    }
 }
 
 extension QueryQualifier {

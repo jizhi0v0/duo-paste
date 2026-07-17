@@ -11,19 +11,41 @@ import DuoPasteCore
 final class StatusBarController: NSObject {
     private let item: NSStatusItem
     private var openMenuItem: NSMenuItem!
+    private var savedViewsMenuItem: NSMenuItem!
     private var exportMenuItem: NSMenuItem!
     private var captureMenuItem: NSMenuItem!
     private var resumeCaptureMenuItem: NSMenuItem!
 
-    init(hotkey: Config.HotkeyConfig) {
+    init(hotkey: Config.HotkeyConfig, savedSearchViews: [SavedSearchView] = []) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         setupButton()
-        setupMenu(hotkey: hotkey)
+        setupMenu(hotkey: hotkey, savedSearchViews: savedSearchViews)
     }
 
     func updateOpenSearchHotkey(_ hotkey: Config.HotkeyConfig) {
         applyHotkey(hotkey, to: openMenuItem)
+    }
+
+    func updateSavedSearchViews(_ views: [SavedSearchView]) {
+        let submenu = NSMenu()
+        if views.isEmpty {
+            let empty = NSMenuItem(title: "暂无保存视图", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+        } else {
+            for view in views {
+                let entry = NSMenuItem(
+                    title: view.name,
+                    action: #selector(openSavedSearchView(_:)),
+                    keyEquivalent: ""
+                )
+                entry.target = self
+                entry.representedObject = view.id
+                submenu.addItem(entry)
+            }
+        }
+        savedViewsMenuItem.submenu = submenu
     }
 
     func setExportProgress(_ text: String?) {
@@ -66,7 +88,7 @@ final class StatusBarController: NSObject {
         button.image?.isTemplate = true
     }
 
-    private func setupMenu(hotkey: Config.HotkeyConfig) {
+    private func setupMenu(hotkey: Config.HotkeyConfig, savedSearchViews: [SavedSearchView]) {
         let menu = NSMenu()
 
         let open = NSMenuItem(
@@ -78,6 +100,11 @@ final class StatusBarController: NSObject {
         applyHotkey(hotkey, to: open)
         menu.addItem(open)
         openMenuItem = open
+
+        let savedViews = NSMenuItem(title: "保存的视图", action: nil, keyEquivalent: "")
+        menu.addItem(savedViews)
+        savedViewsMenuItem = savedViews
+        updateSavedSearchViews(savedSearchViews)
 
         menu.addItem(.separator())
 
@@ -166,6 +193,11 @@ final class StatusBarController: NSObject {
 
     @objc private func openSearch() {
         AppDelegate.shared?.toggleSearch()
+    }
+
+    @objc private func openSavedSearchView(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        AppDelegate.shared?.openSavedSearchView(id: id)
     }
 
     @objc private func openSettings() {

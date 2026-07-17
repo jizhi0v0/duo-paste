@@ -12,6 +12,7 @@ public struct Paths: Sendable {
     public var mainDB: URL { dbDir.appendingPathComponent("main.sqlite") }
     public var deviceIDFile: URL { root.appendingPathComponent("device-id") }
     public var configFile: URL { root.appendingPathComponent("config.json") }
+    public var savedSearchViewsFile: URL { root.appendingPathComponent("saved-search-views.json") }
     public var sharedSecretFile: URL { root.appendingPathComponent("shared-secret") }
 
     public init(root: URL) {

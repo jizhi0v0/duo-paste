@@ -37,7 +37,7 @@
 | R2.1 | iOS 本地 SQLite/FTS mirror | feature / perf | P1 | L | ✅ done |
 | R2.2 | iOS 首次同步进度与离线状态 | UX | P2 | M | ✅ done |
 | R3.1 | 自定义起止时间筛选 | feature | P2 | S | ✅ done |
-| R3.2 | 保存搜索视图 | feature | P2 | S | proposed |
+| R3.2 | 保存搜索视图 | feature | P2 | S | ✅ done |
 | R3.3 | 纯文本粘贴动作 | feature | P2 | S | proposed |
 | R4.1 | 8GB / 百万行搜索基准与回归门槛 | optimization | P1 | M | proposed |
 
@@ -239,7 +239,11 @@ iPhone 17 Pro 签名 build/install/launch 均通过；真机状态卡显示 20,4
 
 ### R3.2 保存搜索视图
 
+**完成记录（2026-07-17）**：新增版本化、原子写入且权限 0600 的 per-device `saved-search-views.json`，独立于 `config.json` 防 Settings 旧快照覆盖。命名视图完整保存 query、qualifier、kind/file sub-kind、预设或自定义时间窗与 pinned-only；同名更新保留稳定 ID。搜索面板支持保存/应用/删除，菜单栏支持按稳定 ID 快速应用并打开。6 项 Core/文件测试 + 3 项 UI/生命周期契约全绿；完整 `swift test`（254 + 601 + 10）、macOS debug/release、iOS Simulator build、Developer ID bundle 重装与 launchd 新 PID 均验证通过。
+
 把 query、qualifier、kind、时间窗和 pinned-only 保存为本机命名视图，支持菜单栏快速打开。第一版只做 per-device 配置，不引入新的跨设备元数据同步。
+
+**执行计划**：[`plans/r3-2-saved-search-views.md`](../plans/r3-2-saved-search-views.md)
 
 ### R3.3 纯文本粘贴动作
 

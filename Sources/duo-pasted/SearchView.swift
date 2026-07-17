@@ -459,6 +459,9 @@ struct SearchView: View {
         to: Date()
     ) ?? Date()
     @State private var customRangeEnd = Date()
+    @State private var savedViewEditorPresented = false
+    @State private var savedViewName = ""
+    @State private var savedViewError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -904,6 +907,7 @@ struct SearchView: View {
                         pinnedOnlyChip
                     }
                 }
+                savedViewMenu
                 timeRangeMenu
             }
             .padding(.horizontal, 22)
@@ -1397,6 +1401,129 @@ struct SearchView: View {
         .fixedSize()
         .popover(isPresented: $customRangePresented, arrowEdge: .bottom) {
             customRangeEditor
+        }
+    }
+
+    private var savedViewMenu: some View {
+        Menu {
+            if state.savedSearchViews.isEmpty {
+                Button("暂无保存视图") {}
+                    .disabled(true)
+            } else {
+                ForEach(state.savedSearchViews) { view in
+                    Button {
+                        state.applySavedSearchView(view)
+                    } label: {
+                        if state.isSavedSearchViewActive(view) {
+                            Label(view.name, systemImage: "checkmark")
+                        } else {
+                            Text(view.name)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+            Button("保存当前视图…") {
+                prepareSavedViewEditor()
+                DispatchQueue.main.async {
+                    savedViewEditorPresented = true
+                }
+            }
+
+            if !state.savedSearchViews.isEmpty {
+                Menu("删除保存的视图") {
+                    ForEach(state.savedSearchViews) { view in
+                        Button(view.name, role: .destructive) {
+                            deleteSavedView(view)
+                        }
+                    }
+                }
+            }
+        } label: {
+            let hasActiveView = state.savedSearchViews.contains(where: state.isSavedSearchViewActive)
+            Image(systemName: hasActiveView ? "bookmark.fill" : "bookmark")
+                .font(.system(size: 11))
+                .foregroundStyle(hasActiveView ? Color.accentColor : .secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule()
+                        .fill(hasActiveView ? Color.accentColor.opacity(0.15) : Color.primary.opacity(0.06))
+                )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("保存的视图")
+        .popover(isPresented: $savedViewEditorPresented, arrowEdge: .bottom) {
+            savedViewEditor
+        }
+    }
+
+    private var savedViewEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("保存当前视图")
+                .font(.headline)
+            TextField("视图名称", text: $savedViewName)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(saveCurrentView)
+            Text("将保存搜索词、类型、qualifier、时间范围和仅置顶状态。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let savedViewError {
+                Text(savedViewError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("取消") {
+                    savedViewEditorPresented = false
+                }
+                Button("保存", action: saveCurrentView)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(savedViewName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 330)
+    }
+
+    private func prepareSavedViewEditor() {
+        savedViewError = nil
+        if let active = state.savedSearchViews.first(where: state.isSavedSearchViewActive) {
+            savedViewName = active.name
+            return
+        }
+        let trimmedQuery = state.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedQuery.isEmpty {
+            savedViewName = String(trimmedQuery.prefix(24))
+        } else if state.pinnedOnly {
+            savedViewName = "置顶内容"
+        } else {
+            savedViewName = "新视图"
+        }
+    }
+
+    private func saveCurrentView() {
+        do {
+            let outcome = try state.saveCurrentSearchView(named: savedViewName)
+            state.postNotice("\(outcome.wasUpdate ? "已更新" : "已保存")视图 · \(outcome.view.name)")
+            savedViewError = nil
+            savedViewEditorPresented = false
+        } catch {
+            savedViewError = error.localizedDescription
+        }
+    }
+
+    private func deleteSavedView(_ view: SavedSearchView) {
+        do {
+            if try state.deleteSavedSearchView(id: view.id) {
+                state.postNotice("已删除视图 · \(view.name)")
+            }
+        } catch {
+            state.postNotice("删除视图失败 · \(error.localizedDescription)")
         }
     }
 

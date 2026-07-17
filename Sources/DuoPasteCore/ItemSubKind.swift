@@ -5,7 +5,7 @@ import Foundation
 /// 不是数据库列。`.file` kind 的所有信号(mime / 路径后缀)在读时再分类——既要避开 schema
 /// 改动(已经在 v8),又让对端 mirror 来的 file 项也能就地分类(它们可能没 blob_mime,只有
 /// textFull 路径)
-public enum FileSubKind: String, Sendable, CaseIterable {
+public enum FileSubKind: String, Codable, Sendable, CaseIterable {
     case video
     case pdf
     case audio
