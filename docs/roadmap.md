@@ -36,7 +36,7 @@
 | R1.4 | iOS 配对通道绑定 | security | P1 | M | ✅ done |
 | R2.1 | iOS 本地 SQLite/FTS mirror | feature / perf | P1 | L | ✅ done |
 | R2.2 | iOS 首次同步进度与离线状态 | UX | P2 | M | ✅ done |
-| R3.1 | 自定义起止时间筛选 | feature | P2 | S | ready |
+| R3.1 | 自定义起止时间筛选 | feature | P2 | S | ✅ done |
 | R3.2 | 保存搜索视图 | feature | P2 | S | proposed |
 | R3.3 | 纯文本粘贴动作 | feature | P2 | S | proposed |
 | R4.1 | 8GB / 百万行搜索基准与回归门槛 | optimization | P1 | M | proposed |
@@ -231,7 +231,11 @@ iPhone 17 Pro 签名 build/install/launch 均通过；真机状态卡显示 20,4
 
 ### R3.1 自定义起止时间筛选
 
+**完成记录（2026-07-17）**：macOS 时间菜单新增自定义起止 DatePicker；Core `SearchTimeRange` 按本地 Calendar 生成完整日期边界，正确覆盖 DST 与跨日范围，预设滚动窗口语义不变。列表、真实总数和类型 chip 共用同一对 `fromNs/toNs`。5 项日历/数据库测试 + 3 项 macOS UI source contract 全绿；完整 `swift test`（254 + 592 + 10）、debug/release build、Developer ID bundle 重装与 launchd 新进程均验证通过。
+
 复用已经存在的 `SearchQuery.fromNs/toNs`，在“全部/24h/7d/30d”之外加入自定义 DatePicker。验收要覆盖时区、跨日、清除筛选、chip count 与结果总数一致。
+
+**执行计划**：[`plans/r3-1-custom-date-range.md`](../plans/r3-1-custom-date-range.md)
 
 ### R3.2 保存搜索视图
 

@@ -39,8 +39,8 @@ final class AppState {
     /// `.file` kind 的虚拟 sub-kind 筛选(视频/PDF/音频/图片文件)。空集 = 不带 sub
     /// 过滤;非空跟 selectedKinds OR 起作用
     var selectedFileSubKinds: Set<FileSubKind> = []
-    /// 时间窗筛选。`.all` = 不带 fromNs；其他换算成 SearchQuery.fromNs
-    var timeRange: TimeRange = .all
+    /// 时间窗筛选。预设使用滚动窗口；自定义范围同时生成 SearchQuery.fromNs/toNs。
+    var timeRange: SearchTimeRange = .all
     /// 仅显示已置顶。SearchQuery.pinnedOnly → SQL `pinned = 1`
     var pinnedOnly: Bool = false
     /// 临时一次性提示（lazy blob 部分失败等场景），3s 自动清掉。
@@ -72,39 +72,6 @@ final class AppState {
     /// 用户点 PDF chip 跟 /pdf 选补全是等价的两条入口
     var activeQualifiers: [QueryQualifier] = []
 
-    /// 时间窗选项。换算成 SearchQuery.fromNs（toNs 始终 nil = 不卡上界）。
-    /// 注：用 wall-clock 算窗口起点，时钟偏移大时窗口范围会跟实际感受偏离——
-    /// 但 mirror 端 ingested_at_ns 已对齐 primary，主要影响是 own-origin item 在
-    /// client 上的"24h 窗"边界，秒级偏差不影响心智
-    enum TimeRange: String, CaseIterable, Identifiable, Sendable {
-        case all
-        case day
-        case week
-        case month
-
-        public var id: String { rawValue }
-
-        func fromNs(now: Date = Date()) -> Int64? {
-            let secondsAgo: TimeInterval
-            switch self {
-            case .all: return nil
-            case .day:   secondsAgo = 24 * 3600
-            case .week:  secondsAgo = 7 * 24 * 3600
-            case .month: secondsAgo = 30 * 24 * 3600
-            }
-            return Int64((now.timeIntervalSince1970 - secondsAgo) * 1_000_000_000)
-        }
-
-        var label: String {
-            switch self {
-            case .all:   "全部时间"
-            case .day:   "最近 24 小时"
-            case .week:  "最近 7 天"
-            case .month: "最近 30 天"
-            }
-        }
-    }
-
     /// 任意筛选维度变化都要触发 SearchView .task(id:) 重新发请求。
     /// 拼成一个紧凑字符串而非 Hashable struct——避免给 ItemKind / TimeRange 加 Hashable
     /// 约束链（其实都已经满足，但用 String 也省去 SwiftUI Equatable 比较的实例化）
@@ -113,7 +80,7 @@ final class AppState {
         let subsStr = selectedFileSubKinds.map { $0.rawValue }.sorted().joined(separator: ",")
         // activeQualifiers 进 filterID:string 化保留顺序,变化触发 .task(id:) 重 fetch
         let qualsStr = activeQualifiers.map { qualifierKey($0) }.joined(separator: ",")
-        return "\(query)\u{1F}\(timeRange.rawValue)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(qualsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
+        return "\(query)\u{1F}\(timeRange.filterKey)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(qualsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
     }
 
     /// QueryQualifier 的 string key,filterID 用
@@ -703,9 +670,11 @@ final class AppState {
             }
         }
         let trimmed = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        let timeBounds = timeRange.bounds()
         let q = SearchQuery(
             text: trimmed.isEmpty ? nil : trimmed,
-            fromNs: timeRange.fromNs(),
+            fromNs: timeBounds.fromNs,
+            toNs: timeBounds.toNs,
             kinds: Array(kindsUnion),
             fileSubKinds: Array(subsUnion),
             textFullSuffixes: suffixes,

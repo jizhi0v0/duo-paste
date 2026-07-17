@@ -190,6 +190,12 @@ excluded/paused outcome 不 refresh、不 wake OCR，`CaptureService.broadcastIf
 
 **核心不变量**：mesh 拓扑下 `item` 表混存本机 own + 对端 peer 行，跨 origin 同 text 是常态。raw count 会把 ToDesk/Continuity 副本算一遍跟对端口径不齐——回归测试 `searchProviderTotalCountMatchesFoldedRowCount`。
 
+### 自定义日期范围必须按本地 Calendar 切日界线
+
+`SearchTimeRange.custom` 的起点是较早选中日期的本地 00:00，终点是较晚选中日期的**下一本地 00:00 减 1ns**，再交给 `SearchQuery` 现有的 inclusive `>= fromNs` / `<= toNs`。不能用固定 `24h * 天数` 推导自定义日期边界——DST 会有 23/25 小时日。预设“最近 24h/7d/30d”仍保持滚动时长语义。
+
+`AppState.refresh()` 必须先产生同一份 `SearchTimeBounds`，再把它的 `fromNs/toNs` 同时传给 SearchProvider；列表、真实总数、kind chip 和 file sub-kind chip 都从这一个 `SearchQuery` 派生，不能各自重算日期。
+
 ### 搜索排序契约：pinned > prefix(24h) > time
 
 `(pinned DESC, prefix_score DESC, captured_at_ns DESC)`。prefix_score：preview 以 query 起始 = 2 / text_full 起始 = 1 / 否则 0。**仅对 24h 内项生效**——跨天老内容哪怕起头匹配也走纯时间倒序，剪贴板心智是"搜=找最近用过的"。

@@ -452,6 +452,13 @@ struct SearchView: View {
     var onOpenSettings: (() -> Void)? = nil
 
     @FocusState private var searchFieldFocused: Bool
+    @State private var customRangePresented = false
+    @State private var customRangeStart = Calendar.current.date(
+        byAdding: .day,
+        value: -7,
+        to: Date()
+    ) ?? Date()
+    @State private var customRangeEnd = Date()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1344,22 +1351,35 @@ struct SearchView: View {
 
     private var timeRangeMenu: some View {
         Menu {
-            ForEach(AppState.TimeRange.allCases) { range in
+            ForEach(SearchTimeRange.presets) { range in
                 Button {
                     state.timeRange = range
                 } label: {
                     if state.timeRange == range {
-                        Label(range.label, systemImage: "checkmark")
+                        Label(timeRangeLabel(range), systemImage: "checkmark")
                     } else {
-                        Text(range.label)
+                        Text(timeRangeLabel(range))
                     }
+                }
+            }
+            Divider()
+            Button {
+                prepareCustomRangeEditor()
+                DispatchQueue.main.async {
+                    customRangePresented = true
+                }
+            } label: {
+                if case .custom = state.timeRange {
+                    Label("自定义日期…", systemImage: "checkmark")
+                } else {
+                    Text("自定义日期…")
                 }
             }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "clock")
                     .font(.system(size: 11))
-                Text(state.timeRange.label)
+                Text(timeRangeLabel(state.timeRange))
                     .font(.system(size: 12))
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
@@ -1375,6 +1395,102 @@ struct SearchView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+        .popover(isPresented: $customRangePresented, arrowEdge: .bottom) {
+            customRangeEditor
+        }
+    }
+
+    private var customRangeEditor: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("自定义日期范围")
+                .font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                GridRow {
+                    Text("开始")
+                        .foregroundStyle(.secondary)
+                    DatePicker(
+                        "开始日期",
+                        selection: $customRangeStart,
+                        displayedComponents: .date
+                    )
+                    .labelsHidden()
+                }
+                GridRow {
+                    Text("结束")
+                        .foregroundStyle(.secondary)
+                    DatePicker(
+                        "结束日期",
+                        selection: $customRangeEnd,
+                        displayedComponents: .date
+                    )
+                    .labelsHidden()
+                }
+            }
+            if !customRangeIsValid {
+                Text("结束日期不能早于开始日期")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Button("清除") {
+                    state.timeRange = .all
+                    customRangePresented = false
+                }
+                Spacer()
+                Button("取消") {
+                    customRangePresented = false
+                }
+                Button("应用") {
+                    let calendar = Calendar.current
+                    state.timeRange = .custom(
+                        start: calendar.startOfDay(for: customRangeStart),
+                        end: calendar.startOfDay(for: customRangeEnd)
+                    )
+                    customRangePresented = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!customRangeIsValid)
+            }
+        }
+        .padding(16)
+        .frame(width: 310)
+    }
+
+    private var customRangeIsValid: Bool {
+        Calendar.current.compare(
+            customRangeStart,
+            to: customRangeEnd,
+            toGranularity: .day
+        ) != .orderedDescending
+    }
+
+    private func prepareCustomRangeEditor() {
+        if case .custom(let start, let end) = state.timeRange {
+            customRangeStart = start
+            customRangeEnd = end
+            return
+        }
+        let now = Date()
+        customRangeEnd = now
+        customRangeStart = Calendar.current.date(byAdding: .day, value: -7, to: now) ?? now
+    }
+
+    private func timeRangeLabel(_ range: SearchTimeRange) -> String {
+        switch range {
+        case .all: "全部时间"
+        case .day: "最近 24 小时"
+        case .week: "最近 7 天"
+        case .month: "最近 30 天"
+        case .custom(let start, let end):
+            "\(compactDate(start))–\(compactDate(end))"
+        }
+    }
+
+    private func compactDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("Md")
+        return formatter.string(from: date)
     }
 
     /// 一次性 notice（pin mirror 行被拒等）。文案 3s 自动消失（AppState 控制）。
