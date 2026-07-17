@@ -16,11 +16,27 @@ public enum ItemClassifier {
     /// `.file` kind 的细分类——优先 mime,退化到 textFull 路径后缀。
     /// 多 sub-kind 互斥优先级:video > pdf > audio > imageFile。一个 mp4 不会同时算视频+音频
     public static func fileSubKind(_ item: Item) -> FileSubKind? {
-        guard item.kind == .file else { return nil }
-        if isVideo(item) { return .video }
-        if isPDF(item) { return .pdf }
-        if isAudio(item) { return .audio }
-        if isImageFile(item) { return .imageFile }
+        fileSubKind(kind: item.kind, blobMime: item.blobMime, textFull: item.textFull)
+    }
+
+    /// Projection rebuild 只持有分类所需的窄字段，走本 overload 避免为了 sub-kind 人工构造
+    /// 完整 Item。语义必须与 `fileSubKind(_:)` 完全同源。
+    public static func fileSubKind(
+        kind: ItemKind,
+        blobMime: String?,
+        textFull: String?
+    ) -> FileSubKind? {
+        guard kind == .file else { return nil }
+        let firstPath = textFull?.split(separator: "\n", omittingEmptySubsequences: true).first
+            .map(String.init)
+        if blobMime?.hasPrefix("video/") == true
+            || firstPath.map(fileLooksLikeVideo(path:)) == true { return .video }
+        if blobMime == "application/pdf"
+            || firstPath.map(fileLooksLikePDF(path:)) == true { return .pdf }
+        if blobMime?.hasPrefix("audio/") == true
+            || firstPath.map(fileLooksLikeAudio(path:)) == true { return .audio }
+        if blobMime?.hasPrefix("image/") == true
+            || firstPath.map(fileLooksLikeImage(path:)) == true { return .imageFile }
         return nil
     }
 

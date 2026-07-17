@@ -86,6 +86,27 @@ public struct SearchQuery: Sendable, Equatable {
     }
 }
 
+/// R4.2 一次搜索刷新所需的完整结果。list/total/facets 必须来自同一 reader snapshot 与
+/// 同一 fold pass，避免 UI 四次独立全表 fold，也避免 capture 恰好插入时四个数字互相打架。
+public struct SearchSummary: Sendable {
+    public let hits: [(Item, String?)]
+    public let totalCount: Int
+    public let kindCounts: [ItemKind: Int]
+    public let fileSubKindCounts: [FileSubKind: Int]
+
+    public init(
+        hits: [(Item, String?)],
+        totalCount: Int,
+        kindCounts: [ItemKind: Int],
+        fileSubKindCounts: [FileSubKind: Int]
+    ) {
+        self.hits = hits
+        self.totalCount = totalCount
+        self.kindCounts = kindCounts
+        self.fileSubKindCounts = fileSubKindCounts
+    }
+}
+
 public struct SearchAPI: Sendable {
     public let database: Database
 
@@ -94,7 +115,7 @@ public struct SearchAPI: Sendable {
     }
 
     public func search(_ q: SearchQuery) throws -> [Item] {
-        try database.pool.read { db in
+        return try database.pool.read { db in
             try Self.fetch(db, query: q)
         }
     }
@@ -113,8 +134,33 @@ public struct SearchAPI: Sendable {
     /// 拓扑下 item 表本身就混 own + peer 行，raw 路径出来的总数跟对端不齐——直接合并
     /// 成单一 fold-aware 路径，删 raw 公开 API。
     public func searchHits(_ q: SearchQuery) throws -> [(Item, String?)] {
-        try database.pool.read { db in
+        if Self.canUseFoldProjection(q) {
+            try database.refreshSearchFoldProjection()
+            return try database.pool.read { db in
+                try Self.fetchProjectionHits(db, query: q)
+            }
+        }
+        return try database.pool.read { db in
             try Self.fetchHitsFolded(db, query: q)
+        }
+    }
+
+    /// 一次返回生产 UI 所需的 list + total + facets。
+    ///
+    /// - 空 query 且无时间范围：走 v16 持久化 fold projection，SQL 一次窄表聚合 + 最近页。
+    /// - FTS / 自定义时间范围：只做一次无 qualifier fold，在同一数组上派生 total/facets/list。
+    ///
+    /// 两条路径都保持 qualifier 在 fold 后按 winner 字段过滤；chip counts 忽略 kinds /
+    /// fileSubKinds 但保留 suffix 的既有语义。
+    public func searchSummary(_ q: SearchQuery) throws -> SearchSummary {
+        if Self.canUseFoldProjection(q) {
+            try database.refreshSearchFoldProjection()
+            return try database.pool.read { db in
+                try Self.fetchProjectionSummary(db, query: q)
+            }
+        }
+        return try database.pool.read { db in
+            try Self.fetchFoldedSummary(db, query: q)
         }
     }
 
@@ -128,7 +174,11 @@ public struct SearchAPI: Sendable {
     /// 等价性:total 跟 `count(q)` 一致(同源 fetchHitsFolded);hits 跟 `searchHits(q)`
     /// 一致(slice 顺序跟 fetchHitsFolded 内置 limit/offset 一致)。回归测试钉死
     public func searchHitsAndCount(_ q: SearchQuery) throws -> (hits: [(Item, String?)], total: Int) {
-        try database.pool.read { db in
+        if Self.canUseFoldProjection(q) {
+            let summary = try searchSummary(q)
+            return (summary.hits, summary.totalCount)
+        }
+        return try database.pool.read { db in
             // limit=Int.max + offset=0 → fetchHitsFolded 返回全部排序后的命中
             // (内部 needsPostFilter 时 oversample 本来就是 Int.max,所以这一改不增加开销)
             let allQuery = SearchQuery(
@@ -153,7 +203,8 @@ public struct SearchAPI: Sendable {
 
     /// Fold-aware fetch 内部实现：oversample raw（无 kinds/pinnedOnly 过滤）→ text-fold
     /// （跨 origin 同 text_full 折一条，pinned OR 聚合）→ 后置 kinds/pinnedOnly 过滤 →
-    /// 排序契约（pinned/prefix24h/captured DESC）→ LIMIT/OFFSET。
+    /// 排序契约：非空 query = prefix group / contains group，各组 captured DESC；
+    /// 空 query = pinned DESC / captured DESC。最后再 LIMIT/OFFSET。
     static func fetchHitsFolded(_ db: GRDB.Database, query q: SearchQuery) throws -> [(Item, String?)] {
         // Exact empty-result fast path for qualifier searches. Fold can change the representative
         // row and OR pinned state, but it cannot synthesize a kind/sub-kind/suffix that no raw hit
@@ -237,25 +288,34 @@ public struct SearchAPI: Sendable {
         if q.pinnedOnly {
             deduped = deduped.filter { $0.0.pinned }
         }
-        // 排序契约：pinned DESC → prefix DESC → captured_at_ns DESC。
-        // prefix 分数跟 SQL 端 CASE 一致（preview 起始=2, text_full 起始=1, 否则 0）。
+        // 排序契约：
+        // - 非空 query：prefix group → contains group，每组 captured_at_ns DESC；pin 不参与
+        // - 空 query：pinned DESC → captured_at_ns DESC
+        // preview / text_full 的前缀属于同一个 relevance tier，不再细分 2/1。
         let prefixText = q.text
-        // 跟 SQL 端口径一致：24h 窗外的项 prefix 分数清零，强制走时间倒序。
-        let nowNs = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
-        let windowNs: Int64 = 86_400 * 1_000_000_000
-        func prefixScore(_ item: Item) -> Int {
-            guard let t = prefixText, !t.isEmpty else { return 0 }
-            if nowNs - item.capturedAtNs >= windowNs { return 0 }
-            let needle = t.lowercased()
-            if let pv = item.preview, pv.lowercased().hasPrefix(needle) { return 2 }
-            if let tf = item.textFull, tf.lowercased().hasPrefix(needle) { return 1 }
-            return 0
+        // 不要在 sort comparator 内 lowercased()：比较次数是 O(n log n)，百万行库即使命中
+        // 只有数百条也会把同一段 text 重复分配/归一化。每个 folded item 只算一次 membership，
+        // comparator 退化成 Set lookup + Int64 compare。
+        let prefixIDs: Set<String>
+        if let prefixText, !prefixText.isEmpty {
+            let needle = prefixText.lowercased()
+            prefixIDs = Set(deduped.compactMap { hit in
+                let item = hit.0
+                let previewMatches = item.preview?.lowercased().hasPrefix(needle) == true
+                let fullTextMatches = item.textFull?.lowercased().hasPrefix(needle) == true
+                return previewMatches || fullTextMatches ? item.id : nil
+            })
+        } else {
+            prefixIDs = []
         }
         deduped.sort { lhs, rhs in
-            if lhs.0.pinned != rhs.0.pinned { return lhs.0.pinned }
-            let lp = prefixScore(lhs.0)
-            let rp = prefixScore(rhs.0)
-            if lp != rp { return lp > rp }
+            if prefixText != nil {
+                let lp = prefixIDs.contains(lhs.0.id)
+                let rp = prefixIDs.contains(rhs.0.id)
+                if lp != rp { return lp && !rp }
+            } else if lhs.0.pinned != rhs.0.pinned {
+                return lhs.0.pinned
+            }
             return lhs.0.capturedAtNs > rhs.0.capturedAtNs
         }
         let start = min(q.offset, deduped.count)
@@ -298,8 +358,8 @@ public struct SearchAPI: Sendable {
         if needsPrefix {
             prefixCol = """
                 , CASE
-                    WHEN instr(LOWER(IFNULL(item.preview, '')), LOWER(?)) = 1 THEN 2
-                    WHEN instr(LOWER(IFNULL(item.text_full, '')), LOWER(?)) = 1 THEN 1
+                    WHEN instr(LOWER(IFNULL(item.preview, '')), LOWER(?)) = 1
+                      OR instr(LOWER(IFNULL(item.text_full, '')), LOWER(?)) = 1 THEN 1
                     ELSE 0
                   END AS _prefix
                 """
@@ -307,19 +367,16 @@ public struct SearchAPI: Sendable {
         } else {
             prefixCol = ""
         }
-        // 时间窗：prefix-boost 仅对 24h 内的项生效。跨天的老内容（哪怕起头匹配）也按
-        // 时间倒序排——剪贴板心智里"搜=找最近用过的"，不希望陈年老条目被翻上来。
-        // SQLite 自带 strftime('%s','now')，避免 Swift 端再往 args 里塞 now_ns。
-        let orderPrefix = needsPrefix
-            ? "(CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - item.captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END) DESC, "
-            : ""
+        let order = needsPrefix
+            ? "_prefix DESC, item.captured_at_ns DESC"
+            : "item.pinned DESC, item.captured_at_ns DESC"
         let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
         let sql = """
             SELECT item.*\(snippetCol)\(prefixCol)
             FROM item
             \(join)
             \(whereClause)
-            ORDER BY item.pinned DESC, \(orderPrefix)item.captured_at_ns DESC
+            ORDER BY \(order)
             LIMIT ? OFFSET ?
         """
         args.append(q.limit)
@@ -337,7 +394,10 @@ public struct SearchAPI: Sendable {
     /// UI 用来显示真实 counter，不受 200 cap 截断影响。跟 `searchHits` 同源走
     /// fold 路径——保证 list / total / chip 三者口径一致。
     public func count(_ q: SearchQuery) throws -> Int {
-        try database.pool.read { db in
+        if Self.canUseFoldProjection(q) {
+            return try searchSummary(q).totalCount
+        }
+        return try database.pool.read { db in
             let oversample = SearchQuery(
                 text: q.text,
                 fromNs: q.fromNs, toNs: q.toNs,
@@ -358,6 +418,9 @@ public struct SearchAPI: Sendable {
     /// chip 会得到多少"，跟当前已选 chip 集合无关。否则多选时 count 来回跳，用户没法
     /// 判断稀疏类型。跟 `searchHits` / `count` 同源走 fold 路径，保证 chip / total / list 口径一致。
     public func countByKind(_ q: SearchQuery) throws -> [ItemKind: Int] {
+        if Self.canUseFoldProjection(q) {
+            return try searchSummary(q).kindCounts
+        }
         // textFullSuffixes 是搜索维度（用户输 /java 想看 java 文件），不是 chip 维度，
         // 跟 kinds/fileSubKinds 不同——保留进 stripped 让 chip count 反映"如果只选这个
         // chip + 当前搜索范围有多少"，而不是"忽略整个搜索范围"
@@ -385,6 +448,9 @@ public struct SearchAPI: Sendable {
     /// 显示假如**只**选视频会有多少条,忽略当前已选 chip。返回所有 FileSubKind 的 entry
     /// (缺的填 0),让 chip "0" 状态可见
     public func countByFileSubKind(_ q: SearchQuery) throws -> [FileSubKind: Int] {
+        if Self.canUseFoldProjection(q) {
+            return try searchSummary(q).fileSubKindCounts
+        }
         let stripped = SearchQuery(
             text: q.text,
             fromNs: q.fromNs, toNs: q.toNs,
@@ -406,6 +472,253 @@ public struct SearchAPI: Sendable {
             }
             return out
         }
+    }
+
+    private static func canUseFoldProjection(_ q: SearchQuery) -> Bool {
+        q.text == nil && q.fromNs == nil && q.toNs == nil
+    }
+
+    /// FTS/time fallback：拿无 qualifier 的完整 folded scope 一次，再从该数组派生四类输出。
+    private static func fetchFoldedSummary(
+        _ db: GRDB.Database,
+        query q: SearchQuery
+    ) throws -> SearchSummary {
+        let baseQuery = SearchQuery(
+            text: q.text,
+            fromNs: q.fromNs,
+            toNs: q.toNs,
+            kinds: [],
+            fileSubKinds: [],
+            textFullSuffixes: [],
+            pinnedOnly: q.pinnedOnly,
+            includeDeleted: q.includeDeleted,
+            limit: Int.max,
+            offset: 0
+        )
+        let base = try fetchHitsFolded(db, query: baseQuery)
+        let actual = hasAnyQualifier(q)
+            ? base.filter { matchesQualifier($0.0, query: q) }
+            : base
+        let facetScope = q.textFullSuffixes.isEmpty
+            ? base
+            : base.filter { matchesSuffix($0.0, suffixes: q.textFullSuffixes) }
+
+        var kinds: [ItemKind: Int] = [:]
+        var fileKinds = Dictionary(uniqueKeysWithValues: FileSubKind.allCases.map { ($0, 0) })
+        for hit in facetScope {
+            let item = hit.0
+            kinds[item.kind, default: 0] += 1
+            if let sub = ItemClassifier.fileSubKind(item) {
+                fileKinds[sub, default: 0] += 1
+            }
+        }
+        let start = min(q.offset, actual.count)
+        let end = min(q.offset + q.limit, actual.count)
+        let hits = start < end ? Array(actual[start..<end]) : []
+        return SearchSummary(
+            hits: hits,
+            totalCount: actual.count,
+            kindCounts: kinds,
+            fileSubKindCounts: fileKinds
+        )
+    }
+
+    private static func hasAnyQualifier(_ q: SearchQuery) -> Bool {
+        !q.kinds.isEmpty || !q.fileSubKinds.isEmpty || !q.textFullSuffixes.isEmpty
+    }
+
+    private static func matchesQualifier(_ item: Item, query q: SearchQuery) -> Bool {
+        if q.kinds.contains(item.kind) { return true }
+        if let sub = ItemClassifier.fileSubKind(item), q.fileSubKinds.contains(sub) { return true }
+        return matchesSuffix(item, suffixes: q.textFullSuffixes)
+    }
+
+    private static func matchesSuffix(_ item: Item, suffixes: [String]) -> Bool {
+        guard !suffixes.isEmpty, let text = item.textFull?.lowercased() else { return false }
+        return suffixes.contains { text.hasSuffix($0.lowercased()) }
+    }
+
+    private static func fetchProjectionSummary(
+        _ db: GRDB.Database,
+        query q: SearchQuery
+    ) throws -> SearchSummary {
+        if q.textFullSuffixes.isEmpty {
+            let counts = try fetchIndexedProjectionCounts(db, query: q)
+            return SearchSummary(
+                hits: try fetchProjectionHits(db, query: q),
+                totalCount: counts.total,
+                kindCounts: counts.kinds,
+                fileSubKindCounts: counts.fileKinds
+            )
+        }
+
+        var aggregateArgs: [DatabaseValueConvertible] = []
+        let actualPredicate = projectionQualifierPredicate(q, alias: "f", args: &aggregateArgs) ?? "1"
+        let suffixPredicate = projectionSuffixPredicate(
+            q.textFullSuffixes, alias: "f", args: &aggregateArgs
+        ) ?? "1"
+        let commonWhere = q.pinnedOnly ? "WHERE f.pinned = 1" : ""
+        let kindColumns = ItemKind.allCases.map { kind in
+            "COALESCE(SUM(CASE WHEN chip_match = 1 AND kind = '\(kind.rawValue)' THEN 1 ELSE 0 END), 0) AS kind_\(kind.rawValue)"
+        }
+        let fileColumns = FileSubKind.allCases.map { sub in
+            "COALESCE(SUM(CASE WHEN chip_match = 1 AND file_sub_kind = '\(sub.rawValue)' THEN 1 ELSE 0 END), 0) AS file_\(sub.rawValue)"
+        }
+        let aggregateSQL = """
+            WITH scoped AS (
+                SELECT kind, file_sub_kind,
+                       CASE WHEN \(actualPredicate) THEN 1 ELSE 0 END AS actual_match,
+                       CASE WHEN \(suffixPredicate) THEN 1 ELSE 0 END AS chip_match
+                FROM search_fold f
+                \(commonWhere)
+            )
+            SELECT COALESCE(SUM(actual_match), 0) AS total_count,
+                   \((kindColumns + fileColumns).joined(separator: ",\n                   "))
+            FROM scoped
+        """
+        guard let row = try Row.fetchOne(
+            db, sql: aggregateSQL, arguments: StatementArguments(aggregateArgs)
+        ) else {
+            return SearchSummary(hits: [], totalCount: 0, kindCounts: [:], fileSubKindCounts: [:])
+        }
+        let total: Int = row["total_count"]
+        var kinds: [ItemKind: Int] = [:]
+        for kind in ItemKind.allCases {
+            let count: Int = row["kind_\(kind.rawValue)"]
+            if count > 0 { kinds[kind] = count }
+        }
+        var fileKinds: [FileSubKind: Int] = [:]
+        for sub in FileSubKind.allCases {
+            fileKinds[sub] = row["file_\(sub.rawValue)"] as Int
+        }
+        return SearchSummary(
+            hits: try fetchProjectionHits(db, query: q),
+            totalCount: total,
+            kindCounts: kinds,
+            fileSubKindCounts: fileKinds
+        )
+    }
+
+    /// 默认空搜索不需要逐行算 11 个 CASE。total、kind、file-sub-kind 分别从覆盖索引
+    /// COUNT/GROUP BY；三次 B-tree scan 比一个宽 conditional aggregate 更省 CPU，百万行
+    /// release p95 的收益由 R4.2 benchmark gate 约束。suffix 是动态字符串，只能留慢路。
+    private static func fetchIndexedProjectionCounts(
+        _ db: GRDB.Database,
+        query q: SearchQuery
+    ) throws -> (total: Int, kinds: [ItemKind: Int], fileKinds: [FileSubKind: Int]) {
+        var totalArgs: [DatabaseValueConvertible] = []
+        var totalWheres: [String] = []
+        if q.pinnedOnly { totalWheres.append("f.pinned = 1") }
+        if let qualifier = projectionQualifierPredicate(q, alias: "f", args: &totalArgs) {
+            totalWheres.append(qualifier)
+        }
+        let totalWhere = totalWheres.isEmpty
+            ? ""
+            : "WHERE " + totalWheres.joined(separator: " AND ")
+        let total = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM search_fold f \(totalWhere)",
+            arguments: StatementArguments(totalArgs)
+        ) ?? 0
+
+        let facetWhere = q.pinnedOnly ? "WHERE pinned = 1" : ""
+        let kindRows = try Row.fetchAll(db, sql: """
+            SELECT kind, COUNT(*) AS count
+            FROM search_fold
+            \(facetWhere)
+            GROUP BY kind
+        """)
+        var kinds: [ItemKind: Int] = [:]
+        for row in kindRows {
+            guard let raw: String = row["kind"], let kind = ItemKind(rawValue: raw) else { continue }
+            kinds[kind] = row["count"]
+        }
+
+        let fileWhere = q.pinnedOnly
+            ? "WHERE file_sub_kind IS NOT NULL AND pinned = 1"
+            : "WHERE file_sub_kind IS NOT NULL"
+        let fileRows = try Row.fetchAll(db, sql: """
+            SELECT file_sub_kind, COUNT(*) AS count
+            FROM search_fold
+            \(fileWhere)
+            GROUP BY file_sub_kind
+        """)
+        var fileKinds = Dictionary(uniqueKeysWithValues: FileSubKind.allCases.map { ($0, 0) })
+        for row in fileRows {
+            guard let raw: String = row["file_sub_kind"],
+                  let sub = FileSubKind(rawValue: raw) else { continue }
+            fileKinds[sub] = row["count"]
+        }
+        return (total, kinds, fileKinds)
+    }
+
+    private static func fetchProjectionHits(
+        _ db: GRDB.Database,
+        query q: SearchQuery
+    ) throws -> [(Item, String?)] {
+        var args: [DatabaseValueConvertible] = []
+        var wheres: [String] = []
+        if q.pinnedOnly { wheres.append("f.pinned = 1") }
+        if let qualifier = projectionQualifierPredicate(q, alias: "f", args: &args) {
+            wheres.append(qualifier)
+        }
+        let whereSQL = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
+        let sql = """
+            SELECT item.*,
+                   f.captured_at_ns AS _fold_captured_at_ns,
+                   f.pinned AS _fold_pinned
+            FROM search_fold f
+            JOIN item ON item.id = f.item_id
+            \(whereSQL)
+            ORDER BY f.pinned DESC, f.captured_at_ns DESC, f.item_id ASC
+            LIMIT ? OFFSET ?
+        """
+        args.append(q.limit)
+        args.append(q.offset)
+        return try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args)).map { row in
+            var item = try Item(row: row)
+            item.capturedAtNs = row["_fold_captured_at_ns"]
+            item.pinned = row["_fold_pinned"]
+            return (item, nil)
+        }
+    }
+
+    private static func projectionQualifierPredicate(
+        _ q: SearchQuery,
+        alias: String,
+        args: inout [DatabaseValueConvertible]
+    ) -> String? {
+        var clauses: [String] = []
+        if !q.kinds.isEmpty {
+            clauses.append("\(alias).kind IN (\(q.kinds.map { _ in "?" }.joined(separator: ",")))")
+            args.append(contentsOf: q.kinds.map(\.rawValue))
+        }
+        if !q.fileSubKinds.isEmpty {
+            clauses.append("\(alias).file_sub_kind IN (\(q.fileSubKinds.map { _ in "?" }.joined(separator: ",")))")
+            args.append(contentsOf: q.fileSubKinds.map(\.rawValue))
+        }
+        if let suffix = projectionSuffixPredicate(q.textFullSuffixes, alias: alias, args: &args) {
+            clauses.append(suffix)
+        }
+        guard !clauses.isEmpty else { return nil }
+        return clauses.count == 1 ? clauses[0] : "(" + clauses.joined(separator: " OR ") + ")"
+    }
+
+    private static func projectionSuffixPredicate(
+        _ suffixes: [String],
+        alias: String,
+        args: inout [DatabaseValueConvertible]
+    ) -> String? {
+        guard !suffixes.isEmpty else { return nil }
+        let clauses = suffixes.map { suffix -> String in
+            let normalized = suffix.lowercased()
+            args.append(normalized)
+            args.append(normalized)
+            // 用 SUBSTR 而非 LIKE：`%` / `_` 在 SearchQuery suffix 里必须仍是字面字符，
+            // 与 Swift `hasSuffix` 后置过滤完全一致。
+            return "SUBSTR(LOWER(IFNULL(\(alias).text_full, '')), -LENGTH(?)) = ?"
+        }
+        return clauses.count == 1 ? clauses[0] : "(" + clauses.joined(separator: " OR ") + ")"
     }
 
     /// 构造 kind + fileSubKinds 的 OR'd WHERE 谓词。返回 nil 表示无 kind 过滤。
@@ -512,8 +825,8 @@ public struct SearchAPI: Sendable {
         if needsPrefix {
             prefixCol = """
                 , CASE
-                    WHEN instr(LOWER(IFNULL(item.preview, '')), LOWER(?)) = 1 THEN 2
-                    WHEN instr(LOWER(IFNULL(item.text_full, '')), LOWER(?)) = 1 THEN 1
+                    WHEN instr(LOWER(IFNULL(item.preview, '')), LOWER(?)) = 1
+                      OR instr(LOWER(IFNULL(item.text_full, '')), LOWER(?)) = 1 THEN 1
                     ELSE 0
                   END AS _prefix
                 """
@@ -521,19 +834,16 @@ public struct SearchAPI: Sendable {
         } else {
             prefixCol = ""
         }
-        // 时间窗：prefix-boost 仅对 24h 内的项生效。跨天的老内容（哪怕起头匹配）也按
-        // 时间倒序排——剪贴板心智里"搜=找最近用过的"，不希望陈年老条目被翻上来。
-        // SQLite 自带 strftime('%s','now')，避免 Swift 端再往 args 里塞 now_ns。
-        let orderPrefix = needsPrefix
-            ? "(CASE WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000000000 - item.captured_at_ns) < 86400000000000 THEN _prefix ELSE 0 END) DESC, "
-            : ""
+        let order = needsPrefix
+            ? "_prefix DESC, item.captured_at_ns DESC"
+            : "item.pinned DESC, item.captured_at_ns DESC"
         let whereClause = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
         let sql = """
             SELECT item.*\(prefixCol)
             FROM item
             \(join)
             \(whereClause)
-            ORDER BY item.pinned DESC, \(orderPrefix)item.captured_at_ns DESC
+            ORDER BY \(order)
             LIMIT ? OFFSET ?
         """
         args.append(q.limit)

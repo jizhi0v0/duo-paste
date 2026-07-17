@@ -12,6 +12,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     /// Enter / 双击触发。多选时按 selectedIDs 顺序传整个数组;空选 fallback 到 currentItem 单项。
     /// 多选合并 vs 降级首项的语义由 AppDelegate.pasteBack 决定
     private let onPaste: ([Item]) -> Void
+    /// ⇧⌘V / 右键“粘贴为纯文本”。只接收全部为 text/rtf/html 的 selection。
+    private let onPastePlainText: ([Item]) -> Void
     /// ⌘Return 时触发——file/image kind 且**单选**。AppDelegate 用它调 NSWorkspace reveal/open。
     /// 多选 reveal 语义不清,仅单选生效。SearchView 右键 contextMenu "在 Finder 显示" 也走这里
     private let onReveal: ((Item) -> Void)?
@@ -64,6 +66,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
     private var previewController: PreviewPanelController?
 
     init(state: AppState, onPaste: @escaping ([Item]) -> Void,
+         onPastePlainText: @escaping ([Item]) -> Void,
          onReveal: ((Item) -> Void)? = nil,
          onOpenWith: ((Item, URL) -> Void)? = nil,
          onDismiss: @escaping () -> Void = {},
@@ -71,6 +74,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
          onCopyText: ((String) -> Void)? = nil) {
         self.state = state
         self.onPaste = onPaste
+        self.onPastePlainText = onPastePlainText
         self.onReveal = onReveal
         self.onOpenWith = onOpenWith
         self.onDismiss = onDismiss
@@ -224,6 +228,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // MainActor 闭包，避免 NSEvent 非 Sendable 进入隔离边界。
             let keyCode = Int(event.keyCode)
             let isCmd = event.modifierFlags.contains(.command)
+            let isShift = event.modifierFlags.contains(.shift)
             // isARepeat = NSEvent 标记本事件是 keyboard repeat(长按持续触发)非首次按下。
             // 方向键路径用它做节流,避免 macOS 默认 ~30/s 重复速率让卡片闪现而非平滑滑过
             let isARepeat = event.isARepeat
@@ -241,6 +246,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             // ⌘A (keyCode=0) = previewShown 状态下全选预览内容(文本→NSTextView.selectAll;
             // 图片→Live Text selectAllText)。preview 未开 / 当前 kind 无可选目标透传给搜索框
             let isCmdA = (keyCode == 0 && isCmd)
+            // ⇧⌘V (ANSI V = keyCode 9) = 纯文本粘贴。只在 selection 全部符合
+            // text/rtf/html 白名单时消费；其它 kind 透传给 TextField 原生行为。
+            let isPlainTextPaste = (keyCode == 9 && isCmd && isShift)
             // 空格键(49)的拦截条件——以 input 焦点状态为主分流:
             //   A) input 没焦点(用户点了卡 / 空白) → 无视 query 直接 toggle preview
             //   B) input 有焦点 + preview 已开 → 空格关 preview(从 preview 状态退出)
@@ -271,7 +279,7 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 return chars
             }()
             guard interceptCodes.contains(keyCode)
-                    || isCmdP || isCmdC || isCmdA || isSpace || cmdDigitPos != nil
+                    || isCmdP || isCmdC || isCmdA || isPlainTextPaste || isSpace || cmdDigitPos != nil
                     || printableChar != nil else { return event }
             // SwiftUI TextField 编辑时 firstResponder = NSTextField 的 field editor（NSTextView）。
             // hasMarkedText() == true 代表 IME 正在 compose 候选词，所有键都让 IME 自己消费。
@@ -436,6 +444,21 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                         return false
                     }
                     return true
+                case 9 where isCmd && isShift:                  // ⇧⌘V = 粘贴为纯文本
+                    let items: [Item]
+                    if !self.state.selectedItems.isEmpty {
+                        items = self.state.selectedItems
+                    } else if let cur = self.state.currentItem {
+                        items = [cur]
+                    } else {
+                        items = []
+                    }
+                    guard !items.isEmpty,
+                          items.allSatisfy({ PlainTextPaste.supports($0.kind) }) else {
+                        return false
+                    }
+                    self.onPastePlainText(items)
+                    return true
                 default:
                     // ⌘1-9 = 直接粘贴 results 前 9 位中第 N 项,不改 selectedIDs。
                     // 越界 (results 不足 N 条) 透传,UI 上对应 ⌘N 角标也不显示
@@ -539,6 +562,9 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 // 显示 spinner，同步路径在完成后调 controller.hide）。
                 // 双击行 → SearchView 传 [item] 单项;直接走 pasteBack 处理 single 路径
                 self.onPaste(items)
+            },
+            onPastePlainText: { [weak self] items in
+                self?.onPastePlainText(items)
             },
             onClose: { [weak self] in
                 self?.hide()

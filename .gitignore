@@ -5,6 +5,7 @@
 Packages/
 xcuserdata/
 DerivedData/
+.benchmark/
 
 # iOS app 的 xcodeproj 走白名单(对端 clone 后要能 build)
 !iOS/DuoPasteApp/DuoPasteApp.xcodeproj/

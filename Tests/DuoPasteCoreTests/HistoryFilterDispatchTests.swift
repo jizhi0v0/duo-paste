@@ -9,7 +9,7 @@ import Foundation
 /// **Branch 1**: 空 query + 空 qualifier → 全列表 fold + iOS list order
 /// **Branch 2**: 空 query + 有 qualifier → items.filter(qualifier) + fold + sort
 /// **Branch 3**: 命中 cached server (`cache.q == query`) → server items.filter(qualifier),
-///              **不再 fold 不再 sort**(保留 server prefix24h boost)
+///              **不再 fold 不再 sort**(保留 server prefix/contains/time relevance)
 /// **Branch 4**: query 非空 + 无 cached server(或 q 不匹配)→ contains fallback + qualifier + fold + sort
 ///
 /// 配合 `ItemFoldTests` (fold 契约) + `QueryQualifierMatchesTests` (qualifier 契约) 三角覆盖.
@@ -174,7 +174,7 @@ struct HistoryFilterDispatchTests {
 
     @Test("Branch 3: cache.q == query + 空 qualifier → 直接返 cache.items")
     func branch3_cacheHitEmptyQualifierReturnsServerItemsAsIs() {
-        // server 已 fold + 已 sort(含 prefix24h boost),客户端直接复用顺序.
+        // server 已 fold + 已 sort(含 prefix/contains/time relevance),客户端直接复用顺序.
         // 故意把 cache 顺序设成"ns 老的在前"——若客户端误 re-sort 会按 ns DESC 把新的放前
         let serverFirst = makeText(id: "boost-old", origin: "self", capturedAtNs: 100, text: "hello world")
         let serverSecond = makeText(id: "ns-new", origin: "self", capturedAtNs: 999, text: "world hello")

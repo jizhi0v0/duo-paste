@@ -645,7 +645,308 @@ public struct Database: Sendable {
             """)
         }
 
+        // v16: R4.2 空搜索 fold projection。
+        //
+        // item 是同步真源；search_fold 只是可重建的派生索引，存每个展示 fold group 的
+        // canonical item id + 聚合后的 captured/pinned/kind/sub-kind。item 的任何写入只把
+        // old/new group key 放进 dirty queue，搜索前在 writer tx 内精确重算受影响 group。
+        // 这样正常 capture/pin/delete 是 O(group size)，百万行空查询不再反复 decode 全表。
+        m.registerMigration("v16_search_fold_projection") { db in
+            try db.execute(sql: """
+                CREATE TABLE search_fold (
+                    group_type       TEXT NOT NULL CHECK (group_type IN ('text', 'blob', 'row')),
+                    group_key        TEXT NOT NULL,
+                    cluster_id       TEXT NOT NULL,
+                    item_id          TEXT NOT NULL,
+                    captured_at_ns   INTEGER NOT NULL,
+                    pinned           INTEGER NOT NULL CHECK (pinned IN (0, 1)),
+                    kind             TEXT NOT NULL,
+                    file_sub_kind    TEXT,
+                    text_full        TEXT,
+                    blob_mime        TEXT,
+                    PRIMARY KEY (group_type, group_key, cluster_id),
+                    FOREIGN KEY (item_id) REFERENCES item(id) ON DELETE CASCADE
+                ) STRICT;
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_search_fold_order
+                    ON search_fold(pinned DESC, captured_at_ns DESC, item_id);
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_search_fold_kind
+                    ON search_fold(kind, pinned, captured_at_ns DESC);
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_search_fold_file_sub_kind
+                    ON search_fold(file_sub_kind, pinned, captured_at_ns DESC)
+                    WHERE file_sub_kind IS NOT NULL;
+            """)
+            try db.execute(sql: """
+                CREATE TABLE search_fold_dirty (
+                    group_type TEXT NOT NULL CHECK (group_type IN ('text', 'blob', 'row')),
+                    group_key  TEXT NOT NULL,
+                    PRIMARY KEY (group_type, group_key)
+                ) STRICT, WITHOUT ROWID;
+            """)
+
+            let newGroupType = Self.searchFoldGroupTypeSQL(alias: "new")
+            let newGroupKey = Self.searchFoldGroupKeySQL(alias: "new")
+            let oldGroupType = Self.searchFoldGroupTypeSQL(alias: "old")
+            let oldGroupKey = Self.searchFoldGroupKeySQL(alias: "old")
+            try db.execute(sql: """
+                CREATE TRIGGER item_search_fold_ai AFTER INSERT ON item BEGIN
+                    INSERT INTO search_fold_dirty(group_type, group_key)
+                    VALUES (\(newGroupType), \(newGroupKey))
+                    ON CONFLICT(group_type, group_key) DO NOTHING;
+                END;
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER item_search_fold_ad AFTER DELETE ON item BEGIN
+                    INSERT INTO search_fold_dirty(group_type, group_key)
+                    VALUES (\(oldGroupType), \(oldGroupKey))
+                    ON CONFLICT(group_type, group_key) DO NOTHING;
+                END;
+            """)
+            try db.execute(sql: """
+                CREATE TRIGGER item_search_fold_au AFTER UPDATE ON item BEGIN
+                    INSERT INTO search_fold_dirty(group_type, group_key)
+                    VALUES (\(oldGroupType), \(oldGroupKey))
+                    ON CONFLICT(group_type, group_key) DO NOTHING;
+                    INSERT INTO search_fold_dirty(group_type, group_key)
+                    VALUES (\(newGroupType), \(newGroupKey))
+                    ON CONFLICT(group_type, group_key) DO NOTHING;
+                END;
+            """)
+
+            try Self.rebuildSearchFoldProjection(db)
+        }
+
         return m
+    }
+
+    /// R4.2 projection 搜索前的精确 refresh。少量 dirty key 逐 group 重算；批量 import / restore
+    /// 积累超过阈值时一次流式 rebuild，避免百万次 point query。必须走 writer tx，确保随后
+    /// reader snapshot 看到 projection 与 item 同一已提交状态。
+    func refreshSearchFoldProjection() throws {
+        try pool.write { db in
+            let dirtyCount = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM search_fold_dirty"
+            ) ?? 0
+            guard dirtyCount > 0 else { return }
+            if dirtyCount > 1_000 {
+                try Self.rebuildSearchFoldProjection(db)
+                return
+            }
+
+            let dirty = try Row.fetchAll(db, sql: """
+                SELECT group_type, group_key
+                FROM search_fold_dirty
+                ORDER BY group_type, group_key
+            """)
+            for row in dirty {
+                let groupType: String = row["group_type"]
+                let groupKey: String = row["group_key"]
+                try Self.rebuildSearchFoldGroup(db, groupType: groupType, groupKey: groupKey)
+                try db.execute(
+                    sql: "DELETE FROM search_fold_dirty WHERE group_type = ? AND group_key = ?",
+                    arguments: [groupType, groupKey]
+                )
+            }
+        }
+    }
+
+    /// Bulk benchmark/restore 可显式预热；普通调用方只需走 SearchAPI，后者会自动 refresh。
+    public func rebuildSearchFoldProjection() throws {
+        try pool.write { db in
+            try Self.rebuildSearchFoldProjection(db)
+        }
+    }
+
+    private static func searchFoldGroupTypeSQL(alias: String) -> String {
+        """
+        CASE
+            WHEN \(alias).blob_sha256 IS NOT NULL AND \(alias).blob_sha256 != '' THEN 'blob'
+            WHEN \(alias).blob_sha256 IS NULL
+             AND \(alias).text_full IS NOT NULL AND \(alias).text_full != '' THEN 'text'
+            ELSE 'row'
+        END
+        """
+    }
+
+    private static func searchFoldGroupKeySQL(alias: String) -> String {
+        """
+        CASE
+            WHEN \(alias).blob_sha256 IS NOT NULL AND \(alias).blob_sha256 != ''
+                THEN \(alias).blob_sha256
+            WHEN \(alias).blob_sha256 IS NULL
+             AND \(alias).text_full IS NOT NULL AND \(alias).text_full != ''
+                THEN \(alias).text_full
+            ELSE \(alias).id
+        END
+        """
+    }
+
+    private static let searchFoldInsertSQL = """
+        INSERT INTO search_fold (
+            group_type, group_key, cluster_id, item_id, captured_at_ns,
+            pinned, kind, file_sub_kind, text_full, blob_mime
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    private static func insertSearchFoldDisplay(
+        _ item: Item,
+        groupType: String,
+        groupKey: String,
+        into db: GRDB.Database
+    ) throws {
+        try db.execute(sql: searchFoldInsertSQL, arguments: [
+            groupType,
+            groupKey,
+            item.id,
+            item.id,
+            item.capturedAtNs,
+            item.pinned ? 1 : 0,
+            item.kind.rawValue,
+            ItemClassifier.fileSubKind(item)?.rawValue,
+            item.textFull,
+            item.blobMime,
+        ])
+    }
+
+    private static func rebuildSearchFoldGroup(
+        _ db: GRDB.Database,
+        groupType: String,
+        groupKey: String
+    ) throws {
+        try db.execute(
+            sql: "DELETE FROM search_fold WHERE group_type = ? AND group_key = ?",
+            arguments: [groupType, groupKey]
+        )
+        let sql: String
+        switch groupType {
+        case "text":
+            sql = """
+                SELECT * FROM item
+                WHERE blob_sha256 IS NULL AND text_full = ? AND deleted_at_ns IS NULL
+                ORDER BY pinned DESC, captured_at_ns DESC, rowid ASC
+            """
+        case "blob":
+            sql = """
+                SELECT * FROM item
+                WHERE blob_sha256 = ? AND blob_sha256 != '' AND deleted_at_ns IS NULL
+                ORDER BY captured_at_ns ASC, id ASC
+            """
+        default:
+            sql = """
+                SELECT * FROM item
+                WHERE id = ? AND deleted_at_ns IS NULL
+                  AND NOT (blob_sha256 IS NOT NULL AND blob_sha256 != '')
+                  AND NOT (blob_sha256 IS NULL AND text_full IS NOT NULL AND text_full != '')
+            """
+        }
+        let items = try Item.fetchAll(db, sql: sql, arguments: [groupKey])
+        for display in Item.foldByTextFull(items) {
+            try insertSearchFoldDisplay(
+                display, groupType: groupType, groupKey: groupKey, into: db
+            )
+        }
+    }
+
+    /// 全量 rebuild 的 text/passthrough 部分在 SQLite 内集合化完成；blob 按 SHA 流式分组，
+    /// 峰值内存只跟单个 SHA 的物理 sibling 数有关，不跟整个 library 行数线性增长。
+    private static func rebuildSearchFoldProjection(_ db: GRDB.Database) throws {
+        try db.execute(sql: "DELETE FROM search_fold")
+
+        // 文本 winner：captured 最大；同 ns 对齐空 query 原始顺序，pinned=true 优先，
+        // 再以 rowid 稳定 tie。group pin 用 window MAX 做 OR。
+        try db.execute(sql: """
+            INSERT INTO search_fold (
+                group_type, group_key, cluster_id, item_id, captured_at_ns,
+                pinned, kind, file_sub_kind, text_full, blob_mime
+            )
+            WITH ranked AS (
+                SELECT item.*,
+                       MAX(pinned) OVER (PARTITION BY text_full) AS folded_pinned,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY text_full
+                           ORDER BY captured_at_ns DESC, pinned DESC, rowid ASC
+                       ) AS folded_rank
+                FROM item
+                WHERE blob_sha256 IS NULL
+                  AND text_full IS NOT NULL AND text_full != ''
+                  AND deleted_at_ns IS NULL
+            )
+            SELECT 'text', text_full, id, id, captured_at_ns,
+                   folded_pinned, kind, NULL, text_full, blob_mime
+            FROM ranked WHERE folded_rank = 1;
+        """)
+
+        // blob/text 都不参与的行按 id passthrough。
+        try db.execute(sql: """
+            INSERT INTO search_fold (
+                group_type, group_key, cluster_id, item_id, captured_at_ns,
+                pinned, kind, file_sub_kind, text_full, blob_mime
+            )
+            SELECT 'row', id, id, id, captured_at_ns,
+                   pinned, kind, NULL, text_full, blob_mime
+            FROM item
+            WHERE deleted_at_ns IS NULL
+              AND NOT (blob_sha256 IS NOT NULL AND blob_sha256 != '')
+              AND NOT (blob_sha256 IS NULL AND text_full IS NOT NULL AND text_full != '');
+        """)
+
+        let blobCursor = try Item.fetchCursor(db, sql: """
+            SELECT * FROM item
+            WHERE blob_sha256 IS NOT NULL AND blob_sha256 != ''
+              AND deleted_at_ns IS NULL
+            ORDER BY blob_sha256 ASC, captured_at_ns ASC, id ASC
+        """)
+        var currentSHA: String?
+        var group: [Item] = []
+        func flushBlobGroup() throws {
+            guard let sha = currentSHA, !group.isEmpty else { return }
+            for display in Item.foldByTextFull(group) {
+                try insertSearchFoldDisplay(
+                    display, groupType: "blob", groupKey: sha, into: db
+                )
+            }
+            group.removeAll(keepingCapacity: true)
+        }
+        while let item = try blobCursor.next() {
+            if item.blobSha256 != currentSHA {
+                try flushBlobGroup()
+                currentSHA = item.blobSha256
+            }
+            group.append(item)
+        }
+        try flushBlobGroup()
+
+        // SQL bulk insert 没有调用 Swift ItemClassifier；只流式修正 winner 为 file 的行，
+        // 保持“首个非空路径 + mime 优先 + sub-kind 互斥”的单点分类契约。
+        let fileRows = try Row.fetchCursor(db, sql: """
+            SELECT f.group_type, f.group_key, f.cluster_id,
+                   i.blob_mime, i.text_full
+            FROM search_fold f
+            JOIN item i ON i.id = f.item_id
+            WHERE f.kind = 'file'
+        """)
+        while let row = try fileRows.next() {
+            let sub = ItemClassifier.fileSubKind(
+                kind: .file,
+                blobMime: row["blob_mime"],
+                textFull: row["text_full"]
+            )
+            try db.execute(sql: """
+                UPDATE search_fold SET file_sub_kind = ?
+                WHERE group_type = ? AND group_key = ? AND cluster_id = ?
+            """, arguments: [
+                sub?.rawValue,
+                row["group_type"] as String,
+                row["group_key"] as String,
+                row["cluster_id"] as String,
+            ])
+        }
+        try db.execute(sql: "DELETE FROM search_fold_dirty")
     }
 
     /// 在 write 事务内调用，返回**严格大于**当前 MAX(item.ingested_at_ns) 的时间戳。

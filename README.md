@@ -4,13 +4,13 @@
 
 ## 当前能力
 
-- macOS daily-driver：剪贴板捕获、按 app 排除与临时暂停、OCR、全文/类型/时间筛选、预览与 Open With、置顶/删除、导出和 Sparkle 更新。
+- macOS daily-driver：剪贴板捕获、按 app 排除与临时暂停、OCR、全文/类型/时间筛选、保存搜索视图、预览与 Open With、`⇧⌘V` 纯文本粘贴、置顶/删除、导出和 Sparkle 更新。
 - 对称多 Mac mesh：每台 Mac 都写本机数据、pull 其他 peer，WebSocket 只负责低延迟唤醒；没有 primary/client 单点。
 - 本地优先：搜索始终走本机 FTS；blob 可完整 mirror，也可在查看时按需拉取。
 - iOS：完整 metadata + cursor 持久化到本机 SQLite/FTS，断网搜索不依赖 Mac；Bonjour 仅发现附近 Mac，配对必须扫描含当前 TLS leaf SHA-256 的 QR，再输入同屏 6 位 PIN。每台 iOS 使用独立凭据，可在 Mac Settings 单独撤销。
 - 可恢复：小时级 snapshot，提供 verify、dry-run、peer 补齐和原子 restore。
 - 可诊断：Settings 与 `mesh-doctor` 主动报告 leaf certificate 的 SAN、到期日和 30/7/1 天预警；安全诊断包只导出脱敏运维信息。
-- 837 个 Swift 测试通过；后续工作与验收标准只看 [`docs/roadmap.md`](docs/roadmap.md)。
+- 882 个 Swift 测试通过；后续工作与验收标准只看 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 要求
 
@@ -139,9 +139,21 @@ Settings → 关于会显示本机 leaf certificate 的 DNS SAN、有效期、�
 
 ```sh
 swift build
-swift test               # 848 tests
+swift test               # 882 tests
 swift build -c release
 ```
+
+百万行性能基准是显式 manual/nightly 命令，不随 `swift test` 执行：
+
+```sh
+swift run -c release duo-pasted benchmark-library \
+  --workspace .benchmark/r4-1 \
+  --rows 1000000 --blob-gib 8 --samples 20 --rebuild
+```
+
+它只接受隔离且带 marker 的 workspace；默认 8GiB blob 是 sparse 逻辑规模，并在报告中
+同时记录 allocated bytes。指标口径、复用方式与已保存 baseline 见
+[`benchmarks/README.md`](benchmarks/README.md)。
 
 LaunchAgent 运行时不要直接 `swift run`：双进程会重复捕获、抢快捷键并竞争 SQLite writer。调试前先执行：
 

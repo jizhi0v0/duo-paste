@@ -7,6 +7,7 @@ import DuoPasteSync
 ///
 /// 这里只暴露现行 mesh、维护与灾难恢复命令。旧 push / primary 生命周期命令已经随
 /// PushWorker / RemoteIngester / Admin.promote/migrate 一起删除。
+@MainActor
 enum CLI {
     static func dispatchAndExitIfApplicable(args: [String] = CommandLine.arguments) {
         guard args.count >= 2 else { return }
@@ -26,6 +27,8 @@ enum CLI {
             runMeshDoctor(args: rest)
         case "diagnostics-export":
             runDiagnosticsExport(args: rest)
+        case "benchmark-library":
+            exit(LibraryBenchmarkUI.run(args: rest))
         case "mesh-fetch-missing":
             runMeshFetchMissing(args: rest)
         case "snapshot-list":
@@ -105,6 +108,12 @@ enum CLI {
                                   quick_check、版本、脱敏 config、白名单运维日志。绝不包含
                                   shared-secret、device credential/token、TLS 私钥、
                                   数据库/剪贴板正文或 blob 字节。
+
+          benchmark-library --workspace PATH [--rebuild|--reuse]
+                            [--rows N] [--blob-gib N] [--samples N] [--output PATH]
+                                  R4.1 manual/nightly 大库基准。只允许独立且带 marker 的
+                                  workspace；默认生成 100 万 metadata + 8GiB sparse blob，
+                                  跑生产 SearchAPI 与真实 SearchView layout，保存 JSON baseline。
 
           mesh-fetch-missing [--dry-run] [--concurrency N] [--peer URL]
                                   一次性 catch-up：扫本机所有 peer-origin 缺字节的

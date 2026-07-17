@@ -67,7 +67,7 @@ public enum HistoryFilterDispatch {
         }
 
         // Branch 3: query 非空且命中 cached server search(q + qualifier snapshot 双匹配)→
-        // 用 server fold-aware items,保留 server 顺序(含 prefix24h boost)。
+        // 用 server fold-aware items,保留 server 顺序(非空搜索 prefix/contains/time)。
         // server #41 已按 qualifier filter 过,client-side filter 是 idempotent no-op
         // (qualifier 匹配的语义在两端同源 `QueryQualifier.matches`),仍保留作为老 server
         // 兜底——若 cache.qualifiers 非空但 items 含不匹配项(理论上不应该,纵深防御)
@@ -90,14 +90,14 @@ public enum HistoryFilterDispatch {
     }
 
     /// fold + iOS list 排序契约一体应用. fold 走 `Item.foldByTextFull` 单点契约,
-    /// sort 本地化(Mac 跟 iOS 排序契约不同,Mac 多 prefix24h boost——见 `dispatch` 文档).
+    /// sort 本地化；远端搜索结果已按服务端 relevance 排好，不能在这里二次打乱。
     public static func foldAndSort(_ list: [Item]) -> [Item] {
         Item.foldByTextFull(list).sorted(by: iosListOrder)
     }
 
     /// iOS 列表排序契约 — pinned DESC, captured_at_ns DESC.
     /// 单点定义避免多处 sort 闭包重复 + 漂移; Mac 端走 `Search.fetchHitsFolded` 自己的契约
-    /// (pinned > prefix24h > captured_at_ns) 不调本函数.
+    /// (prefix > contains > captured_at_ns) 不调本函数.
     public static func iosListOrder(_ a: Item, _ b: Item) -> Bool {
         if a.pinned != b.pinned { return a.pinned && !b.pinned }
         return a.capturedAtNs > b.capturedAtNs

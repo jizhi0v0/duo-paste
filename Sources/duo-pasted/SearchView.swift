@@ -436,6 +436,9 @@ struct SearchView: View {
     /// Enter / 双击触发的 paste 回调。双击行传 `[item]` 单条;Enter 由 SearchPanelController
     /// 走 selectedItems 传多条。AppDelegate.pasteBack 根据数量决定单项 / 合并 / 降级路径
     var onPaste: ([Item]) -> Void
+    /// 右键菜单的“粘贴为纯文本”。快捷键由 SearchPanelController 路由到同一回调。
+    /// 只接受 text/rtf/html；多选资格在 controller/Core 双层校验。
+    var onPastePlainText: ([Item]) -> Void
     var onClose: () -> Void
     /// 预览状态变化时通知 caller (SearchPanelController) 驱动 PreviewPanelController。
     /// `shown=true` 表示 show/update 浮窗(controller 自己 read state.currentItem + 卡片
@@ -570,23 +573,18 @@ struct SearchView: View {
         // 让内容延伸到 NSPanel titlebar 区域（fullSizeContentView 把 contentView 占位让出来，
         // 但 SwiftUI 默认仍把 titlebar 计入 top safe area，所以 header 上方会留 ~28pt 空白）
         .ignoresSafeArea()
-        // debounce 180ms:用户连打 / 切 chip 时上一个 task 被 .task(id:) cancel 掉,新 task
-        // 先 sleep 180ms 再 refresh。停手 180ms 后才真正发远端请求——连打事件合并率最大化。
-        // 原来 100ms 实测在快速连打时仍触发多次 refresh(每次 100-180ms app update),
-        // 拉到 180ms 后单字符快速连打几乎合并成 1 次 query。
+        // 非空本地搜索 debounce 60ms：用户连打时上一个 task 被 .task(id:) cancel，新 task
+        // 短暂合并输入后走本地 FTS。清空 query 则跳过等待，完整列表立即回来，避免“卡住”感。
+        // 旧 180ms 是远端搜索时代遗留值，R4.1 实测它单独就超过 150ms 首屏 gate。
         // id 用 filterID(query + kinds + timeRange 联合指纹),任一维度变化都触发新 fetch
         .task(id: state.filterID) {
-            do {
-                try await Task.sleep(nanoseconds: 180_000_000)
-                await state.refresh()
-            } catch {
-                // 被取消（用户继续打字 / 改筛选）→ 让下一个 task 接手，啥也不做
-            }
+            let delay = SearchRefreshPolicy.delayNanoseconds(for: state.query)
+            await refreshShowingLoading(after: delay)
         }
         .onAppear {
             searchFieldFocused = true
             // onAppear 时不 debounce——首次打开应当立刻 refresh
-            Task { await state.refresh() }
+            Task { await refreshShowingLoading() }
         }
         // panel 被复用（orderOut 不销毁 hosting view），每次 show() bump openPulse
         // → 这里把焦点抢回 TextField + 立即 refresh，避免 reshow 时光标不见 / 看到 stale results
@@ -598,7 +596,7 @@ struct SearchView: View {
             DispatchQueue.main.async {
                 searchFieldFocused = true
             }
-            Task { await state.refresh() }
+            Task { await refreshShowingLoading() }
         }
         // 摘焦点状态(点卡 / 空白)下用户开始打字 → keyMonitor 把字符吃进 query 再 bump
         // 这个 pulse,这里负责把 TextField 焦点抢回来,后续字符走正常 TextField 输入
@@ -609,6 +607,30 @@ struct SearchView: View {
         // 截下来直接调 state.navigate / onPaste，绕过 SwiftUI TextField 对箭头键的吞噬。
     }
 
+    /// 从 debounce 开始就显示 loading，而不是等 SQL 真正启动才显示。每轮拿独立 token，
+    /// 被取消的旧 task 结束时不会误关掉当前搜索的 spinner。
+    private func refreshShowingLoading(after delayNanoseconds: UInt64 = 0) async {
+        let token = state.beginSearchLoading()
+        defer { state.endSearchLoading(token) }
+        do {
+            if delayNanoseconds > 0 {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            try Task.checkCancellation()
+            let restored = state.restoreCachedEmptySearch()
+            if restored {
+                // 完整列表已在同一帧恢复；后台 refresh 继续校准，但不再让 spinner 暗示
+                // 用户还得等它才能操作。
+                state.endSearchLoading(token)
+            }
+            await state.refresh()
+        } catch is CancellationError {
+            // 用户继续输入：新 `.task(id:)` 已接管 loading 和 refresh。
+        } catch {
+            state.lastError = "\(error)"
+        }
+    }
+
     /// 紧凑搜索头。search field 自带 capsule border + bg 像 macOS 标准 input;count 跟着
     /// 一起在 maxWidth 800 box 内居中。user 反馈"搜索框 + label + 时间是一个整体" → 三者
     /// 共享 maxWidth 让视觉聚焦同一区域;search 加 border 让它看着是"输入框"而非裸文字
@@ -616,9 +638,18 @@ struct SearchView: View {
         HStack(spacing: 10) {
             // search 加 capsule bg + border,像标准 macOS 搜索 input
             HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundStyle(.secondary)
+                Group {
+                    if state.isSearching {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("正在搜索")
+                    } else {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: 14, height: 14)
                 // 已激活的 slash qualifier 渲染成 pill chip,排在 TextField 左侧。每个 chip
                 // 自带 ✕ 一键删,Backspace 在 TextField 为空时弹最后一个(SearchPanelController
                 // 装的 keyMonitor 拦 keyCode=51)
@@ -1149,6 +1180,10 @@ struct SearchView: View {
                         // 不是 selectedItems。这跟 Finder 行为对齐:右键单张文件不改多选
                         .contextMenu {
                             Button("粘贴") { onPaste([item]) }
+                            if PlainTextPaste.supports(item.kind) {
+                                Button("粘贴为纯文本") { onPastePlainText([item]) }
+                                    .keyboardShortcut("v", modifiers: [.command, .shift])
+                            }
                             if let onReveal,
                                item.kind == .file || item.kind == .image {
                                 Button("在 Finder 显示") { onReveal(item) }

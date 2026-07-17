@@ -2,7 +2,7 @@ import Foundation
 import DuoPasteCore
 
 /// 搜索选择层。Mesh 拓扑下 item 表是单表混存 own + peer，永远走本机 fold-aware
-/// （`SearchAPI.search / count / countByKind` 内部 text-fold）。AppState 调 `search(_:)`
+/// （`SearchAPI.searchSummary` 内部 fold projection / 单次 text-fold）。AppState 调 `search(_:)`
 /// 拿结果 + 当前 mode（用于 UI banner）。
 ///
 /// PR 6 之前还有 `.remoteOK / .remoteFallback / .localMirror` 等 mode + 一条远端
@@ -80,15 +80,16 @@ public struct SearchProvider: Sendable {
     }
 
     private func foldOutcome(query: SearchQuery, mode: Mode) -> Outcome {
-        // 一次 SQL 拿 items + snippets，count / countByKind 走同源 fold 路径——
-        // list / total / chip 三者口径一致是 plan §"Search 改动"的硬不变量
-        let hits = (try? local.searchHits(query)) ?? []
+        // R4.2: list / total / facets 来自同一 snapshot + 单次 fold summary。空 query 走
+        // 持久化 projection；FTS/time query 走一次 Swift fold，不再四次重复扫同一批行。
+        let summary = try? local.searchSummary(query)
+        let hits = summary?.hits ?? []
         let snippets = Dictionary(uniqueKeysWithValues: hits.compactMap { (item, s) in
             s.map { (item.id, $0) }
         })
-        let total = (try? local.count(query)) ?? hits.count
-        let raw = (try? local.countByKind(query)) ?? [:]
-        let subRaw = (try? local.countByFileSubKind(query)) ?? [:]
+        let total = summary?.totalCount ?? hits.count
+        let raw = summary?.kindCounts ?? [:]
+        let subRaw = summary?.fileSubKindCounts ?? [:]
         return Outcome(
             items: hits.map(\.0),
             mode: mode,

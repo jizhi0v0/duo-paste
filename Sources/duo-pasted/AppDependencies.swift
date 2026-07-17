@@ -35,8 +35,14 @@ final class AppDependencies {
     /// broadcaster 引用即可
     let wsBroadcaster: WSBroadcaster
 
-    init() throws {
-        let paths = Paths.makeDefault()
+    convenience init() throws {
+        try self.init(paths: Paths.makeDefault())
+    }
+
+    /// Injectable root for the explicit library benchmark. Production always calls `init()` and
+    /// therefore keeps using Application Support; the benchmark passes its marked isolated root.
+    init(paths: Paths) throws {
+        paths.ensureExists()
         let deviceID = try DeviceID.loadOrCreate(at: paths.deviceIDFile)
         let config = try Config.load(from: paths.configFile)
         let database = try Database(path: paths.mainDB)

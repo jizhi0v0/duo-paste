@@ -559,6 +559,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel = SearchPanelController(
             state: state,
             onPaste: { [weak self] items in self?.pasteBack(items) },
+            onPastePlainText: { [weak self] items in self?.pasteBackPlainText(items) },
             onReveal: { [weak self] item in self?.revealInFinder(item) },
             onOpenWith: { [weak self] item, app in self?.openWith(item, app: app) },
             onDismiss: { [weak self] in self?.cancelLazyPasteIfAny() },
@@ -1285,6 +1286,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 PasteInjector.injectCmdV(into: target)
                 await self.bumpUsedItems(items)
             }
+        }
+    }
+
+    /// R3.3 纯文本粘贴。写入的是解码后的 `.string`，再走普通 Cmd+V 注入——不把
+    /// “目标 app 是否实现 ⇧⌘V”当成协议。多选只有全为 text/rtf/html 才接受。
+    ///
+    /// 两层 suppression 都保留：
+    /// 1. watcher.pasteBack actor barrier 在写入期间挡 tick，随后 suppress changeCount；
+    /// 2. 按实际 pastedText 记录 PasteSuppressionSet，挡 Universal Clipboard 对端 echo。
+    private func pasteBackPlainText(_ items: [Item]) {
+        guard !items.isEmpty,
+              items.allSatisfy({ PlainTextPaste.supports($0.kind) }) else { return }
+
+        currentPasteTask?.cancel()
+        currentPasteTask = nil
+        state.pasteProgress = .idle
+
+        currentPasteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let pastedText = await self.watcher.pasteBack {
+                Copyback.writePlainText(items: items)
+            }
+            if Task.isCancelled { return }
+            guard let pastedText else {
+                self.state.pasteProgress = .failed(reason: "无法转换为纯文本")
+                return
+            }
+            self.deps.pasteSuppressions.record(
+                fingerprint: PasteSuppressionSet.fingerprint(text: pastedText),
+                ttlSec: 300
+            )
+            let target = self.panel.previousFrontmostApp
+            self.panel.hide(immediate: true)
+            PasteInjector.injectCmdV(into: target)
+            await self.bumpUsedItems(items)
         }
     }
 

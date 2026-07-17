@@ -92,6 +92,24 @@ enum Copyback {
         return true
     }
 
+    /// 把一组 text/rtf/html item 解码后只写一个 `.string` representation。
+    /// 返回实际写入的文本给 AppDelegate 记录 PasteSuppressionSet 指纹；nil 表示任一项
+    /// 不支持、缺内容、解码失败或 pasteboard 写入失败。多选是 all-or-nothing。
+    @MainActor
+    @discardableResult
+    static func writePlainText(items: [Item]) -> String? {
+        guard let pastedText = PlainTextPaste.joinedText(
+            for: items,
+            decodeRTF: stripRTF,
+            decodeHTML: stripHTML
+        ) else { return nil }
+
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard pb.setString(pastedText, forType: .string) else { return nil }
+        return pastedText
+    }
+
     /// 合并写多项到 NSPasteboard 单次粘贴。调用方已通过 `PasteMerge.strategy(for:)` 判定走
     /// mergedText / mergedFile 路径。本函数只负责副作用:FileManager.fileExists 校验 + 写 pb。
     /// - 全 text/url/rtf/html → 拼成单字符串(\n 分隔),写 .string 一份
@@ -237,6 +255,22 @@ enum Copyback {
               let attr = try? NSAttributedString(
                 data: data,
                 options: [.documentType: NSAttributedString.DocumentType.rtf],
+                documentAttributes: nil
+              )
+        else { return nil }
+        return attr.string
+    }
+
+    /// HTML 转纯文本。NSAttributedString 负责标签、entity、换行和列表结构解析；失败时
+    /// 返回 nil，调用方不会把 raw markup 当纯文本兜底。
+    private static func stripHTML(_ html: String) -> String? {
+        guard let data = html.data(using: .utf8),
+              let attr = try? NSAttributedString(
+                data: data,
+                options: [
+                    .documentType: NSAttributedString.DocumentType.html,
+                    .characterEncoding: String.Encoding.utf8.rawValue,
+                ],
                 documentAttributes: nil
               )
         else { return nil }

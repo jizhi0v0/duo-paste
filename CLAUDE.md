@@ -2,7 +2,7 @@
 - **HTTP routes**：`GET /health` + `GET /blob/<sha>` + `GET /since` + `GET /app_icon/<bundleID>` + `GET /search` + `GET /endpoints` + `GET /auth/revocations` + `POST /bump/<id>` + `POST /pin/<id>` + `POST /pair/<pin>` + `DELETE /item/<id>`；WebSocket = `/sync/ws`。无 push/ingest 路径
 - **CaptureService**：永远走 `Database.nextIngestNs` stamp（writer tx 内）；merge candidate 带 `origin_device == selfDeviceID` 过滤防 bump 对端行；commit 后回调 `onCursorAdvanced` 让 server 端 `WSBroadcaster` fan-out
 - **Pin/unpin owner routing**：pin 是带稳定 `operation_id` 的绝对值命令。只有 `item.origin_device` owner 能 canonical 修改 `item.pinned + ingested_at_ns`；非 owner 只做 optimistic UI + 写 v13 `pin_operation`，绑定 owner 的 PullWorker 投递。owner 的 `pin_operation_receipt` 保证重试不二次执行；requester 看到达到 receipt cursor 的 `/since` canonical replay 才清“等待同步”。禁止回退到 mirror 整行广播、wall-clock LWW 或 pinned OR merge（OR 会吞 unpin）
-- **Search**：单一 fold-aware 路径——`SearchAPI.searchHits / count / countByKind` 内部 oversample → content-fold（文本跨 origin 同 text_full；blob 同 SHA 仅折叠 15s 内跨 origin 副本）→ kinds/pinnedOnly 后置过滤 → 排序契约 `(pinned DESC, prefix24h DESC, captured_at_ns DESC)` → LIMIT/OFFSET。**list / total / chip 三者口径一致**是硬不变量。Mac `SearchProvider.Mode` 仅 `.local` / `.mesh(stalenessSec:)`；iOS 也直接对本机 `MetadataMirrorStore` 调同一个 `SearchAPI`，History UI 不调用远端 `/search`
+- **Search**：`SearchProvider` 每次刷新只调一次 `SearchAPI.searchSummary`。非空/时间范围只做一次 content fold 后派生 list/total/facets；空查询走 v16 `search_fold` projection。fold 契约不变：文本跨 origin 同 text_full；blob 同 SHA 仅折叠 15s 内跨 origin 副本；qualifier/pinnedOnly 后置过滤。非空排序为 `(prefix_match DESC, captured_at_ns DESC)`，空搜索为 `(pinned DESC, captured_at_ns DESC)`。**list / total / chip 同一 snapshot、同一 fold 口径**是硬不变量。Mac/iOS 都只搜本机 SQLite，不调用远端 `/search`
 - **跨设备 dedup**：两层防御——capture 层（同 origin 同 text 永久合并，merge candidate 加 origin 过滤）+ search fold 层（跨 origin 兜底）。Blob 的物理文件本来就按 SHA 内容寻址只存一份；不同设备产生的 metadata 行为保持 mesh 对称不删库，UI 将 15s 内跨 origin 同 SHA 折为一张卡并保留最早的原始文件名。同 origin 主动重复 copy 不折叠
 - **Blob**：内容寻址 BlobStore（linkItem 不 moveItem，见 §"BlobStore 并发竞态"）；`mesh.storage_mode=full`（默认）同步元数据后拉齐字节，`optimized` 才在 paste/preview 时按需 GET `/blob/<sha>`（TaskGroup 30s 超时 race，见 §"blob 懒拉的不变量" #8）
 - **HMAC + device credential 认证**：canonical string 仍是 `<ts>\n<METHOD>\n<path>\n<body_sha256_hex>`。可信 Mac 可用 mesh 根 secret；iOS 用独立 request secret 签名并携 `X-DP-Credential` 密封 token。请求一旦带 token 就只能走 credential 验证，任何失败都不得降级根 secret。middleware 不读 body，handler 读完后必须复核 body hash；WS upgrade 同模板，upgrade 后 frame 不签
@@ -13,6 +13,7 @@
 - **WS auth rotation**：`WSBroadcaster.rotationIntervalSec` 内部默认 4h（已不从 config 暴露）并周期主动 close 所有连接；单设备撤销或收到新撤销 tombstone 时也立即 rotate。合法 client backoff 重连并重新认证，被撤销 credential 不能恢复连接
 - **依赖**：GRDB 7 + Hummingbird 2 + HummingbirdTLS + hummingbird-websocket（具体版本看 Package.resolved）
 - **测试**：HTTP/WS 集成测试统一使用系统分配端口和真实 bind readiness；`TestSyncServerFixture` 负责隔离 DB/blob、超时与 graceful shutdown。禁止重新引入随机端口或 readiness sleep
+- **百万行 benchmark**：R4.1/R4.2 只由 `duo-pasted benchmark-library --workspace ...` 显式 manual/nightly 触发，普通 `swift test` 禁止生成 10 万/100 万行。workspace 必须远离默认 Application Support，`--rebuild` 只删带版本 marker 的目录。8GiB 默认是 sparse placeholder，报告必须同时写 logical/allocated bytes；`cold_fts` 只保证 connection-cold，不能宣称清过 macOS page cache；`first_screen_render` 必须从按键开始，引用生产 `SearchRefreshPolicy.delayNanoseconds`，再走真实 `AppState + SearchView + NSHostingView`。`count_by_kind` 现代表生产空查询完整 summary，并有 p95 `<150ms` gate。baseline 见 `benchmarks/results/`
 - **灾难恢复**：`snapshot-list` / `snapshot-verify` 只读；`snapshot-restore` 永远先在 `.snapshot-recovery-*` staging 库跑 migration、`integrity_check` 和可选 peer catch-up，daemon 未 bootout 时拒绝真实提交。提交前保留 `snapshots/recovery-safety-*/db`，DB 目录用同卷 `RENAME_SWAP` 原子换入，换入后重开验证，失败 swap 回旧库。只有一次性 `DisasterRecovery.refill` 可接收 active own-origin；普通 PullWorker guard 禁止放宽
 - **iOS 端**：
   - **WS zombie 检测**：URLSessionWebSocketTask 没协议层 PING，走应用层 `WSMessage.ping/.pong`——`PeerWebSocket.pingLoop` 每 30s ping，10s 内没 pong 抛 `WSError.pongTimeout` 重连。`PeerSyncCoordinator` 5s tick + 90s heartbeat staleness 兜底降级到 `.error("链路无响应")`
@@ -186,7 +187,7 @@ excluded/paused outcome 不 refresh、不 wake OCR，`CaptureService.broadcastIf
 
 ### SearchProvider 永远走本机 fold-aware（chip 总数对齐）
 
-`SearchProvider.search` 永远走 `SearchAPI.searchHits / count / countByKind`——内部 fold-aware（文本跨 origin 同 text_full；blob 按近时间跨 origin 同 SHA），无 "raw count vs fold count" 双路径。
+`SearchProvider.search` 永远只走一次 `SearchAPI.searchSummary`——内部 fold-aware（文本跨 origin 同 text_full；blob 按近时间跨 origin 同 SHA），无 list/count/facet 四次重复查询，也无 "raw count vs fold count" 双路径。
 
 **核心不变量**：mesh 拓扑下 `item` 表混存本机 own + 对端 peer 行，跨 origin 同 text 是常态。raw count 会把 ToDesk/Continuity 副本算一遍跟对端口径不齐——回归测试 `searchProviderTotalCountMatchesFoldedRowCount`。
 
@@ -196,19 +197,26 @@ excluded/paused outcome 不 refresh、不 wake OCR，`CaptureService.broadcastIf
 
 `AppState.refresh()` 必须先产生同一份 `SearchTimeBounds`，再把它的 `fromNs/toNs` 同时传给 SearchProvider；列表、真实总数、kind chip 和 file sub-kind chip 都从这一个 `SearchQuery` 派生，不能各自重算日期。
 
+### 空查询 fold projection：item 是真源，dirty refresh 后才读
+
+v16 的 `search_fold` / `search_fold_dirty` 是可重建的本机派生索引，不进入 Item Codable、`/since` 或 mesh。item trigger 只记录 old/new group key；空查询前 `Database.refreshSearchFoldProjection` 必须在 writer transaction 内精确重算 dirty group，随后 reader 才能读 projection。正常 capture/pin/bump/delete 只重算受影响 content group；dirty 超过 1000（初次同步、restore、benchmark bulk load）才流式全量 rebuild。
+
+projection 的 display 行仍由 `Item.foldByTextFull` 产出，不能在 trigger/SQL 里另写一份 blob cluster 算法。文本 bulk rebuild 的 winner/pin 可用 window SQL，但 blob 必须按 SHA 流式喂同一个 fold 真源；file sub-kind 必须走 `ItemClassifier.fileSubKind`。自定义时间范围会改变“哪些 sibling 参与 fold”，因此不得读全局 projection，必须回退一次 Swift fold summary。
+
 ### 保存搜索视图：独立本机文件 + 写盘后发布
 
 命名搜索视图住 `~/Library/Application Support/duo-paste/saved-search-views.json`，不塞进 `config.json`，也不进入 DB/mesh。原因：SettingsModel 会持有启动时 Config 快照；若视图是 Config 字段，用户保存新视图后再应用旧 Settings 快照会把它静默覆盖。独立文件是 per-device 单一真相，顶层 schema version 必须先于完整 payload 解码检查，未来版本拒绝降级覆盖。
 
 `AppState.saveCurrentSearchView` / `deleteSavedSearchView` 必须保持 `local library mutation → SavedSearchViewStore atomic write + 0600 → savedSearchViews publish → StatusBar callback` 顺序。**写盘失败绝不能先改内存数组或菜单栏**，否则 UI 显示已保存、重启后却消失。菜单栏只保存稳定 view ID，点击时回 AppState 查当前数组、应用完整 filter 后再打开 panel。
 
-### 搜索排序契约：pinned > prefix(24h) > time
+### 搜索排序契约：非空 relevance-first；空查询 pin-first
 
-`(pinned DESC, prefix_score DESC, captured_at_ns DESC)`。prefix_score：preview 以 query 起始 = 2 / text_full 起始 = 1 / 否则 0。**仅对 24h 内项生效**——跨天老内容哪怕起头匹配也走纯时间倒序，剪贴板心智是"搜=找最近用过的"。
+- 非空 query：`(prefix_match DESC, captured_at_ns DESC)`。preview 或 text_full 任一以完整 query 起始都算同一个 prefix tier；其余 FTS 命中属于 contains tier。没有 24h 窗，pin 不参与搜索排序。
+- 空 query：`(pinned DESC, captured_at_ns DESC)`，保留剪贴板首页的置顶语义。
 
-SQL 端 `fetchHitsRaw` 内 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 算 `_prefix` 列 + `CASE WHEN now-captured_at_ns < 86400000000000 THEN _prefix ELSE 0 END DESC` 进 ORDER BY。prefix 占位符必须 `args.insert(at: 0)`（SELECT 列表 `?` 在 WHERE/LIMIT 之前）。Swift 端 `fetchHitsFolded.prefixScore` 跟 SQL 口径**必须**一致——fold 后 SQL 算的 `_prefix` 列已丢，重算。
+SQL 端 `fetchHitsRaw` 内 `instr(LOWER(IFNULL(col, '')), LOWER(?)) = 1` 算布尔 `_prefix` 列。prefix 占位符必须 `args.insert(at: 0)`（SELECT 列表 `?` 在 WHERE/LIMIT 之前）。Swift 端 `fetchHitsFolded.prefixScore` 跟 SQL 口径**必须**一致——fold 后 SQL 算的 `_prefix` 列已丢，必须重算。
 
-回归测试 `SearchPrefixBoostTests.swift`：单表 boost / pinned 优先 / 24h 窗外不 boost / fold 后保留优先级。
+回归测试 `SearchPrefixBoostTests.swift`：prefix 胜过 pinned contains / 老 prefix 不失效 / pin 不打乱 contains 组 / preview 与 text_full 同 tier / 空查询仍 pin-first / fold 后保持 relevance。
 
 ### 文本永久 dedup（capture + search 双层）
 
@@ -330,11 +338,19 @@ Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复
 
 ### NSPasteboard 自写回环——双层防御
 
-**第一层** 写后立刻 `watcher.suppressUpToCurrent()` —— 把 watcher `lastChangeCount` 推到当前 `pasteboard.changeCount`，下一 tick `cc == lastChangeCount` 跳过。位置：`AppDelegate.pasteBack(_:)`。**不要**重新引入 `lastSelfWriteChangeCount` 静态比较方案（实测不稳，写多 type 或时机错位会漏）。
+**第一层** 所有程序化写回都必须走 `watcher.pasteBack { ... }` actor barrier —— barrier 先 flush pending 的真实用户复制，写入期间 `isPasteBackInFlight=true` 挡 polling tick，写后内部 `suppressUpToCurrent()` 把 `lastChangeCount` 推到当前 `pasteboard.changeCount`。普通粘贴、R3.3 纯文本粘贴和预览选区复制都走这条入口。**不要**直接从 AppDelegate 调 private suppression，也不要重新引入 `lastSelfWriteChangeCount` 静态比较方案（实测不稳，写多 type 或时机错位会漏）。
 
 **第二层** `Watcher.extract()` 顶端 `frontApp.pid == self.pid → return nil`。suppressUpToCurrent 只挡程序化写回；用户在搜索框 / Settings 文本框**手动** Cmd+C 时 changeCount 真实自增 suppressUpToCurrent 来不及介入——只有 self-pid 过滤能拦下来，否则触发"复制 → 入库 → 又出现 → 再复制"回环。
 
 已知副作用接受：self frontmost 期间所有 changeCount 自增被吃掉。这是期望行为，跟"在 search 框敲字然后 Cmd+C 整段当新条目入库"二者只能选一，已选不污染。
+
+### 纯文本粘贴：只写 `.string`，两层 suppression 都保留
+
+R3.3 的“粘贴为纯文本”只支持 `.text/.rtf/.html`；URL、图片、文件不显示该动作。快捷键是 `⇧⌘V`，多选时必须全部符合白名单才执行，不能静默跳过其中的非文本项。资格、decoder 路由和多选 all-or-nothing 语义统一在 `PlainTextPaste`；RTF/HTML decoder 失败必须返回 nil，绝不能把 raw markup 当纯文本兜底。
+
+`Copyback.writePlainText` 用 `NSAttributedString` 解码富文本后只写一个 `.string` representation，再由 `PasteInjector` 向目标 app 注入普通 `Cmd+V`。**不要**向目标 app 转发 `⇧⌘V`——各 app 对该快捷键的实现不一致，写 plain pasteboard + 普通 paste 才是稳定协议。
+
+写回必须走 `watcher.pasteBack` 防本机 watcher self-capture；成功后还要按**实际解码后的 pasted text**记录 `PasteSuppressionSet.fingerprint(text:)`，挡 Universal Clipboard 在其他 Mac 捕获后反弹回来的 mirror echo。原 RTF/HTML item 的 raw `textFull` 指纹与纯文本输出不同，不能复用 `fingerprint(forItem:)`。
 
 ### 自动粘贴 (PasteInjector) 的不变量
 

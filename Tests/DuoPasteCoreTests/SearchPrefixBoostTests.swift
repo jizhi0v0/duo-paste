@@ -5,9 +5,8 @@ import GRDB
 
 private typealias DuoDB = DuoPasteCore.Database
 
-/// 覆盖 (pinned DESC, prefix DESC, captured_at_ns DESC) 排序契约的回归测试。
-/// 不写这些断言，prefix-boost 被回退也能让旧的"按时间倒序"测试继续通过——
-/// 这就是 review 提出来要补的盲区。
+/// 非空搜索：prefix group → contains group；每组 captured_at_ns DESC，pin 不参与相关性。
+/// 空搜索：pinned DESC → captured_at_ns DESC。
 private func makeDB() throws -> DuoDB {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("duo-prefix-\(UUID().uuidString)", isDirectory: true)
@@ -77,9 +76,8 @@ private func nowNs() -> Int64 {
     #expect(hits.map(\.0.id) == ["older-prefix", "newer-noprefix"])
 }
 
-@Test func pinnedAlwaysBeatsPrefixBoost() throws {
-    // pinned 优先级 > prefix。一个 pinned non-prefix + 一个 unpinned prefix 同时存在时，
-    // pinned 必须置顶。避免把 prefix-boost 误升到 pinned 之上
+@Test func prefixRelevanceBeatsPinnedContains() throws {
+    // 搜索相关性优先：pinned 的包含命中不能压过未 pinned 的前缀命中。
     let db = try makeDB()
     let now = nowNs()
     try insertOwn(db, id: "pinned-noprefix",
@@ -90,12 +88,11 @@ private func nowNs() -> Int64 {
                   capturedAtNs: now - 30_000_000_000,
                   text: "git status")
     let hits = try SearchAPI(database: db).searchHits(SearchQuery(text: "git", limit: 10))
-    #expect(hits.map(\.0.id) == ["pinned-noprefix", "unpinned-prefix"])
+    #expect(hits.map(\.0.id) == ["unpinned-prefix", "pinned-noprefix"])
 }
 
-@Test func prefixOutside24hWindowGetsNoBoost() throws {
-    // 24h 之外的 prefix 不享受 boost。两天前 prefix-match 应被 1h 前 non-prefix-match 反超，
-    // 退化成纯时间倒序——剪贴板心智是"搜=找最近用过的"，不希望陈年起头匹配翻上来
+@Test func prefixRelevanceHasNoAgeWindow() throws {
+    // 前缀相关性不设 24h 窗：两天前 prefix 仍排在 1h 前 contains 前。
     let db = try makeDB()
     let now = nowNs()
     try insertOwn(db, id: "old-prefix",
@@ -105,8 +102,56 @@ private func nowNs() -> Int64 {
                   capturedAtNs: now - 3600 * 1_000_000_000,         // 1h ago, 窗内
                   text: "look the git is here")
     let hits = try SearchAPI(database: db).searchHits(SearchQuery(text: "git", limit: 10))
-    // recent-noprefix 排前：prefix-boost 对 old-prefix 失效，纯时间倒序
-    #expect(hits.map(\.0.id) == ["recent-noprefix", "old-prefix"])
+    #expect(hits.map(\.0.id) == ["old-prefix", "recent-noprefix"])
+}
+
+@Test func pinnedDoesNotReorderContainsGroup() throws {
+    let db = try makeDB()
+    let now = nowNs()
+    try insertOwn(db, id: "older-pinned",
+                  capturedAtNs: now - 90_000_000_000,
+                  text: "contains git here",
+                  pinned: true)
+    try insertOwn(db, id: "newer-unpinned",
+                  capturedAtNs: now - 30_000_000_000,
+                  text: "newer git here")
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(text: "git", limit: 10))
+    #expect(hits.map(\.0.id) == ["newer-unpinned", "older-pinned"])
+}
+
+@Test func emptyQueryStillSortsPinnedBeforeTime() throws {
+    let db = try makeDB()
+    let now = nowNs()
+    try insertOwn(db, id: "older-pinned",
+                  capturedAtNs: now - 90_000_000_000,
+                  text: "old",
+                  pinned: true)
+    try insertOwn(db, id: "newer-unpinned",
+                  capturedAtNs: now - 30_000_000_000,
+                  text: "new")
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
+    #expect(hits.map(\.0.id) == ["older-pinned", "newer-unpinned"])
+}
+
+@Test func previewAndFullTextPrefixesShareOneRelevanceTier() throws {
+    let db = try makeDB()
+    let now = nowNs()
+    let olderPreviewPrefix = Item(
+        id: "older-preview-prefix", originDevice: "self",
+        capturedAtNs: now - 90_000_000_000, kind: .text,
+        preview: "git old", textFull: "contains git old"
+    )
+    let newerFullTextPrefix = Item(
+        id: "newer-full-prefix", originDevice: "self",
+        capturedAtNs: now - 30_000_000_000, kind: .text,
+        preview: "contains git new", textFull: "git new"
+    )
+    try db.pool.write { conn in
+        try olderPreviewPrefix.insert(conn)
+        try newerFullTextPrefix.insert(conn)
+    }
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(text: "git", limit: 10))
+    #expect(hits.map(\.0.id) == ["newer-full-prefix", "older-preview-prefix"])
 }
 
 @Test func unionPrefixBoostMatchesSingleTableOrdering() throws {
@@ -123,4 +168,24 @@ private func nowNs() -> Int64 {
                      text: "tracking git issues")
     let hits = try SearchAPI(database: db).searchHits(SearchQuery(text: "git", limit: 10))
     #expect(hits.map(\.0.id) == ["own-prefix", "mir-noprefix"])
+}
+
+@Test func directSearchAndFoldedHitsShareRelevanceOrdering() throws {
+    let db = try makeDB()
+    let now = nowNs()
+    try insertOwn(db, id: "pinned-contains",
+                  capturedAtNs: now - 10_000_000_000,
+                  text: "contains git",
+                  pinned: true)
+    try insertOwn(db, id: "older-prefix",
+                  capturedAtNs: now - 30_000_000_000,
+                  text: "git older")
+    try insertOwn(db, id: "newer-prefix",
+                  capturedAtNs: now - 20_000_000_000,
+                  text: "git newer")
+    let query = SearchQuery(text: "git", limit: 10)
+    let api = SearchAPI(database: db)
+
+    #expect(try api.search(query).map(\.id) == ["newer-prefix", "older-prefix", "pinned-contains"])
+    #expect(try api.searchHits(query).map(\.0.id) == ["newer-prefix", "older-prefix", "pinned-contains"])
 }

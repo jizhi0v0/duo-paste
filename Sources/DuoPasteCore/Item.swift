@@ -167,8 +167,8 @@ extension Item {
     /// - Key：`text_full` 原值，大小写敏感、不 trim、不归一化空白
     /// - 文本 Winner：`max(capturedAtNs)`；同 ns 时保留先入的（与 dict 语义一致）
     /// - Pinned：参与行 `pinned` OR 聚合赋给 winner——"pin 是对内容的属性而非具体 row"
-    /// - **不排序**：fold 后顺序未定义，调用方自行 sort（Mac 走 prefix24h 三层契约，
-    ///   iOS 默认 list 走 pinned + captured_at_ns DESC）
+    /// - **不排序**：fold 后顺序未定义，调用方自行 sort（非空搜索走 prefix/contains/time，
+    ///   空搜索走 pinned/time）
     /// - **不做 kind 白名单 / pinnedOnly 过滤**：query 维度的过滤由调用方在 fold 前/后处理
     ///
     /// Mac 的 `fetchHitsFolded` 因为要同时持有 FTS5 snippet，内部走自己的 tuple-aware fold

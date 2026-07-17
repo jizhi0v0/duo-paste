@@ -422,49 +422,4 @@ struct MetadataMirrorStoreTests {
         #expect(suffixLocal.items.map(\.id) == suffixDirect.map(\.0.id))
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func hundredThousandRowsColdOpenAndFTSStayInteractive() throws {
-        let (mirror, path) = try makeMetadataMirror()
-        let pageSize = 2_000
-        for start in stride(from: 0, to: 100_000, by: pageSize) {
-            let items = (start..<(start + pageSize)).map { index in
-                mirrorItem(
-                    id: String(format: "perf-%06d", index),
-                    capturedAtNs: Int64(index + 1),
-                    text: index == 99_999
-                        ? "uniqueofflineperformance needle"
-                        : "ordinary clipboard metadata \(index)"
-                )
-            }
-            _ = try mirror.applyPage(
-                items: items,
-                nextCursor: SinceCursor(
-                    ingestedAtNs: Int64(start + pageSize),
-                    id: String(format: "perf-%06d", start + pageSize - 1)
-                )
-            )
-        }
-
-        let clock = ContinuousClock()
-        let coldStart = clock.now
-        let reopened = try MetadataMirrorStore(path: path)
-        let recent = try reopened.recentItems(limit: 1_000)
-        let coldDuration = coldStart.duration(to: clock.now)
-
-        let searchStart = clock.now
-        let result = try reopened.search(text: "uniqueofflineperformance")
-        let searchDuration = searchStart.duration(to: clock.now)
-
-        let qualifierStart = clock.now
-        let emptyURLResult = try reopened.search(text: nil, qualifiers: [.kind(.url)])
-        let qualifierDuration = qualifierStart.duration(to: clock.now)
-
-        #expect(recent.count == 1_000)
-        #expect(result.items.map(\.id) == ["perf-099999"])
-        #expect(emptyURLResult.items.isEmpty)
-        // Generous anti-flake gates: either duration would be a visible UI stall on an M-series host.
-        #expect(coldDuration < .seconds(2), "cold open + recent page took \(coldDuration)")
-        #expect(searchDuration < .seconds(1), "local FTS search took \(searchDuration)")
-        #expect(qualifierDuration < .seconds(2), "100k qualifier search took \(qualifierDuration)")
-    }
 }

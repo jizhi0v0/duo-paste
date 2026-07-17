@@ -21,6 +21,9 @@ final class AppState {
     /// shift+点 → 不动 anchor,只改 selectedIDs(Finder 行为)。没 anchor 时 shift+点退化单选
     var anchorID: String?
     var lastError: String?
+    /// 搜索框 loading。token 归属保证旧 `.task(id:)` 被取消时不会把新搜索的 spinner 关掉。
+    private var searchLoadingTracker = SearchLoadingTracker()
+    var isSearching: Bool { searchLoadingTracker.isLoading }
     /// 当前搜索源——决定顶部 banner 显示什么。
     var searchMode: SearchProvider.Mode = .local
     /// 当前 query 条件下匹配的真实总数（不受 list limit 截断）。UI counter 显示这个。
@@ -78,11 +81,41 @@ final class AppState {
     /// 拼成一个紧凑字符串而非 Hashable struct——避免给 ItemKind / TimeRange 加 Hashable
     /// 约束链（其实都已经满足，但用 String 也省去 SwiftUI Equatable 比较的实例化）
     var filterID: String {
+        "\(query)\u{1F}\(searchContextID)"
+    }
+
+    /// 不含自由文本的筛选上下文。空查询 cache 只允许在这个 key 完全一致时恢复，避免
+    /// 切换时间窗/chip 后瞬间闪回另一套列表。
+    private var searchContextID: String {
         let kindsStr = selectedKinds.map { $0.rawValue }.sorted().joined(separator: ",")
         let subsStr = selectedFileSubKinds.map { $0.rawValue }.sorted().joined(separator: ",")
         // activeQualifiers 进 filterID:string 化保留顺序,变化触发 .task(id:) 重 fetch
         let qualsStr = activeQualifiers.map { qualifierKey($0) }.joined(separator: ",")
-        return "\(query)\u{1F}\(timeRange.filterKey)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(qualsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
+        return "\(timeRange.filterKey)\u{1F}\(kindsStr)\u{1F}\(subsStr)\u{1F}\(qualsStr)\u{1F}\(pinnedOnly ? "1" : "0")"
+    }
+
+    func beginSearchLoading() -> UInt64 {
+        searchLoadingTracker.begin()
+    }
+
+    func endSearchLoading(_ token: UInt64) {
+        searchLoadingTracker.end(token)
+    }
+
+    /// 清空输入时先恢复最近一次相同筛选上下文下的完整列表。真实 DB refresh 仍会在后台
+    /// 继续，cache 只负责消除从最后一个 FTS 字符切回全库 fold 的可见空窗。
+    func restoreCachedEmptySearch() -> Bool {
+        guard query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let cachedEmptySearch,
+              cachedEmptySearch.contextID == searchContextID else {
+            return false
+        }
+        applySearchOutcome(
+            cachedEmptySearch.outcome,
+            queryIsEmpty: true,
+            prefetchThumbnails: false
+        )
+        return true
     }
 
     /// QueryQualifier 的 string key,filterID 用
@@ -630,7 +663,7 @@ final class AppState {
         }
     }
 
-    init(deps: AppDependencies) {
+    init(deps: AppDependencies, bootstrapSearch: Bool = true) {
         self.deps = deps
         self.savedViewStore = SavedSearchViewStore(fileURL: deps.paths.savedSearchViewsFile)
         self.capturePolicy = CapturePolicy(excludedBundleIDs: deps.config.capture.excludedBundleIDs)
@@ -645,7 +678,9 @@ final class AppState {
         // 时 results=[] → 看到 "0 条" 闪一下。Panel 触发 .task 后会异步 refresh
         // 一次（可能从 remote 拿更新），把这里的结果替换/扩展。
         // 用本地不走 searchProvider，绕开 remote 慢路径——0 ms 同步可拿到结果。
-        let initial = (try? deps.searchAPI.search(SearchQuery(limit: Self.listLimit))) ?? []
+        let initial = bootstrapSearch
+            ? ((try? deps.searchAPI.search(SearchQuery(limit: Self.listLimit))) ?? [])
+            : []
         self.results = initial
         if let firstID = initial.first?.id {
             self.selectedIDs = [firstID]
@@ -653,18 +688,26 @@ final class AppState {
         }
         // 同步 init 阶段 mirror union 还没接入（searchProvider 没跑），用本机 item 计数作初值——
         // panel 打开后第一次 refresh() 会替换成正确的 union/mirror 总数。
-        self.totalCount = (try? deps.searchAPI.count(SearchQuery())) ?? initial.count
-        self.kindCounts = (try? deps.searchAPI.countByKind(SearchQuery())) ?? [:]
-        self.fileSubKindCounts = (try? deps.searchAPI.countByFileSubKind(SearchQuery())) ?? [:]
+        self.totalCount = bootstrapSearch
+            ? ((try? deps.searchAPI.count(SearchQuery())) ?? initial.count)
+            : 0
+        self.kindCounts = bootstrapSearch
+            ? ((try? deps.searchAPI.countByKind(SearchQuery())) ?? [:])
+            : [:]
+        self.fileSubKindCounts = bootstrapSearch
+            ? ((try? deps.searchAPI.countByFileSubKind(SearchQuery())) ?? [:])
+            : [:]
         // 后台预热 image thumbnail——daemon 重启后 ImageThumbnailCache 空,首次打开 panel
         // 时每张 image 卡 .task 命中 miss 会先显占位再异步 replace。这里 fire-and-forget
         // 让 decode 提前跑,常规场景(daemon 启动后秒级以上才开 panel)cache 已 hot
-        ImageThumbnailCache.shared.prefetch(
-            items: initial,
-            blobs: deps.blobs,
-            fetcher: pasteBlobFetcher,
-            storageMode: deps.config.mesh.storageMode
-        )
+        if bootstrapSearch {
+            ImageThumbnailCache.shared.prefetch(
+                items: initial,
+                blobs: deps.blobs,
+                fetcher: pasteBlobFetcher,
+                storageMode: deps.config.mesh.storageMode
+            )
+        }
     }
 
     /// 列表一次最多返回多少条。比 totalCount 小时只是 UI 截断,无业务语义——稀疏类型
@@ -680,6 +723,12 @@ final class AppState {
     /// 防止快速连打 query 时 N 个 detached SQL read 堆在 GRDB pool reader 队列。
     /// @ObservationIgnored:这是内部并发状态,UI 不依赖也不应触发 SwiftUI 重渲
     @ObservationIgnored private var currentSearchTask: Task<SearchProvider.Outcome, Error>?
+    /// 只保留最近一个空查询结果（最多 `listLimit` 条 item），而不是缓存任意 FTS query。
+    /// contextID 防止跨 chip/time/pinned 上下文误用；后台 refresh 完成后会覆盖为最新值。
+    @ObservationIgnored private var cachedEmptySearch: (
+        contextID: String,
+        outcome: SearchProvider.Outcome
+    )?
 
     /// 当前应该粘贴的项：优先选中项(取 selectedIDs 末位 = 最后一次 cmd+点 / 单击的那个),
     /// 否则取列表首项兜底。**注**:多项 paste 用 `selectedItems`,这里只是单项 fallback
@@ -740,6 +789,7 @@ final class AppState {
             }
         }
         let trimmed = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextID = searchContextID
         let timeBounds = timeRange.bounds()
         let q = SearchQuery(
             text: trimmed.isEmpty ? nil : trimmed,
@@ -788,37 +838,10 @@ final class AppState {
         if Task.isCancelled {
             return
         }
-        // **F**: 每个 setter 前 equality guard——内容等价时直接跳过,避免 Observation
-        // 框架 didSet wave 触发下游 ForEach diff / chip 重渲。新旧 Item array 在
-        // query 没变的高频 refresh(openPulse / onAppear)场景下大概率等价,
-        // ItemCard EquatableView 已能跳 body 重算,这里再叠一层让 ForEach enumerate
-        // 都不发生
-        if self.results != outcome.items {
-            self.results = outcome.items
+        if trimmed.isEmpty {
+            cachedEmptySearch = (contextID: contextID, outcome: outcome)
         }
-        // refresh 拿到新 results 顺路预热 thumbnail——新 mirror 进来的 image 项
-        // 让下次卡进 viewport 时已 cached。已 cached / 黑名单的 sha 自动跳过
-        ImageThumbnailCache.shared.prefetch(
-            items: outcome.items,
-            blobs: deps.blobs,
-            fetcher: pasteBlobFetcher,
-            storageMode: deps.config.mesh.storageMode
-        )
-        if self.snippets != outcome.snippets {
-            self.snippets = outcome.snippets
-        }
-        if self.searchMode != outcome.mode {
-            self.searchMode = outcome.mode
-        }
-        if self.totalCount != outcome.totalCount {
-            self.totalCount = outcome.totalCount
-        }
-        if self.kindCounts != outcome.kindCounts {
-            self.kindCounts = outcome.kindCounts
-        }
-        if self.fileSubKindCounts != outcome.fileSubKindCounts {
-            self.fileSubKindCounts = outcome.fileSubKindCounts
-        }
+        applySearchOutcome(outcome, queryIsEmpty: trimmed.isEmpty, prefetchThumbnails: true)
         if let pending = try? await deps.database.pendingPinItemIDs(),
            self.pendingPinItemIDs != pending {
             self.pendingPinItemIDs = pending
@@ -829,10 +852,35 @@ final class AppState {
         if self.clockSkewMs != newSkew {
             self.clockSkewMs = newSkew
         }
-        updateSelection(forItems: outcome.items, queryIsEmpty: trimmed.isEmpty)
-        if self.lastError != nil {
-            self.lastError = nil
+    }
+
+    /// 发布搜索结果的唯一入口。cache restore 和真实 DB outcome 共用，避免两条路径遗漏
+    /// counter/snippet/mode 中任一字段；真实结果才做 thumbnail 预热。
+    private func applySearchOutcome(
+        _ outcome: SearchProvider.Outcome,
+        queryIsEmpty: Bool,
+        prefetchThumbnails: Bool
+    ) {
+        // **F**: 每个 setter 前 equality guard——内容等价时直接跳过,避免 Observation
+        // 框架 didSet wave 触发下游 ForEach diff / chip 重渲。
+        if results != outcome.items { results = outcome.items }
+        if prefetchThumbnails {
+            ImageThumbnailCache.shared.prefetch(
+                items: outcome.items,
+                blobs: deps.blobs,
+                fetcher: pasteBlobFetcher,
+                storageMode: deps.config.mesh.storageMode
+            )
         }
+        if snippets != outcome.snippets { snippets = outcome.snippets }
+        if searchMode != outcome.mode { searchMode = outcome.mode }
+        if totalCount != outcome.totalCount { totalCount = outcome.totalCount }
+        if kindCounts != outcome.kindCounts { kindCounts = outcome.kindCounts }
+        if fileSubKindCounts != outcome.fileSubKindCounts {
+            fileSubKindCounts = outcome.fileSubKindCounts
+        }
+        updateSelection(forItems: outcome.items, queryIsEmpty: queryIsEmpty)
+        if lastError != nil { lastError = nil }
     }
 
     /// 列表刷新后调整选中行,策略统一 "kept 优先":

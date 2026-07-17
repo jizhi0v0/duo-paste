@@ -9,7 +9,7 @@
 - macOS 已可 daily-driver：本机捕获、SQLite/FTS5、OCR、slash qualifier、置顶/删除、多选、预览/Open With、导出、Sparkle 更新、snapshot 与 blob 水位回收均已落地。
 - 多 Mac 已是对称 mesh：每个 peer 本地写入，通过 `/since` pull + WebSocket 通知同步；支持 Tailscale/Surge Ponte、full/optimized blob、本地 fold-aware 搜索和 `mesh-doctor`。
 - iOS 已不是“只读概念版”：已有 Bonjour 发现、QR leaf binding + PIN 配对、完整 SQLite/FTS metadata mirror、离线搜索、复制 bump、置顶、删除、后台 pull、独立 Blob LRU 和 WS zombie 检测。
-- 当前已知真实缺口：滚动升级期仍接受不带 device token 的 legacy HMAC，旧 iOS 需重新配对后才具备单设备撤销能力；搜索仍缺自定义时间窗和保存视图。
+- 当前 R0–R4.2 已定义工作全部完成；滚动升级期仍接受不带 device token 的 legacy HMAC，旧 iOS 需重新配对后才具备单设备撤销能力。后续只剩 P3 产品探索，尚无默认承诺的实现项。
 
 ## 优先级规则
 
@@ -38,8 +38,10 @@
 | R2.2 | iOS 首次同步进度与离线状态 | UX | P2 | M | ✅ done |
 | R3.1 | 自定义起止时间筛选 | feature | P2 | S | ✅ done |
 | R3.2 | 保存搜索视图 | feature | P2 | S | ✅ done |
-| R3.3 | 纯文本粘贴动作 | feature | P2 | S | proposed |
-| R4.1 | 8GB / 百万行搜索基准与回归门槛 | optimization | P1 | M | proposed |
+| R3.3 | 纯文本粘贴动作 | feature | P2 | S | ✅ done |
+| R3.4 | 搜索相关性排序 | UX / refactor | P2 | S | ✅ done |
+| R4.1 | 8GB / 百万行搜索基准与回归门槛 | optimization | P1 | M | ✅ done |
+| R4.2 | 空查询与类型计数优化 | optimization | P1 | M | ✅ done |
 
 ## R0 — 可靠性与可恢复性（Now）
 
@@ -245,18 +247,55 @@ iPhone 17 Pro 签名 build/install/launch 均通过；真机状态卡显示 20,4
 
 **执行计划**：[`plans/r3-2-saved-search-views.md`](../plans/r3-2-saved-search-views.md)
 
-### R3.3 纯文本粘贴动作
+### ✅ R3.3 纯文本粘贴动作
+
+**完成记录（2026-07-17）**：macOS 搜索卡右键菜单为 text/rtf/html 增加“粘贴为纯文本”，并支持 `⇧⌘V`；URL、图片、文件不暴露该动作。富文本通过 AppKit 解码后 pasteboard 只写 `.string`，多选保持顺序且遇到任一不支持/解码失败项整体拒绝。写回复用 watcher actor barrier，并按实际纯文本记录跨设备 echo 指纹。5 项 Core resolver、4 项 UI/source contract 和 1 项真实 pasteboard 轮询回环测试全绿；完整 `swift test`（254 + 610 + 11）、macOS debug/release、iOS Simulator release、Developer ID bundle 重装与 launchd 新 PID 均验证通过。
 
 对 text/rtf/html 提供“粘贴为纯文本”菜单项和快捷键；图片/文件不显示。必须复用现有 paste suppression，不能让 app 自写内容重新被 watcher 捕获。
 
+**执行计划**：[`plans/r3-3-plain-text-paste.md`](../plans/r3-3-plain-text-paste.md)
+
+### ✅ R3.4 搜索相关性排序
+
+**完成记录（2026-07-17）**：非空搜索从旧 `(pinned, prefix24h, time)` 改为严格的
+`prefix group → contains group`，两组内部均按 `captured_at_ns DESC`；pin 不再压过搜索
+相关性，前缀不再有 24h 窗，preview/text_full 前缀合并为同一 tier。空查询仍保持
+`pinned DESC → captured_at_ns DESC`。SQL raw fetch、公开 `SearchAPI.search` 与 fold 后 Swift
+排序三路已统一；prefix membership 从 sort comparator 的重复 lowercase 改为每条只计算一次。
+8 项排序回归覆盖 pin/时间窗/同 tier/组内倒序/空查询/direct-vs-folded parity；完整
+`swift test` 891/891、macOS release、iOS Simulator release 与 `git diff --check` 均通过。
+百万行真实首屏初版重构 p95 153.40ms 被性能门拦下，优化后连续两轮 p95 142.32ms / 139.82ms，
+均重新通过 `<150ms` gate。
+
+**验收（已通过）**：
+
+- [x] 非空 query 的所有 prefix 命中排在 contains 命中之前，不受 pin 或记录年龄影响。
+- [x] prefix/contains 各组内部只按捕获时间倒序；preview 与 text_full prefix 同 tier。
+- [x] 空 query 仍按 pinned/time；raw SQL、fold 后结果、Mac 与 iOS 共用同一 Core 契约。
+- [x] 百万行真实首屏连续两轮通过 p95 `<150ms` 性能门。
+
+**执行计划**：[`plans/r3-4-search-relevance-ordering.md`](../plans/r3-4-search-relevance-ordering.md)
+
 ## R4 — 大库性能门槛（并行测量，按结果优化）
 
-### R4.1 8GB / 百万行基准
+### ✅ R4.1 8GB / 百万行基准
+
+**完成记录（2026-07-17）**：新增只由显式 `benchmark-library` CLI 触发的版本化合成库与报告器；固定 seed 生成 100 万条混合 kind/OCR/pin/delete/fold metadata，8GiB sparse blob 同时记录 logical/allocated bytes，拒绝默认 Application Support 与无 marker destructive rebuild。release 基线在 M3 Max / 36GiB 上每项采 20 次：warm FTS p95 15.00ms；真实按键到首屏包含生产 debounce、四段查询及 `AppState + SearchView + NSHostingView` layout，p95 137.36ms，分别通过 100/150ms gate。口径审计发现旧 180ms debounce 单独就超门槛，改为本地搜索 60ms 并让生产与 benchmark 共用常量。connection-cold FTS 17.84ms、空 query 54.16ms；后续热点为 qualifier 11.10s、kind counts 25.69s、offset 100k 分页 2.28s，峰值分别 2.28/1.84/0.87GiB。8 项 benchmark support/CLI/render 契约全绿；完整 `swift test`（254 + 617 + 11 = 882）、macOS debug/release、iOS Simulator release、SQLite `integrity_check` 与 `git diff --check` 均通过。基线：[`benchmarks/results/r4-1-20260717-m3-max.json`](../benchmarks/results/r4-1-20260717-m3-max.json)。
 
 - 增加可重复生成的合成数据集：100 万 metadata 行、混合 kind/OCR、8GB blob 仓库。
 - 记录 cold/warm FTS、空 query、qualifier、countByKind、深分页、首屏渲染的 p50/p95 和峰值内存。
 - 初始目标：Apple Silicon 上 warm FTS p95 < 100ms、键入到首屏 p95 < 150ms；若不达标，优先优化 fold oversample/count 和分页，不先堆 UI 动画。
 - benchmark 不进入每次 `swift test`，放 nightly/manual，保存基线防回退。
+
+**执行计划**：[`plans/r4-1-large-library-benchmark.md`](../plans/r4-1-large-library-benchmark.md)
+
+### ✅ R4.2 空查询与类型计数优化
+
+**完成记录（2026-07-17）**：新增 v16 可重建 `search_fold` projection + dirty-key trigger，正常写入只重算受影响 content group，批量导入才流式全量 rebuild；`SearchProvider` 从 list/total/kind/sub-kind 四次 fold 收敛为单次 `searchSummary`，自定义时间范围保留一次 Swift fold fallback。百万行 / 8GiB sparse / 20 samples 最终 p95：空页 1.57ms、完整 summary 49.15ms、qualifier 6.57ms、offset 100k 38.26ms、first-screen data 16.64ms、真实 keypress-to-render 95.28ms；三项 gate 全绿。相对 R4.1，count/facets 约快 523×、qualifier 约 1,690×、深分页约 60×，峰值内存从 GiB 级降至约 16MiB；代价是百万行 DB 481→735MiB。完整 `swift test`（254 + 629 + 11 = 894）、真实 v15 migration integrity、macOS/iOS Release、日用库 v16/dirty=0 与 Developer ID 部署全绿。基线：[`benchmarks/results/r4-2-20260717-m3-max.json`](../benchmarks/results/r4-2-20260717-m3-max.json)。
+
+R4.1 量出百万行库的明确热点：空 query 最近页本身 p95 54.16ms，但生产刷新会另外执行三次无界 fold；`countByKind + countByFileSubKind` p95 25.69s、峰值 1.84GiB。R4.2 将四段查询收敛为一次 summary，并为空查询维护精确的 fold projection；不放宽跨 origin 文本/blob fold、pin OR 或 qualifier 后置过滤语义。
+
+**执行计划**：[`plans/r4-2-empty-query-facets.md`](../plans/r4-2-empty-query-facets.md)
 
 ## P3 产品探索（不承诺实现）
 
