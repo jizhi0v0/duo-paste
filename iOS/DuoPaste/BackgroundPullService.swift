@@ -74,6 +74,12 @@ enum BackgroundPullService {
 
     private static func runPull() async throws {
         let defs = UserDefaults.standard
+        guard !defs.bool(forKey: HistoryStore.syncPausedDefaultsKey) else {
+            // A user pause is intentional, not a failed background refresh. Reporting failure to
+            // BGTaskScheduler would unnecessarily penalize future scheduling after the user resumes.
+            DebugLog.shared.append("BG pull skipped: metadata sync paused by user")
+            return
+        }
         guard let credential = try ClientCredentialKeychain.load() else {
             throw BackgroundPullError.notConfigured
         }
@@ -98,12 +104,24 @@ enum BackgroundPullService {
         let client = PeerClient(config: cfg)
 
         let mirror = try HistoryStore.openMirror()
-        _ = try await mirror.synchronize(
+        let report = try await mirror.synchronize(
             pageLimit: pageLimit,
             maxPages: maxPages
         ) { cursor, limit in
             try await client.fetchSince(cursor: cursor, limit: limit)
         }
+        // Keep the strict-completion proof outside Caches. If iOS later evicts mirror.sqlite,
+        // foreground launch sees this proof plus a missing DB and explicitly enters rebuilding.
+        let checkpoint = MetadataMirrorSyncCheckpoint(
+            lastSuccessAt: Date(),
+            lastPeerDeviceID: report.sourceDeviceID ?? url.host,
+            lastLocalItemCount: report.localTotalCount,
+            lastSourceTrackedItemCount: report.sourceTrackedItemCount,
+            lastServerTotalCount: report.serverTotalCount,
+            finalCursor: report.finalCursor
+        )
+        try MetadataMirrorSyncCheckpointStore(path: HistoryStore.syncCheckpointFile)
+            .save(checkpoint)
     }
 }
 

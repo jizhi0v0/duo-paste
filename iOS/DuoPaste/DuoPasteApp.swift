@@ -123,6 +123,7 @@ struct DuoPasteApp: App {
                     case .active:
                         // 回前台:BG task 可能已更新 SQLite，刷新 bounded projection + active FTS。
                         store.refreshFromMirror()
+                        store.reloadSyncCheckpoint()
                         Task { await store.refreshActiveSearch() }
                         // 通知 coordinator 给 heartbeat 检测加 grace,避免后台返回橙字误报
                         coordinator.applicationDidBecomeActive()

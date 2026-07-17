@@ -122,12 +122,6 @@ private actor BlockingBlobFetcher: BlobFetcher {
     }
 }
 
-private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
-    await worker.start()
-    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-    await worker.stop()
-}
-
 // MARK: - eager_blobs 主路径
 
 @Test func eagerBlobsFetchesMissingBytes() async throws {
@@ -152,7 +146,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
 
     // mirror 行写好
     let mirroredIDs = try await db.pool.read { conn in
@@ -195,20 +189,23 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
 
+    let target = await worker.completedTickCountForTesting() + 2
     await worker.start()
-    var cursorNs: Int64?
-    for _ in 0..<60 {
-        cursorNs = try await db.pool.read { conn in
-            try Int64.fetchOne(conn, sql: "SELECT cursor_ns FROM pull_cursor")
-        }
-        if cursorNs == 200 { break }
-        try? await Task.sleep(for: .milliseconds(10))
+    let metadataCaughtUp = await worker.waitForCompletedTicksForTesting(atLeast: target)
+    let cursorNs = try await db.pool.read { conn in
+        try Int64.fetchOne(conn, sql: "SELECT cursor_ns FROM pull_cursor")
     }
 
+    #expect(metadataCaughtUp)
     #expect(await fetcher.started)
     #expect(cursorNs == 200)
 
     await fetcher.release()
+    let hydrationFinished = await worker.waitForCompletedTicksForTesting(
+        atLeast: target,
+        includingBlobHydration: true
+    )
+    #expect(hydrationFinished)
     await worker.stop()
 }
 
@@ -230,7 +227,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .optimized)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
 
     // mirror 行写了
     let count = try await db.pool.read { conn -> Int in
@@ -264,7 +261,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
     #expect(await fetcher.totalCalls() == 0)
 }
 
@@ -289,7 +286,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
     #expect(await fetcher.totalCalls() == 0)
 }
 
@@ -311,7 +308,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
     #expect(await fetcher.totalCalls() == 0)
 }
 
@@ -334,7 +331,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
 
     // mirror 行仍在
     let count = try await db.pool.read { conn -> Int in
@@ -373,7 +370,7 @@ private func runBriefly(_ worker: PullWorker, ms: Int = 300) async {
         blobFetcher: fetcher, blobs: blobs,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
 
     let count = try await db.pool.read { conn -> Int in
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? 0

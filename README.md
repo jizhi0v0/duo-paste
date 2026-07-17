@@ -139,7 +139,7 @@ Settings → 关于会显示本机 leaf certificate 的 DNS SAN、有效期、�
 
 ```sh
 swift build
-swift test               # 822 tests
+swift test               # 848 tests
 swift build -c release
 ```
 

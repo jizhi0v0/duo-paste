@@ -21,6 +21,9 @@ struct HistoryView: View {
                 if let msg = store.deleteFailureMessage {
                     deleteFailureBanner(message: msg)
                 }
+                syncStatusCard
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
                 searchBar
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
@@ -56,6 +59,169 @@ struct HistoryView: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarBackground(.visible, for: .tabBar)
         }
+    }
+
+    /// R2.2 completeness card. Connection and cache completeness are deliberately separate: an
+    /// offline but previously verified archive remains usable, while an initial/refill archive keeps
+    /// saying “不是全集” even though partial rows are already visible and searchable.
+    private var syncStatusCard: some View {
+        let sync = store.syncStatus
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Image(systemName: syncStatusIcon)
+                    .foregroundStyle(syncStatusColor)
+                Text(syncStatusTitle)
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 8)
+                if coordinator.isPulling {
+                    Button("取消") {
+                        coordinator.cancelPull()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else if coordinator.canForcePull {
+                    Button(sync.activity == .paused ? "继续同步" : "立即刷新") {
+                        coordinator.forcePull()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            if sync.activity == .syncing,
+               let total = sync.serverTotalCount,
+               total > 0 {
+                let completed = min(sync.sourceTrackedItemCount ?? sync.localItemCount, total)
+                ProgressView(value: Double(completed), total: Double(total))
+                    .tint(sync.mode == .rebuilding ? .orange : .accentColor)
+            }
+
+            HStack(spacing: 6) {
+                Text(syncCountSummary)
+                if let peer = sync.currentPeer, !peer.isEmpty {
+                    Text("·")
+                    Text("peer \(displayPeer(peer))")
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 6) {
+                Text(syncCompletenessLabel)
+                Spacer(minLength: 8)
+                if let lastSuccessAt = sync.lastSuccessAt {
+                    Text("上次成功")
+                    Text(lastSuccessAt, style: .relative)
+                } else {
+                    Text("尚无成功记录")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(sync.isStrictlyCaughtUp ? Color.secondary : Color.orange)
+
+            if let failure = sync.failureMessage {
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(.secondarySystemBackground))
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("同步详情")
+    }
+
+    private var syncStatusTitle: String {
+        let sync = store.syncStatus
+        if peerIsUnavailable, sync.mode == .ready, sync.activity == .idle {
+            return "离线可用"
+        }
+        switch sync.activity {
+        case .paused:
+            return "同步已暂停"
+        case .failed:
+            return "同步失败，本地历史可用"
+        case .syncing:
+            switch sync.mode {
+            case .initialSync: return "首次同步中"
+            case .verifyingExistingCache: return "正在验证本地历史"
+            case .rebuilding: return "正在重建本地历史"
+            case .ready: return "正在检查更新"
+            }
+        case .idle:
+            switch sync.mode {
+            case .initialSync: return "等待首次同步"
+            case .verifyingExistingCache: return "等待验证本地历史"
+            case .rebuilding: return "正在重建本地历史"
+            case .ready: return "已严格追平"
+            }
+        }
+    }
+
+    private var syncStatusIcon: String {
+        let sync = store.syncStatus
+        if sync.activity == .syncing { return "arrow.triangle.2.circlepath" }
+        if sync.activity == .failed { return "exclamationmark.triangle.fill" }
+        if sync.activity == .paused { return "pause.circle.fill" }
+        if sync.isStrictlyCaughtUp, !peerIsUnavailable { return "checkmark.circle.fill" }
+        if peerIsUnavailable { return "wifi.slash" }
+        return "clock.arrow.circlepath"
+    }
+
+    private var syncStatusColor: Color {
+        let sync = store.syncStatus
+        if sync.isStrictlyCaughtUp, !peerIsUnavailable { return .green }
+        if sync.activity == .syncing { return sync.mode == .rebuilding ? .orange : .accentColor }
+        return .orange
+    }
+
+    private var syncCompletenessLabel: String {
+        let sync = store.syncStatus
+        if sync.isStrictlyCaughtUp {
+            return peerIsUnavailable ? "上次已严格追平" : "已严格追平"
+        }
+        switch sync.mode {
+        case .initialSync:
+            return "首次同步未完成，当前结果不是全集"
+        case .verifyingExistingCache:
+            return "尚未完成完整性验证"
+        case .rebuilding:
+            return "正在重建，当前结果不是全集"
+        case .ready:
+            return sync.activity == .paused ? "已暂停，尚未重新追平" : "尚未严格追平"
+        }
+    }
+
+    private var syncCountSummary: String {
+        let sync = store.syncStatus
+        let local = sync.localItemCount.formatted()
+        if let tracked = sync.sourceTrackedItemCount,
+           let total = sync.serverTotalCount {
+            return "本机 \(local) 条 · peer 覆盖 \(tracked.formatted())/\(total.formatted())"
+        }
+        return "本机 \(local) 条"
+    }
+
+    private var peerIsUnavailable: Bool {
+        return switch coordinator.status {
+        case .error, .backoff, .unconfigured:
+            true
+        case .idle, .connecting, .connected:
+            false
+        }
+    }
+
+    private func displayPeer(_ peer: String) -> String {
+        if UUID(uuidString: peer) != nil {
+            return String(peer.prefix(8))
+        }
+        return peer
     }
 
     /// 整套 toolbar:左上角同步状态徽标,右上角刷新按钮
@@ -298,7 +464,14 @@ struct HistoryView: View {
     }
 
     private var emptyTitle: String {
-        switch coordinator.status {
+        if store.syncStatus.mode == .rebuilding {
+            return "正在重建本地历史"
+        }
+        if store.syncStatus.mode == .initialSync,
+           !store.syncStatus.isStrictlyCaughtUp {
+            return "首次同步中"
+        }
+        return switch coordinator.status {
         case .unconfigured: "需要配置 peer"
         case .connecting, .backoff: "正在连接"
         case .connected: "等待新内容"
@@ -308,7 +481,7 @@ struct HistoryView: View {
     }
 
     private var emptyIcon: String {
-        switch coordinator.status {
+        return switch coordinator.status {
         case .unconfigured: "gearshape"
         case .error: "exclamationmark.triangle"
         default: "doc.on.clipboard"
@@ -316,7 +489,14 @@ struct HistoryView: View {
     }
 
     private var emptyDescription: String {
-        switch coordinator.status {
+        if store.syncStatus.mode == .rebuilding {
+            return "已恢复 \(store.syncStatus.localItemCount.formatted()) 条；完成前不会把局部结果当作全集"
+        }
+        if store.syncStatus.mode == .initialSync,
+           !store.syncStatus.isStrictlyCaughtUp {
+            return "连接 Mac 后会从已保存的 cursor 继续同步"
+        }
+        return switch coordinator.status {
         case .unconfigured:
             "去「设置」填 peer URL + shared secret"
         case .error(let m):

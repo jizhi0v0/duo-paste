@@ -77,12 +77,6 @@ private func page(_ items: [Item], nextNs: Int64, nextID: String) -> SincePageWi
     )
 }
 
-private func runWorker(_ worker: PullWorker, ms: Int = 250) async {
-    await worker.start()
-    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-    await worker.stop()
-}
-
 @Test func ownTombstoneUpdatesLocalActiveRow() async throws {
     // 本机 own 行 active(ingested=100) → /since 推回带 deletedAtNs 的 own tombstone
     // (ingested=200,严格单增)→ 应用 UPDATE,deleted_at_ns 落,ingested 顶,
@@ -105,7 +99,7 @@ private func runWorker(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorker(worker)
+    await runPullWorkerToCompletion(worker)
 
     let after = try await db.pool.read { try Item.filter(Column("id") == "own1").fetchOne($0)! }
     #expect(after.deletedAtNs == 300, "tombstone 必须落")
@@ -134,7 +128,7 @@ private func runWorker(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorker(worker)
+    await runPullWorkerToCompletion(worker)
 
     let after = try await db.pool.read { try Item.filter(Column("id") == "own1").fetchOne($0)! }
     #expect(after.deletedAtNs == 999, "原 tombstone 时间戳不动")
@@ -161,7 +155,7 @@ private func runWorker(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorker(worker)
+    await runPullWorkerToCompletion(worker)
 
     let after = try await db.pool.read { try Item.filter(Column("id") == "own1").fetchOne($0)! }
     #expect(after.deletedAtNs == nil, "incoming 不够新,不该 tombstone")
@@ -189,7 +183,7 @@ private func runWorker(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorker(worker)
+    await runPullWorkerToCompletion(worker)
 
     let after = try await db.pool.read { try Item.filter(Column("id") == "own1").fetchOne($0)! }
     #expect(after.deletedAtNs == nil)
@@ -216,7 +210,7 @@ private func runWorker(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorker(worker)
+    await runPullWorkerToCompletion(worker)
 
     let count = try await db.pool.read {
         try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM item WHERE id = 'own1'") ?? 0

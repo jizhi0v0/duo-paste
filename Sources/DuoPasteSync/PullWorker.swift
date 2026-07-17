@@ -129,6 +129,10 @@ public actor PullWorker {
     /// 或慢链路，`fetchBlobsFull` 的 await 就会把后续 `/since` cursor 永久堵在半路。
     private var blobHydrationTask: Task<Void, Never>?
     private var pendingBlobSHAs = Set<String>()
+    /// Monotonic completion fence used by deterministic lifecycle tests. Keeping the fence in the
+    /// worker also makes it possible to distinguish "start() returned" from "a full tick committed"
+    /// without sleeping and guessing under a loaded test runner.
+    private var completedTickCount: UInt64 = 0
     private var consecutiveTransientFailures = 0
     /// 当前 tick 锚定的 peer device_id。reconcilePeer 学到 / 严格模式从 init 注入。
     /// 用于 setLastPullNs / setClockSkewMs 等 MeshStatus per-peer 调用。
@@ -209,6 +213,7 @@ public actor PullWorker {
         log("worker started · self=\(selfDeviceID)\(peerSuffix) · interval=\(Int(config.intervalSec))s")
         while !Task.isCancelled {
             let r = await tick()
+            completedTickCount &+= 1
 
             // 标 lastPullNs 的语义：「mirror 已严格追平该 peer」——only when has_more=false 且无 transient
             // 若 has_more=true（中途）或有 transient，保持原值，SearchProvider 仍可看到旧 lastPullNs。
@@ -260,6 +265,28 @@ public actor PullWorker {
             }
         }
         log("worker stopped")
+    }
+
+    /// Test synchronization fence: waits for committed/finished ticks, and optionally for the
+    /// detached full-mirror blob hydration spawned by those ticks. This is intentionally internal;
+    /// production callers continue to use start/stop/wake while `@testable` suites avoid wall-clock
+    /// sleeps that become flaky under parallel load.
+    func completedTickCountForTesting() -> UInt64 {
+        completedTickCount
+    }
+
+    func waitForCompletedTicksForTesting(
+        atLeast target: UInt64,
+        includingBlobHydration: Bool = false,
+        timeoutSec: TimeInterval = 10
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(max(0.1, timeoutSec))
+        while completedTickCount < target
+            || (includingBlobHydration && blobHydrationTask != nil) {
+            if Date() >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return true
     }
 
     private struct TickResult: Sendable {

@@ -114,12 +114,6 @@ private actor StubBlobFetcher: BlobFetcher {
     }
 }
 
-private func runBriefly(_ w: PullWorker, ms: Int = 300) async {
-    await w.start()
-    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-    await w.stop()
-}
-
 // MARK: - 联动场景
 
 /// 用户场景：本机 mirror 老 peer 行已软删（用户在对端 swipe-to-delete + /since 同步过来 DB
@@ -174,7 +168,7 @@ private func runBriefly(_ w: PullWorker, ms: Int = 300) async {
         evictOnFull: evictOnFull,
         config: PullWorker.Config(intervalSec: 60, storageMode: .full)
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker, includingBlobHydration: true)
 
     // PullWorker 这一刀的结果——新 blob 落盘 + mirror 行写入
     #expect(blobs.exists(sha256: newSha))
@@ -206,4 +200,3 @@ private func runBriefly(_ w: PullWorker, ms: Int = 300) async {
     }
     #expect(tombstoneCount == 3)
 }
-

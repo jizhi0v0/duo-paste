@@ -2,6 +2,37 @@ import Foundation
 import Observation
 import DuoPasteCore
 
+struct HistorySyncStatus: Sendable, Equatable {
+    enum Mode: Sendable, Equatable {
+        case initialSync
+        case verifyingExistingCache
+        case rebuilding
+        case ready
+    }
+
+    enum Activity: Sendable, Equatable {
+        case idle
+        case syncing
+        case paused
+        case failed
+    }
+
+    var mode: Mode = .initialSync
+    var activity: Activity = .idle
+    var localItemCount: Int = 0
+    var sourceTrackedItemCount: Int?
+    var serverTotalCount: Int?
+    var currentPeer: String?
+    var lastSuccessAt: Date?
+    var failureMessage: String?
+
+    /// `ready` only means the durable mirror passed a full source-count audit. Any in-flight,
+    /// paused, or failed attempt makes the current state non-strict until another pass completes.
+    var isStrictlyCaughtUp: Bool {
+        mode == .ready && activity == .idle
+    }
+}
+
 /// iOS full-history SQLite mirror 的 MainActor UI projection。
 /// `items` 只保留最近 1000 条供首页渲染；完整 metadata、cursor 与 FTS 都住在
 /// `MetadataMirrorStore`。Coordinator/BackgroundPullService 共用同一个 SQLite page apply。
@@ -9,14 +40,23 @@ import DuoPasteCore
 @MainActor
 final class HistoryStore {
     nonisolated static let displayLimit = 1_000
+    nonisolated static let syncPausedDefaultsKey = "metadataSyncPausedByUser"
     private nonisolated let mirror: MetadataMirrorStore?
+    private nonisolated let checkpointStore: MetadataMirrorSyncCheckpointStore
+    private let mirrorFileExistedAtLaunch: Bool
 
-    init(mirror: MetadataMirrorStore? = HistoryStore.openMirrorOrNil()) {
-        self.mirror = mirror
+    init() {
+        let existed = FileManager.default.fileExists(atPath: Self.mirrorFile.path)
+        self.mirrorFileExistedAtLaunch = existed
+        self.mirror = Self.openMirrorOrNil()
+        self.checkpointStore = MetadataMirrorSyncCheckpointStore(path: Self.syncCheckpointFile)
     }
 
     /// 显示用,按 captured_at_ns DESC + pinned-first 排好序的列表。
     private(set) var items: [Item] = []
+    /// Full-history completeness is separate from connection status. A partial initial/refill cache
+    /// remains searchable, but the UI must keep labeling it as incomplete until strict audit success.
+    private(set) var syncStatus = HistorySyncStatus()
     /// 搜索框文本。非空文本或 qualifier 由本机 SQLite FTS/SearchAPI 返回。
     var query: String = ""
 
@@ -362,6 +402,13 @@ final class HistoryStore {
         return dir
     }
     nonisolated static var mirrorFile: URL { persistenceDir.appendingPathComponent("mirror.sqlite") }
+    /// Durable completion proof must survive iOS purging the Caches directory that owns mirror.sqlite.
+    nonisolated static var syncCheckpointFile: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base
+            .appendingPathComponent("DuoPaste", isDirectory: true)
+            .appendingPathComponent("metadata-sync-checkpoint.json")
+    }
     /// Pre-R2.1 files. They remain named here solely for one-time verified migration.
     nonisolated static var itemsFile: URL { persistenceDir.appendingPathComponent("items.json") }
     nonisolated static var cursorFile: URL { persistenceDir.appendingPathComponent("cursor.json") }
@@ -412,6 +459,7 @@ final class HistoryStore {
         }
 
         refreshFromMirror()
+        reloadSyncCheckpoint(useLaunchMirrorExistence: true)
     }
 
     func refreshFromMirror() {
@@ -430,6 +478,75 @@ final class HistoryStore {
             items = recent.sorted(by: Self.iosListOrder)
         } catch {
             DebugLog.shared.append("HistoryStore refresh mirror failed: \(error)")
+        }
+    }
+
+    /// Reconcile the evictable SQLite mirror with the durable strict-completion proof. App launch
+    /// uses the pre-open file existence bit so opening a new empty DB cannot hide a cache purge;
+    /// foreground resume uses current existence so a successful BG pull becomes visible immediately.
+    func reloadSyncCheckpoint(useLaunchMirrorExistence: Bool = false) {
+        guard syncStatus.activity != .syncing else { return }
+        guard let mirror else {
+            syncStatus.activity = .failed
+            syncStatus.failureMessage = "本地 SQLite 历史无法打开，请重新启动后再试"
+            return
+        }
+        do {
+            let localItemCount = try mirror.totalItemCount()
+            let cursor = try mirror.cursor()
+            let checkpoint = try checkpointStore.load()
+            let mirrorExists = useLaunchMirrorExistence
+                ? mirrorFileExistedAtLaunch
+                : FileManager.default.fileExists(atPath: Self.mirrorFile.path)
+            let disposition = MetadataMirrorBootstrapDisposition.classify(
+                mirrorFileExisted: mirrorExists,
+                localItemCount: localItemCount,
+                cursor: cursor,
+                checkpoint: checkpoint
+            )
+            switch disposition {
+            case .initialSync:
+                syncStatus = HistorySyncStatus(
+                    mode: .initialSync,
+                    activity: .idle,
+                    localItemCount: localItemCount
+                )
+            case .verifyingExistingCache:
+                syncStatus = HistorySyncStatus(
+                    mode: .verifyingExistingCache,
+                    activity: .idle,
+                    localItemCount: localItemCount
+                )
+            case .rebuilding:
+                syncStatus = HistorySyncStatus(
+                    mode: .rebuilding,
+                    activity: .idle,
+                    localItemCount: localItemCount,
+                    // The durable checkpoint describes the evicted archive, not this partial refill.
+                    sourceTrackedItemCount: nil,
+                    serverTotalCount: checkpoint?.lastServerTotalCount,
+                    currentPeer: checkpoint?.lastPeerDeviceID,
+                    lastSuccessAt: checkpoint?.lastSuccessAt
+                )
+            case .ready(let checkpoint):
+                syncStatus = HistorySyncStatus(
+                    mode: .ready,
+                    activity: .idle,
+                    localItemCount: localItemCount,
+                    sourceTrackedItemCount: checkpoint.lastSourceTrackedItemCount,
+                    serverTotalCount: checkpoint.lastServerTotalCount,
+                    currentPeer: checkpoint.lastPeerDeviceID,
+                    lastSuccessAt: checkpoint.lastSuccessAt
+                )
+            }
+            if isSyncPausedByUser {
+                syncStatus.activity = .paused
+                syncStatus.failureMessage = nil
+            }
+        } catch {
+            syncStatus.activity = .failed
+            syncStatus.failureMessage = "本地同步状态读取失败：\(error.localizedDescription)"
+            DebugLog.shared.append("HistoryStore sync checkpoint reload failed: \(error)")
         }
     }
 
@@ -456,18 +573,159 @@ final class HistoryStore {
     /// `total_count` 暴露迟到旧行缺口时，Core 自动从 zero 做非破坏性 backfill。
     func synchronizeMetadata(
         client: PeerClient,
+        currentPeer: String?,
         pageLimit: Int = 500,
         maxPages: Int = 200
     ) async throws -> MetadataMirrorSyncReport {
         guard let mirror else { throw HistoryStoreError.mirrorUnavailable }
-        let report = try await mirror.synchronize(
-            pageLimit: pageLimit,
-            maxPages: maxPages
-        ) { cursor, limit in
-            try await client.fetchSince(cursor: cursor, limit: limit)
+        markSyncStarted(currentPeer: currentPeer)
+        do {
+            let report = try await mirror.synchronize(
+                pageLimit: pageLimit,
+                maxPages: maxPages,
+                progress: { progress in
+                    await self.applySyncProgress(progress)
+                },
+                fetchPage: { cursor, limit in
+                    try await client.fetchSince(cursor: cursor, limit: limit)
+                }
+            )
+            try Task.checkCancellation()
+            refreshFromMirror()
+            try markSyncComplete(report)
+            return report
+        } catch is CancellationError {
+            // Every completed page is already durable. Refresh the bounded projection; explicit
+            // user cancellation already labeled it paused, while automatic route switches stay
+            // transient and let their replacement pull own the status.
+            refreshFromMirror()
+            throw CancellationError()
+        } catch {
+            // URLSession/NWConnection may surface a transport error after its parent task was
+            // cancelled for route switching. Treat it as cancellation so an obsolete route cannot
+            // overwrite the replacement pull's UI with a stale failure.
+            if Task.isCancelled {
+                refreshFromMirror()
+                throw CancellationError()
+            }
+            refreshFromMirror()
+            markSyncFailed(error)
+            throw error
         }
-        refreshFromMirror()
-        return report
+    }
+
+    func markSyncStarted(currentPeer: String?) {
+        if let currentPeer, !currentPeer.isEmpty {
+            syncStatus.currentPeer = currentPeer
+        }
+        syncStatus.activity = .syncing
+        syncStatus.failureMessage = nil
+    }
+
+    func applySyncProgress(_ progress: MetadataMirrorSyncProgress) {
+        if progress.pass == .backfill {
+            syncStatus.mode = .rebuilding
+        }
+        syncStatus.activity = .syncing
+        syncStatus.localItemCount = progress.localItemCount
+        syncStatus.sourceTrackedItemCount = progress.sourceTrackedItemCount
+        syncStatus.serverTotalCount = progress.serverTotalCount
+        if syncStatus.currentPeer == nil {
+            syncStatus.currentPeer = progress.sourceDeviceID
+        }
+    }
+
+    func markSyncPaused() {
+        UserDefaults.standard.set(true, forKey: Self.syncPausedDefaultsKey)
+        syncStatus.activity = .paused
+        syncStatus.failureMessage = nil
+    }
+
+    func markSyncResumed() {
+        UserDefaults.standard.set(false, forKey: Self.syncPausedDefaultsKey)
+        if syncStatus.activity == .paused {
+            syncStatus.activity = .idle
+        }
+    }
+
+    var isSyncPausedByUser: Bool {
+        UserDefaults.standard.bool(forKey: Self.syncPausedDefaultsKey)
+    }
+
+    @discardableResult
+    func markSyncFailed(_ error: Error) -> String {
+        let message = Self.readableSyncFailure(error)
+        syncStatus.activity = .failed
+        syncStatus.failureMessage = message
+        return message
+    }
+
+    private func markSyncComplete(_ report: MetadataMirrorSyncReport) throws {
+        let successAt = Date()
+        let peerDeviceID = report.sourceDeviceID ?? syncStatus.currentPeer
+        let checkpoint = MetadataMirrorSyncCheckpoint(
+            lastSuccessAt: successAt,
+            lastPeerDeviceID: peerDeviceID,
+            lastLocalItemCount: report.localTotalCount,
+            lastSourceTrackedItemCount: report.sourceTrackedItemCount,
+            lastServerTotalCount: report.serverTotalCount,
+            finalCursor: report.finalCursor
+        )
+        try checkpointStore.save(checkpoint)
+        UserDefaults.standard.set(false, forKey: Self.syncPausedDefaultsKey)
+        syncStatus = HistorySyncStatus(
+            mode: .ready,
+            activity: .idle,
+            localItemCount: report.localTotalCount,
+            sourceTrackedItemCount: report.sourceTrackedItemCount,
+            serverTotalCount: report.serverTotalCount,
+            currentPeer: peerDeviceID,
+            lastSuccessAt: successAt
+        )
+    }
+
+    nonisolated static func readableSyncFailure(_ error: Error) -> String {
+        if let metadataError = error as? MetadataMirrorSyncError {
+            switch metadataError {
+            case .cursorDidNotAdvance:
+                return "Mac 返回的同步游标没有推进，请点“立即刷新”重试"
+            case .pageLimitExceeded:
+                return "本次数据较多，当前进度已保存；点“继续同步”即可接着拉取"
+            case .countMismatch(let expected, let actual):
+                return "完整性校验未通过（Mac \(expected) 条，本机 \(actual) 条），请继续同步修复"
+            case .sourceChanged:
+                return "同步期间切换了 Mac，已安全暂停；请立即刷新重试"
+            }
+        }
+        if let peerError = error as? PeerClientError {
+            switch peerError {
+            case .httpStatus(let code) where code == 401 || code == 403:
+                return "配对凭据已失效，请到设置重新配对"
+            case .httpStatus(let code):
+                return "Mac 返回 HTTP \(code)，请稍后立即刷新"
+            case .nonHTTP:
+                return "Mac 返回了无效响应，请检查当前 peer"
+            default:
+                return peerError.localizedDescription
+            }
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            switch URLError.Code(rawValue: nsError.code) {
+            case .notConnectedToInternet:
+                return "当前离线；已同步到本机的历史仍可搜索"
+            case .timedOut:
+                return "连接 Mac 超时；请检查 Mac 是否在线后立即刷新"
+            case .cannotFindHost, .cannotConnectToHost, .networkConnectionLost:
+                return "暂时连不上 Mac；本地历史仍可用，恢复网络后可继续同步"
+            case .userAuthenticationRequired, .userCancelledAuthentication:
+                return "配对凭据已失效，请到设置重新配对"
+            default:
+                break
+            }
+        }
+        let fallback = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? "同步失败，请检查网络后立即刷新" : fallback
     }
 }
 

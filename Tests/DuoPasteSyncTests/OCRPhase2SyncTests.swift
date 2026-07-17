@@ -82,9 +82,7 @@ private func makeDB() throws -> DuoDB {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await worker.start()
-    try? await Task.sleep(nanoseconds: 300_000_000)
-    await worker.stop()
+    await runPullWorkerToCompletion(worker)
 
     // 验证：MBP 上同 id item 的 ocr_state 变 done + extracted_text 写入
     let after = try await db.pool.read { conn in
@@ -146,9 +144,7 @@ private func makeDB() throws -> DuoDB {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await worker.start()
-    try? await Task.sleep(nanoseconds: 300_000_000)
-    await worker.stop()
+    await runPullWorkerToCompletion(worker)
 
     // FTS5 search 走 SearchAPI.searchHits — 搜独特词应命中这条 image
     let api = SearchAPI(database: db)

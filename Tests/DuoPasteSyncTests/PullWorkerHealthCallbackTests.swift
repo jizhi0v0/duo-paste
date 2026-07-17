@@ -88,18 +88,12 @@ private func makeWorker(
     )
 }
 
-private func runBriefly(_ w: PullWorker, ms: Int = 200) async {
-    await w.start()
-    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-    await w.stop()
-}
-
 @Test func onHealthProbedFiresPositiveRttOnOK() async throws {
     let db = try makeClientDB()
     let transport = HealthCallbackTransport(modes: [.ok(deviceID: "primary-device")])
     let collector = RTTCollector()
     let worker = makeWorker(transport: transport, collector: collector, db: db)
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     let rtts = collector.snapshot()
     #expect(!rtts.isEmpty)
     // .ok → 非负 RTT (Date wall-clock,fake 调用通常 < 10ms)
@@ -111,7 +105,7 @@ private func runBriefly(_ w: PullWorker, ms: Int = 200) async {
     let transport = HealthCallbackTransport(modes: [.unreachable])
     let collector = RTTCollector()
     let worker = makeWorker(transport: transport, collector: collector, db: db)
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     let rtts = collector.snapshot()
     #expect(!rtts.isEmpty)
     #expect(rtts.allSatisfy { $0 == -1 })
@@ -122,7 +116,7 @@ private func runBriefly(_ w: PullWorker, ms: Int = 200) async {
     let transport = HealthCallbackTransport(modes: [.rejected])
     let collector = RTTCollector()
     let worker = makeWorker(transport: transport, collector: collector, db: db)
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     let rtts = collector.snapshot()
     #expect(!rtts.isEmpty)
     #expect(rtts.allSatisfy { $0 == -1 })
@@ -133,7 +127,7 @@ private func runBriefly(_ w: PullWorker, ms: Int = 200) async {
     let transport = HealthCallbackTransport(modes: [.throwError])
     let collector = RTTCollector()
     let worker = makeWorker(transport: transport, collector: collector, db: db)
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     let rtts = collector.snapshot()
     #expect(!rtts.isEmpty)
     #expect(rtts.allSatisfy { $0 == -1 })
@@ -144,7 +138,7 @@ private func runBriefly(_ w: PullWorker, ms: Int = 200) async {
     let transport = HealthCallbackTransport(modes: [.okEmptyID])
     let collector = RTTCollector()
     let worker = makeWorker(transport: transport, collector: collector, db: db)
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     let rtts = collector.snapshot()
     #expect(!rtts.isEmpty)
     #expect(rtts.allSatisfy { $0 == -1 })
@@ -160,7 +154,7 @@ private func runBriefly(_ w: PullWorker, ms: Int = 200) async {
         collector: collector,
         db: db
     )
-    await runBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     let rtts = collector.snapshot()
     #expect(!rtts.isEmpty)
     #expect(rtts.allSatisfy { $0 == -1 })
@@ -209,11 +203,8 @@ private func makeFailingWorker(
     let db = try makeClientDB()
     let counter = DownCounter()
     let worker = makeFailingWorker(threshold: 3, counter: counter, db: db)
-    await worker.start()
-    // 让 3+ 次 tick 跑完:initial=0.05, 失败 backoff 2^n × 0.05,3 次后 sleep 0.05+0.1+0.2 = 0.35s
-    // 给 1500ms 余量让第 4/5 次也跑完,验证只触发 1 次不会 spam
-    try? await Task.sleep(nanoseconds: 1_500_000_000)
-    await worker.stop()
+    // 等 5 个实际完成的 tick，覆盖 threshold 后继续失败仍不重复 callback。
+    await runPullWorkerToCompletion(worker, ticks: 5)
     // ==threshold 时触发一次。后续 tick 仍 unreachable 但 consecutiveTransientFailures 已 > threshold,
     // 不再触发(等下次 .ok reset 后才会再积累到 threshold)
     #expect(counter.count == 1, "got \(counter.count) — should fire exactly once at threshold boundary")
@@ -223,9 +214,7 @@ private func makeFailingWorker(
     let db = try makeClientDB()
     let counter = DownCounter()
     let worker = makeFailingWorker(threshold: 100, counter: counter, db: db)  // 高阈值跑不到
-    await worker.start()
-    try? await Task.sleep(nanoseconds: 500_000_000)
-    await worker.stop()
+    await runPullWorkerToCompletion(worker, ticks: 3)
     #expect(counter.count == 0)
 }
 
@@ -245,9 +234,6 @@ private func makeFailingWorker(
         ),
         onChosenLikelyDown: { counter.hit() }
     )
-    await worker.start()
-    try? await Task.sleep(nanoseconds: 1_000_000_000)
-    await worker.stop()
+    await runPullWorkerToCompletion(worker, ticks: 5)
     #expect(counter.count == 0)
 }
-

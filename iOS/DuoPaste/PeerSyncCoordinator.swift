@@ -66,6 +66,8 @@ final class PeerSyncCoordinator {
     private var wsPool: PeerWSPool?
     private var cursor: SinceCursor = .zero
     private var pullTask: Task<Void, Never>?
+    /// Invalidates cleanup from an obsolete route's cancelled task so it cannot nil a newer pull.
+    private var pullGeneration: UInt64 = 0
     private var statusTickTask: Task<Void, Never>?
     /// inflight pullTask 期间收到 advance → 置 true,task 结束再 kick 一轮
     private var pendingAdvance: Bool = false
@@ -530,6 +532,7 @@ final class PeerSyncCoordinator {
     /// 切换 HTTP route 时旧 `/since` 可能正卡在 tailscale 黑洞里。必须取消旧 pull,
     /// 否则 `kickPull()` 只会置 pendingAdvance,新 Ponte client 要等旧请求超时才会用上。
     private func cancelPullForHTTPRouteChange() {
+        pullGeneration &+= 1
         if let t = pullTask, !t.isCancelled {
             t.cancel()
         }
@@ -828,6 +831,7 @@ final class PeerSyncCoordinator {
     private func cancelRuntimeTasks() {
         wsPool?.stop()
         wsPool = nil
+        pullGeneration &+= 1
         pullTask?.cancel()
         pullTask = nil
         periodicRepickTask?.cancel()
@@ -871,6 +875,7 @@ final class PeerSyncCoordinator {
         lastRTT = [:]
         status = .unconfigured
         pairingDataIssue = nil
+        store.markSyncResumed()
     }
 
     /// 启动时 `DuoPasteApp.task` 把 PairingDataValidator 的 reason 写进来——SettingsView
@@ -880,6 +885,10 @@ final class PeerSyncCoordinator {
     }
 
     private func kickPull() {
+        guard !store.isSyncPausedByUser else {
+            DebugLog.shared.append("pull suppressed: paused by user")
+            return
+        }
         // 已有 inflight task → 不并发起新的,只置 pendingAdvance 让它收尾后再 kick
         if let t = pullTask, !t.isCancelled {
             pendingAdvance = true
@@ -893,8 +902,16 @@ final class PeerSyncCoordinator {
         cursor = startCursor
         DebugLog.shared.append("pull start cursor=(\(startCursor.ingestedAtNs),\(startCursor.id)) url=\(currentEndpointURL ?? "?")")
         isPulling = true
+        pullGeneration &+= 1
+        let generation = pullGeneration
+        let peerLabel = currentPeerLabel
         pullTask = Task { [weak self] in
-            await self?.runPull(client: client, from: startCursor)
+            await self?.runPull(
+                client: client,
+                from: startCursor,
+                currentPeer: peerLabel,
+                generation: generation
+            )
         }
     }
 
@@ -906,7 +923,18 @@ final class PeerSyncCoordinator {
     /// 不维护任何状态,纯转发
     func forcePull() {
         DebugLog.shared.append("forcePull invoked by user")
+        store.markSyncResumed()
         kickPull()
+    }
+
+    /// User-visible cancellation for initial/refill sync. Completed pages and their cursor stay in
+    /// SQLite; pressing “继续同步” later starts from that exact durable cursor.
+    func cancelPull() {
+        guard let task = pullTask, !task.isCancelled else { return }
+        pendingAdvance = false
+        store.markSyncPaused()
+        task.cancel()
+        DebugLog.shared.append("pull cancelled by user; committed cursor preserved")
     }
 
     /// UI 判断 forcePull 按钮是否应启用——`client` 是 private,UI 不直接 read。
@@ -915,11 +943,17 @@ final class PeerSyncCoordinator {
         client != nil
     }
 
-    private func runPull(client: PeerClient, from startCursor: SinceCursor) async {
+    private func runPull(
+        client: PeerClient,
+        from startCursor: SinceCursor,
+        currentPeer: String?,
+        generation: UInt64
+    ) async {
         let maxPages = 200 // 100k items 上限,正常用例远到不了
         do {
             let report = try await store.synchronizeMetadata(
                 client: client,
+                currentPeer: currentPeer,
                 pageLimit: 500,
                 maxPages: maxPages
             )
@@ -939,8 +973,9 @@ final class PeerSyncCoordinator {
         } catch is CancellationError {
             // 静默
         } catch {
-            recordConnectionProblem(error.localizedDescription)
+            recordConnectionProblem(store.syncStatus.failureMessage ?? error.localizedDescription)
         }
+        guard generation == pullGeneration else { return }
         pullTask = nil
         // 这里**先**落 isPulling 再 kick——如果 pendingAdvance 让 kickPull 立即起新一轮,
         // 它会自己把 isPulling 重置 true。UI 角度看是"持续转"无闪烁
@@ -949,6 +984,11 @@ final class PeerSyncCoordinator {
             pendingAdvance = false
             kickPull()
         }
+    }
+
+    private var currentPeerLabel: String? {
+        guard let currentEndpointURL else { return nil }
+        return URL(string: currentEndpointURL)?.host ?? currentEndpointURL
     }
 
     private func applyConnectedStatus() {

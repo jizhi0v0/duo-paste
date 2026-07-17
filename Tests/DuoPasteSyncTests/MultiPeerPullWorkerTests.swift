@@ -125,7 +125,9 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
     )
     let supervisor = MeshSupervisor(workers: [workerA, workerB])
     await supervisor.start()
-    try? await Task.sleep(nanoseconds: 400_000_000)
+    let workerAReady = await workerA.waitForCompletedTicksForTesting(atLeast: 1)
+    let workerBReady = await workerB.waitForCompletedTicksForTesting(atLeast: 1)
+    #expect(workerAReady && workerBReady)
     await supervisor.stop()
 
     // 两条 peer 行都在 item 表
@@ -220,9 +222,7 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
     // 严格模式下 /health 返回的 ID 跟 expectedPeerDeviceID 不一致 → tick 入口直接 transient skip，
     // reconcile 根本进不去。这是 PR 2 的合理边界：严格模式 = 配置错应该排查，不该自动迁移
     // device_id（避免本机被错配 peer 污染）。
-    await workerB.start()
-    try? await Task.sleep(nanoseconds: 300_000_000)
-    await workerB.stop()
+    await runPullWorkerToCompletion(workerB)
 
     // 严格模式 + ID 不匹配 → 没有任何 SQL 落地。验证旧状态完整保留。
     let allRows = try await db.pool.read { conn in
@@ -274,9 +274,7 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
         meshStatus: mesh,
         config: PullWorker.Config(intervalSec: 60)
     )
-    await worker.start()
-    try? await Task.sleep(nanoseconds: 300_000_000)
-    await worker.stop()
+    await runPullWorkerToCompletion(worker)
 
     // peer-old 行 + cursor 删；other-peer 行保留；self 行（这里没插）也保留
     let remainingIDs = try await db.pool.read { conn in
@@ -316,17 +314,20 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
         // intervalSec 长到测试期内绝不会自然到期 → 第二条只能靠 wake() 触发
         config: PullWorker.Config(intervalSec: 30)
     )
+    let firstBaseline = await worker.completedTickCountForTesting()
     await worker.start()
-    // 等第一页落表
-    try? await Task.sleep(nanoseconds: 250_000_000)
+    let firstReady = await worker.waitForCompletedTicksForTesting(atLeast: firstBaseline + 1)
+    #expect(firstReady)
     let firstCount = try await db.pool.read { conn in
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
     }
     #expect(firstCount == 1)
 
     // wake() 模拟 WS notify
+    let secondTarget = await worker.completedTickCountForTesting() + 1
     worker.wake()
-    try? await Task.sleep(nanoseconds: 300_000_000)
+    let secondReady = await worker.waitForCompletedTicksForTesting(atLeast: secondTarget)
+    #expect(secondReady)
     let secondCount = try await db.pool.read { conn in
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
     }
@@ -359,7 +360,9 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
     let supervisor = MeshSupervisor(workers: [w1, w2])
     #expect(await supervisor.peerCount == 2)
     await supervisor.start()
-    try? await Task.sleep(nanoseconds: 200_000_000)
+    let w1Ready = await w1.waitForCompletedTicksForTesting(atLeast: 1)
+    let w2Ready = await w2.waitForCompletedTicksForTesting(atLeast: 1)
+    #expect(w1Ready && w2Ready)
     // 两 peer 都被 /health + /since 调过 → mesh 注册两 peer
     let registered = Set(mesh.registeredPeerDeviceIDs())
     #expect(registered == ["p1", "p2"])

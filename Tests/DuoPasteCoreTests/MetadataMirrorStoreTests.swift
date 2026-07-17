@@ -103,6 +103,52 @@ private actor GrowingSource {
     }
 }
 
+private actor SyncProgressRecorder {
+    private(set) var values: [MetadataMirrorSyncProgress] = []
+
+    func append(_ value: MetadataMirrorSyncProgress) {
+        values.append(value)
+    }
+}
+
+private actor ResumablePagedSource {
+    private let items: [Item] = (1...5).map { index in
+        mirrorItem(
+            id: "resume-\(index)",
+            capturedAtNs: Int64(index),
+            text: "resume \(index)"
+        )
+    }
+    private var interruptAfterFirstPage = true
+    private(set) var requestedCursors: [SinceCursor] = []
+
+    func fetch(cursor: SinceCursor, limit: Int) throws -> SincePageWire {
+        requestedCursors.append(cursor)
+        if interruptAfterFirstPage, cursor != .zero {
+            interruptAfterFirstPage = false
+            throw CancellationError()
+        }
+        let remaining = items.filter { item in
+            let candidate = SinceCursor(ingestedAtNs: item.ingestedAtNs ?? 0, id: item.id)
+            return candidate.ingestedAtNs > cursor.ingestedAtNs
+                || (candidate.ingestedAtNs == cursor.ingestedAtNs && candidate.id > cursor.id)
+        }
+        let pageItems = Array(remaining.prefix(limit))
+        let nextCursor = pageItems.last.map {
+            SinceCursor(ingestedAtNs: $0.ingestedAtNs ?? 0, id: $0.id)
+        } ?? cursor
+        return SincePageWire(
+            ok: true,
+            count: pageItems.count,
+            items: pageItems,
+            nextCursor: nextCursor,
+            hasMore: remaining.count > pageItems.count,
+            totalCount: items.count,
+            sourceDeviceID: "resume-mac"
+        )
+    }
+}
+
 @Suite("iOS metadata mirror")
 struct MetadataMirrorStoreTests {
     @Test func foregroundAndBackgroundWritersConvergeOnOneCursor() async throws {
@@ -195,9 +241,13 @@ struct MetadataMirrorStoreTests {
         )
         let source = LateOlderRowSource()
 
-        let report = try await mirror.synchronize { cursor, limit in
-            await source.fetch(cursor: cursor, limit: limit)
-        }
+        let progress = SyncProgressRecorder()
+        let report = try await mirror.synchronize(
+            progress: { await progress.append($0) },
+            fetchPage: { cursor, limit in
+                await source.fetch(cursor: cursor, limit: limit)
+            }
+        )
 
         #expect(report.incrementalPages == 1)
         #expect(report.backfillPages == 1)
@@ -211,6 +261,53 @@ struct MetadataMirrorStoreTests {
         #expect(await source.requestedCursors == [
             SinceCursor(ingestedAtNs: 300, id: otherPeerExtra.id),
             .zero,
+        ])
+        #expect(await progress.values.map(\.pass) == [.incremental, .backfill])
+        #expect(await progress.values.last?.sourceTrackedItemCount == 2)
+        #expect(await progress.values.last?.serverTotalCount == 2)
+    }
+
+    @Test func interruptedInitialSyncResumesFromTheAtomicallyPersistedPage() async throws {
+        let (mirror, _) = try makeMetadataMirror()
+        let source = ResumablePagedSource()
+        let progress = SyncProgressRecorder()
+
+        do {
+            _ = try await mirror.synchronize(
+                pageLimit: 2,
+                progress: { await progress.append($0) },
+                fetchPage: { cursor, limit in
+                    try await source.fetch(cursor: cursor, limit: limit)
+                }
+            )
+            Issue.record("the first run should be interrupted after its first committed page")
+        } catch is CancellationError {
+            // Expected: the first page and cursor must remain durable for a later resume.
+        }
+
+        #expect(try mirror.totalItemCount() == 2)
+        #expect(try mirror.cursor() == SinceCursor(ingestedAtNs: 2, id: "resume-2"))
+        #expect(await progress.values.map(\.localItemCount) == [2])
+        #expect(await progress.values.first?.hasMore == true)
+
+        let report = try await mirror.synchronize(
+            pageLimit: 2,
+            progress: { await progress.append($0) },
+            fetchPage: { cursor, limit in
+                try await source.fetch(cursor: cursor, limit: limit)
+            }
+        )
+
+        #expect(report.localTotalCount == 5)
+        #expect(report.sourceTrackedItemCount == 5)
+        #expect(report.finalCursor == SinceCursor(ingestedAtNs: 5, id: "resume-5"))
+        #expect(await progress.values.map(\.localItemCount) == [2, 4, 5])
+        #expect(await progress.values.last?.hasMore == false)
+        #expect(await source.requestedCursors == [
+            .zero,
+            SinceCursor(ingestedAtNs: 2, id: "resume-2"),
+            SinceCursor(ingestedAtNs: 2, id: "resume-2"),
+            SinceCursor(ingestedAtNs: 4, id: "resume-4"),
         ])
     }
 

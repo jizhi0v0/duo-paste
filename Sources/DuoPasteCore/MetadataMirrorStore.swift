@@ -121,6 +121,7 @@ public struct MetadataMirrorStore: Sendable {
     public func synchronize(
         pageLimit: Int = 500,
         maxPages: Int = 200,
+        progress: @escaping @Sendable (MetadataMirrorSyncProgress) async -> Void = { _ in },
         fetchPage: @escaping @Sendable (SinceCursor, Int) async throws -> SincePageWire
     ) async throws -> MetadataMirrorSyncReport {
         let startCursor = try cursor()
@@ -128,6 +129,8 @@ public struct MetadataMirrorStore: Sendable {
             from: startCursor,
             pageLimit: pageLimit,
             maxPages: maxPages,
+            pass: .incremental,
+            progress: progress,
             fetchPage: fetchPage
         )
 
@@ -155,6 +158,8 @@ public struct MetadataMirrorStore: Sendable {
                 pageLimit: pageLimit,
                 maxPages: maxPages,
                 expectedSourceDeviceID: sourceDeviceID,
+                pass: .backfill,
+                progress: progress,
                 fetchPage: fetchPage
             )
             backfillPages = backfill.pages
@@ -202,6 +207,8 @@ public struct MetadataMirrorStore: Sendable {
         pageLimit: Int,
         maxPages: Int,
         expectedSourceDeviceID: String? = nil,
+        pass: MetadataMirrorSyncPass,
+        progress: @escaping @Sendable (MetadataMirrorSyncProgress) async -> Void,
         fetchPage: @escaping @Sendable (SinceCursor, Int) async throws -> SincePageWire
     ) async throws -> PullPassResult {
         var requestCursor = startCursor
@@ -225,6 +232,24 @@ public struct MetadataMirrorStore: Sendable {
                 nextCursor: page.nextCursor,
                 sourceDeviceID: pageSourceDeviceID
             )
+            let localItemCount = try totalItemCount()
+            let sourceTrackedItemCount: Int?
+            if let sourceDeviceID = observedSourceDeviceID {
+                sourceTrackedItemCount = try trackedItemCount(sourceDeviceID: sourceDeviceID)
+            } else {
+                sourceTrackedItemCount = nil
+            }
+            await progress(MetadataMirrorSyncProgress(
+                pass: pass,
+                pageNumber: pageNumber,
+                localItemCount: localItemCount,
+                sourceTrackedItemCount: sourceTrackedItemCount,
+                serverTotalCount: page.totalCount,
+                sourceDeviceID: observedSourceDeviceID,
+                cursor: page.nextCursor,
+                hasMore: page.hasMore
+            ))
+            try Task.checkCancellation()
             if !page.hasMore {
                 return PullPassResult(
                     pages: pageNumber,

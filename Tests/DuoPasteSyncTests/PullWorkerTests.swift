@@ -89,12 +89,6 @@ private func page(items: [Item], nextNs: Int64, nextID: String, hasMore: Bool) -
     )
 }
 
-private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
-    await worker.start()
-    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-    await worker.stop()
-}
-
 @Test func pullWorkerInsertsMirrorRowsAndAdvancesCursor() async throws {
     let db = try makeClientDB()
     let items = [
@@ -114,7 +108,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         config: PullWorker.Config(intervalSec: 60),
         nowNs: { 999 }
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let mirrored = try await db.pool.read { conn in
         try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
@@ -154,7 +148,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let mirrored = try await db.pool.read { conn in
         try String.fetchAll(conn, sql: "SELECT id FROM item")
@@ -187,7 +181,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorkerBriefly(worker, ms: 500)
+    await runPullWorkerToCompletion(worker, ticks: 2)
 
     let mirrored = try await db.pool.read { conn in
         try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
@@ -231,7 +225,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let ids = try await db.pool.read { conn in
         try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
@@ -286,7 +280,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     // v7 合表后 item 表里既有 own 行也有 peer 行。dedup 命中 = peer 行不应入表。
     // 验证 origin != self 的 peer 行数 == 0
@@ -337,7 +331,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         // crossDeviceDedupWindowNs=0：明确排除 own-item dedup 路径，保证测的是 paste-echo 拦截
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let mirrorCount = try await db.pool.read { conn in
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item") ?? -1
@@ -383,7 +377,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         pasteSuppressions: suppressions,
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     // 历史行应该正常写入 mirror —— 不被 suppression 误杀
     let mirrorCount = try await db.pool.read { conn in
@@ -436,7 +430,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         pasteSuppressions: suppressions,
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 0)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     // mirror 行应被软删盖上，不被 suppression 误挡
     let deletedAt: Int64? = try await db.pool.read { conn in
@@ -465,7 +459,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let mirrorCount = try await db.pool.read { conn in
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item WHERE id='mini-only'") ?? -1
@@ -523,7 +517,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     // mirror 表里 mini-x 的 deleted_at_ns 必须已被盖上，否则 stale 内容继续可搜
     let deletedAt = try await db.pool.read { conn in
@@ -562,7 +556,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         meshStatus: MeshStatus(),
         config: PullWorker.Config(intervalSec: 60, crossDeviceDedupWindowNs: 5_000_000_000)
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let mirrorCount = try await db.pool.read { conn in
         try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM item WHERE id='mini-late'") ?? -1
@@ -585,7 +579,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         selfDeviceID: "self",
         meshStatus: MeshStatus()
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
 
     let deletedAt = try await db.pool.read { conn -> Int64? in
         try Int64.fetchOne(conn, sql: "SELECT deleted_at_ns FROM item WHERE id='dead'")
@@ -613,7 +607,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         config: PullWorker.Config(intervalSec: 60, clockSkewWarnMs: 30_000),
         nowNs: { localNowNs }
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     #expect(status.worstClockSkewMs() == 45_000)
 }
 
@@ -634,7 +628,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
         config: PullWorker.Config(intervalSec: 60),
         nowNs: { 1_000_000 * 1_000_000 }
     )
-    await runWorkerBriefly(worker)
+    await runPullWorkerToCompletion(worker)
     #expect(status.worstClockSkewMs() == -60_000)
 }
 
@@ -664,7 +658,7 @@ private func runWorkerBriefly(_ worker: PullWorker, ms: Int = 250) async {
             meshStatus: status,
             config: PullWorker.Config(intervalSec: 60)
         )
-        await runWorkerBriefly(worker, ms: 600)
+        await runPullWorkerToCompletion(worker)
         let ids = try await clientDB.pool.read { conn in
             try String.fetchAll(conn, sql: "SELECT id FROM item ORDER BY id")
         }

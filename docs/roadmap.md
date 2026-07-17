@@ -1,6 +1,6 @@
 # duo-paste Roadmap
 
-最后更新：2026-07-16。
+最后更新：2026-07-17。
 
 这份文件是**未来工作的唯一入口**。`CLAUDE.md` 只记录已经落地的不变量、best practice 和硬护栏；`plans/` 下的文件是历史实现计划，不能直接当成当前 backlog。
 
@@ -9,7 +9,7 @@
 - macOS 已可 daily-driver：本机捕获、SQLite/FTS5、OCR、slash qualifier、置顶/删除、多选、预览/Open With、导出、Sparkle 更新、snapshot 与 blob 水位回收均已落地。
 - 多 Mac 已是对称 mesh：每个 peer 本地写入，通过 `/since` pull + WebSocket 通知同步；支持 Tailscale/Surge Ponte、full/optimized blob、本地 fold-aware 搜索和 `mesh-doctor`。
 - iOS 已不是“只读概念版”：已有 Bonjour 发现、QR leaf binding + PIN 配对、完整 SQLite/FTS metadata mirror、离线搜索、复制 bump、置顶、删除、后台 pull、独立 Blob LRU 和 WS zombie 检测。
-- 当前已知真实缺口：首次全量 mirror 尚未展示严格追平/重建进度；滚动升级期仍接受不带 device token 的 legacy HMAC，旧 iOS 需重新配对后才具备单设备撤销能力。
+- 当前已知真实缺口：滚动升级期仍接受不带 device token 的 legacy HMAC，旧 iOS 需重新配对后才具备单设备撤销能力；搜索仍缺自定义时间窗和保存视图。
 
 ## 优先级规则
 
@@ -35,7 +35,7 @@
 | R1.3 | 每设备凭据与撤销 | security | P1 | L | ✅ done |
 | R1.4 | iOS 配对通道绑定 | security | P1 | M | ✅ done |
 | R2.1 | iOS 本地 SQLite/FTS mirror | feature / perf | P1 | L | ✅ done |
-| R2.2 | iOS 首次同步进度与离线状态 | UX | P2 | M | proposed |
+| R2.2 | iOS 首次同步进度与离线状态 | UX | P2 | M | ✅ done |
 | R3.1 | 自定义起止时间筛选 | feature | P2 | S | ready |
 | R3.2 | 保存搜索视图 | feature | P2 | S | proposed |
 | R3.3 | 纯文本粘贴动作 | feature | P2 | S | proposed |
@@ -45,7 +45,7 @@
 
 ### ✅ R0.1 消灭网络集成测试 flake
 
-**完成记录（2026-07-16）**：所有 `SyncServer` 集成测试已改用 `port: 0` + channel 实际监听端口；统一 fixture 负责临时 DB/blob、bind readiness、超时和 graceful shutdown。另修复 `MeshSupervisorReconcileTests` 脱离结构化并发的异步记账竞态。`swift test` 连续 20 次全绿，定向 flake 用例 50/50 全绿，测试目录无随机/固定监听端口与 readiness sleep。
+**完成记录（2026-07-16）**：所有 `SyncServer` 集成测试已改用 `port: 0` + channel 实际监听端口；统一 fixture 负责临时 DB/blob、bind readiness、超时和 graceful shutdown。另修复 `MeshSupervisorReconcileTests` 脱离结构化并发的异步记账竞态。`swift test` 连续 20 次全绿，定向 flake 用例 50/50 全绿，测试目录无随机/固定监听端口与 readiness sleep。2026-07-17 R2.2 最终门又捕获到 PullWorker actor 测试用固定 200–300ms 睡眠猜 tick 完成的长尾；现改为等待单调 tick fence/可选 blob hydration，完整全集通过，相关 36 项再连续 10 轮（360/360）全绿。
 
 **问题**：`PullWorkerTests` / `BlobLazyPullTests` 等仍使用随机固定端口，全集并发时可能撞端口或共享生命周期；“单跑必绿”不能作为长期质量门槛。
 
@@ -208,11 +208,24 @@ mini ∪ MBP（双向缺失 0），相对两台 Mac 最新 revision 的旧版本
   zero-cursor 非破坏 backfill；最终 v15 真机验证 ledger 与 source total 精确一致，且
   iPhone ID 集覆盖 mini ∪ MBP 全集。
 
-### R2.2 首次同步进度与离线状态
+### ✅ R2.2 首次同步进度与离线状态
 
-- 展示已同步条数、当前 peer、最后成功时间、是否已严格追平。
-- 首次全量同步可取消/恢复；提供“立即刷新”和可读的失败原因。
-- cache 被系统清理后明确进入“正在重建”，不把局部结果伪装成全集。
+**完成记录（2026-07-17）**：Core metadata sync 增加逐页 post-commit progress，明确区分
+incremental/backfill；iOS 常驻状态卡展示本机条数、per-source 覆盖、当前 peer、最后成功时间
+和严格追平状态。首次/重建同步可取消并从 SQLite cursor 恢复，用户暂停同时约束 WS 自动 pull
+和 BGAppRefreshTask；立即刷新会显式恢复。严格完成 checkpoint 只在 `has_more=false` 且 source
+count audit 通过后原子写入 Application Support，mirror 仍在 Caches；cache 被清理或回退时据此
+进入“正在重建，当前结果不是全集”。完整 `swift test` 848/848、Mac release、iOS simulator、
+iPhone 17 Pro 签名 build/install/launch 均通过；真机状态卡显示 20,449 条、当前 peer 覆盖
+19,363/19,363 并“已严格追平”，设备上的 durable checkpoint 与 UI 数字一致。
+
+**验收（已通过）**：
+
+- [x] 展示已同步条数、当前 peer、最后成功时间、是否已严格追平。
+- [x] 首次全量同步可取消/恢复；提供“立即刷新”和可读的失败原因。
+- [x] cache 被系统清理后明确进入“正在重建”，不把局部结果伪装成全集。
+- [x] iPhone 17 Pro 保留原 app container 覆盖安装，真实 mirror 完成 strict source-count audit
+  并在 Application Support 写出 checkpoint。
 
 ## R3 — 搜索与粘贴体验（Later）
 
