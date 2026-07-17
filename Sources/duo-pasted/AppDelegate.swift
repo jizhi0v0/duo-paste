@@ -842,7 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onHealthProbed: onHealthProbedCb,
                 onChosenLikelyDown: onChosenLikelyDownCb,
                 onPinOperationsResolved: { [weak appState] in
-                    Task { @MainActor in
+                    Task { @MainActor [weak appState] in
                         await appState?.refresh()
                     }
                 },
@@ -856,7 +856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // reconcile 完成回调:既 push 到 AppState 让 Settings 显示新 transport,也踢
             // MeshEndpointsCache 立即 refreshNow——避免新发现的 peer / ponte_host 等
             // 周期 60s 才出现在 iOS 端
-            let onDecisionsUpdated: @Sendable ([SmartTransport.PeerDecision]) -> Void = { [weak self] newDecisions in
+            let onDecisionsUpdated: @Sendable ([SmartTransport.PeerDecision]) -> Void = { [weak self, weak appState] newDecisions in
                 Task { @MainActor [weak appState] in
                     appState?.setTransports(newDecisions)
                 }
