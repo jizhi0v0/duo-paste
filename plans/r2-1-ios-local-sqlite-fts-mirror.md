@@ -5,13 +5,13 @@
 > [`docs/roadmap.md`](../docs/roadmap.md) 为准。本文件只记录 R2.1 的测试先行实施过程；
 > 全部验证通过后归档。
 
-状态：R2.1 主体已归档；2026-07-16 v15 同步缺口补丁待真机复验
+状态：已完成并归档（2026-07-17，含 v15 同步缺口真机复验）
 
 完成记录：完整 841 tests、10 万条性能门、Mac release 与 iOS simulator 全绿，最终 server
-已部署双 Mac。第一轮真机修复审计中旧 JSON 已移除、SQLite `integrity_check=ok`，20,402 条
-metadata/FTS 的 ID 集精确等于 mini ∪ MBP，两方向缺失 0；相对两台 Mac 最新 revision 的
-旧版本数与用户可见关键字段不一致数均为 0。最终 v15 per-source ledger client 已签名，等待
-iPhone 重新连接后覆盖安装与复验。
+已部署双 Mac。2026-07-17 最终 v15 client 覆盖安装到 iPhone 17 Pro，原 app container、历史
+与配对数据均保留；SQLite `integrity_check=ok`，20,436 条 metadata/FTS 的 ID 集精确等于
+mini ∪ MBP，双向缺失 0；相对两台 Mac 最新 revision 的旧版本数与用户可见关键字段不一致
+数均为 0。当前 source ledger 19,350 条，精确等于 MBP `/since.total_count=19,350`。
 
 ## 不变量
 
@@ -46,8 +46,8 @@ iPhone 重新连接后覆盖安装与复验。
   legacy import、最近页和本地搜索。
 - [x] `HistoryStore` 启动时打开 mirror、迁移/校验/删除旧 JSON，并以有限最近页驱动 UI。
 - [x] 前台 `PeerSyncCoordinator.runPull` 和 `BackgroundPullService` 统一调用 mirror page apply。
-- [x] 前台与后台统一调用 Core `synchronize`；incremental 后按 server raw count 自动决定是否
-  做非破坏 backfill。
+- [x] 前台与后台统一调用 Core `synchronize`；incremental 后按 per-source membership ledger
+  与 server raw count 自动决定是否做非破坏 backfill。
 - [x] HistoryView 的 debounce 改为本地 SQLite 搜索；删除远端 `/search` 调用与 contains
   fallback 依赖。
 - [x] 乐观 bump/pin/delete 在本地搜索结果和后续 canonical page 回放期间不闪回。
@@ -58,10 +58,10 @@ iPhone 重新连接后覆盖安装与复验。
 - [x] 定向 mirror tests 先红后绿；完整 Swift tests 全绿。
 - [x] macOS debug/release 与 iOS simulator build 通过。
 - [x] iPhone 17 Pro build/install/launch 通过，保留现有 app data。
-- [x] iPhone 17 Pro 实库验证覆盖 mini ∪ MBP 全部 20,402 个 ID；缺失、旧 revision 与用户
+- [x] iPhone 17 Pro 实库验证覆盖 mini ∪ MBP 全部 20,436 个 ID；缺失、旧 revision 与用户
   可见关键字段不一致均为 0，SQLite/FTS integrity 正常。
-- [ ] 最终 v15 client 覆盖安装后，真机 `mirror_source_item` 对当前 source 的 count 与
-  `/since.total_count` 一致，再勾选并重新归档。
+- [x] 最终 v15 client 覆盖安装后，真机 `mirror_source_item` 对当前 source 的 19,350 条
+  membership 与 `/since.total_count=19,350` 精确一致。
 - [x] 在断网/不可达 peer 条件下，本地 FTS 可查询完整已同步历史，且静态检查确认搜索不发
   `/search`。
 - [x] roadmap R2.1 验收逐项勾选，本计划完成并归档。

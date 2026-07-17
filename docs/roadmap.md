@@ -186,9 +186,10 @@ hydration 改为后台队列，不再阻塞 metadata 下一页；`/since` 增加
 union 的额外行掩盖。发现 source 曾补入落在旧 cursor 之前的迟到行时，从 zero 做非破坏
 backfill，既不清库也不回退持久化 cursor；正常新行只增量记账，不反复全拉。前台与 BG pull
 共用该修复。完整 841 tests、Mac release 与 iOS simulator 全绿，最终 server 已部署双 Mac。
-第一轮真机修复审计中 SQLite `integrity_check=ok`，20,402 条 metadata/FTS 的 ID 集精确等于
-mini ∪ MBP（两方向缺失 0），相对两台 Mac 最新 revision 的旧版本数与用户可见关键字段
-不一致数均为 0；最终 v15 client 真机复验等待设备重新连接，所以下方新增验收项暂不勾。
+2026-07-17 最终 v15 client 已覆盖安装到 iPhone 17 Pro 并保留原 app container；真机
+SQLite `integrity_check=ok`，20,436 条 metadata 与 FTS row 一致，ID 集精确等于
+mini ∪ MBP（双向缺失 0），相对两台 Mac 最新 revision 的旧版本数与用户可见关键字段
+不一致数均为 0。当前 source ledger 19,350 条，精确等于 MBP `/since.total_count=19,350`。
 
 **问题**：iOS 目前最多持久化 1000 条 `items.json`；非空查询优先依赖 Mac `/search`，断网时只能对缓存做 `contains`，不等价于 Mac FTS/fold 语义。
 
@@ -203,8 +204,9 @@ mini ∪ MBP（两方向缺失 0），相对两台 Mac 最新 revision 的旧版
 - [x] 无可用 peer 时仍能从本地 FTS 搜索超过旧 1000 条上限的完整已同步历史；源码契约保证 UI 不调用远端 `/search`。
 - [x] 10 万条 metadata 冷启动最近页、FTS 和稀疏 qualifier 查询通过可交互性能门。
 - [x] Mac/iOS 对同 query + qualifier 的 fold 后 ID 集与 pin 聚合一致。
-- [ ] source 在 client cursor 之后补入更老时间戳的行时，per-source ledger 自动触发
-  zero-cursor 非破坏 backfill；最终 v15 client 真机复验覆盖 mini ∪ MBP 后再勾。
+- [x] source 在 client cursor 之后补入更老时间戳的行时，per-source ledger 自动触发
+  zero-cursor 非破坏 backfill；最终 v15 真机验证 ledger 与 source total 精确一致，且
+  iPhone ID 集覆盖 mini ∪ MBP 全集。
 
 ### R2.2 首次同步进度与离线状态
 
