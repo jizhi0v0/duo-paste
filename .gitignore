@@ -21,3 +21,7 @@ iOS/DuoPasteApp/DuoPasteApp.xcodeproj/project.xcworkspace/xcuserdata/
 # AI 助手本地状态/约定文件
 .claude/
 AGENTS.md
+
+# JetBrains IDE
+.idea/
+*.iml
