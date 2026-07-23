@@ -31,7 +31,12 @@ public struct SmartTransport: Sendable {
         public let chosenWSURL: URL
         /// WS 字节层 transport 类型——为 PeerBuilder 选 NIO 还是 URLSession 实现
         public let chosenWSKind: TransportKind
-        /// 每个 candidate URL 的 /health RTT（ms）。unreachable = -1。决策证据 + log
+        /// 每个 candidate URL 的 /health RTT（ms）。unreachable = -1。决策证据 + log 用，
+        /// **不参与 Equatable**——每次探测天然抖动（同一 candidate 前后两次 rtt 常差几百到几千 ms），
+        /// 若纳入逐字段比较会让 `MeshSupervisor.applyDecisions` 的 `oldDecision == decision`
+        /// 几乎永远判定为"变了"，导致每次周期 reconcile（默认 300s）都误判 transport changed，
+        /// 把没变的 peer 的 PullWorker + WSNotificationClient 整对拆了重建一次。
+        /// 见 `MeshSupervisorReconcileTests.reconcileSameTransportDifferentRttIsNoOp` 回归测试
         public let httpRttMs: [URL: Int64]
 
         public init(
@@ -52,6 +57,19 @@ public struct SmartTransport: Sendable {
             self.chosenWSURL = chosenWSURL
             self.chosenWSKind = chosenWSKind
             self.httpRttMs = httpRttMs
+        }
+
+        /// 手写而非编译器合成——刻意排除 `httpRttMs`，理由见该字段上的注释：RTT 天然抖动，
+        /// 纳入比较会让 `MeshSupervisor.applyDecisions` 的 `oldDecision == decision` 几乎永远
+        /// 判定为"变了"，导致周期 reconcile 把没变的 peer 也整对拆了重建。
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.peerIndex == rhs.peerIndex
+                && lhs.configuredURL == rhs.configuredURL
+                && lhs.manualPullURL == rhs.manualPullURL
+                && lhs.learnedPonteHost == rhs.learnedPonteHost
+                && lhs.chosenPullURL == rhs.chosenPullURL
+                && lhs.chosenWSURL == rhs.chosenWSURL
+                && lhs.chosenWSKind == rhs.chosenWSKind
         }
 
         /// 给日志 / mesh-doctor 打印用：`ponte (mac.sgponte:8443)` / `tailscale (mbp.tail.ts.net:8443)`

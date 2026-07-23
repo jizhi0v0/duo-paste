@@ -127,6 +127,76 @@ struct MeshSupervisorReconcileTests {
         #expect(buildLog.snapshot().isEmpty)
     }
 
+    /// 回归测试：同一 transport（chosenPullURL/chosenWSKind 等都没变），仅 httpRttMs 在两次
+    /// 探测间抖动（生产路径必然如此——网络 RTT 不会两次探测完全相同）。`PeerDecision` 的
+    /// Equatable 必须忽略 httpRttMs，否则 `applyDecisions` 会把这判定为 "transport changed"
+    /// 误重建 worker + WS client——这正是 daemon 长时间运行后 phys_footprint 持续增长的根因
+    /// （每次误重建在 Ponte HTTP CONNECT 隧道上留一个不会被回收的 CLOSED socket）。
+    @Test func reconcileSameTransportDifferentRttIsNoOp() async throws {
+        let peer = makePeerConfig("https://mbp.tail.ts.net:8443")
+        let pullURL = URL(string: "https://mbp.tail.ts.net:8443")!
+        let oldDecision = SmartTransport.PeerDecision(
+            peerIndex: 0,
+            configuredURL: pullURL,
+            manualPullURL: nil,
+            learnedPonteHost: nil,
+            chosenPullURL: pullURL,
+            chosenWSURL: pullURL,
+            chosenWSKind: .nio,
+            httpRttMs: [pullURL: 82]
+        )
+        let newDecisionSameTransportDifferentRtt = SmartTransport.PeerDecision(
+            peerIndex: 0,
+            configuredURL: pullURL,
+            manualPullURL: nil,
+            learnedPonteHost: nil,
+            chosenPullURL: pullURL,
+            chosenWSURL: pullURL,
+            chosenWSKind: .nio,
+            httpRttMs: [pullURL: 2301]
+        )
+        #expect(oldDecision == newDecisionSameTransportDifferentRtt)
+
+        let initialWorker = makeNoopWorker(label: "init")
+        let initialPeer = MeshSupervisor.Peer(worker: initialWorker)
+
+        let buildLog = BuildLog()
+        let buildPeer: @Sendable (SmartTransport.PeerDecision) -> MeshSupervisor.Peer = { d in
+            // 这条不该被调（transport 没变，只是 RTT 不同）；若被调测试会失败
+            buildLog.record(d.peerIndex)
+            return MeshSupervisor.Peer(worker: PullWorker(
+                database: try! makeMemoryDB(),
+                transport: NoopTransport(),
+                selfDeviceID: "self",
+                expectedPeerDeviceID: nil,
+                meshStatus: MeshStatus(),
+                blobFetcher: NoopTransport(),
+                blobs: makeMemoryBlobs(),
+                evictOnFull: { false },
+                config: PullWorker.Config(intervalSec: 60)
+            ))
+        }
+
+        let supervisor = MeshSupervisor(
+            initialPeers: [initialPeer],
+            initialDecisions: [oldDecision],
+            smart: SmartTransport(),
+            configPeers: [peer],
+            auth: HMACAuth(secret: Data(repeating: 0xC0, count: 32)),
+            tailscaleSession: .shared,
+            buildPeer: buildPeer,
+            discoverOverride: { [newDecisionSameTransportDifferentRtt] },
+            autoRecoverOnDNSChange: false
+        )
+
+        await supervisor.reconcileTransports()
+
+        let workers = await supervisor.workers
+        #expect(workers.count == 1)
+        #expect(workers[0] === initialWorker)
+        #expect(buildLog.snapshot().isEmpty)
+    }
+
     @Test func reconcileURLChangeRebuildsAffectedPeerOnly() async throws {
         // 两 peer。reconcile 时 peer 0 决策变了，peer 1 没变 →
         // peer 0 worker 是新实例，peer 1 是老实例
