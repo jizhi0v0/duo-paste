@@ -430,11 +430,29 @@ Swift 6 strict concurrency 拒绝同一 iterator 实例 capture 进多个 child 
 
 唯一守得住的路径是**不让 NSImageView / PDFView 持续挂在 hosting view 的 SwiftUI 子树里**——`.id(kindKey)` 切 kind 时 SwiftUI 整体 tear down NSViewRepresentable，AppKit 没东西可推就不 auto-resize。位置：`PreviewOverlay.swift` 的 `PreviewPanelContent.contentBody` + `kindKey`。
 
-### Settings 窗口使用 macOS 26 原生 scene
+### Settings 窗口由 SettingsWindowPresenter 持有（不是 SwiftUI Settings scene）
 
-Settings 由 `App.swift` 的 SwiftUI `Settings` scene 托管；页面用系统 `TabView` + `Form` + `Section` + `LabeledContent`。状态栏是 `MenuBarExtra`，菜单从 `SettingsLink` 打开；HUD 齿轮复用 MenuBarExtra environment 里的 `openSettings` action。
+页面内容仍是系统 `TabView` + `Form` + `Section` + `LabeledContent`（拆在 `Sources/duo-pasted/Settings/`），**不要**自绘 sidebar / 卡片、也不要隐藏系统 traffic lights 后自画——窗口材质、标题栏、交通灯交给系统。但**承载窗口**是 `SettingsWindowPresenter` 里的 AppKit `NSWindow`，不是 SwiftUI `Settings` scene：accessory app 在别的 app 活跃时，scene 会声称 `showSettingsWindow:` 已处理却根本不 materialize `NSWindow`。
 
-**不要回退**到手动 `NSWindow` / `NSHostingView`、自绘 sidebar / 卡片、隐藏系统 traffic lights 后自画的方案。macOS 26 窗口材质、标题栏、交通灯、焦点和窗口生命周期应由系统 Settings scene 管理。
+三条硬不变量：
+
+1. **`App.body` 不得注册任何会产生窗口的 scene** —— 空 `Settings {}` 占位也不行。它是可恢复窗口，`NSQuitAlwaysKeepsWindows=1`（默认）下每次启动被系统重开成空白 900×450 "DuoPaste Settings" 并抢 key。当前写法是 `MenuBarExtra(isInserted: .constant(false))`，什么都不渲染；真状态栏是 AppKit `StatusBarController`
+2. **永远保持 `.accessory`，用 `activate(ignoringOtherApps: true)`** —— accessory app 本来就能持 key 窗口（见 `NSApplicationActivationPolicyAccessory` 头文件）。**不要**回退到"提升 `.regular` → 轮询 20 次等 `isActive && isKeyWindow` → 兜底 `.floating` → 关窗恢复 `.accessory`"那套：提升会插 Dock 图标 + app 菜单（菜单栏 extras 跳动），give-up 路径的 `setActivationPolicy(.accessory)` 反而把刚显示的窗口藏掉——这就是用户看到的"设置窗口闪一下就消失"。裸 `NSApp.activate()` 是**协作式**的、文档明说不保证成功，别换
+3. **激活必须留在触发它的用户事件内** —— `StatusBarController.openSettings` 直接调 `AppDelegate.showSettings()`，**不要**再包 `DispatchQueue.main.async` "等菜单 tracking loop 结束"：macOS 14+ 协作激活会拒绝这种延迟到事件之外的请求
+
+测量注意：焦点是全局状态，用脚本驱动打开 Settings 时别的 app 正持焦点会污染 `isKeyWindow` / `isActive` 读数（实测给出自相矛盾的结果）。手动点开看标题栏，别信脚本轮询。
+
+### 预览浮窗上屏必须脱离 SwiftUI layout pass
+
+`SearchPanelController` 的 `onPreviewChange` 是 SwiftUI value action，**同步**跑在 `SearchView` 的 `NSHostingView.layout()` 里。在那里面直接 `PreviewPanelController.show` → `panel.orderFront` 会重入 ViewBridge，搜索框 `TextField` 背后 NSTextField 的跨进程补全列表抛未捕获 NSException：
+
+```
+'<NSRemoteView: com.apple.SafariPlatformSupport.Helper SPCompletionListServiceViewController>
+ notified of <duo_pasted.NonKeyHUDPanel> but expected (null)'
+in -[NSRemoteView containingWindowWillOrderOnScreen:]
+```
+
+崩过两次（2026-07-22 SIGABRT；2026-07-24 AppKit 改走 `_crashOnException` 后表现为 EXC_BREAKPOINT SIGTRAP，crash log 里 `asiBacktraces` 才有真因）。修法是 `DispatchQueue.main.async` 推到下一个 runloop turn 再 order，并在 async 闭包内**重读** `previewShown / currentItem / selectedCardWindowRect`——期间可能已被 hide 或箭头切卡换了目标。**不要**改回同步调用；同理任何新的"布局回调里开窗/上屏"路径都要走同一条 defer。
 
 ## 已知环境坑
 
