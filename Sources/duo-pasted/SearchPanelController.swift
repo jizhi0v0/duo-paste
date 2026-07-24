@@ -591,7 +591,20 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                     return
                 }
                 FileHandle.standardError.write(Data("preview-debug: → show item=\(item.id) rect=\(self.state.selectedCardWindowRect)\n".utf8))
-                preview.show(item: item, cardRectInGlobal: self.state.selectedCardWindowRect)
+                // show() 会 orderFront 一个内含 VisionKit `ImageAnalysisOverlayView`(ViewBridge
+                // out-of-process remote view)的窗口。onPreviewChange 是 SwiftUI value-action，
+                // 会在 SearchView 的 `NSHostingView.layout()` pass 内**同步**触发；此刻若同步 order，
+                // ViewBridge 会在 layout/display 周期里重入 `-[NSRemoteView
+                // containingWindowWillOrderOnScreen:]` 抛未捕获 NSException → SIGABRT
+                // (crash 2026-07-22-115423：FDA 让 Telegram 图有了 blob、预览首次挂上 Live Text
+                // overlay 后必现)。挪到下一个 runloop turn，脱离 layout pass 再 order。
+                // async 内重新读状态——期间可能已被 hide 或箭头切卡改了目标 item / rect。
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.state.previewShown,
+                          let item = self.state.currentItem,
+                          self.state.selectedCardWindowRect != .zero else { return }
+                    preview.show(item: item, cardRectInGlobal: self.state.selectedCardWindowRect)
+                }
             },
             // contextMenu "在 Finder 显示" + ⌘Return 走同一 onReveal handler
             onReveal: onReveal,
