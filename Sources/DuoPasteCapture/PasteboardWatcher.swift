@@ -275,25 +275,18 @@ public actor PasteboardWatcher {
         ]) as? [URL], !urls.isEmpty {
             let paths = urls.map { $0.path }.joined(separator: "\n")
 
-            // 单文件且后缀是图片：尝试读字节存 blob，让 mirror client 能通过 /blob/<sha> 同步
+            // 单文件且后缀是图片：尝试读字节存 blob，让 mirror client 能通过 /blob/<sha> 同步。
+            // resolve symlink + dangling 短重试见 readImageFileBlob——治 Telegram 复制媒体
+            // 写 symlink + 懒 materialize 那一刻读不到字节导致的纯路径降级（无缩略图文件卡）
             var imageBlob: Data? = nil
             var imageBlobExt: String? = nil
             var imageBlobMime: String? = nil
-            if urls.count == 1 {
-                let url = urls[0]
-                if fileLooksLikeImage(path: url.path) {
-                    // 先检查文件大小，避免在 @MainActor 路径上同步读超大文件
-                    let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-                    if fileSize > 0 && fileSize <= maxBlobBytes {
-                        // 读失败（权限/文件已删）→ imageBlob=nil，静默降级为纯路径 capture
-                        imageBlob = try? Data(contentsOf: url)
-                        if imageBlob != nil {
-                            let ext = url.pathExtension.lowercased()
-                            imageBlobExt = ext
-                            imageBlobMime = Self.imageExtToMime(ext)
-                        }
-                    }
-                }
+            if urls.count == 1,
+               let read = Self.readImageFileBlob(at: urls[0], maxBlobBytes: maxBlobBytes)
+            {
+                imageBlob = read.data
+                imageBlobExt = read.ext
+                imageBlobMime = read.mime
             }
 
             return CapturedPasteboard(
@@ -506,6 +499,48 @@ public actor PasteboardWatcher {
         guard rtf.utf8.count <= maxRawBytes else { return false }
         guard let plain = decodeRTFToPlain(rtf) else { return false }
         return plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 单个图片文件 URL → (bytes, ext, mime)；读不到返回 nil 让调用方降级为纯路径 capture。
+    ///
+    /// 两个非平凡点，都由真实现网 case（Telegram 复制媒体）驱动：
+    ///
+    /// 1. **按 resolve 后的 target 大小守门**：Telegram 往剪贴板写的是指向自身 cache 的
+    ///    **symlink**（`telegram-cloud-photo-...-w.jpg` → 无后缀的 `-w`）。symlink 自身
+    ///    `.fileSizeKey` 只报 link 大小（几十字节），拿它跟 maxBlobBytes 比 = 大小闸形同
+    ///    虚设（指向 500MB 的 symlink 也会被全量读进内存）。必须 resolve 后按真实 target
+    ///    大小判。
+    ///
+    /// 2. **dangling symlink 短重试**：Telegram 懒 materialize——copy 那一刻 symlink 已写好
+    ///    但 target 还没落盘，`Data(contentsOf:)` 抛错。单次读会静默降级成纯路径（历史里
+    ///    留一张没缩略图的文件卡）。target 通常几十~几百 ms 内落盘，短重试即可补上。每轮
+    ///    都重新 resolve，好让重试间隙才 materialize 的 target 被看到。
+    ///
+    /// size > cap 是真超限（立刻返 nil 不重试）；size == 0 / 读失败当 dangling 重试。
+    /// ext 取**原始 url** 后缀（resolve 后的 target 常常没后缀）。
+    ///
+    /// `sleep` 注入让单测不真睡、且能在重试间隙 materialize target 驱动重试路径。跑在
+    /// watcher actor executor 上（非 main），worst-case 阻塞 = sum(retryDelaysMs)，仅单
+    /// 图片文件 capture 触发，跟本分支既有同步 `Data(contentsOf:)` 同源，可接受。
+    static func readImageFileBlob(
+        at url: URL,
+        maxBlobBytes: Int,
+        retryDelaysMs: [Int] = [0, 120, 250],
+        sleep: (Int) -> Void = { ms in if ms > 0 { Thread.sleep(forTimeInterval: Double(ms) / 1000.0) } }
+    ) -> (data: Data, ext: String, mime: String)? {
+        guard fileLooksLikeImage(path: url.path) else { return nil }
+        let ext = url.pathExtension.lowercased()
+        for delayMs in retryDelaysMs {
+            sleep(delayMs)
+            let target = url.resolvingSymlinksInPath()
+            let size = (try? target.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if size > maxBlobBytes { return nil }              // 真超限，别读进内存
+            if size > 0, let data = try? Data(contentsOf: target) {
+                return (data, ext, Self.imageExtToMime(ext))
+            }
+            // size == 0（dangling / 未 materialize）或读失败 → 下一轮重试
+        }
+        return nil
     }
 
     /// 图片文件后缀 → MIME type。未知格式返回通用二进制流类型。
