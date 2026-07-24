@@ -48,13 +48,33 @@ enum CLI {
         case "--help", "-h", "help":
             printUsage()
             exit(0)
+        case "--version", "version":
+            printVersion()
+            exit(0)
         default:
-            // 未知第一个参数：不拦截。launchctl 这种无参调用走这里。
-            return
+            // 无参调用（launchd 拉 daemon）早在上面的 `args.count >= 2` 就返回了，这里只可能
+            // 是打错的参数或系统注入的参数。见 CLIInvocation 的前缀分流理由。
+            switch CLIInvocation.classifyUnrecognized(cmd) {
+            case .runDaemon:
+                return
+            case .refuse:
+                FileHandle.standardError.write(Data("未知参数: \(cmd)\n\n".utf8))
+                printUsage(to: FileHandle.standardError)
+                exit(2)
+            }
         }
     }
 
-    private static func printUsage() {
+    /// `--version` / `version`。CFBundleShortVersionString 是 CI 写的语义版本
+    /// （`0.1.<build>-beta+<sha>` 或 tag），CFBundleVersion 是 Sparkle 用来比新旧的单调 build 号。
+    private static func printVersion() {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = info?["CFBundleVersion"] as? String ?? "unknown"
+        FileHandle.standardOutput.write(Data("duo-pasted \(short) (build \(build))\n".utf8))
+    }
+
+    private static func printUsage(to handle: FileHandle = .standardOutput) {
         let text = """
         duo-pasted [subcommand]
 
@@ -145,8 +165,12 @@ enum CLI {
                                   用——peer config 里写这个串就能走 ponte 快路径。
                                   找不到（没装 Surge / 没配 Ponte / 算法不命中）退出码 1
                                   + stderr 写原因。--verbose 多打硬件指纹方便排查。
+
+          --version               打印版本 + build 号。
+
+        无参数 = daemon 流程（LaunchAgent 的调用方式）。
         """
-        FileHandle.standardOutput.write(Data((text + "\n").utf8))
+        handle.write(Data((text + "\n").utf8))
     }
 
     private static func runInitSecret(force: Bool) {

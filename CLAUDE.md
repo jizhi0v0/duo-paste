@@ -164,6 +164,27 @@ plist `KeepAlive={SuccessfulExit:false}` + `ThrottleInterval=30`（install-agent
 - **`ThrottleInterval=30` 只节流「上次启动后 30s 内」的 respawn**——正常运行数小时后的崩溃自愈 / 重启按钮不受影响，只压 bootstrap 持久失败的 tight loop（exit 1 立刻又被拉起）烧 CPU + 灌日志。`launchctl kickstart -k`（含 relaunch helper）强制重启不走 throttle。
 - 「退出」菜单弹 NSAlert 确认——讲清 daemon 真停、恢复要 kickstart / install-agent.sh，避免误以为只是关窗。
 
+### 启动时接管：daemon 必须跑在 launchd 手里
+
+上面整张退出码表**只在进程是 launchd 亲生的时候有意义**。有多条路径会让 installed app 的进程跑在 launchd 之外——Sparkle 装完更新用 LaunchServices 重开 .app、RelaunchHelper 120s 内没等到版本变化、用户直接在 Finder 双击 DuoPaste.app。这种孤儿进程功能全正常，唯独 `launchctl print` 显示 `state = not running`，**崩了没人拉起**。
+
+2026-07-24 现场：LaunchAgent `last exit code = 0`（宿主为装更新自退，被 `SuccessfulExit:false` gate 正确判为"别重启"），Sparkle 重开的进程接管运行，19 小时后崩在 NSRemoteView 断言上，launchd 手里没东西可重启，用户只能手动开。
+
+修法是 `App.init` 里的 `SparkleLaunchdHandoff.adoptLaunchdIfNeeded()`——**状态驱动**，每次启动重判一次，不管是谁经由哪条路径把我拉起来的。判据在纯函数 `DuoPasteCore.LaunchdAdoption.decide`：
+
+1. **自我识别用 `XPC_SERVICE_NAME` 环境变量**，不用 pid 比较。launchd 给自己起的 job 一定注入这个变量（值 = job label）；`launchctl print` 的 pid 在 kickstart 刚返回时可能还没记上，pid 比较会假阴性 → 新 job 把自己再 kickstart 一遍。
+2. **binary path 必须跟 job 的 `program` 对上**（resolve symlink 后比）——否则 `swift run` 的 dev 二进制会莫名启动 `~/Applications` 那份 release 再把自己退掉。
+3. **接管路径用裸 `kickstart` 不用 `-k`**。万一自我识别失灵形成"接管→退出→再接管"环，`-k` 是无限 kill/respawn 风暴，裸 kickstart 最坏只是 no-op。
+4. **kickstart 返 0 不等于起来了**——必须 poll 到 `servicePID != getpid()` 才 `exit(0)`。等不到就继续跑：孤儿进程再糟也好过"我退了、job 也没起来"的彻底消失。
+
+**不要退回到 Sparkle marker 文件那套**（`sparkle-launchd-handoff` + `consumeAndExitIfNeeded`）。它是事件驱动的，只覆盖 `updaterWillRelaunchApplication` 真被调到的那条路径；marker 没写成 / helper 超时 / 用户手动双击一律漏。marker 的读取已删，只保留清理让残留文件消失。回归测试 `LaunchdAdoptionTests.swift`。
+
+### 未知 CLI 参数必须拒绝，不能 fall through 到 daemon
+
+`CLI.dispatchAndExitIfApplicable` 的 `default` 分支历史上一律放行（注释写"launctl 这种无参调用走这里"），但无参调用早在 `args.count >= 2` 就返回了，`default` 实际只接得到**打错的**参数。于是 `duo-pasted --version` 不报错，反而静默拉起第二个 daemon 实例——重复捕获、抢全局快捷键、跟常驻实例抢 SQLite WAL 写锁。
+
+分流规则在 `DuoPasteCore.CLIInvocation.classifyUnrecognized`：`--long-flag` 和裸 token（子命令拼错）→ 打 usage 到 stderr + `exit(2)`；**单 `-` 前缀放行**——daemon 由 LaunchServices / 调试器拉起时会被塞 `-psn_0_…` / `-NSDocumentRevisionsDebugMode YES` / `-AppleLanguages (en)`，拦下它们会让 daemon 在某些启动路径下起不来，比崩溃更糟。`--version` 现在是真子命令（打 `CFBundleShortVersionString` + build 号）。
+
 ### Capture 字节守门（防意外 Cmd+C 巨物）
 
 `config.capture.{max_blob_mb=32, max_text_kb=512}`。超 cap → CaptureService 跳过入库返 `.skippedTooLarge`，**NSPasteboard 自身不受影响**（Cmd+V 仍正常）。文件路径走 `.file` kind + 字符串形式（< 1KB）永远过文本 cap，Finder 复制 50GB 工程文件夹零受影响。

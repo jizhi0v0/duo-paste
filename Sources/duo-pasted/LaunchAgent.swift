@@ -38,6 +38,16 @@ enum LaunchAgent {
     }
 
     static func servicePID(label: String) -> pid_t? {
+        printField(label: label, key: "pid").flatMap { pid_t($0) }
+    }
+
+    /// job plist 里的 `program`(即 launchd 会执行的二进制)。用来判断"launchd 手里那个 job
+    /// 跟我是不是同一份安装"——见 LaunchdAdoption.decide。
+    static func programPath(label: String) -> String? {
+        printField(label: label, key: "program")
+    }
+
+    private static func printField(label: String, key: String) -> String? {
         let uid = getuid()
         let p = Process()
         p.launchPath = "/bin/launchctl"
@@ -50,27 +60,34 @@ enum LaunchAgent {
         } catch {
             return nil
         }
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
+        // readDataToEndOfFile 必须在 waitUntilExit 之前——`launchctl print` 的输出远超
+        // pipe buffer(64KB),先 wait 会让子进程阻塞在写、父进程阻塞在 wait,直接死锁
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let prefix = "\(key) = "
         for line in text.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("pid = ") else { continue }
-            let raw = trimmed.dropFirst("pid = ".count).trimmingCharacters(in: .whitespaces)
-            if let pid = pid_t(raw) {
-                return pid
-            }
+            guard trimmed.hasPrefix(prefix) else { continue }
+            let value = trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
         }
         return nil
     }
 
+    /// - Parameter force: `true` 走 `kickstart -k`(有实例就 kill 后重起),给"立即重启"这类
+    ///   显式动作用。`false` 走裸 `kickstart`,只在 job 没跑时启动——接管路径必须用它:
+    ///   万一自我识别失灵形成"接管→退出→再接管"环,`-k` 会变成无限 kill/respawn 风暴,
+    ///   裸 kickstart 最坏只是 no-op。
     @discardableResult
-    static func kickstart(label: String) -> Int32 {
+    static func kickstart(label: String, force: Bool = true) -> Int32 {
         let uid = getuid()
         let p = Process()
         p.launchPath = "/bin/launchctl"
-        p.arguments = ["kickstart", "-k", "gui/\(uid)/\(label)"]
+        p.arguments = force
+            ? ["kickstart", "-k", "gui/\(uid)/\(label)"]
+            : ["kickstart", "gui/\(uid)/\(label)"]
         p.standardOutput = Pipe()
         p.standardError = Pipe()
         do {
