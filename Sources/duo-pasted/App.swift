@@ -15,8 +15,21 @@ struct DuoPasteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        Settings {
-            SettingsView()
-        }
+        // The daemon owns its Settings NSWindow through SettingsWindowPresenter. This scene only
+        // exists to satisfy `SwiftUI.App.body`; registering a second SettingsView here can
+        // materialize a duplicate window through the responder chain.
+        //
+        // It must never produce a window, so a settings-placeholder scene is banned here: even
+        // an empty one is a restorable window. With restoration on (`NSQuitAlwaysKeepsWindows=1`,
+        // the default) macOS reopened it on every launch as an empty 900x450 "DuoPaste Settings",
+        // and — worse — that window took key focus, so the presenter's cooperative-activation
+        // handshake never reached key/active, burned its 20 retries, and fell back to
+        // `setActivationPolicy(.accessory)`, which hides the app's windows. Net effect: the real
+        // Settings window flashed and vanished, and the menu bar shifted as the policy bounced.
+        //
+        // `MenuBarExtra` with `isInserted: false` renders nothing at all — no window to restore,
+        // no key to steal. The real status item is AppKit (`StatusBarController`), so nothing is
+        // lost. ⌘, still routes through that status menu into `AppDelegate.showSettings()`.
+        MenuBarExtra("duo-paste", isInserted: .constant(false)) { EmptyView() }
     }
 }

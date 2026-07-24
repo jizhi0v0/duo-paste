@@ -58,6 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var exportProgressKey = 0
     private var exportIsVacuuming = false
     private var diagnosticExportInFlight = false
+    /// `.accessory` app 的 SwiftUI Settings selector 会偶发只返回 handled 却不创建窗口。
+    /// 显式持有唯一 presenter，窗口关闭后仍复用，避免 responder-chain / scene 生命周期竞态。
+    private lazy var settingsWindowPresenter = SettingsWindowPresenter()
 
     private static var reopenSettingsFlag: URL {
         Paths.makeDefault().root.appendingPathComponent("reopen-settings-on-launch")
@@ -172,48 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showSettings() {
-        if bringSettingsWindowForward() {
-            return
-        }
-
-        // `.accessory` app 在未激活时发送 Settings selector，responder chain 可能报告
-        // handled 但不真正 materialize scene。先激活保证首次创建发生；窗口挂载后
-        // `bringSettingsWindowForward()` 还会再激活一次并明确 order front。
-        NSApp.activate(ignoringOtherApps: true)
-
-        // Settings scene 由 SwiftUI 注册在 responder chain。从 NSMenu tracking loop 返回后
-        // 发 selector，让系统继续管理单例窗口、标题栏和 TabView 外观。首次创建是异步的，
-        // 等 SettingsWindowProbe 拿到真实 NSWindow 后再 activate + order front。
-        let selectors = ["showSettingsWindow:", "showPreferencesWindow:"]
-        for name in selectors {
-            if NSApp.sendAction(NSSelectorFromString(name), to: nil, from: nil) {
-                bringSettingsWindowForwardWhenReady(attempt: 0)
-                return
-            }
-        }
-        fputs("settings: Settings scene selector unavailable\n", stderr)
-    }
-
-    @discardableResult
-    private func bringSettingsWindowForward() -> Bool {
-        guard let window = SettingsWindowBridge.window else { return false }
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
-        return true
-    }
-
-    private func bringSettingsWindowForwardWhenReady(attempt: Int) {
-        if bringSettingsWindowForward() {
-            return
-        }
-        guard attempt < 20 else {
-            fputs("settings: Settings window unavailable after 1s\n", stderr)
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.bringSettingsWindowForwardWhenReady(attempt: attempt + 1)
-        }
+        settingsWindowPresenter.show()
     }
 
     func toggleSearch() {

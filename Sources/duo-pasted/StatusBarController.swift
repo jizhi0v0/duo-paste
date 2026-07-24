@@ -201,10 +201,9 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func openSettings() {
-        // Return from AppKit's menu tracking loop before activating the Settings scene.
-        DispatchQueue.main.async {
-            AppDelegate.shared?.showSettings()
-        }
+        // Keep activation inside the originating user event. On macOS 14+ cooperative
+        // activation may reject a request deferred until after the menu tracking loop.
+        AppDelegate.shared?.showSettings()
     }
 
     @objc private func pauseFiveMinutes() {
