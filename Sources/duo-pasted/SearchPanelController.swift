@@ -334,7 +334,6 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 }
                 switch keyCode {
                 case 49:                                        // Space — Quick Look 风格预览
-                    FileHandle.standardError.write(Data("preview-debug: SPACE pressed · inputFocused=\(inputFocused) · previewShown=\(self.state.previewShown) · currentItem=\(self.state.currentItem?.id ?? "nil") · rect=\(self.state.selectedCardWindowRect) · query='\(self.state.query)'\n".utf8))
                     if self.state.previewShown {
                         // preview 已开,空格关闭(同时也响应 Esc 路径,但这里更明确)
                         self.state.previewShown = false
@@ -571,13 +570,12 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
             },
             onPreviewChange: { [weak self] shown in
                 guard let self else { return }
-                FileHandle.standardError.write(Data("preview-debug: onPreviewChange(\(shown)) · current=\(self.state.currentItem?.id ?? "nil") · rect=\(self.state.selectedCardWindowRect)\n".utf8))
                 if !shown {
                     preview.hide()
                     return
                 }
-                guard let item = self.state.currentItem else {
-                    FileHandle.standardError.write(Data("preview-debug: → hide (no currentItem)\n".utf8))
+                // 目标 item 在下面的 async 闭包里重读，这里只判存在
+                guard self.state.currentItem != nil else {
                     preview.hide()
                     return
                 }
@@ -587,10 +585,8 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
                 // alphaValue 1→0→1 闪烁;改成保持上一帧状态等新 frame nonzero 时一次性
                 // 切换到新 item + 新位置,视觉无中断
                 guard self.state.selectedCardWindowRect != .zero else {
-                    FileHandle.standardError.write(Data("preview-debug: → wait (rect=.zero)\n".utf8))
                     return
                 }
-                FileHandle.standardError.write(Data("preview-debug: → show item=\(item.id) rect=\(self.state.selectedCardWindowRect)\n".utf8))
                 // show() 会 orderFront 一个内含 VisionKit `ImageAnalysisOverlayView`(ViewBridge
                 // out-of-process remote view)的窗口。onPreviewChange 是 SwiftUI value-action，
                 // 会在 SearchView 的 `NSHostingView.layout()` pass 内**同步**触发；此刻若同步 order，
@@ -678,7 +674,6 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         // windowDidResignKey 立即 hide() 会让 panel + preview 跟 alert 一起消失,用户
         // 还没来得及点"允许"就以为 daemon crash。preview 打开就保留 panel,让 user
         // 主动 Esc 或 space 关。普通 panel(非 preview)时仍按原逻辑——切走自动隐藏
-        FileHandle.standardError.write(Data("resign-key: previewShown=\(state.previewShown)\n".utf8))
         if state.previewShown { return }
         hide()
     }

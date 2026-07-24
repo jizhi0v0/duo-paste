@@ -525,7 +525,6 @@ struct SearchView: View {
         //   2) selectedIDs 变化(箭头切换 currentItem) → 内容跟随
         //   3) selectedCardWindowRect 变化(滚动 / 布局更新) → 浮窗 reposition
         .onChange(of: state.previewShown) { _, shown in
-            FileHandle.standardError.write(Data("preview-debug: previewShown changed → \(shown) · rect=\(state.selectedCardWindowRect) · anchor=\(previewAnchorID ?? "nil")\n".utf8))
             onPreviewChange(shown)
         }
         .onChange(of: state.selectedIDs) { _, _ in
@@ -559,7 +558,6 @@ struct SearchView: View {
             let dw = abs(rect.width - current.width)
             let dh = abs(rect.height - current.height)
             if isReset || dx > 1 || dy > 1 || dw > 1 || dh > 1 {
-                FileHandle.standardError.write(Data("preview-debug: pref-change rect=\(rect) (was \(current))\n".utf8))
                 state.selectedCardWindowRect = rect
             }
         }
