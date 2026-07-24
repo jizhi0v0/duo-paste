@@ -13,6 +13,14 @@ public enum FileSubKind: String, Codable, Sendable, CaseIterable {
 }
 
 public enum ItemClassifier {
+    /// 是否是有内容哈希的图片 blob。裸 `.image` 与带图片 MIME/后缀的 `.file` 都算，
+    /// 让同一张截图在 app 间以 file/image 两种 pasteboard 表示流转时共享去重契约。
+    public static func isImageBlob(_ item: Item) -> Bool {
+        guard item.blobSha256?.isEmpty == false else { return false }
+        if item.kind == .image { return true }
+        return item.kind == .file && isImageFile(item)
+    }
+
     /// `.file` kind 的细分类——优先 mime,退化到 textFull 路径后缀。
     /// 多 sub-kind 互斥优先级:video > pdf > audio > imageFile。一个 mp4 不会同时算视频+音频
     public static func fileSubKind(_ item: Item) -> FileSubKind? {

@@ -243,6 +243,50 @@ private func makeService(limits: Config.CaptureLimits) throws -> (CaptureService
     #expect(count == 2)
 }
 
+@Test func captureServiceMergesImageFileIntoLaterRawImageAcrossLongGap() async throws {
+    let limits = Config.CaptureLimits(
+        maxBlobBytes: 1024,
+        maxTextBytes: 1024,
+        mergeWindowSec: 300,
+        textMergeWindowSec: nil
+    )
+    let (service, db) = try makeService(limits: limits)
+    let bytes = Data([0x89, 0x50, 0x4E, 0x47])
+    let firstNs: Int64 = 1_700_000_000_000_000_000
+    let laterNs = firstNs + 3_600 * 1_000_000_000
+
+    let first = try await service.ingest(CapturedPasteboard(
+        kind: .file,
+        text: "/tmp/CleanShot.png",
+        blob: bytes,
+        blobExt: "png",
+        blobMime: "image/png",
+        fileName: "CleanShot.png",
+        sourceAppBundleID: "com.google.Chrome",
+        sourceAppName: "Google Chrome",
+        capturedAtNs: firstNs
+    ))
+    #expect(first.outcome == .inserted)
+
+    let second = try await service.ingest(CapturedPasteboard(
+        kind: .image,
+        blob: bytes,
+        blobExt: "png",
+        blobMime: "image/png",
+        sourceAppBundleID: "com.anthropic.claudefordesktop",
+        sourceAppName: "Claude",
+        capturedAtNs: laterNs
+    ))
+    #expect(second.outcome == .mergedWithPrevious)
+
+    let rows = try await db.pool.read { try Item.fetchAll($0) }
+    #expect(rows.count == 1)
+    #expect(rows[0].kind == .image)
+    #expect(rows[0].sourceAppName == "Claude")
+    #expect(rows[0].textFull == nil)
+    #expect(rows[0].capturedAtNs == laterNs)
+}
+
 @Test func captureServiceBlobMergeWindowZeroBlocksSameNsMerge() async throws {
     // 边界回归：mergeWindowSec=0 必须与 textMergeWindowSec=0 语义对齐——任何时间都不合并，
     // 包括同 ns 的边界。旧代码用 `mergeFloor = now - 0 = now` + WHERE `>= mergeFloor` 仍会

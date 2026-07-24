@@ -11,14 +11,15 @@ import Foundation
 ///
 /// **本 tracker 提供两个原语**:
 /// 1. [markDeleted]:返回 caller 应当从 items 移除的所有 id(text-kind cascade,以及
-///    15s 内跨 origin 的同 SHA blob group).同时记 pending 让后续 [observeIncoming] 用.
+///    15s 内跨 origin 的同 SHA blob group，以及同 origin 图片 file/image 表示组)。
+///    同时记 pending 让后续 [observeIncoming] 用.
 /// 2. [observeIncoming]:扫 incoming 批,返回 (skipIds, resurrectedIds).skip 让 caller 把
 ///    in-flight `/since` 带回的同 text_full sibling 屏蔽在 grace 窗口内不入库;resurrected
 ///    让 caller 弹"删除未送达"banner.tombstone 自动清对应 pending entry.
 ///
 /// **不变量**:
 /// - cascade 范围跟 server `Database.softDelete` 严格对齐——文本按 `text_full`；blob
-///   复用 `Item.blobFoldSiblingIDs` 的跨 origin + 15s cluster 契约
+///   复用 `Item.blobFoldSiblingIDs` 的跨 origin + 15s、同 origin 图片跨 kind 契约
 /// - 所有 cascade 出来的 id 都进 pendingIds——sibling 后续在 grace 后回流时 banner 也算
 /// - pendingTextFulls 命中 + 未超 grace → skip(不闪回);超 grace → resurrected(banner)
 /// - tombstone 行到达永远清两边 pending entry(server 真删除了,后续 sibling 不再 skip)

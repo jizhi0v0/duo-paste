@@ -47,6 +47,27 @@ struct ItemFoldTests {
         )
     }
 
+    private func makeImageFile(
+        id: String,
+        origin: String,
+        capturedAtNs: Int64,
+        sha: String,
+        path: String,
+        pinned: Bool = false
+    ) -> Item {
+        Item(
+            id: id,
+            originDevice: origin,
+            capturedAtNs: capturedAtNs,
+            kind: .file,
+            preview: URL(fileURLWithPath: path).lastPathComponent,
+            textFull: path,
+            blobSha256: sha,
+            blobMime: "image/png",
+            pinned: pinned
+        )
+    }
+
     @Test("跨 origin 同 text_full fold 一条")
     func crossOriginSameTextFoldsToOne() {
         let a = makeText(id: "own", origin: "self", capturedAtNs: 100, text: "duplicate")
@@ -83,6 +104,32 @@ struct ItemFoldTests {
         let b = makeImage(id: "img2", origin: "self", capturedAtNs: 500, sha: "abcd")
         let folded = Item.foldByTextFull([a, b])
         #expect(folded.count == 2, "blob 行必须保留两份")
+    }
+
+    @Test("同 origin 同 SHA 的图片文件与裸图片永久 fold，最新表示获胜")
+    func sameOriginImageFileAndImageFoldAcrossLongGap() {
+        let sha = String(repeating: "f", count: 64)
+        let file = makeImageFile(
+            id: "file-first",
+            origin: "self",
+            capturedAtNs: 100,
+            sha: sha,
+            path: "/tmp/CleanShot.png",
+            pinned: true
+        )
+        let image = makeImage(
+            id: "image-later",
+            origin: "self",
+            capturedAtNs: 10_000_000_000_000,
+            sha: sha
+        )
+
+        let folded = Item.foldByTextFull([file, image])
+
+        #expect(folded.count == 1)
+        #expect(folded[0].id == "image-later", "最新一次复制决定 file/image 粘贴语义")
+        #expect(folded[0].kind == .image)
+        #expect(folded[0].pinned == true, "同内容卡片的置顶状态做 OR")
     }
 
     @Test("跨 origin 近时间同 sha fold，保留原始文件名 + 最新排序时间")

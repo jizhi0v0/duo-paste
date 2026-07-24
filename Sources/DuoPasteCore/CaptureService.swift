@@ -30,7 +30,8 @@ public actor CaptureService {
     public let database: Database
     public let blobs: BlobStore
     public let deviceID: String
-    /// Blob 路径合并窗口（纳秒）。默认从 limits.mergeWindowSec 推导（300s）。
+    /// Blob 同 kind 路径合并窗口（纳秒）。默认从 limits.mergeWindowSec 推导（300s）。
+    /// 图片 file/image 跨 kind 表示转换另按 SHA 永久合并（除非窗口显式设 0）。
     /// 显式参数仅用于测试覆盖：生产路径走 config.capture.merge_window_sec。
     public let mergeWindowNs: Int64
     /// Text 路径合并窗口（纳秒）。`nil` = 永久 dedup（无时间限制）；
@@ -212,6 +213,18 @@ public actor CaptureService {
         }
         let preview = c.fileName ?? "[\(c.kind.rawValue) \(humanSize(info.size))]"
         let now = c.capturedAtNs
+        let incomingIsImageBlob = c.kind == .image
+            || (c.kind == .file && c.blobMime?.hasPrefix("image/") == true)
+        let resolvedTextFull: String?
+        switch c.kind {
+        case .file:
+            resolvedTextFull = c.text ?? c.fileName
+        case .image:
+            resolvedTextFull = nil
+        default:
+            resolvedTextFull = c.fileName
+        }
+        let incomingOCRState: OCRState? = incomingIsImageBlob ? .pending : nil
 
         let result: CaptureResult = try database.pool.write { db -> CaptureResult in
             // mergeWindowNs == 0 → 完全禁用合并（与 ingestText 路径语义对齐）。
@@ -222,21 +235,42 @@ public actor CaptureService {
                 mergeCandidate = nil
             } else {
                 let mergeFloor = now - mergeWindowNs
-                // 同 ingestText：blob 合并候选必须限定 origin=self，避免 bump peer 行
-                mergeCandidate = try Item
-                    .filter(Column("kind") == c.kind.rawValue)
+                // 同 ingestText：blob 合并候选必须限定 origin=self，避免 bump peer 行。
+                // 同 kind 仍遵守 merge window；图片 file/image 是同内容的表示转换，按 SHA
+                // 永久合并，堵住“上传截图文件后 app 又写回裸图片”的稳定重复路径。
+                let candidates = try Item
                     .filter(Column("blob_sha256") == info.sha256)
                     .filter(Column("origin_device") == deviceID)
-                    .filter(Column("captured_at_ns") >= mergeFloor)
                     .filter(Column("deleted_at_ns") == nil)
                     .order(Column("captured_at_ns").desc)
-                    .fetchOne(db)
+                    .fetchAll(db)
+                mergeCandidate = candidates.first { candidate in
+                    if candidate.kind == c.kind {
+                        return candidate.capturedAtNs >= mergeFloor
+                    }
+                    return incomingIsImageBlob && ItemClassifier.isImageBlob(candidate)
+                }
             }
             if let last = mergeCandidate {
                 var updated = last
                 updated.capturedAtNs = now
-                if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }
-                if updated.sourceAppName == nil { updated.sourceAppName = c.sourceAppName }
+                if updated.kind != c.kind,
+                   incomingIsImageBlob,
+                   ItemClassifier.isImageBlob(updated) {
+                    // 最新 pasteboard 表示决定 copyback 语义：file→image 后从历史粘贴应写
+                    // 图片字节，不应继续写旧 file URL；反向 image→file 同理保留最新路径。
+                    updated.kind = c.kind
+                    updated.sourceApp = c.sourceAppBundleID
+                    updated.sourceAppName = c.sourceAppName
+                    updated.preview = preview
+                    updated.textFull = resolvedTextFull
+                    updated.blobSize = info.size
+                    updated.blobMime = c.blobMime
+                    if updated.ocrState == nil { updated.ocrState = incomingOCRState }
+                } else {
+                    if updated.sourceApp == nil { updated.sourceApp = c.sourceAppBundleID }
+                    if updated.sourceAppName == nil { updated.sourceAppName = c.sourceAppName }
+                }
                 updated.ingestedAtNs = try DuoPasteCore.Database.nextIngestNs(db, now: now)
                 try updated.update(db)
                 return CaptureResult(outcome: .mergedWithPrevious, item: updated)
@@ -250,25 +284,6 @@ public actor CaptureService {
             //     blob_mime 已被设成 image/<ext>）。这类行 OCRWorker 也能扫
             // 其它 kind（file path-only / non-image blob）不标。判别用 blob_mime 不用
             // 路径后缀启发（mime 是 capture 时读字节成功才设的，等价于"OCR 可用字节就绪"）
-            let isImageBlob = (c.kind == .image)
-                || (c.kind == .file && (c.blobMime?.hasPrefix("image/") == true))
-            let ocrState: OCRState? = isImageBlob ? .pending : nil
-            // text_full 契约（v9 之后）：
-            //   - file kind：路径列表（Cmd+V 时写回 NSPasteboard 当 file URL）。c.text 是
-            //     PasteboardWatcher \n-join 的多路径串；单文件无 c.text 时用 fileName 兜底
-            //   - image kind：永远 nil。image 的"可粘贴主体"是字节，fileName 不参与 paste
-            //     路径（Copyback.copy .image 直接 setData），装 textFull 只污染 FTS5 索引
-            //   - 其他 blob kind：暂用 fileName（沿用旧行为）
-            // v9 migration step 3 已把历史 image kind text_full 清 NULL，新数据按此契约统一
-            let resolvedTextFull: String?
-            switch c.kind {
-            case .file:
-                resolvedTextFull = c.text ?? c.fileName
-            case .image:
-                resolvedTextFull = nil
-            default:
-                resolvedTextFull = c.fileName
-            }
             let item = Item(
                 id: UUIDv7.generateString(),
                 originDevice: deviceID,
@@ -282,7 +297,7 @@ public actor CaptureService {
                 blobSha256: info.sha256,
                 blobSize: info.size,
                 blobMime: c.blobMime,
-                ocrState: ocrState
+                ocrState: incomingOCRState
             )
             try item.insert(db)
             return CaptureResult(outcome: .inserted, item: item)

@@ -721,6 +721,13 @@ public struct Database: Sendable {
             try Self.rebuildSearchFoldProjection(db)
         }
 
+        // v17:同设备的图片 `file ↔ image` 表示按 SHA 折叠。表结构不变，但 v16 的
+        // projection 已把历史两行物化成两张卡；升级时必须重建派生索引，旧重复才会
+        // 立即消失，而不是等下一次相关 item 更新碰巧把 group 标 dirty。
+        m.registerMigration("v17_cross_kind_image_fold") { db in
+            try Self.rebuildSearchFoldProjection(db)
+        }
+
         return m
     }
 
@@ -1148,7 +1155,8 @@ public struct Database: Sendable {
     /// contextMenu 走 AppState.deleteItem;CLI admin-soft-delete 通过 HTTP DELETE 兜底。
     ///
     /// **Cascade**(plan hashed-allen §C):`cascade=true` 时，text 按同 text_full 全量
-    /// cascade；blob 按 `Item` 的“近时间跨-origin 同 sha”展示 fold group cascade。
+    /// cascade；blob 按 `Item` 的“近时间跨-origin / 同-origin 图片跨 kind”展示 fold
+    /// group cascade。
     /// 理由:mesh 行集合保持对称，只删代表 id 会让折叠 sibling 立即复活。
     /// `cascade=false` 仍只删单 id。
     ///

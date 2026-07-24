@@ -44,6 +44,23 @@ struct OptimisticDeleteTrackerTests {
         )
     }
 
+    private func makeImageFile(
+        id: String,
+        origin: String,
+        capturedAtNs: Int64 = 100,
+        sha: String
+    ) -> Item {
+        Item(
+            id: id,
+            originDevice: origin,
+            capturedAtNs: capturedAtNs,
+            kind: .file,
+            textFull: "/tmp/shot.png",
+            blobSha256: sha,
+            blobMime: "image/png"
+        )
+    }
+
     /// **C1**:删 fold 代表 → `items` 里所有同 text_full sibling(不同 id / origin)
     /// 全部返回让 caller remove.cascade 范围跟 server `Database.softDelete` 对齐——
     /// fold-aware cascade 是修复"删了又出现"的核心.
@@ -132,6 +149,18 @@ struct OptimisticDeleteTrackerTests {
 
         #expect(ids == ["img1"])
         #expect(tracker.pendingCount.ids == 1)
+    }
+
+    @Test("同 origin 的图片文件与裸图片是一张卡，删除一起 cascade")
+    func sameOriginCrossKindImageCascades() {
+        var tracker = OptimisticDeleteTracker()
+        let file = makeImageFile(id: "file", origin: "self", capturedAtNs: 100, sha: "abc")
+        let image = makeImage(id: "image", origin: "self", capturedAtNs: 9_999, sha: "abc")
+
+        let ids = tracker.markDeleted(image, in: [file, image])
+
+        #expect(ids == ["file", "image"])
+        #expect(tracker.pendingCount.ids == 2)
     }
 
     @Test("blob 删除 grace 内新到的跨 origin sibling 不闪回")

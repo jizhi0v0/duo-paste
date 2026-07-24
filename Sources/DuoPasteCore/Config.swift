@@ -64,7 +64,8 @@ public struct Config: Codable, Sendable, Equatable {
         /// 大小写与首尾空白。跳过不影响系统 pasteboard / Cmd+V。
         public var excludedBundleIDs: [String]
         /// Blob (image / 同 sha 字节) 合并窗口（秒）。窗口内同 kind+blob_sha256 的重复粘贴
-        /// 只刷 captured_at_ns，不插新行。默认 300（5 分钟）。
+        /// 只刷 captured_at_ns，不插新行。默认 300（5 分钟）。同 SHA 图片在 file/image
+        /// 两种 pasteboard 表示间转换时永久合并；0 会显式关闭捕获层全部 blob 合并。
         /// 注意：**只**作用于 blob 路径（ingestBlob）；text 走 `textMergeWindowSec` 独立配置，
         /// 因为文本字节相等即同（不需要 sha 抽象），永久 dedup 比窗口语义更符合剪贴板心智。
         public var mergeWindowSec: Int

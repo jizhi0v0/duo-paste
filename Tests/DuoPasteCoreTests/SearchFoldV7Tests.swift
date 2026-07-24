@@ -10,7 +10,8 @@ import GRDB
 ///
 /// 本套覆盖 v7 单表语义下的 fold 不变量，保证 SearchProvider.localMirror 路径行为跟合表前一致：
 /// - 跨 origin 同 text_full 在单表内 fold 为一条（winner = max(capturedAtNs)，pinned OR 聚合）
-/// - 同 blob_sha256 的近时间跨-origin 副本 fold；同 origin 重复仍保留
+/// - 同 blob_sha256 的近时间跨-origin 副本 fold；同 origin 同 kind 重复仍保留，
+///   图片 file/image 表示转换折叠
 /// - kinds / pinnedOnly filter 应用到 winner 行（不前置到子查询）
 /// - fetchUnion / count / countByKind 三路口径一致
 ///
@@ -36,6 +37,7 @@ private func insertItem(
     kind: ItemKind = .text,
     text: String? = nil,
     blobSha256: String? = nil,
+    blobMime: String? = nil,
     pinned: Bool = false,
     deletedAtNs: Int64? = nil
 ) throws {
@@ -49,10 +51,41 @@ private func insertItem(
         preview: text,
         textFull: text,
         blobSha256: blobSha256,
+        blobMime: blobMime,
         pinned: pinned,
         deletedAtNs: deletedAtNs
     )
     try db.pool.write { conn in try it.insert(conn) }
+}
+
+@Test func foldSameOriginImageFileAndImageBySHAInSingleTable() throws {
+    let db = try makeDB()
+    let sha = String(repeating: "c", count: 64)
+    try insertItem(
+        db,
+        id: "file-first",
+        origin: "self",
+        capturedAtNs: 100,
+        kind: .file,
+        text: "/tmp/CleanShot.png",
+        blobSha256: sha,
+        blobMime: "image/png",
+        pinned: true
+    )
+    try insertItem(
+        db,
+        id: "image-later",
+        origin: "self",
+        capturedAtNs: 999_000_000_000,
+        kind: .image,
+        blobSha256: sha,
+        blobMime: "image/png"
+    )
+
+    let hits = try SearchAPI(database: db).searchHits(SearchQuery(limit: 10))
+    #expect(hits.count == 1)
+    #expect(hits.first?.0.id == "image-later")
+    #expect(hits.first?.0.pinned == true)
 }
 
 @Test func foldSameTextAcrossOwnAndPeerInSingleTable() throws {

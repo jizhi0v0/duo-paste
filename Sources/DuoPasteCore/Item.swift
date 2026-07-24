@@ -160,10 +160,11 @@ extension Item {
     ///   Mac 端走 SQL `WHERE deleted_at_ns IS NULL` 在 fold 前过滤，iOS HistoryStore.merge
     ///   也已剔除——本函数作为 public API 不依赖 caller 记忆，自带这层兜底
     /// - 文本：`blob_sha256 == nil` 且 `text_full` 非空的行按 byte-equal 永久 fold
-    /// - Blob：同 sha 仅在**不同 origin** 且原始 capture 时间差 ≤ 15s 时 fold。
-    ///   每个 cluster 同一 origin 最多一行，所以本机主动重复复制仍保留时间线。
+    /// - Blob：同 sha 在**不同 origin** 且原始 capture 时间差 ≤ 15s 时 fold。
+    ///   同 origin、同 kind 的主动重复复制仍保留时间线；但图片 `file ↔ image` 是同一
+    ///   内容在 app 间的两种 pasteboard 表示，永久一对一 fold，最新表示决定粘贴语义。
     ///   原始时间优先从 UUIDv7 id 取，避免 paste 后 bump `captured_at_ns` 把组拆开。
-    ///   代表行取最早 capture（保留 CleanShot 等原始文件名），但排序时间取组内最新。
+    ///   普通跨 origin cluster 保留最早代表；含同-origin 跨 kind 图片时取最新代表。
     /// - Key：`text_full` 原值，大小写敏感、不 trim、不归一化空白
     /// - 文本 Winner：`max(capturedAtNs)`；同 ns 时保留先入的（与 dict 语义一致）
     /// - Pinned：参与行 `pinned` OR 聚合赋给 winner——"pin 是对内容的属性而非具体 row"
@@ -220,7 +221,9 @@ extension Item {
 
     private static func foldBlobGroup(_ items: [Item]) -> [Item] {
         blobFoldClusters(items).map { cluster in
-            var display = cluster.representative
+            var display = containsSameOriginCrossKindImage(cluster.members)
+                ? latestCapturedItem(cluster.members)
+                : cluster.representative
             display.capturedAtNs = cluster.latestCapturedAtNs
             display.pinned = cluster.pinned
             return display
@@ -249,8 +252,21 @@ extension Item {
             let candidate = clusters.indices
                 .filter { index in
                     let cluster = clusters[index]
-                    return !cluster.origins.contains(item.originDevice)
-                        && originalNs - cluster.earliestOriginalNs <= crossOriginBlobFoldWindowNs
+                    let sameOriginMembers = cluster.members.filter {
+                        $0.originDevice == item.originDevice
+                    }
+                    if sameOriginMembers.isEmpty {
+                        return originalNs - cluster.earliestOriginalNs
+                            <= crossOriginBlobFoldWindowNs
+                    }
+                    // CleanShot/浏览器先写 file，Claude/ChatGPT 随后把同字节写成 image。
+                    // 同 SHA + 同 origin + 图片 + 不同 kind 是表示转换，不是第二次内容。
+                    // 每个 cluster 同 origin/kind 最多一行，因此 file/image 只一对一配对，
+                    // 不会把同设备多次主动复制的 image/image 时间线全吞掉。
+                    return ItemClassifier.isImageBlob(item)
+                        && sameOriginMembers.allSatisfy {
+                            ItemClassifier.isImageBlob($0) && $0.kind != item.kind
+                        }
                 }
                 .min { lhs, rhs in
                     let leftDistance = originalNs - clusters[lhs].latestOriginalNs
@@ -281,6 +297,28 @@ extension Item {
             }
         }
         return clusters
+    }
+
+    private static func containsSameOriginCrossKindImage(_ items: [Item]) -> Bool {
+        for (index, item) in items.enumerated() where ItemClassifier.isImageBlob(item) {
+            if items.dropFirst(index + 1).contains(where: {
+                ItemClassifier.isImageBlob($0)
+                    && $0.originDevice == item.originDevice
+                    && $0.kind != item.kind
+            }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func latestCapturedItem(_ items: [Item]) -> Item {
+        items.max { lhs, rhs in
+            if lhs.capturedAtNs != rhs.capturedAtNs {
+                return lhs.capturedAtNs < rhs.capturedAtNs
+            }
+            return lhs.id < rhs.id
+        }!
     }
 
     private static func originalCaptureNs(_ item: Item) -> Int64 {
