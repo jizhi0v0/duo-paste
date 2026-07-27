@@ -111,3 +111,22 @@ private let pngBytes: Data = {
     let read = PasteboardWatcher.readImageFileBlob(at: file, maxBlobBytes: 1 << 20, sleep: { _ in })
     #expect(read == nil, "非图片后缀不读字节，保持 .file 纯路径语义")
 }
+
+@Test func uuRemotePlaceholderPrefersImageRepresentation() {
+    let first = URL(fileURLWithPath: "/private/tmp/.uuremote_aeawu02755850784238")
+    let second = URL(fileURLWithPath: "/private/tmp/.uuremote_aeawu027503496827147")
+
+    #expect(PasteboardWatcher.shouldPreferImagePayload(over: [first]))
+    #expect(PasteboardWatcher.shouldPreferImagePayload(over: [first, second]))
+}
+
+@Test func ordinaryOrMixedFilesKeepFileFirstSemantics() {
+    let ordinaryImage = URL(fileURLWithPath: "/Users/test/Desktop/photo.png")
+    let uuPlaceholder = URL(fileURLWithPath: "/private/tmp/.uuremote_123")
+    let misleadingDirectory = URL(fileURLWithPath: "/private/tmp/.uuremote_cache/report.pdf")
+
+    #expect(!PasteboardWatcher.shouldPreferImagePayload(over: []))
+    #expect(!PasteboardWatcher.shouldPreferImagePayload(over: [ordinaryImage]))
+    #expect(!PasteboardWatcher.shouldPreferImagePayload(over: [uuPlaceholder, ordinaryImage]))
+    #expect(!PasteboardWatcher.shouldPreferImagePayload(over: [misleadingDirectory]))
+}

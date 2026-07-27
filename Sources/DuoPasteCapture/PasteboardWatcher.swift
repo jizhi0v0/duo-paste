@@ -273,6 +273,38 @@ public actor PasteboardWatcher {
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [
             .urlReadingFileURLsOnly: true
         ]) as? [URL], !urls.isEmpty {
+            // UU 远程桌面同步图片时会同时写：
+            // - 一个无扩展名的 `.uuremote_*` 临时 file URL（传输占位，不是用户复制的文件）
+            // - 真正可粘贴的 PNG / TIFF representation
+            //
+            // 通常仍坚持 file > image，保住 Finder / 聊天软件“复制图片文件”的文件语义；
+            // 只有所有 file URL 都是 UU 占位名时才尝试图片 representation。若 UU 没提供
+            // 图片字节，继续按 file capture，避免静默吞掉未知内容。
+            if Self.shouldPreferImagePayload(over: urls) {
+                if let data = pasteboard.data(forType: .png) {
+                    return CapturedPasteboard(
+                        kind: .image,
+                        blob: data,
+                        blobExt: "png",
+                        blobMime: "image/png",
+                        sourceAppBundleID: bundleID,
+                        sourceAppName: appName,
+                        capturedAtNs: capturedAtNs
+                    )
+                }
+                if let data = pasteboard.data(forType: .tiff) {
+                    return CapturedPasteboard(
+                        kind: .image,
+                        blob: data,
+                        blobExt: "tiff",
+                        blobMime: "image/tiff",
+                        sourceAppBundleID: bundleID,
+                        sourceAppName: appName,
+                        capturedAtNs: capturedAtNs
+                    )
+                }
+            }
+
             let paths = urls.map { $0.path }.joined(separator: "\n")
 
             // 单文件且后缀是图片：尝试读字节存 blob，让 mirror client 能通过 /blob/<sha> 同步。
@@ -442,6 +474,16 @@ public actor PasteboardWatcher {
         }
 
         return nil
+    }
+
+    /// UU 远程桌面的图片剪贴板会附带 `.uuremote_*` file URL 占位。
+    /// 规则刻意只看 basename 且要求整组全命中，避免目录名偶然包含该字样、或多文件复制
+    /// 混入一个同名文件时改变既有 file-first 语义。调用方还必须确认 PNG/TIFF 字节存在；
+    /// 没有真实图片 representation 时仍按普通文件处理。
+    static func shouldPreferImagePayload(over fileURLs: [URL]) -> Bool {
+        !fileURLs.isEmpty && fileURLs.allSatisfy {
+            $0.lastPathComponent.hasPrefix(".uuremote_")
+        }
     }
 
     /// 把一段已确认非空的 plain text 包成 CapturedPasteboard。trim 后符合 `looksLikeURL`
