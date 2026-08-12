@@ -685,4 +685,40 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
 final class HUDPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    /// 关掉搜索框的系统自动补全候选列表。
+    ///
+    /// **这是 `SPCompletionListServiceViewController` 崩溃的根因修复**，不是又一个时序 hack。
+    ///
+    /// 崩栈（2026-07-25 与 2026-07-28 各一次，build 1270 = 含 2f2398e 的 HEAD）：
+    /// ```
+    /// 21 CoreFoundation __CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE__
+    /// 14 duo-pasted     SearchPanelController…closure   ← 已经是 DispatchQueue.main.async 里
+    /// 13 duo-pasted     PreviewPanelController.show
+    ///  9 AppKit         -[NSWindow _doWindowWillBeVisibleAsSheet:]   ← 发全局通知
+    ///  3 ViewBridge     -[NSRemoteView containingWindowWillOrderOnScreen:]  ← assert
+    /// ```
+    /// 关键：frame 14→16→19→21 说明 order 已经跑在干净的 main dispatch queue turn 上，
+    /// **完全不在 SwiftUI layout pass 里**。所以 CLAUDE.md 里"挪出 layout pass 就好了"
+    /// 的说法是错的——deferral 生效了，仍然崩。
+    ///
+    /// 真正的机制在 frame 9→3：任何窗口上屏都会广播一个通知，进程内**每个**
+    /// `NSRemoteView` 都是观察者。搜索框的自动补全候选列表是一个跨进程 remote view
+    /// （`com.apple.SafariPlatformSupport.Helper`）；当它自己已经没有 containing window
+    /// （assert 里的 `expected (null)`）却仍挂在观察者表上时，收到"某个 NonKeyHUDPanel
+    /// 要上屏"就会断言失败 → 未捕获 NSException → daemon 直接 abort。
+    ///
+    /// 预览浮窗那边无论怎么调时序都躲不开这条广播，唯一稳的办法是**让这个 remote view
+    /// 根本不存在**：剪贴板搜索框不需要系统文本补全。`NSWindow.fieldEditor(_:for:)` 是
+    /// SwiftUI `TextField` 背后 NSTextField 取字段编辑器的统一入口，在这里一次性关掉。
+    ///
+    /// **不要**把 `DispatchQueue.main.async` 那层 deferral 删掉——它便宜、无害，且崩溃
+    /// 复现困难，两层一起留着。
+    override func fieldEditor(_ createFlag: Bool, for client: Any?) -> NSText? {
+        let editor = super.fieldEditor(createFlag, for: client)
+        if let textView = editor as? NSTextView {
+            textView.isAutomaticTextCompletionEnabled = false
+        }
+        return editor
+    }
 }
