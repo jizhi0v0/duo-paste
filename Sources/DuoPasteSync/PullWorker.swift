@@ -125,6 +125,9 @@ public actor PullWorker {
 
     private var runTask: Task<Void, Never>?
     private var currentSleep: Task<Void, Error>?
+    /// `wake()` 在 tick 执行期间到达时（`currentSleep == nil`，cancel 无处可施）的留痕。
+    /// runLoop 在决定 sleep 前消费：见 `wake()` 与 runLoop 的注释。
+    private var pendingWake = false
     /// Full mirror 的 blob hydration 独立于 metadata pagination。否则一页里只要有大文件
     /// 或慢链路，`fetchBlobsFull` 的 await 就会把后续 `/since` cursor 永久堵在半路。
     private var blobHydrationTask: Task<Void, Never>?
@@ -198,13 +201,20 @@ public actor PullWorker {
         runTask = nil
     }
 
-    /// 外部（比如手动「立即同步」入口）通知：跳过当前 sleep。
-    /// 用法和 PushWorker.wake() 一致。
+    /// 外部（WSNotificationClient 收到 `cursor_advanced` / 手动「立即同步」）通知：
+    /// 跳过当前 sleep。
+    ///
+    /// **只 cancel sleep 是不够的**：通知很可能落在 tick **执行期间**（对端 commit 后
+    /// 立刻广播，而我们这一轮 `/since` 已经发出去了）。那一刻 `currentSleep == nil`，
+    /// cancel 无处可施，通知就被静默丢掉——本轮拉到空结果，新行要等满一个 `intervalSec`
+    /// （默认 30s）才被看见，违反 CLAUDE.md "WS 通知层让推送延迟 < 1s"。
+    /// 所以额外置 `pendingWake` 留痕，由 runLoop 在决定 sleep 前消费。
     public nonisolated func wake() {
-        Task { await self.cancelCurrentSleep() }
+        Task { await self.handleWake() }
     }
 
-    private func cancelCurrentSleep() {
+    private func handleWake() {
+        pendingWake = true
         currentSleep?.cancel()
     }
 
@@ -239,7 +249,7 @@ public actor PullWorker {
                 meshStatus.setConsecutiveFailures(peerDeviceID: pid, consecutiveTransientFailures)
             }
 
-            let sleepSec: TimeInterval
+            var sleepSec: TimeInterval
             if r.hadTransient {
                 sleepSec = min(
                     config.initialBackoffSec * pow(2.0, Double(consecutiveTransientFailures - 1)),
@@ -249,6 +259,14 @@ public actor PullWorker {
                 sleepSec = 0  // 立刻接下一页，赶上为止
             } else {
                 sleepSec = config.intervalSec
+            }
+            // tick 执行期间到达的 wake：本轮 /since 可能在对端 commit 之前就发出去了，
+            // 必须立刻再拉一轮而不是睡满 intervalSec。
+            // `!r.hadTransient` 短路在前 —— backoff **不**被 wake 打断，也不消费 flag：
+            // 对端 HTTP 持续失败而 WS 仍在推送时，打断退避会退化成无退避 tight loop。
+            if !r.hadTransient, pendingWake {
+                pendingWake = false
+                sleepSec = 0
             }
 
             if r.applied > 0 || r.skippedDedup > 0 || r.skippedPasteEcho > 0 || r.hadTransient {
@@ -262,6 +280,9 @@ public actor PullWorker {
                 self.currentSleep = task
                 _ = try? await task.value   // wake() / stop() 取消时抛 CancellationError，忽略
                 self.currentSleep = nil
+                // 走到这里 sleep 已结束——正常到期，或被 wake 取消。两种情况下一轮都会
+                // 立刻 tick，通知已经兑现；不清掉会让**再下一轮**白白少睡一次。
+                pendingWake = false
             }
         }
         log("worker stopped")
@@ -650,17 +671,49 @@ public actor PullWorker {
                     dedupSkipped += 1
                     continue
                 }
-                // INSERT OR REPLACE 让 state update（pin / 软删 / ingested_at_ns bump /
+                // UPSERT 让 state update（pin / 软删 / ingested_at_ns bump /
                 // OCR done 回放 extracted_text）。PR 4 已删 push_state / push_attempts /
                 // last_push_error 列。v9 加 extracted_text + extracted_text_source 两列。
+                //
+                // **绝对不能回退成 `INSERT OR REPLACE`**：REPLACE 为了满足 PK 约束会先
+                // DELETE 冲突行，而 DELETE 在这张表上有三个副作用，全都是错的：
+                //   1. `PRAGMA foreign_keys = ON` 下触发 `ON DELETE CASCADE`，把这条 item
+                //      的 v13 `pin_operation` 队列行**删掉**——非 owner 排队中的 pin 命令
+                //      凭空消失，UI 停在乐观值，下一次 canonical replay 又把 pinned 翻回
+                //      对端的旧值。破坏 CLAUDE.md"pin 由 owner 的 PullWorker 投递"不变量
+                //   2. **不**触发 `item_ad`（SQLite 文档：REPLACE 删行时 delete trigger
+                //      只在 `recursive_triggers` 打开时才 fire，本库没开），于是 FTS5
+                //      contentless-external 表里留下一条永不回收的孤儿行——每次 peer 行
+                //      重放泄漏一条，索引无界增长且旧正文永远搜得到
+                //   3. 走的是 `item_ai` 而非 `item_au`，只把 **new** group key 标 dirty；
+                //      text_full 变化时 **old** search_fold group 不会被重算
+                // ON CONFLICT DO UPDATE 三条全部规避：不删父行、走 `item_au`（FTS
+                // delete+insert）、old/new group key 都进 dirty 队列
                 let activePin = try DuoPasteCore.Database.activePinOperation(db, itemID: item.id)
                 try db.execute(sql: """
-                    INSERT OR REPLACE INTO item
+                    INSERT INTO item
                       (id, origin_device, captured_at_ns, ingested_at_ns, kind,
                        source_app, source_app_name, preview, text_full,
                        blob_sha256, blob_size, blob_mime, pinned, deleted_at_ns,
                        ocr_state, extracted_text, extracted_text_source)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        origin_device = excluded.origin_device,
+                        captured_at_ns = excluded.captured_at_ns,
+                        ingested_at_ns = excluded.ingested_at_ns,
+                        kind = excluded.kind,
+                        source_app = excluded.source_app,
+                        source_app_name = excluded.source_app_name,
+                        preview = excluded.preview,
+                        text_full = excluded.text_full,
+                        blob_sha256 = excluded.blob_sha256,
+                        blob_size = excluded.blob_size,
+                        blob_mime = excluded.blob_mime,
+                        pinned = excluded.pinned,
+                        deleted_at_ns = excluded.deleted_at_ns,
+                        ocr_state = excluded.ocr_state,
+                        extracted_text = excluded.extracted_text,
+                        extracted_text_source = excluded.extracted_text_source
                 """, arguments: [
                     item.id,
                     item.originDevice,
