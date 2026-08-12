@@ -9,7 +9,10 @@
 #         DP_SPARKLE_FW(Sparkle.framework 路径；空/不存在 → 不嵌、不写 SU 键)
 #         DP_SU_FEED_URL / DP_SU_PUBLIC_ED_KEY(嵌 Sparkle 时必填)
 #         DP_TIMESTAMP(1 → codesign 加 --timestamp，notarize 必需；默 0)
+#         DP_ICON(.icns 路径；默仓库 Resources/AppIcon.icns，不存在 → 不放图标也不写 key)
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 : "${DP_APP:?DP_APP 必填}"
 : "${DP_BINARY:?DP_BINARY 必填}"
@@ -47,6 +50,21 @@ if [[ "$EMBED_SPARKLE" == "1" ]]; then
     cp -R "$SPARKLE_FW" "$DP_APP/Contents/Frameworks/Sparkle.framework"
     install_name_tool -add_rpath "@loader_path/../Frameworks" "$DP_APP/Contents/MacOS/duo-pasted" 2>/dev/null \
         || echo "   (rpath 已存在，跳过)"
+fi
+
+# 图标：LSUIElement app 没有 Dock 图标，但 Finder、DMG、系统设置的登录项 / 隐私与安全性
+# （辅助功能授权列表）、通知和 Sparkle 更新界面都按 CFBundleIconFile 取它。缺文件时整段跳过，
+# 保持"没有图标也能出包"（.icns 由 scripts/make-icon.swift 生成，源在那个脚本里）。
+ICON_SRC="${DP_ICON:-$SCRIPT_DIR/../Resources/AppIcon.icns}"
+ICON_KEYS=""
+if [[ -f "$ICON_SRC" ]]; then
+    echo "==> 放入 app 图标: $(basename "$ICON_SRC")"
+    mkdir -p "$DP_APP/Contents/Resources"
+    cp "$ICON_SRC" "$DP_APP/Contents/Resources/AppIcon.icns"
+    ICON_KEYS="    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>"
+else
+    echo "==> 未找到图标($ICON_SRC)，跳过" >&2
 fi
 
 # 嵌 Sparkle 时拼一段 SU 键，注入 Info.plist。变量先算好，避免 heredoc 内嵌条件展开。
@@ -88,6 +106,7 @@ cat >"$DP_APP/Contents/Info.plist" <<INFO_EOF
     <true/>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+${ICON_KEYS}
 ${SU_KEYS}
 </dict>
 </plist>

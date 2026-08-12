@@ -118,6 +118,8 @@ CA root 位置 `mkcert -CAROOT`（默 `~/Library/Application Support/mkcert/`）
 
 部署产物：`~/Applications/DuoPaste.app` (`…/Contents/MacOS/duo-pasted`) + `~/Library/LaunchAgents/io.duopaste.agent.plist` + 日志 `~/Library/Logs/duo-paste/duo-pasted.{out,err}.log`。
 
+图标：`Resources/AppIcon.icns` 由 `scripts/make-icon.swift` **画出来**（双卡叠放 + 石墨底板，呼应菜单栏的 `doc.on.clipboard`）。改配色/构图改脚本重跑，**不要**手工 PS 一张覆盖进去——覆盖后下次要改就没有源了。每个尺寸独立矢量渲染而不是缩放 1024，且 ≤64px 换成两条更粗的文字线（缩下去会糊成灰块）。`assemble-bundle.sh` 负责拷进 `Contents/Resources/` 并写 `CFBundleIconFile`；文件缺失时整段跳过，不影响出包。LSUIElement app 没有 Dock 图标，这个图标出现在 Finder / DMG / 登录项 / 隐私与安全性的辅助功能列表 / 通知 / Sparkle 更新界面。
+
 签名：Developer ID Application: BO LI (`RS59HDH7Y3`) + hardened runtime，Bundle ID = `io.duopaste.daemon`。macOS TCC 按 Team ID + Bundle ID 判 Accessibility 权限——`install-agent.sh` 重装 cdhash 变但 DR 不变，权限自动跟。**禁止回退 adhoc 签名**：adhoc 让 Accessibility 列表旧 cdhash 失效，每次 install 都得重勾。
 
 ### launchctl 速查
