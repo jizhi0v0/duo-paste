@@ -303,6 +303,27 @@ public actor PasteboardWatcher {
                         capturedAtNs: capturedAtNs
                     )
                 }
+                // 只剩占位符、没有任何图片字节 → **整条不入库**。
+                //
+                // 这里推翻了本分支初版"没图片字节就继续按 file capture，避免静默吞掉未知
+                // 内容"的判断。当时的顾虑合理，但线上数据否定了它：用户库里 31 条
+                // `.uuremote_` 行全是 `kind=file` / `blob_sha256=NULL`，抽查 8 条路径有 7 条
+                // 在磁盘上**已经不存在**——它们是 UU 自己的剪贴板传输临时文件
+                // （`com.netease.uuremote{,.server}/Clipboard/`），用完即删，从来不是用户内容。
+                //
+                // 继续捕获的实际危害（用户报告"UU 远程时剪贴板被覆盖成 UU 的奇怪文件"）：
+                // 它们是最新条目、永远排在面板首位，⌥⌘V + Enter 粘出来就是这些死路径，
+                // `Copyback` 把它们当 file URL 写回 NSPasteboard —— 剪贴板真的被覆盖了；
+                // 还会通过 mesh / `/since` 同步到另一台 Mac 和 iOS，那边路径更无意义。
+                //
+                // **不能**靠 `capture.excluded_bundle_ids` 兜：实测 31 条里只有 15 条是 UU
+                // 前台时捕获的，其余 source_app 是 Claude / Chrome / ChatGPT / 钉钉 /
+                // System Settings —— UU 在别的 app 前台时也会往 pasteboard 写占位符。
+                //
+                // 跳过只影响 duo-paste 历史；**NSPasteboard 本身不受影响**，UU 自己的
+                // 粘贴照常工作。回归测试 `UURemotePlaceholderSkipTests.swift` 走真实
+                // named pasteboard，钉的是这条 `return nil` 而不是某个只有测试在用的谓词。
+                return nil
             }
 
             let paths = urls.map { $0.path }.joined(separator: "\n")
@@ -478,13 +499,13 @@ public actor PasteboardWatcher {
 
     /// UU 远程桌面的图片剪贴板会附带 `.uuremote_*` file URL 占位。
     /// 规则刻意只看 basename 且要求整组全命中，避免目录名偶然包含该字样、或多文件复制
-    /// 混入一个同名文件时改变既有 file-first 语义。调用方还必须确认 PNG/TIFF 字节存在；
-    /// 没有真实图片 representation 时仍按普通文件处理。
+    /// 混入一个同名文件时改变既有 file-first 语义。
     static func shouldPreferImagePayload(over fileURLs: [URL]) -> Bool {
         !fileURLs.isEmpty && fileURLs.allSatisfy {
             $0.lastPathComponent.hasPrefix(".uuremote_")
         }
     }
+
 
     /// 把一段已确认非空的 plain text 包成 CapturedPasteboard。trim 后符合 `looksLikeURL`
     /// 升 `.url`，否则保留原 `.text`。RTF/HTML 降级 + step 6 都共用，让"plain text + 看
