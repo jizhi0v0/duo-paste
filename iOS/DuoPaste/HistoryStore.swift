@@ -216,58 +216,49 @@ final class HistoryStore {
         pendingPinTargets.removeValue(forKey: id)
     }
 
-    /// peer 拉到一批 item 时调。按 id 去重,tombstone (deletedAtNs 非空) 直接移除。
-    /// 重排序:pinned DESC,captured_at_ns DESC。
+    /// 每页 canonical 行落库后的本地乐观状态对账。由 `MetadataMirrorStore.synchronize`
+    /// 的 `onPageApplied` 驱动（前台 pull 与 BGAppRefreshTask 共用同一条路径）。
     ///
-    /// 已有 id 跟 incoming id 撞 → 用 incoming 全字段(Mac 是权威),**但 capturedAtNs
-    /// 取 max(local, incoming)**——保护 iOS 本机乐观顶(bumpToFront)在 /since 拉
-    /// stale Mac 行时不被覆盖回去。Mac 的 UCB 链路真 bump 了的话 Mac 那行 capturedAtNs
-    /// 也是新的,max 仍是新值,两边一致;Mac 没 bump → 本机乐观值赢
+    /// **为什么必须有这个 hook**：R2.1 之后 item 行归 SQLite mirror 所有，列表由
+    /// `refreshFromMirror()` 从 SQLite 重新投影，原来的 `merge(_:)` 里"把 incoming 并进
+    /// 内存数组"那半边确实被取代了——但它同时还承担着三件**没有替代品**的对账工作，
+    /// 随着 `merge` 一起变成死代码：
     ///
-    /// **乐观删除联动**:`deleteTracker.observeIncoming` 返回的 skipIds 让 in-flight
-    /// /since 带回的同 text_full sibling 屏蔽不入库,resurrectedIds 触发 banner.
-    /// Server cascade tombstone 到达自动清 pending entry
-    func merge(_ incoming: [Item]) {
+    /// 1. **删除未送达**：`removeOptimistic` 把 id 放进 `optimisticallyDeletedIDs`，
+    ///    `refreshFromMirror` / `searchLocal` 据此把行藏起来。Mac 不可达时 DELETE 被
+    ///    swallow（`PeerSyncCoordinator.deleteItemOnServer`），行根本没被 tombstone；
+    ///    没有本函数就永远没人把它从集合里拿出来 —— 卡片一直"假装已删"，橙色 banner
+    ///    （`HistoryView` 的 `deleteFailureMessage`）永远不出现，重启后条目又无声无息
+    ///    地回来了。
+    /// 2. **pin 等待同步**：非 owner 的 pin 走 owner-routed command，`/pin` 返回
+    ///    `pending`，`markPinApplied` 不会被调用（它只在 `applied` 时调）。CLAUDE.md
+    ///    要求"后续 canonical `/since` 行确认目标值再清"——就是这里。否则卡片永久显示
+    ///    "等待同步"。
+    /// 3. **tombstone 清场**：真 tombstone 回流时清掉三张 overlay 表，避免无界增长。
+    ///
+    /// `skipIds` 在 mirror 架构下不需要特别处理：grace 窗口内的 sibling 仍在
+    /// `optimisticallyDeletedIDs` 里，投影时本来就是隐藏的。
+    func reconcileOptimisticState(with incoming: [Item]) {
         guard !incoming.isEmpty else { return }
         let outcome = deleteTracker.observeIncoming(incoming)
-        var byID: [String: Item] = [:]
-        for it in items { byID[it.id] = it }
-        for incomingItem in incoming {
-            var it = incomingItem
+
+        for it in incoming {
             if it.isTombstone {
-                byID.removeValue(forKey: it.id)
+                // server 真删掉了：乐观态功成身退，overlay 全清
                 pendingPinTargets.removeValue(forKey: it.id)
                 optimisticCapturedAtNs.removeValue(forKey: it.id)
                 optimisticallyDeletedIDs.remove(it.id)
                 continue
             }
-            // grace 窗口内 in-flight /since 带回同 text_full sibling → skip 不入库
-            // (Mac cascade tombstone 还在路上,先压住不让 fold 闪回)
-            if outcome.skipIds.contains(it.id) {
-                continue
-            }
-            if let desired = pendingPinTargets[it.id] {
-                if it.pinned == desired {
-                    // owner-routed command 已通过 Mac `/since` 回放到 iOS。
-                    pendingPinTargets.removeValue(forKey: it.id)
-                } else {
-                    // pending window 保护 optimistic UI，不让旧 canonical 行造成闪回。
-                    it.pinned = desired
-                }
-            }
-            if let optimisticNs = optimisticCapturedAtNs[it.id] {
-                it.capturedAtNs = max(it.capturedAtNs, optimisticNs)
-            }
-            if let existing = byID[it.id], existing.capturedAtNs > it.capturedAtNs {
-                var merged = it
-                merged.capturedAtNs = existing.capturedAtNs
-                byID[it.id] = merged
-            } else {
-                byID[it.id] = it
+            // canonical 行已经达到目标值 → owner 的 pin 命令确实回放到了，清"等待同步"
+            if let desired = pendingPinTargets[it.id], it.pinned == desired {
+                pendingPinTargets.removeValue(forKey: it.id)
             }
         }
+
+        // grace 之后仍以 active 身份回流 = 删除没送达。放出来让用户看见并重试——
+        // 不回滚乐观删除（内容字段已丢），只恢复可见性 + 提示
         for id in outcome.resurrectedIds { optimisticallyDeletedIDs.remove(id) }
-        items = Array(byID.values.sorted(by: Self.iosListOrder).prefix(Self.displayLimit))
         let resurrectedCount = outcome.resurrectedIds.count
         if resurrectedCount > 0 {
             deleteFailureMessage = resurrectedCount == 1
@@ -559,16 +550,6 @@ final class HistoryStore {
         }
     }
 
-    @discardableResult
-    func applyPage(items incoming: [Item], nextCursor: SinceCursor) async throws -> SinceCursor {
-        guard let mirror else { throw HistoryStoreError.mirrorUnavailable }
-        let persisted = try await Task.detached(priority: .utility) {
-            try mirror.applyPage(items: incoming, nextCursor: nextCursor)
-        }.value
-        merge(incoming)
-        return persisted
-    }
-
     /// 前台与 BG pull 的统一 gap-safe 路径。正常先从持久化 cursor 增量拉；server
     /// `total_count` 暴露迟到旧行缺口时，Core 自动从 zero 做非破坏性 backfill。
     func synchronizeMetadata(
@@ -586,6 +567,9 @@ final class HistoryStore {
                 progress: { progress in
                     await self.applySyncProgress(progress)
                 },
+                onPageApplied: { pageItems in
+                    await self.reconcileOptimisticState(with: pageItems)
+                },
                 fetchPage: { cursor, limit in
                     try await client.fetchSince(cursor: cursor, limit: limit)
                 }
@@ -599,6 +583,7 @@ final class HistoryStore {
             // user cancellation already labeled it paused, while automatic route switches stay
             // transient and let their replacement pull own the status.
             refreshFromMirror()
+            resolveCancelledSyncActivity()
             throw CancellationError()
         } catch {
             // URLSession/NWConnection may surface a transport error after its parent task was
@@ -606,6 +591,7 @@ final class HistoryStore {
             // overwrite the replacement pull's UI with a stale failure.
             if Task.isCancelled {
                 refreshFromMirror()
+                resolveCancelledSyncActivity()
                 throw CancellationError()
             }
             refreshFromMirror()
@@ -623,6 +609,18 @@ final class HistoryStore {
     }
 
     func applySyncProgress(_ progress: MetadataMirrorSyncProgress) {
+        // 取消之后到达的进度必须丢弃。`cancelPull` 是同步 @MainActor（markSyncPaused →
+        // task.cancel() 之间没有 await），所以它跟本函数在 main actor 上严格串行：一次
+        // progress 要么整个跑在 cancel 之前（随后被 `.paused` 正确覆盖），要么跑在之后
+        // 被这道 guard 挡下。
+        //
+        // 少了这道 guard 就有一个真实窗口：用户点「取消」时恰好有一页刚 commit ——
+        // `pullPass` 先 applyPage 再 await progress，最后才 checkCancellation。progress
+        // 把 activity 从 `.paused` 又推回 `.syncing`，随后 CancellationError 抛出，没人
+        // 再改它。结果：卡片永久停在「首次同步中」，取消按钮消失（isPulling 已 false），
+        // 而 `reloadSyncCheckpoint` 开头的 `guard activity != .syncing` 让之后每一次
+        // 前台恢复都变成 no-op —— 只能重启 app 才能解开。
+        guard !Task.isCancelled else { return }
         if progress.pass == .backfill {
             syncStatus.mode = .rebuilding
         }
@@ -633,6 +631,20 @@ final class HistoryStore {
         if syncStatus.currentPeer == nil {
             syncStatus.currentPeer = progress.sourceDeviceID
         }
+    }
+
+    /// 取消收尾兜底：确保没有任何 activity 停在「正在同步」这句谎话上。
+    ///
+    /// 用户主动取消时 `cancelPull` 已经置 `.paused`，这里不动它——**也绝不能**在这里调
+    /// `markSyncPaused()`，那会写 `syncPausedDefaultsKey` 把用户级自动同步一并关掉，
+    /// 而 route 切换并不是用户的暂停意图。
+    ///
+    /// 剩下的情况是 `cancelPullForHTTPRouteChange`：如果替补 pull 没能接手（切换后
+    /// kickPull 未触发 / 立刻失败），`.syncing` 就没有主人了。降级成 `.idle` 让
+    /// `reloadSyncCheckpoint` 能重新分类，而不是被它开头的 guard 永久短路。
+    private func resolveCancelledSyncActivity() {
+        guard syncStatus.activity == .syncing else { return }
+        syncStatus.activity = .idle
     }
 
     func markSyncPaused() {

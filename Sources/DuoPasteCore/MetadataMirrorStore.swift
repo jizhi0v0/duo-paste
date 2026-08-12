@@ -118,10 +118,16 @@ public struct MetadataMirrorStore: Sendable {
     /// 增量追平后若 server raw row count 大于本地，说明 source 曾在 client cursor 之后
     /// 补进更老的行。普通 `(ingested_at_ns,id) > cursor` 永远看不到它们；从 zero 做一次
     /// **非破坏性 backfill**，upsert 缺行且保持已持久化 cursor 单调不回退。
+    /// - Parameter onPageApplied: Called with the page's items **after** they are durably committed.
+    ///   `progress` deliberately carries only counters, so a client that must reconcile per-row
+    ///   optimistic state (iOS: pending pin intents, optimistic deletes) has no other hook — without
+    ///   one it silently never sees canonical rows at all. Fires after the writer transaction so a
+    ///   client may clear local state knowing the row is already persisted. Default no-op.
     public func synchronize(
         pageLimit: Int = 500,
         maxPages: Int = 200,
         progress: @escaping @Sendable (MetadataMirrorSyncProgress) async -> Void = { _ in },
+        onPageApplied: @escaping @Sendable ([Item]) async -> Void = { _ in },
         fetchPage: @escaping @Sendable (SinceCursor, Int) async throws -> SincePageWire
     ) async throws -> MetadataMirrorSyncReport {
         let startCursor = try cursor()
@@ -131,6 +137,7 @@ public struct MetadataMirrorStore: Sendable {
             maxPages: maxPages,
             pass: .incremental,
             progress: progress,
+            onPageApplied: onPageApplied,
             fetchPage: fetchPage
         )
 
@@ -160,6 +167,7 @@ public struct MetadataMirrorStore: Sendable {
                 expectedSourceDeviceID: sourceDeviceID,
                 pass: .backfill,
                 progress: progress,
+                onPageApplied: onPageApplied,
                 fetchPage: fetchPage
             )
             backfillPages = backfill.pages
@@ -209,6 +217,7 @@ public struct MetadataMirrorStore: Sendable {
         expectedSourceDeviceID: String? = nil,
         pass: MetadataMirrorSyncPass,
         progress: @escaping @Sendable (MetadataMirrorSyncProgress) async -> Void,
+        onPageApplied: @escaping @Sendable ([Item]) async -> Void = { _ in },
         fetchPage: @escaping @Sendable (SinceCursor, Int) async throws -> SincePageWire
     ) async throws -> PullPassResult {
         var requestCursor = startCursor
@@ -232,6 +241,8 @@ public struct MetadataMirrorStore: Sendable {
                 nextCursor: page.nextCursor,
                 sourceDeviceID: pageSourceDeviceID
             )
+            // 已 commit 才回调：client 据此清本地乐观状态时，行必然已经持久化。
+            await onPageApplied(page.items)
             let localItemCount = try totalItemCount()
             let sourceTrackedItemCount: Int?
             if let sourceDeviceID = observedSourceDeviceID {
@@ -239,6 +250,16 @@ public struct MetadataMirrorStore: Sendable {
             } else {
                 sourceTrackedItemCount = nil
             }
+            // 取消之后**绝不再发布进度**。原来这里只在 progress 之后 check，于是"用户点
+            // 取消时恰好有一页刚 commit"会让最后一次 progress 把 UI 状态推回"正在同步"，
+            // 而随后抛出的 CancellationError 没有任何人再纠正它——iOS 卡片永久停在
+            // 「首次同步中」，且 `HistoryStore.reloadSyncCheckpoint` 开头的
+            // `guard activity != .syncing` 让之后每次前台恢复都成为 no-op。
+            //
+            // 注意顺序：`onPageApplied` 在上面、取消检查在这里。已经 commit 的行照常对账
+            // （client 清乐观状态是安全的，行确实持久化了）；只有"报告仍在进行中"这件事
+            // 必须停下。cursor 已在同一 writer transaction 里推进，取消不丢进度。
+            try Task.checkCancellation()
             await progress(MetadataMirrorSyncProgress(
                 pass: pass,
                 pageNumber: pageNumber,
