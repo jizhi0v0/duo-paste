@@ -1241,6 +1241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.state.pasteProgress = .failed(reason: "选中项无可写入内容")
                     return
                 }
+                self.detachCompletedPasteTask()
                 let target = self.panel.previousFrontmostApp
                 // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
@@ -1279,6 +1280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 fingerprint: PasteSuppressionSet.fingerprint(text: pastedText),
                 ttlSec: 300
             )
+            self.detachCompletedPasteTask()
             let target = self.panel.previousFrontmostApp
             self.panel.hide(immediate: true)
             PasteInjector.injectCmdV(into: target)
@@ -1314,6 +1316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.state.pasteProgress = .failed(reason: "选中图片无可写入内容")
                     return
                 }
+                self.detachCompletedPasteTask()
                 let target = self.panel.previousFrontmostApp
                 // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
@@ -1347,6 +1350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let got = items.count - stillMissing.count
                 self.state.postNotice("已 paste \(got) 张图（共 \(items.count)，余 \(stillMissing.count) 张未拉到）")
             }
+            self.detachCompletedPasteTask()
             let target = self.panel.previousFrontmostApp
             // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
             // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
@@ -1441,6 +1445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .success:
                 self.state.pasteProgress = .idle
                 await self.performLocalPaste(item)
+                self.detachCompletedPasteTask()
                 let target = self.panel.previousFrontmostApp
                 // immediate=true 同步 orderOut,让出 key window 给 target,否则 panel
                 // 140ms 淡出动画期间 CGEvent Cmd+V 会被路由到 panel 而不是目标 app
@@ -1490,6 +1495,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentPasteTask?.cancel()
         currentPasteTask = nil
         state.pasteProgress = .idle
+    }
+
+    /// 字节已经写进 NSPasteboard = 过了不可回退点。之后的收尾（`panel.hide` → `injectCmdV`
+    /// → `bumpUsedItems`）必须**注销** currentPasteTask 才能继续跑。
+    ///
+    /// **为什么**：paste 路径要 `panel.hide(immediate: true)` 同步让出 key window，而
+    /// `hide` 会同步走 `finalizeHideImmediate → onDismiss → cancelLazyPasteIfAny`——
+    /// 那一刻 `currentPasteTask` 还指向**正在执行这段代码的 task 自己**，于是 task 自杀。
+    /// 后面的 `await bumpUsedItems(...)` 就跑在一个已取消的 task 里：GRDB 的 async
+    /// read/write 遵循 task cancellation（官方文档："Once an async Task is cancelled,
+    /// reads and writes throw CancellationError"），`bumpCapturedAt` 抛错被 `try?` 吞掉 →
+    /// `maxIngest` 恒为 0 → 提前 return → **"用过即顶"静默失效，`state.refresh()` 也不跑**。
+    /// 快路径 `pasteBackSingle`（不存 currentPasteTask）不受影响，所以这个 bug 只在
+    /// ⇧⌘V / 多选 / 懒拉 blob 上出现，日常单条 Enter 看不出来。
+    ///
+    /// 注销**不等于**放弃取消能力：注销点在 pasteboard 写入之后，此前的 lazy fetch 阶段
+    /// currentPasteTask 仍然挂着，Esc / 失焦 仍按 CLAUDE.md §"blob 懒拉的不变量" #6 正常
+    /// cancel，不会留下孤儿写入。
+    private func detachCompletedPasteTask() {
+        currentPasteTask = nil
     }
 
     /// paste 成功后顶 used items:bump captured_at_ns + ingested_at_ns 让列表里浮到最前 +
