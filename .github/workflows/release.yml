@@ -422,7 +422,13 @@ jobs:
             git push
           fi
 
+      # continue-on-error：这一步的失败**不可信**。2026-08-12 的 run 31577953326 在
+      # 'Uploading …dmg' 之后报 `other side closed` 判失败，但 asset 实际已完整落地
+      # （state=uploaded、size 跟 appcast length 一字不差，DMG 下载回来 hdiutil verify +
+      # spctl + stapler 全过）。self-hosted runner 走本机 Surge 代理，长上传的响应端断连
+      # 是常态。真假由下一步按 GitHub API 的事实判定，别拿这一步的退出码当结论。
       - name: Create release on releases repo
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ env.RELEASES_REPO }}
@@ -437,3 +443,89 @@ jobs:
             Channel: **${{ needs.prepare.outputs.channel }}**
             Build: ${{ needs.prepare.outputs.build }}
             Commit: ${{ github.sha }}
+
+      # 上一步的红叉/绿勾都不作数，这里按 GitHub API 的事实收敛：release 在不在、asset 在不在、
+      # state 是不是 uploaded、字节数对不对。缺什么补什么，补不上才让 job 真失败。
+      #
+      # 为什么必须校到字节数：appcast 的 <enclosure length> 是 build job 对本地 DMG 算的，
+      # Sparkle 会拿它跟下载到的字节比。传了一半的 asset 会让**所有**客户端更新失败，而
+      # release 页面看上去是好的——比整步失败更难发现。
+      - name: Verify + repair release asset
+        env:
+          TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          REPO: ${{ env.RELEASES_REPO }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+          DMG_NAME: ${{ needs.build-macos.outputs.dmg_name }}
+          DMG_SIZE: ${{ needs.build-macos.outputs.dmg_size }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          DMG="artifacts/macos-dmg/${DMG_NAME}"
+          test -f "$DMG" || { echo "::error::DMG 不见了: $DMG"; exit 1; }
+          ACTUAL=$(stat -f%z "$DMG")
+          # appcast 里写的 length 来自 build job；跟本地文件对不上说明两个 job 拿到的不是
+          # 同一个文件，此时补传只会让 Sparkle 拿到一个签名/长度都对不上的包
+          if [[ "$ACTUAL" != "$DMG_SIZE" ]]; then
+            echo "::error::DMG 字节数跟 appcast length 不一致 (本地 $ACTUAL / appcast $DMG_SIZE)"
+            exit 1
+          fi
+          # tag 里有 '+'（v0.1.1279-beta+8dccf16），URL path 段必须转义
+          TAG_ENC="${TAG//+/%2B}"
+          API="https://api.github.com/repos/${REPO}"
+          UPLOADS="https://uploads.github.com/repos/${REPO}"
+          AUTH=(-H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28")
+
+          # 6 次：一轮 create + 两轮"传坏了再补"还留有余量（实测一次修复要吃掉 3 轮）
+          for attempt in 1 2 3 4 5 6; do
+            [[ $attempt -gt 1 ]] && { echo "== 第 $attempt 次尝试（退避 $((attempt * 10))s）"; sleep $((attempt * 10)); }
+
+            REL=$(curl -sS --fail-with-body "${AUTH[@]}" "${API}/releases/tags/${TAG_ENC}" 2>/dev/null || echo "")
+            REL_ID=$(printf '%s' "$REL" | python3 -c 'import json,sys; d=sys.stdin.read().strip(); print(json.loads(d)["id"] if d else "")' 2>/dev/null || echo "")
+
+            if [[ -z "$REL_ID" ]]; then
+              echo "release ${TAG} 不存在，创建"
+              BODY=$(python3 -c 'import json,os; print(json.dumps({
+                  "tag_name": os.environ["TAG"],
+                  "name": os.environ["TAG"],
+                  "prerelease": os.environ["PRERELEASE"] == "true",
+                  "body": "Channel: **%s**\nBuild: %s\nCommit: %s" % (
+                      os.environ["CHANNEL"], os.environ["BUILD"], os.environ["COMMIT_SHA"]),
+              }))')
+              curl -sS --fail-with-body "${AUTH[@]}" -X POST "${API}/releases" -d "$BODY" >/dev/null || true
+              continue
+            fi
+
+            # 这个 asset 现在是什么状态？(id, state, size)
+            read -r ASSET_ID STATE SIZE <<<"$(printf '%s' "$REL" | DMG_NAME="$DMG_NAME" python3 -c '
+            import json, os, sys
+            rel = json.load(sys.stdin)
+            for a in rel.get("assets", []):
+                if a["name"] == os.environ["DMG_NAME"]:
+                    print(a["id"], a.get("state", "?"), a.get("size", -1)); break
+            else:
+                print("", "", "")
+            ')"
+
+            if [[ -n "$ASSET_ID" && "$STATE" == "uploaded" && "$SIZE" == "$ACTUAL" ]]; then
+              echo "✅ asset 完整：${DMG_NAME} state=uploaded size=${SIZE}"
+              exit 0
+            fi
+
+            if [[ -n "$ASSET_ID" ]]; then
+              echo "asset 不完整 (state=${STATE} size=${SIZE} 期望 ${ACTUAL})，删掉重传"
+              curl -sS "${AUTH[@]}" -X DELETE "${API}/releases/assets/${ASSET_ID}" >/dev/null || true
+            fi
+
+            echo "上传 ${DMG_NAME} (${ACTUAL} bytes)"
+            curl -sS "${AUTH[@]}" -H "Content-Type: application/octet-stream" \
+              --data-binary @"$DMG" \
+              "${UPLOADS}/releases/${REL_ID}/assets?name=${DMG_NAME// /%20}" >/dev/null || \
+              echo "上传返回非零（可能只是响应端断连），下一轮按 API 事实复核"
+          done
+
+          echo "::error::${DMG_NAME} 在 6 次尝试后仍未完整落地到 release ${TAG}"
+          exit 1
