@@ -477,7 +477,7 @@ struct SearchView: View {
             if state.results.isEmpty {
                 emptyView
             } else {
-                cardScroller
+                cardScrollerRow
             }
         }
         // panel 内点空白(非 card / 非 TextField / 非 chip)关 preview——SwiftUI hit-test
@@ -1042,6 +1042,41 @@ struct SearchView: View {
         return state.results.first?.id
     }
 
+    /// 左侧「回到开头」箭头 + 横向卡片区。箭头占独立 slot(不是 overlay)——overlay 会盖在
+    /// 第一张卡的 source icon(offset -9,-9)上,既挡内容又抢 hit-test
+    private var cardScrollerRow: some View {
+        HStack(spacing: 0) {
+            jumpToStartButton
+            cardScroller
+        }
+    }
+
+    /// 把卡片区滚回最左。**纯滚动控件**——不清 query、不改选中、不动 chip。
+    /// 搜索条件是用户刚敲进去的上下文,顺手清掉会很糟糕(清空搜索框是右键菜单
+    /// 「在完整列表中显示」那条路的事)
+    private var jumpToStartButton: some View {
+        Button {
+            state.scrollToStart()
+        } label: {
+            // 大号 chevron:小箭头在 236pt 高的卡片区旁边几乎看不见(user 反馈)。
+            // 命中区给满整个卡片区高度,鼠标往左边一甩就能点到
+            Image(systemName: "chevron.left")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 30, height: Self.cardScrollerHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("回到最左")
+        .padding(.leading, 6)
+        // 跟 cardScroller 同样的底部 padding,让按钮跟卡片区在同一垂直中心上
+        .padding(.bottom, Self.cardScrollerBottomPadding)
+    }
+
+    /// LazyHStack 最前面那个不可见 spacer 的 scrollTo 锚点。**不是** item id,
+    /// 用固定字符串避开跟真实 item id 撞车
+    private static let startAnchorID = "__duo_paste_card_scroller_start__"
+
     /// Paste.app 风格横向卡片滚动。LazyHStack 让千条 item 不卡——出视口的卡 unload。
     /// ScrollViewReader.scrollTo 配 selectedIDs.last + scrollPulse 让箭头导航能滚到选中卡
     private var cardScroller: some View {
@@ -1058,6 +1093,15 @@ struct SearchView: View {
                 // 含 12pt slack,topRight icon 的 8pt 溢出落在 slack 内,scrollTo 最右卡时
                 // 不会被 ScrollView clip 切掉 icon
                 LazyHStack(alignment: .top, spacing: 14) {
+                    // 开头 16pt slack 用 spacer 而不是容器 `.padding(.leading, 16)` 实现——
+                    // 只有独立的 view 才能挂 .id 被 scrollTo 锚定。锚 spacer 的 leading 边
+                    // = 内容 offset 0,第一张卡 offset(-9,-9) 的 source icon 完整落在 slack 里;
+                    // 锚第一张卡本身(anchor .leading)会把卡的左边缘贴到视口左缘,icon 被
+                    // ScrollView clip 切掉一半(user 反馈"第一个 card 的 icon 仍然显示不全")。
+                    // spacing=14 会额外加在它跟第一张卡之间,所以宽度取 16-14=2
+                    Color.clear
+                        .frame(width: 2, height: 1)
+                        .id(Self.startAnchorID)
                     // 前 9 张挂 ⌘1 ~ ⌘9 序号,enumerated 拿 index;之后传 nil 不显示角标
                     ForEach(Array(state.results.enumerated()), id: \.element.id) { offset, item in
                         ItemCard(
@@ -1182,6 +1226,14 @@ struct SearchView: View {
                                 Button("粘贴为纯文本") { onPastePlainText([item]) }
                                     .keyboardShortcut("v", modifiers: [.command, .shift])
                             }
+                            // 搜索状态下才有意义：清空搜索框回到完整列表，并把这张卡
+                            // 滚进视口选中。query 为空时列表本来就是完整的，不显示
+                            if !state.query.isEmpty {
+                                Divider()
+                                Button("在完整列表中显示") {
+                                    state.revealInFullList(item)
+                                }
+                            }
                             if let onReveal,
                                item.kind == .file || item.kind == .image {
                                 Button("在 Finder 显示") { onReveal(item) }
@@ -1213,15 +1265,14 @@ struct SearchView: View {
                     Color.clear
                         .frame(width: 24, height: 1)
                 }
-                // 顶部 12pt 给 icon offset(y:-9) 上溢出留 buffer + 跟 filter hairline 间距;
-                // leading 16 让最左第一张卡的 source icon offset(-9,-9) 不被 ScrollView clip。
-                // **从 12pt 加到 16pt 的原因**:去掉 ItemCard `.equatable()` 后 SwiftUI layout
-                // 算法换了一条路径,第一张卡 icon 中心刚好落在 ScrollView 整数像素 clip 边界
-                // 上,渲染时向内取整切掉 icon 最左半像素。给 4pt buffer 把 icon 中心推离边界
-                // safe zone 内,顶住 sub-pixel rounding 振荡 + 未来 icon size 调整 / SwiftUI
-                // 升级 / HiDPI 缩放差异
+                // 顶部 12pt 给 icon offset(y:-9) 上溢出留 buffer + 跟 filter hairline 间距。
+                // **leading 16 已改成开头那个带 .id 的 spacer**(2pt + spacing 14 = 同样 16pt),
+                // 因为容器 padding 挂不上 scrollTo 锚点。它保护的东西没变:最左第一张卡的
+                // source icon offset(-9,-9) 不被 ScrollView clip。历史上从 12 加到 16 是因为
+                // 去掉 ItemCard `.equatable()` 后 SwiftUI layout 换了路径,icon 中心刚好落在
+                // ScrollView 整数像素 clip 边界上被向内取整切掉半像素——4pt buffer 顶住
+                // sub-pixel rounding 振荡 + 未来 icon size 调整 / SwiftUI 升级 / HiDPI 差异
                 .padding(.top, 12)
-                .padding(.leading, 16)
             }
             // 横向 padding 22 跟 header/filterBar 对齐,panel 左右两侧 padding 统一。
             // frame height = 卡片 236 + top 12 + bottom 6 余量,ScrollView 不 fill remaining
@@ -1229,7 +1280,9 @@ struct SearchView: View {
             // SwiftUI 让内容 vertical center 留下方空白)。常量 `cardScrollerHeight` 跟
             // emptyView 共用避免改一处忘改另一处再抖
             .frame(height: Self.cardScrollerHeight)
-            .padding(.horizontal, 22)
+            // leading 由 jumpToStartButton 的 slot(12 + 24)顶掉,这里只留 trailing 22
+            // 跟 header/filterBar 右边对齐
+            .padding(.trailing, 22)
             .padding(.bottom, Self.cardScrollerBottomPadding)
             .onChange(of: state.scrollPulse) { _, _ in
                 if let id = state.selectedIDs.last {
@@ -1242,7 +1295,24 @@ struct SearchView: View {
                     // 视觉上"闪现"而非"一张一张滑过去"。即时跳变让每个 keyDown 跳一张
                     // 距离,60fps 下长按看起来是连续平滑翻动,跟 macOS Finder 列表箭头
                     // 行为一致
-                    proxy.scrollTo(id)
+                    //
+                    // 目标是第一张卡时改锚 startAnchorID:anchor=nil 只保证卡片 frame 完整
+                    // 露出,而 source icon 是 offset(-9,-9) 溢出到 frame 之外的,照样被 clip
+                    if id == state.results.first?.id {
+                        proxy.scrollTo(Self.startAnchorID, anchor: .leading)
+                    } else {
+                        proxy.scrollTo(id)
+                    }
+                }
+            }
+            // 左侧箭头 —— 纯滚动,不动 selectedIDs / query / chip
+            .onChange(of: state.scrollToStartPulse) { _, _ in
+                proxy.scrollTo(Self.startAnchorID, anchor: .leading)
+            }
+            // 「在完整列表中显示」定位 —— 居中,让用户一眼看到命中的是哪张
+            .onChange(of: state.centerScrollPulse) { _, _ in
+                if let id = state.selectedIDs.last {
+                    proxy.scrollTo(id, anchor: .center)
                 }
             }
             // panel 复用——openPulse++ 时 scrollTo **minimal** (anchor=nil) 让 anchor 卡
@@ -1256,7 +1326,12 @@ struct SearchView: View {
             // 张"到"保留用户视野" 经过两轮迭代,详 CLAUDE.md "空格预览" 段
             .onChange(of: state.openPulse) { _, _ in
                 if let id = state.selectedIDs.last ?? state.results.first?.id {
-                    proxy.scrollTo(id)
+                    // 同 scrollPulse:第一张卡锚 startAnchorID 才不切 icon
+                    if id == state.results.first?.id {
+                        proxy.scrollTo(Self.startAnchorID, anchor: .leading)
+                    } else {
+                        proxy.scrollTo(id)
+                    }
                 }
             }
         }
@@ -2178,7 +2253,12 @@ private struct ItemCard: View, Equatable {
             radius: isSelected ? 14 : 0,
             x: 0, y: isSelected ? 4 : 0
         )
-        .animation(.smooth(duration: 0.22), value: isSelected)
+        // **isSelected 不挂隐式动画**——高亮必须跟卡片同帧出现。
+        // 曾经是 `.animation(.smooth(duration: 0.22), value: isSelected)`,但 LazyHStack
+        // 的 cell pool 会把旧 cell 复用给新 item:results 整批替换时,slot 里那个 view 实例
+        // 不变、只是 isSelected 从 false 翻成 true,SwiftUI 于是把它当"同一个视图的属性变化"
+        // 播 0.22s 过渡。用户看到的就是"搜索后 card 已经出来,高亮框慢一点才飞过来"。
+        // hover ring 不受影响(hover 永远是同一个 item 上的真实状态变化,animate 合理)
         .animation(.smooth(duration: 0.18), value: isHovered)
         .onHover { isHovered = $0 }
         // source app icon **钉在卡左上 border 上**——sticker 半溢出风格,

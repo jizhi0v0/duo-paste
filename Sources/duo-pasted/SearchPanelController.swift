@@ -119,6 +119,10 @@ final class SearchPanelController: NSObject, NSWindowDelegate {
         p.makeKeyAndOrderFront(nil)
         installKeyMonitor()
         installGlobalClickMonitor()
+        // 「在完整列表中显示」把列表切成了目标条目前后 200 条的窗口。那是一次性定位状态,
+        // 不该跨 panel 生命周期粘着——否则用户下次打开面板看到的是三周前那一段,还没有
+        // 显而易见的回到最新的路。重开面板 = 回到最新,这也是窗口模式唯一的退出口
+        state.resetListWindow()
         // 触发 SearchView 重新抢焦点 + kick refresh（panel 被复用，onAppear 不再 fire）
         state.openPulse &+= 1
         // **保留 selectedIDs**:用户上次翻到第 N 张关 panel,再开 panel 应该回到第 N 张

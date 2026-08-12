@@ -769,7 +769,9 @@ public struct Database: Sendable {
         }
     }
 
-    private static func searchFoldGroupTypeSQL(alias: String) -> String {
+    /// internal 而非 private —— `Search.foldPosition` 要用同一份 group key 定义把 item
+    /// 映射到它的 fold 展示行,两处必须逐字一致
+    static func searchFoldGroupTypeSQL(alias: String) -> String {
         """
         CASE
             WHEN \(alias).blob_sha256 IS NOT NULL AND \(alias).blob_sha256 != '' THEN 'blob'
@@ -780,7 +782,7 @@ public struct Database: Sendable {
         """
     }
 
-    private static func searchFoldGroupKeySQL(alias: String) -> String {
+    static func searchFoldGroupKeySQL(alias: String) -> String {
         """
         CASE
             WHEN \(alias).blob_sha256 IS NOT NULL AND \(alias).blob_sha256 != ''

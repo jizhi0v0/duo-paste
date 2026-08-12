@@ -113,7 +113,8 @@ final class AppState {
         applySearchOutcome(
             cachedEmptySearch.outcome,
             queryIsEmpty: true,
-            prefetchThumbnails: false
+            prefetchThumbnails: false,
+            fromRevealWindow: false
         )
         return true
     }
@@ -757,7 +758,138 @@ final class AppState {
         scrollPulse &+= 1
     }
 
-    func refresh() async {
+    /// 左侧箭头按下的计数器。SearchView 监听它 `proxy.scrollTo(startAnchorID, anchor: .leading)`。
+    ///
+    /// **它只是滚动，不带任何筛选语义**——不清 query、不改 selectedIDs、不动 chip。
+    /// 用户明确要求过:"左键不要丢失条件，这只是移动到最左，如果你添加太多语义，会很糟糕"。
+    /// 也因此不能复用 `scrollPulse`——那条路锚的是 `selectedIDs.last`，选中项不在开头时
+    /// 会滚到别处去。
+    var scrollToStartPulse: Int = 0
+
+    /// 左侧箭头：把卡片区滚回最左，其余状态一概不动。
+    func scrollToStart() {
+        guard !results.isEmpty else { return }
+        scrollToStartPulse &+= 1
+    }
+
+    /// 清空搜索框后要定位到哪条。**不能**在清 query 的同一 tick 里直接 scrollPulse——
+    /// 清 query 只是触发 `SearchView.task(id: filterID)` 异步重搜，那一刻 `results`
+    /// 还是被过滤的旧数组，scrollTo 会锚到一个马上就要消失的 id。所以记下意图，
+    /// 由 `applySearchOutcome` 在新结果落地后消费。
+    /// @ObservationIgnored：内部一次性意图，UI 不读也不该因它重渲。
+    @ObservationIgnored private var pendingRevealID: String?
+
+    /// 定位到某条时,列表加载它前后各多少条。
+    ///
+    /// 为什么是窗口而不是"把 listLimit 去掉":实测本机 29,593 条 live item(fold 后 22,523),
+    /// 空查询 refresh 中位数 limit=200 → 7.9ms、无界 → 717ms(每条约 33µs 线性),还要再加
+    /// 2.2 万个 LazyHStack cell 的 main-thread reconciliation。窗口是常数代价(~400 条 ≈ 13ms),
+    /// 而且比"从最新一条一路拉到目标"更有用——目标条目前后的上下文都在
+    static let revealWindowRadius = 200
+
+    /// 当前列表要取的窗口。nil = 默认取最新 `listLimit` 条。
+    ///
+    /// `filterID` 是自我作废机制:窗口只对创建它时的那套筛选条件有效,用户一改 query /
+    /// chip / 时间范围,refresh 里发现指纹对不上就自动丢弃回到默认视图。不需要在每个
+    /// chip toggle 上手动清。
+    private struct ListWindow {
+        let offset: Int
+        let limit: Int
+        let filterID: String
+    }
+    @ObservationIgnored private var listWindow: ListWindow?
+
+    /// 卡片右键「在完整列表中显示」：清空搜索框，加载这条前后各 200 条，再定位到它。
+    ///
+    /// 位次要在清 query **之后**的筛选条件下算(chip / 仅置顶仍然生效),所以先改 query
+    /// 再查 `foldPosition`。查不到(条目被 chip 滤掉 / 已删 / 走不了 projection)就退化成
+    /// 默认视图 + 提示,由 `applyPendingFocus` 兜底。
+    func revealInFullList(_ item: Item) {
+        guard !query.isEmpty else {
+            pendingRevealID = nil
+            focusItem(id: item.id, in: results)
+            return
+        }
+        query = ""
+        pendingRevealID = item.id
+        listWindow = nil
+        let q = currentQuery()
+        let fingerprint = filterID
+        let api = deps.searchAPI
+        let itemID = item.id
+        Task { [weak self] in
+            let position = (try? await Task.detached(priority: .userInitiated) {
+                try api.foldPosition(ofItemID: itemID, query: q)
+            }.value) ?? nil
+            guard let self else { return }
+            // 用户在这期间又改了筛选 → 窗口作废,别把视图拽回去
+            guard self.filterID == fingerprint else { return }
+            guard let position else {
+                // 拿不到位次(条目被 chip 滤掉 / 已删)——清掉待定意图并说清楚,
+                // 否则 pendingRevealID 会一直挂着,下一次无关 refresh 才误报
+                self.pendingRevealID = nil
+                self.postNotice("这条不在当前列表范围内")
+                return
+            }
+            self.pendingRevealID = position.displayItemID
+            self.listWindow = ListWindow(
+                offset: max(0, position.rank - Self.revealWindowRadius),
+                limit: Self.revealWindowRadius * 2 + 1,
+                filterID: fingerprint
+            )
+            await self.refresh()
+        }
+    }
+
+    /// 丢弃定位窗口，下一次 refresh 回到默认的"最新 listLimit 条"。
+    func resetListWindow() {
+        listWindow = nil
+    }
+
+    /// 新一批 results 落地后消费 pendingRevealID。找不到目标（已删 / 被 chip 滤掉 /
+    /// 走不了 fold projection 拿不到位次）时只提示不改选中——静默跳到别处比什么都不做
+    /// 更让人困惑。
+    ///
+    /// **`fromRevealWindow` 不能换成读当时的 `listWindow`**:清空 query 会先触发一轮
+    /// **默认**视图的 refresh(SearchView 的 `.task(id: filterID)`),它跟算位次的 detached
+    /// task 是并发的。默认那轮很可能在窗口装好之后才落地,此时 `listWindow != nil` 但
+    /// `items` 是最新 200 条、根本没有目标 —— 于是误报"不在列表范围内"并把 pendingRevealID
+    /// 清掉,紧接着真正的窗口结果落地时已经没有意图可消费,列表跳过去了却没选中任何卡。
+    /// 判据必须是"**这一份 results** 是不是窗口查出来的"。
+    private func applyPendingFocus(items: [Item], fromRevealWindow: Bool) {
+        guard let id = pendingRevealID else { return }
+        if items.contains(where: { $0.id == id }) {
+            pendingRevealID = nil
+            focusItem(id: id, in: items)
+            if fromRevealWindow {
+                postNotice("已定位 · 显示这条前后各 \(Self.revealWindowRadius) 条，重开面板回到最新")
+            }
+            return
+        }
+        // 默认视图那一轮不算数——窗口还在路上,留着意图等它
+        guard fromRevealWindow else { return }
+        pendingRevealID = nil
+        postNotice("这条不在当前列表范围内")
+    }
+
+    /// 定位专用的滚动脉冲：**居中**展示目标卡。
+    ///
+    /// 不复用 `scrollPulse`——那条是箭头导航用的 minimal scroll(卡片已在视口就不动),
+    /// 定位场景下目标卡刚从别处跳过来,minimal 会把它贴在视口边缘,用户得先找一下
+    /// 才知道命中的是哪张。居中是"我把你要的这条摆在你眼前"。
+    var centerScrollPulse: Int = 0
+
+    private func focusItem(id: String, in items: [Item]) {
+        guard items.contains(where: { $0.id == id }) else { return }
+        selectedIDs = [id]
+        anchorID = id
+        centerScrollPulse &+= 1
+    }
+
+    /// 由当前 UI 状态(query / chip / 时间 / 仅置顶)构造 SearchQuery。
+    /// `refresh` 跟 `revealInFullList` 必须用同一份构造——位次是在某套筛选条件下算的,
+    /// 两边条件不一致窗口就会错位
+    private func currentQuery(limit: Int? = nil, offset: Int = 0) -> SearchQuery {
         // 把 chip selection 跟 activeQualifiers 取并集落到 SearchQuery —— 用户点 PDF chip
         // 跟选 /pdf 补全必须等价。imageMerged 同时贡献到 kinds(.image) + fileSubKinds(.imageFile)
         var kindsUnion = selectedKinds
@@ -789,9 +921,8 @@ final class AppState {
             }
         }
         let trimmed = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
-        let contextID = searchContextID
         let timeBounds = timeRange.bounds()
-        let q = SearchQuery(
+        return SearchQuery(
             text: trimmed.isEmpty ? nil : trimmed,
             fromNs: timeBounds.fromNs,
             toNs: timeBounds.toNs,
@@ -799,8 +930,22 @@ final class AppState {
             fileSubKinds: Array(subsUnion),
             textFullSuffixes: suffixes,
             pinnedOnly: pinnedOnly,
-            limit: Self.listLimit
+            limit: limit ?? Self.listLimit,
+            offset: offset
         )
+    }
+
+    func refresh() async {
+        let contextID = searchContextID
+        // 定位窗口只对创建它时那套筛选有效——指纹对不上直接丢,回默认"最新 listLimit 条"
+        if let window = listWindow, window.filterID != filterID {
+            listWindow = nil
+        }
+        // 快照住这一轮用的窗口:结果落地时 listWindow 可能已经被并发的 reveal 换掉,
+        // 判"这份 results 是不是窗口查出来的"必须看当时这个值
+        let window = listWindow
+        let q = window.map { currentQuery(limit: $0.limit, offset: $0.offset) } ?? currentQuery()
+        let trimmed = q.text ?? ""
         // **E**: 把 SearchProvider.search 整段(4 次同步 SQL + fold + 转 Item array)
         // 搬出 main actor。SearchProvider.search 是 async 但内部全同步——`async`
         // 只为接口稳定保留(见 SearchClient.swift:72-74 注释),实际所有工作在调用者
@@ -841,7 +986,12 @@ final class AppState {
         if trimmed.isEmpty {
             cachedEmptySearch = (contextID: contextID, outcome: outcome)
         }
-        applySearchOutcome(outcome, queryIsEmpty: trimmed.isEmpty, prefetchThumbnails: true)
+        applySearchOutcome(
+            outcome,
+            queryIsEmpty: trimmed.isEmpty,
+            prefetchThumbnails: true,
+            fromRevealWindow: window != nil
+        )
         if let pending = try? await deps.database.pendingPinItemIDs(),
            self.pendingPinItemIDs != pending {
             self.pendingPinItemIDs = pending
@@ -859,7 +1009,8 @@ final class AppState {
     private func applySearchOutcome(
         _ outcome: SearchProvider.Outcome,
         queryIsEmpty: Bool,
-        prefetchThumbnails: Bool
+        prefetchThumbnails: Bool,
+        fromRevealWindow: Bool
     ) {
         // **F**: 每个 setter 前 equality guard——内容等价时直接跳过,避免 Observation
         // 框架 didSet wave 触发下游 ForEach diff / chip 重渲。
@@ -880,6 +1031,9 @@ final class AppState {
             fileSubKindCounts = outcome.fileSubKindCounts
         }
         updateSelection(forItems: outcome.items, queryIsEmpty: queryIsEmpty)
+        // updateSelection 的 "kept 优先" 只保住旧选中项;清空搜索框那次动作想落在哪张卡
+        // 由 pendingFocus 决定,所以放在它之后覆盖
+        applyPendingFocus(items: outcome.items, fromRevealWindow: fromRevealWindow)
         if lastError != nil { lastError = nil }
     }
 

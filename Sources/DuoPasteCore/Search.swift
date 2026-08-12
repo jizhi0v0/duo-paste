@@ -145,6 +145,80 @@ public struct SearchAPI: Sendable {
         }
     }
 
+    /// 某条 item 在**空查询列表**里的位置。给"从搜索结果跳回完整列表"用:
+    /// 只有知道位次,才能只拉它前后一小段而不是把整库 22k 行都拉出来。
+    public struct FoldPosition: Sendable, Equatable {
+        /// fold 之后真正被展示的那一行的 id。跨 origin 重复文本会被折叠,用户右键的那条
+        /// 未必是展示行——定位必须落到展示行上,否则列表里根本没有这个 id
+        public let displayItemID: String
+        /// 0-based 位次,按空查询排序 `(pinned DESC, captured_at_ns DESC, item_id ASC)`
+        public let rank: Int
+    }
+
+    /// 查 `itemID` 在当前 (chip / pinnedOnly) 条件下的空查询列表位次。
+    ///
+    /// 只支持 fold projection 路径(无搜索词、无自定义时间范围)——那条路的 `LIMIT/OFFSET`
+    /// 是真 SQL 分页,拿到 rank 后即可只取窗口。FTS / 时间范围路径的 offset 是 Swift 端
+    /// 切数组,先要构造全集,拿 rank 反而更贵,直接返回 nil 让调用方降级。
+    ///
+    /// 找不到(条目已删 / 被 chip 过滤掉 / 不走 projection)返回 nil。
+    public func foldPosition(ofItemID itemID: String, query q: SearchQuery) throws -> FoldPosition? {
+        guard Self.canUseFoldProjection(q) else { return nil }
+        try database.refreshSearchFoldProjection()
+        return try database.pool.read { db in
+            // 1. 先把 item 映射到它所在 fold group 的展示行。group_type / group_key 完全由
+            //    item 行自身决定(见 Database.searchFoldGroupKeySQL),所以能直接 JOIN 出来。
+            //    blob group 会按 15s 时间窗分多个 cluster,取 captured_at 最接近的那个
+            let anchorSQL = """
+                SELECT f.item_id AS display_id, f.pinned AS pinned, f.captured_at_ns AS captured_at_ns
+                FROM item i
+                JOIN search_fold f
+                  ON f.group_type = \(Database.searchFoldGroupTypeSQL(alias: "i"))
+                 AND f.group_key = \(Database.searchFoldGroupKeySQL(alias: "i"))
+                WHERE i.id = ?
+                ORDER BY ABS(f.captured_at_ns - i.captured_at_ns) ASC
+                LIMIT 1
+            """
+            guard let anchor = try Row.fetchOne(db, sql: anchorSQL, arguments: [itemID]) else {
+                return nil
+            }
+            let displayID: String = anchor["display_id"]
+            let pinned: Int = anchor["pinned"]
+            let capturedAtNs: Int64 = anchor["captured_at_ns"]
+
+            // 2. 数排在展示行**之前**的行数 = 它的 0-based 位次。谓词必须逐字对应
+            //    fetchProjectionHits 的 ORDER BY (pinned DESC, captured_at_ns DESC, item_id ASC),
+            //    否则窗口会错位
+            var args: [DatabaseValueConvertible] = []
+            var wheres: [String] = []
+            if q.pinnedOnly { wheres.append("f.pinned = 1") }
+            if let qualifier = Self.projectionQualifierPredicate(q, alias: "f", args: &args) {
+                wheres.append(qualifier)
+            }
+            // 展示行自己被 chip 过滤掉时位次没有意义 —— 让调用方走"不在列表里"的提示
+            var selfArgs = args
+            var selfWheres = wheres
+            selfWheres.append("f.item_id = ?")
+            selfArgs.append(displayID)
+            let selfSQL = "SELECT COUNT(*) FROM search_fold f WHERE " + selfWheres.joined(separator: " AND ")
+            let selfCount = try Int.fetchOne(db, sql: selfSQL, arguments: StatementArguments(selfArgs)) ?? 0
+            if selfCount == 0 { return nil }
+
+            wheres.append("""
+                (f.pinned > ?
+                 OR (f.pinned = ? AND f.captured_at_ns > ?)
+                 OR (f.pinned = ? AND f.captured_at_ns = ? AND f.item_id < ?))
+            """)
+            let rankArgs: [DatabaseValueConvertible] = [
+                pinned, pinned, capturedAtNs, pinned, capturedAtNs, displayID
+            ]
+            args.append(contentsOf: rankArgs)
+            let rankSQL = "SELECT COUNT(*) FROM search_fold f WHERE " + wheres.joined(separator: " AND ")
+            let rank = try Int.fetchOne(db, sql: rankSQL, arguments: StatementArguments(args)) ?? 0
+            return FoldPosition(displayItemID: displayID, rank: rank)
+        }
+    }
+
     /// 一次返回生产 UI 所需的 list + total + facets。
     ///
     /// - 空 query 且无时间范围：走 v16 持久化 fold projection，SQL 一次窄表聚合 + 最近页。
