@@ -24,6 +24,8 @@
   - **完整 metadata mirror**：`Caches/HistoryStore/mirror.sqlite` 保存完整 item + FTS + `ios-metadata-mirror` cursor；`HistoryStore.items` 只加载最近 1000 条作为 bounded UI projection，不是同步上限。非空 query 和 qualifier-only 都在 detached task 里走本机 `SearchAPI`，断网时语义不降级为 contains
   - **iOS strict sync 状态**：每页进度只能在 item/source ledger/cursor 同一 writer transaction 提交后发布。`has_more=false` 且 source count audit 通过后，才把 strict checkpoint 原子写到 `Application Support/DuoPaste/metadata-sync-checkpoint.json`；它必须与可清理的 `Caches/HistoryStore/mirror.sqlite` 分离。checkpoint 存在但 mirror 缺失、行数或 cursor 落后时必须显示 rebuilding/“当前结果不是全集”，不能伪装 ready。取消保留逐页 cursor；用户 pause 同时禁止前台自动 pull 与 BGAppRefreshTask，直到显式继续/立即刷新
   - **BlobCache 磁盘 + LRU**：`Caches/Blobs/v1/<ab>/<cd>/<sha>.bin` 三层目录持久化跨启动。500MB cap 按 mtime 升序 evict。Detached IO 避免大图同步读卡 main actor
+  - **乐观状态对账必须挂在 `onPageApplied`**：R2.1 之后 item 归 SQLite mirror，`HistoryStore.merge(_:)` 连同其调用方 `applyPage` 一起变成死代码（生产走 `MetadataMirrorStore.synchronize` → `refreshFromMirror`）。`merge` 里"并进内存数组"那半边确实被取代了，但它同时承担的三件对账工作**没有替代品**：① 删除未送达时把 id 从 `optimisticallyDeletedIDs` 放出来 + 弹橙色 banner（否则卡片永远假装已删、重启后无声复活）；② 非 owner pin 的「等待同步」靠 canonical `/since` 行确认目标值才能清（`markPinApplied` 只在 `/pin` 返回 `applied` 时调，非 owner 永远返回 `pending`）；③ tombstone 到达清 overlay 表。现由 `MetadataMirrorStore.synchronize(onPageApplied:)` 在 writer transaction 提交**之后**逐页回调 `HistoryStore.reconcileOptimisticState(with:)`。**不要**复活 `merge` / `applyPage`——留着它们只会再次制造"看起来有人处理了"的假象。回归测试 `MetadataMirrorPageHookTests.swift` + `IOSOptimisticReconcileWiringTests.swift`
+  - **取消的同步绝不能停在 `.syncing`**：`pullPass` 的顺序是 applyPage → onPageApplied → **checkCancellation** → progress。取消检查必须在 progress **之前**——否则"用户点取消时恰好有一页刚 commit"会让最后一次 progress 把 `activity` 从 `.paused` 推回 `.syncing`，而随后抛出的 `CancellationError` 没人再纠正它：卡片永久停在「首次同步中」、取消按钮消失，且 `reloadSyncCheckpoint` 开头的 `guard activity != .syncing` 让之后每次前台恢复都成为 no-op，只能重启 app。iOS 侧 `applySyncProgress` 另有一道 `guard !Task.isCancelled` 纵深防御，`resolveCancelledSyncActivity()` 兜底把无主的 `.syncing` 降级成 `.idle`——**兜底里绝不能调 `markSyncPaused()`**，那会写 `syncPausedDefaultsKey` 把用户级自动同步一起关掉，而 route 切换并不是用户的暂停意图
   - **前后台统一 pull**：前台 WS 只唤醒 `/since`；`PeerSyncCoordinator` 与 BGAppRefreshTask（id `io.duopaste.ios.background-pull`）都调用 `MetadataMirrorStore.applyPage`，item rows + 二元 cursor 在同一个 writer transaction 提交，cursor 只单调前进。app 回前台从 SQLite 刷新 bounded projection；WS 后台不能跑（iOS 限制）时降级周期 HTTP pull
   - **旧 JSON 一次性迁移**：升级时 `items.json` 只做 `INSERT OR IGNORE`，逐 ID 校验 SQLite 成功后才删除。旧 `cursor.json` 绝不沿用——它可能已经越过被 1000 条 cap 丢掉的历史，SQLite 首轮必须从 zero 全量重拉。blob 仍由独立 500MB LRU 管理
 
@@ -224,6 +226,34 @@ v16 的 `search_fold` / `search_fold_dirty` 是可重建的本机派生索引，
 
 projection 的 display 行仍由 `Item.foldByTextFull` 产出，不能在 trigger/SQL 里另写一份 blob cluster 算法。文本 bulk rebuild 的 winner/pin 可用 window SQL，但 blob 必须按 SHA 流式喂同一个 fold 真源；file sub-kind 必须走 `ItemClassifier.fileSubKind`。自定义时间范围会改变“哪些 sibling 参与 fold”，因此不得读全局 projection，必须回退一次 Swift fold summary。
 
+### 从搜索结果跳回完整列表：位次窗口，不是放大 `listLimit`
+
+卡片右键「在完整列表中显示」清空搜索框后要定位到那一条。**不能**靠把 `AppState.listLimit`（200）调大或去掉——本机真实库实测（29,593 条 live item / 22,523 条 fold 行）：
+
+| limit | 空查询 refresh 中位数 |
+|---|---|
+| 200 | 7.9 ms |
+| 1000 / 2000 / 5000 | 32.9 / 65.3 / 166.8 ms |
+| 无界 | 716.7 ms |
+
+每条约 33µs 线性，还要再加 2.2 万个 LazyHStack cell 的 main-thread reconciliation（注释里那条"1000 条时 100-158ms hitch"的实测就是这个）。
+
+正确做法是 `SearchAPI.foldPosition(ofItemID:query:)` 先算位次，再取 `limit=401 / offset=rank-200` 的窗口：定位最老一条（rank 22,522）= 位次查询 2.9ms + 窗口拉取 12.9ms ≈ 16ms，且跟条目多老无关。四条不变量：
+
+1. **只支持 fold projection 路径**（无搜索词、无自定义时间范围）——那条路的 `LIMIT/OFFSET` 是真 SQL 分页。FTS / 时间范围路径的 offset 是 Swift 端切数组，要先构造全集，拿 rank 反而更贵，直接返回 nil 让调用方降级提示
+2. **位次谓词必须逐字对应** `fetchProjectionHits` 的 `ORDER BY f.pinned DESC, f.captured_at_ns DESC, f.item_id ASC`，差一位窗口就偏
+3. **定位落在 fold 展示行上**：用户右键的那条未必是展示行（跨 origin 同文本折叠后展示行是最新那条）。`foldPosition` 用跟 trigger 同一份 `Database.searchFoldGroupKeySQL` 把 item 映射到展示行，否则列表里根本没有这个 id，卡片选不中
+4. **判"这份 results 是不是窗口查出来的"要用 `fromRevealWindow` 参数，不能读当时的 `listWindow`**：清空 query 会先触发一轮**默认**视图的 refresh（`SearchView.task(id: filterID)`），它跟算位次的 detached task 并发。默认那轮常在窗口装好之后才落地——此时 `listWindow != nil` 但 items 是最新 200 条，于是误报"这条不在当前列表范围内"并把 `pendingRevealID` 吞掉，紧接着真正的窗口结果落地时已经没有意图可消费：列表跳过去了却没有卡被选中（实机复现过）
+
+窗口按 `filterID` 自我作废（用户一改 query/chip/时间就丢弃），并在 `SearchPanelController.show` 里重置——它是一次性定位状态，粘着会让用户下次开面板停在三周前那一段且没有出路。**重开面板回到最新是窗口模式唯一的退出口**，banner 文案里写明了。
+
+配套的两个 UI 契约：
+
+- **左侧箭头是纯滚动控件**：`AppState.scrollToStart()` 只 bump 自己的 `scrollToStartPulse`，不清 query、不改 `selectedIDs`、不动 chip（user：“左键不要丢失条件，这只是移动到最左，如果你添加太多语义，会很糟糕”）。也不能复用 `scrollPulse`——那条锚 `selectedIDs.last`。滚动锚点是 LazyHStack 开头那个带 `.id` 的 spacer（2pt + spacing 14 = 原来的 16pt leading padding），**不是**第一张卡：容器 padding 挂不上 `.id`，而锚第一张卡（anchor `.leading`）会把卡贴到视口左缘，`offset(-9,-9)` 的 source icon 被 ScrollView 切掉
+- **定位用 `centerScrollPulse` 居中**，不复用箭头那条 minimal scroll；**`ItemCard` 不许给 `isSelected` 挂隐式动画**——LazyHStack cell pool 把旧 cell 复用给新 item 时，SwiftUI 会把它当"同一视图的属性变化"播过渡，表现为"搜索后卡片已经出来、高亮框慢一点才飞过来"
+
+回归测试 `SearchFoldPositionTests.swift`（位次语义 5 条）+ `SearchJumpToStartWiringTests.swift`（接线契约 6 条）。
+
 ### 保存搜索视图：独立本机文件 + 写盘后发布
 
 命名搜索视图住 `~/Library/Application Support/duo-paste/saved-search-views.json`，不塞进 `config.json`，也不进入 DB/mesh。原因：SettingsModel 会持有启动时 Config 快照；若视图是 Config 字段，用户保存新视图后再应用旧 Settings 快照会把它静默覆盖。独立文件是 per-device 单一真相，顶层 schema version 必须先于完整 payload 解码检查，未来版本拒绝降级覆盖。
@@ -304,6 +334,7 @@ Blob 不做永久 SHA fold：相同图片可能被用户在同一设备主动复
 5. **lazy paste 同步阻塞 panel** —— Enter case 的 hide 责任移交 onPaste 回调（AppDelegate.pasteBack）。同步路径完成后 `panel.hide()`；慢路径起 `currentPasteTask` 完成后再 hide。**不要回退**——async 关 panel 让用户切到目标 app 后已脱离原 context
 6. **panel hide 必须 cancel 进行中的 lazy task** —— `SearchPanelController.init` 接 `onDismiss` callback，`hide()` 调它；AppDelegate 注册 cancel currentPasteTask + 清 progress。覆盖 Esc / `windowDidResignKey` / 主动 `hide()`。**不要回退**——不 cancel 让 task 继续写 NSPasteboard 形成孤儿写入
 7. **lazy 多次 Enter 自动 cancel 旧 task** —— `AppDelegate.currentPasteTask` 保存上次 Task，pasteBack 调用时先 cancel 再起新的
+7b. **写完 pasteboard 后必须 `detachCompletedPasteTask()` 再 `panel.hide`** —— #6 的 cancel 是同步的：`hide(immediate:) → finalizeHideImmediate → onDismiss → cancelLazyPasteIfAny`，而这一刻 `currentPasteTask` 指向的正是**执行收尾代码的 task 自己**，于是 task 自杀。后面的 `await bumpUsedItems(...)` 就跑在已取消的 task 里——GRDB async read/write 遵循 task cancellation（官方文档："Once an async Task is cancelled, reads and writes throw `CancellationError`"），`bumpCapturedAt` 抛错被 `try?` 吞 → `maxIngest` 恒为 0 → 提前 return → **"用过即顶"与 `state.refresh()` 双双静默失效**。注销点必须在 pasteboard 写入**之后**（此前仍要能 cancel，否则回到孤儿写入），命中 5 条注册型路径：mergedText/mergedFile、plainText、mergedImages ×2、lazy 单条。快路径 `pasteBackSingle` 用裸 `Task {}` 不注册，天然不受影响——这也是为什么日常单条 Enter 粘贴看不出问题。回归测试 `PasteBumpCancellationTests.swift`（机制 + 源码接线契约各一条）
 8. **lazy 30s 总超时靠 TaskGroup race，不靠 `Date()` 检查** —— DERP 中继 TLS 握手 3s+ 经常超时所以 30s。`fetchBlobLazy` 用 `withThrowingTaskGroup` race：(a) `fetchBlobLazyInner` 重试循环 `backoffs=[0, 2, 4]`（`.transient` 进下一轮；`.rejected`/`.shaMismatch`/`.notFound` 立即 fail），(b) `Task.sleep(lazyBlobTimeoutSec)` 抛 timeout。先完成的赢 + `group.cancelAll()`。**不要回退**——URLSession 单 request 默 60s，server hang 在 connection 建立但不返数据时 inner 没机会 check Date()；group cancel 让 URLSession 抛 `URLError.cancelled` 立即返回。`lazyBlobTimeoutSec` 必须 `nonisolated`。配合：`SearchPanelController.hide` 必须**同步**先调 `onDismiss()` 再走 140ms 视觉收场动画
 9. **`pasteBlobFetcher` 跟 PullWorker 解耦** —— `setupPasteBlobFetcher` 在 `applicationDidFinishLaunching` 跟 `startMeshSupervisor` 平行调用，只依赖 `peers[0] + shared-secret`，**不**依赖 `mesh.enabled` / `serve`。配 peers 但关 `mesh.enabled`（只想 paste 时按需取 blob）是合法配置
 
@@ -421,6 +452,14 @@ TextField 抢焦点后吞箭头键，父视图 `.onKeyPress(.upArrow/.downArrow)
 
 GRDB `pool.write { ... }` 自动包事务，SQLite 禁止事务内 VACUUM。要用 `pool.writeWithoutTransaction { ... }`。位置：`Snapshot.takeSnapshot`、`Exporter.writeSQLite`。
 
+### UU 远程的 `.uuremote_*` 占位符不进历史
+
+UU 远程桌面同步剪贴板时会往本机 pasteboard 写 `~/Library/Application Support/com.netease.uuremote{,.server}/Clipboard/.uuremote_*` 这类 file URL。它们是 UU 自己的传输临时文件，用完即删——线上库里 31 条全是 `kind=file` / `blob_sha256=NULL`，抽查 8 条路径 7 条已从磁盘消失。
+
+`extract()` 的规则：整组 file URL 的 basename 全部以 `.uuremote_` 开头时，优先取 PNG/TIFF representation 当图片入库；**没有图片字节就整条 `return nil` 跳过**。后半条推翻了 be822a3 初版"没图片字节就继续按 file capture，避免静默吞掉未知内容"的判断——继续捕获的实际后果是：这些死路径永远排在面板首位，⌥⌘V + Enter 让 `Copyback` 把它们当 file URL 写回 NSPasteboard（用户报的"UU 远程时剪贴板被覆盖成 UU 的奇怪文件"就是这个），还会经 mesh 同步到另一台 Mac 和 iOS。
+
+**不能**改用 `capture.excluded_bundle_ids` 兜：实测 31 条里只有 15 条是 UU 前台时捕获的，其余 source_app 是 Claude / Chrome / ChatGPT / 钉钉 / System Settings——UU 在别的 app 前台时也会写占位符，只能按路径特征在捕获层拦。混选（占位符 + 用户真实文件）保持 file-first 语义不跳过。跳过只影响 duo-paste 历史，NSPasteboard 本身不动，UU 自己的粘贴照常。回归测试 `UURemotePlaceholderSkipTests.swift` 走真实 named pasteboard，且**带对照组**（普通文件必须仍被捕获），避免 skip 断言因环境抓不到东西而假通过。
+
 ### Watcher 自身实现的两个轮询事实
 
 - NSPasteboard 没有 KVO/通知 API，只能 200ms 轮询 `changeCount`
@@ -431,9 +470,36 @@ GRDB `pool.write { ... }` 自动包事务，SQLite 禁止事务内 VACUUM。要�
 
 签名输入：`<ts_ms>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`，hex 在 header `X-DP-Body-SHA256`。中间件**只**校验 header hex 跟签名匹配——**不读 body**（让 multi-MB blob 不占中间件内存）。Handler 读完 body 必须**自己**再 sha256 跟 header 对比，否则攻击者可伪造合法签名 + 任意 body。`/blob` 的 handler 还多校验 path sha = body sha = header sha 三方一致。
 
+### `HMACAuth.verify` 必须是 total function（预认证路径不许陷阱算术）
+
+时间窗口检查跑在签名验证**之前**，`timestampMs` 直接来自 header `X-DP-Timestamp`，`AuthMiddleware` 用裸 `Int64(tsStr)` 解析不做范围限制——**攻击者无需任何凭据即可控制这个值**。原实现 `abs(nowMs - timestampMs)` 有两处陷阱算术：减法溢出（`X-DP-Timestamp: -9223372036854775808`）和 `abs(Int64.min)`。任一都让 daemon 当场 SIGTRAP；`KeepAlive` 拉起后下一个请求再杀一次（`ThrottleInterval=30` 只放慢重启挡不住），`serve_host=0.0.0.0` 时 tailnet/LAN 任意设备可打。
+
+现在用 `subtractingReportingOverflow` + `magnitude`（对 `Int64.min` 有定义），`skewMs` 走 `Int64(exactly:)` 让 NaN/越界的 `clockSkew` fail closed。**不要**把窗口检查改回 `abs()`，也不要在 middleware 之外新增未夹紧的 `Int64(...)` 时间戳转换。同类：`/health` 响应**不签名**，`SinceClient` 的 `now_ms` 与 `Admin` 的 skew 减法同样必须夹紧（恶意/损坏 peer 一个 JSON 数字就能打挂 PullWorker / mesh-doctor）。回归测试 `AuthTimestampBoundsTests.swift`。
+
+### PullWorker 写 peer 行必须 UPSERT，禁止 `INSERT OR REPLACE`
+
+`applyPage` 用 `INSERT ... ON CONFLICT(id) DO UPDATE SET`。REPLACE 为满足 PK 约束会先 DELETE 冲突行，三个副作用全是错的：
+
+1. `PRAGMA foreign_keys = ON` 下触发 `ON DELETE CASCADE`，删掉该 item 的 v13 `pin_operation` 队列行——非 owner 排队中的 pin 命令凭空消失，UI 停在乐观值，下次 canonical replay 把 `pinned` 翻回对端旧值（破坏 §"Pin/unpin owner routing"）
+2. **不**触发 `item_ad`（SQLite 文档：REPLACE 删行时 delete trigger 只在 `recursive_triggers` 打开才 fire，本库没开）→ FTS5 contentless-external 表留下永不回收的孤儿行，每次 peer 行重放泄漏一条
+3. 走 `item_ai` 而非 `item_au`，只标 **new** group key dirty；`text_full` 变化时 **old** `search_fold` group 不重算，projection 留陈旧展示行
+
+注意 1 和 3 是 SQLite 官方文档**没写**的行为（`lang_conflict.html` 只写了 trigger 那条，foreign key 页完全没提 REPLACE），只能靠实测发现——所以这条必须留在这里。回归测试 `PullWorkerUpsertTests.swift` 三条各钉一个。
+
 ### Worker 不能用共享 AsyncStream.Iterator 跨 Task
 
 Swift 6 strict concurrency 拒绝同一 iterator 实例 capture 进多个 child task。`PullWorker` 持 `currentSleep: Task<Void, Error>?`，每 tick 起新 sleep task，`wake()` nonisolated 调用 actor method 取消让 sleep 提前结束。`wake()` 必须 `nonisolated`，否则外部回调（WSNotificationClient.onCursorAdvanced）拿不到非阻塞接口。
+
+### `wake()` 只 cancel sleep 不够，必须留 `pendingWake` 痕
+
+通知很可能落在 tick **执行期间**：本轮 `/since` 已经发出 → 对端此刻才 commit → 广播 `cursor_advanced` → `wake()`。那一刻 `currentSleep == nil`，cancel 是空操作，通知被静默丢掉；本轮拉到空结果，新行要等满一个 `intervalSec`（默认 30s）才被看见——违反"WS 通知层让推送延迟 < 1s"。
+
+`handleWake` 同时置 `pendingWake = true`，runLoop 决定 sleep 前消费它把 `sleepSec` 压成 0。两条边界不要动：
+
+- **`!r.hadTransient` 短路在前**：backoff 不被 wake 打断也不消费 flag。否则对端 HTTP 持续失败而 WS 仍在推送时，退避被反复打断 → 无退避 tight loop
+- **sleep 结束后无条件清 flag**：sleep 正常到期或被 wake 取消，两种情况下一轮都会立刻 tick，通知已兑现；不清会让**再下一轮**白白少睡一次，退化成空转
+
+回归测试 `PullWorkerWakeDuringTickTests.swift`：一条钉"tick 期间的 wake 生效"，一条反向钉"没有 wake 时仍睡满 interval"（防止修复过头）。老测试只覆盖"sleep 期间 wake"，那条路径靠 cancel 就够，所以这个缺口一直没暴露。
 
 ### Server 序列化 Item：pinned 必须是 Bool
 
@@ -473,7 +539,24 @@ Swift 6 strict concurrency 拒绝同一 iterator 实例 capture 进多个 child 
 in -[NSRemoteView containingWindowWillOrderOnScreen:]
 ```
 
-崩过两次（2026-07-22 SIGABRT；2026-07-24 AppKit 改走 `_crashOnException` 后表现为 EXC_BREAKPOINT SIGTRAP，crash log 里 `asiBacktraces` 才有真因）。修法是 `DispatchQueue.main.async` 推到下一个 runloop turn 再 order，并在 async 闭包内**重读** `previewShown / currentItem / selectedCardWindowRect`——期间可能已被 hide 或箭头切卡换了目标。**不要**改回同步调用；同理任何新的"布局回调里开窗/上屏"路径都要走同一条 defer。
+崩过两次（2026-07-22 SIGABRT；2026-07-24 AppKit 改走 `_crashOnException` 后表现为 EXC_BREAKPOINT SIGTRAP，crash log 里 `asiBacktraces` 才有真因）。第一层修法是 `DispatchQueue.main.async` 推到下一个 runloop turn 再 order，并在 async 闭包内**重读** `previewShown / currentItem / selectedCardWindowRect`——期间可能已被 hide 或箭头切卡换了目标。**不要**改回同步调用。
+
+**但 deferral 不是根因修复——本节旧版说"挪出 layout pass 就好了"是错的。** 2026-07-25 与 2026-07-28 又各崩一次，且都发生在**已包含**该 deferral 的 build 1270 上。日志里的完整调用栈证明 order 当时跑在干净的 main dispatch queue turn 上：
+
+```
+21 CoreFoundation __CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE__
+19 libdispatch    _dispatch_main_queue_drain
+14 duo-pasted     SearchPanelController…closure   ← 就是 DispatchQueue.main.async 那个块
+13 duo-pasted     PreviewPanelController.show
+ 9 AppKit         -[NSWindow _doWindowWillBeVisibleAsSheet:]   ← 发全局通知
+ 3 ViewBridge     -[NSRemoteView containingWindowWillOrderOnScreen:]  ← assert
+```
+
+真机制在 frame 9→3：**任何**窗口上屏都会广播通知给进程内**每个** `NSRemoteView`。搜索框的系统自动补全候选列表是一个跨进程 remote view；当它自己已经没有 containing window（assert 里的 `expected (null)`）却仍挂在观察者表上时，收到"某个 `NonKeyHUDPanel` 要上屏"就断言失败。预览浮窗侧**无论怎么调时序都躲不开这条广播**——继续加时序 hack 是死路。
+
+根因修复：让这个 remote view 根本不存在。`HUDPanel` 覆盖 `NSWindow.fieldEditor(_:for:)`，把 SwiftUI `TextField` 背后的字段编辑器 `isAutomaticTextCompletionEnabled = false`（剪贴板搜索框不需要系统文本补全）。两层一起留着：deferral 便宜无害，而这个崩溃复现困难。回归测试 `SearchPanelCompletionListTests.swift` 同时钉住两层。
+
+**验证状态**：根因修复有崩栈支撑但**未经复现验证**（无法按需触发）。若日志里再出现该 assert，说明补全列表不是唯一的 remote view 来源，下一步应查还有谁在进程里持有 `NSRemoteView`（Live Text overlay / VisionKit `ImageAnalysisOverlayView` 是首要嫌疑）。
 
 ## 已知环境坑
 
