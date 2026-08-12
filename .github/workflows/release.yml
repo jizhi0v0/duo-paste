@@ -474,6 +474,32 @@ jobs:
           fi
           # tag 里有 '+'（v0.1.1279-beta+8dccf16），URL path 段必须转义
           TAG_ENC="${TAG//+/%2B}"
+          # asset 名字进的是 **query string**，那里 '+' 表示空格：直接拼 name=…+… 会让
+          # GitHub 把 '+' 当空格再清洗成 '.'，落地一个 DuoPaste-0.1.1280-beta.6b0e543.dmg
+          # 这样的错名 asset，appcast 指向的 URL 反而 404（2026-08-12 run 31579493741 现场）。
+          NAME_ENC=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DMG_NAME")
+
+          # JSON 解析写成独立脚本文件，**不用 `python3 -c` 加缩进的内联代码**：runner service
+          # 的 python3 是 /usr/bin/python3 (3.9)，对 `-c` 里的统一前导缩进直接 IndentationError；
+          # 而交互 shell 解析到的是 homebrew 3.14（容忍缩进）。同一台机器两个 python，本机测过
+          # 不等于 CI 能跑（跟 runner 拿不到 shell PATH 是同一族问题）。
+          echo "python3 = $(command -v python3) $(python3 -V 2>&1)"
+          PROBE="${RUNNER_TEMP:-/tmp}/dp-asset-probe-${GITHUB_RUN_ID}.py"
+          cat > "$PROBE" <<'PROBE_PY'
+          import json, os, sys
+          try:
+              rel = json.load(sys.stdin)
+          except Exception:
+              print("", "", "")
+              sys.exit(0)
+          for a in rel.get("assets", []):
+              if a["name"] == os.environ["DMG_NAME"]:
+                  print(a["id"], a.get("state", "?"), a.get("size", -1))
+                  break
+          else:
+              print("", "", "")
+          PROBE_PY
+
           API="https://api.github.com/repos/${REPO}"
           UPLOADS="https://uploads.github.com/repos/${REPO}"
           AUTH=(-H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
@@ -500,15 +526,7 @@ jobs:
             fi
 
             # 这个 asset 现在是什么状态？(id, state, size)
-            read -r ASSET_ID STATE SIZE <<<"$(printf '%s' "$REL" | DMG_NAME="$DMG_NAME" python3 -c '
-            import json, os, sys
-            rel = json.load(sys.stdin)
-            for a in rel.get("assets", []):
-                if a["name"] == os.environ["DMG_NAME"]:
-                    print(a["id"], a.get("state", "?"), a.get("size", -1)); break
-            else:
-                print("", "", "")
-            ')"
+            read -r ASSET_ID STATE SIZE <<<"$(printf '%s' "$REL" | DMG_NAME="$DMG_NAME" python3 "$PROBE")"
 
             if [[ -n "$ASSET_ID" && "$STATE" == "uploaded" && "$SIZE" == "$ACTUAL" ]]; then
               echo "✅ asset 完整：${DMG_NAME} state=uploaded size=${SIZE}"
@@ -523,7 +541,7 @@ jobs:
             echo "上传 ${DMG_NAME} (${ACTUAL} bytes)"
             curl -sS "${AUTH[@]}" -H "Content-Type: application/octet-stream" \
               --data-binary @"$DMG" \
-              "${UPLOADS}/releases/${REL_ID}/assets?name=${DMG_NAME// /%20}" >/dev/null || \
+              "${UPLOADS}/releases/${REL_ID}/assets?name=${NAME_ENC}" >/dev/null || \
               echo "上传返回非零（可能只是响应端断连），下一轮按 API 事实复核"
           done
 
