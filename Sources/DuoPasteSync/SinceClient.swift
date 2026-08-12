@@ -65,9 +65,14 @@ private struct HealthResponse: Codable {
             self.nowMs = n
         } else if let n = try? c.decode(Int64.self, forKey: .nowMs) {
             self.nowMs = n
-        } else if let d = try? c.decode(Double.self, forKey: .nowMs) {
-            // 保险：JSON formatter 把整数写成 1.7e18 这类 → 接受 Double 截断为 Int64
-            self.nowMs = Int64(d)
+        } else if let d = try? c.decode(Double.self, forKey: .nowMs),
+                  let n = Int64(exactly: d.rounded(.towardZero)) {
+            // 保险：JSON formatter 把整数写成 1.7e18 这类 → 接受 Double 截断为 Int64。
+            // 必须走 `Int64(exactly:)`：裸 `Int64(d)` 对 NaN / 1e30 是陷阱算术，而
+            // `/health` 响应**没有签名**（HMAC 只覆盖 request），恶意或损坏的 peer 能借
+            // 一个 JSON 数字把 PullWorker / mesh-doctor 直接打成 SIGTRAP。越界即当作
+            // 无效 now_ms，走下面的 dataCorrupted 分支
+            self.nowMs = n
         } else {
             throw DecodingError.dataCorruptedError(forKey: .nowMs, in: c, debugDescription: "now_ms 非 Int64 / 数字字符串")
         }

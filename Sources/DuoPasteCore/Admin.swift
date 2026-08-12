@@ -199,7 +199,11 @@ public enum Admin {
             var matches: Bool? = nil
             switch outcome {
             case .ok(let did, let nowMs):
-                let skew = nowMs - localNowMs
+                // `nowMs` 来自对端 /health body，该响应不签名——极值会让裸减法溢出 trap
+                // 掉整个 mesh-doctor / diagnostics-export。skew 只用于展示与告警阈值，
+                // 溢出时钳到边界即可（一定会触发"时钟严重不同步"的判断，语义正确）
+                let (rawSkew, skewOverflow) = nowMs.subtractingReportingOverflow(localNowMs)
+                let skew = skewOverflow ? (nowMs < 0 ? Int64.min : Int64.max) : rawSkew
                 healthOutcome = .ok(deviceID: did, nowMs: nowMs, skewMs: skew)
                 if let expected = peer.deviceID {
                     matches = (did == expected)

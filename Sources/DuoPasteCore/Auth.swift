@@ -71,6 +71,20 @@ public struct HMACAuth: Sendable {
 
     /// 服务端校验：常量时间比较 + 时间窗口。
     /// 注意 `nowMs` 显式注入便于测试；运行时传 `Clock.nowMs()`。
+    ///
+    /// **本函数必须是 total function（任何输入都只返回 true/false，绝不 trap）**：
+    /// `timestampMs` 直接来自请求 header `X-DP-Timestamp`，中间件用裸 `Int64(tsStr)` 解析
+    /// 不做范围限制，而这道窗口检查跑在签名验证**之前**——攻击者不需要任何凭据就能控制它。
+    /// 历史实现写的是 `abs(nowMs - timestampMs)`，两处都是陷阱算术：
+    ///   - `X-DP-Timestamp: -9223372036854775808` → 减法溢出 → SIGTRAP
+    ///   - delta 恰好等于 `Int64.min` → `abs` 溢出 → SIGTRAP
+    /// 任一都让 daemon 当场死掉，且 launchd `KeepAlive` 拉起后下一个请求再杀一次
+    /// （`ThrottleInterval=30` 只放慢重启，挡不住）。`serve_host=0.0.0.0` 时 tailnet /
+    /// LAN 上任何设备都能打。
+    ///
+    /// 现在用溢出报告版减法 + `magnitude`（对 `Int64.min` 也有定义）：溢出意味着时间戳
+    /// 离 now 有 Int64 量级的距离，必然超出任何合法窗口，一律 reject。`skewMs` 也走
+    /// `Int64(exactly:)`，让 NaN / 越界的 `clockSkew` 退化成"全拒"而不是 trap。
     public func verify(
         timestampMs: Int64,
         method: String,
@@ -79,8 +93,10 @@ public struct HMACAuth: Sendable {
         signatureHex: String,
         nowMs: Int64
     ) -> Bool {
-        let skewMs = Int64(clockSkew * 1000)
-        if abs(nowMs - timestampMs) > skewMs { return false }
+        let skewMs = Int64(exactly: (clockSkew * 1000).rounded(.towardZero)) ?? -1
+        guard skewMs >= 0 else { return false }
+        let (deltaMs, overflow) = nowMs.subtractingReportingOverflow(timestampMs)
+        guard !overflow, deltaMs.magnitude <= UInt64(skewMs) else { return false }
         let expected = sign(
             timestampMs: timestampMs,
             method: method,
