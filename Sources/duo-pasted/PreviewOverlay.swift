@@ -145,6 +145,15 @@ final class PreviewPanelController {
         currentImageOverlay = nil
         panel?.alphaValue = 0
         panel?.ignoresMouseEvents = true
+        // alpha=0 只是视觉隐藏,窗口仍以 .floating 留在 window list 里——系统把它当成
+        // 遮挡物:App Store 的 PassKit 付款单判 "Payment UI is occluded" 后不进 Touch ID /
+        // 密码,只剩取消按钮。必须真正 orderOut。挪到下一个 runloop turn:hide() 会从
+        // onPreviewChange(SearchView layout pass 内)同步调用,同 show() 那条 ViewBridge
+        // 重入崩溃的理由,不在 layout 期间改窗口 order。期间又被 show() 了就不撤。
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.currentItemID == nil, let p = self.panel else { return }
+            p.orderOut(nil)
+        }
     }
 
     /// 当前预览的选中字符串。nil = 当前 kind 不是文本路径 / 无选中字符 /
